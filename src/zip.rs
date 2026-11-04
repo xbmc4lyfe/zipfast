@@ -109,9 +109,12 @@ impl Archive {
         // the end record is 22 bytes plus a comment of at most 65535
         let tail_len = len.min(22 + 65535);
         let tail = read_at(&mut file, len - tail_len, tail_len as usize)?;
-        let end = (0..tail.len().saturating_sub(21))
-            .rev()
-            .find(|&i| le32(&tail, i) == SIG_END && i + 22 + le16(&tail, i + 20) as usize <= tail.len())
+        // the real end record's comment runs exactly to the end of the file; one whose comment would stop short
+        // is more likely a signature inside a comment, so it is only a fallback, for files with bytes appended
+        let candidates = || (0..tail.len().saturating_sub(21)).rev().filter(|&i| le32(&tail, i) == SIG_END);
+        let end = candidates()
+            .find(|&i| i + 22 + le16(&tail, i + 20) as usize == tail.len())
+            .or_else(|| candidates().find(|&i| i + 22 + le16(&tail, i + 20) as usize <= tail.len()))
             .ok_or(Error::NotAnArchive)?;
         let end_at = len - tail_len + end as u64;
         let e = &tail[end..end + 22];
@@ -124,15 +127,20 @@ impl Archive {
         if end_at >= 20 {
             let loc = read_at(&mut file, end_at - 20, 20)?;
             if le32(&loc, 0) == SIG_END64_LOCATOR {
-                let rec_at = le64(&loc, 8);
+                let stored_at = le64(&loc, 8);
                 multi_disk |= le32(&loc, 16) > 1;
-                if rec_at.checked_add(56).is_none_or(|e| e > end_at) {
-                    return Err(Error::Corrupt("ZIP64 end record offset"));
+                // the stored offset, or, behind a self-extracting stub, where a plain 56-byte record would sit
+                let mut rec = None;
+                for at in [Some(stored_at), (end_at - 20).checked_sub(56)].into_iter().flatten() {
+                    if at.checked_add(56).is_some_and(|e| e <= end_at - 20) {
+                        let r = read_at(&mut file, at, 56)?;
+                        if le32(&r, 0) == SIG_END64 {
+                            rec = Some((at, r));
+                            break;
+                        }
+                    }
                 }
-                let rec = read_at(&mut file, rec_at, 56)?;
-                if le32(&rec, 0) != SIG_END64 {
-                    return Err(Error::Corrupt("ZIP64 end record signature"));
-                }
+                let Some((rec_at, rec)) = rec else { return Err(Error::Corrupt("ZIP64 end record")) };
                 multi_disk |= le32(&rec, 16) != 0 || le32(&rec, 20) != 0;
                 count = le64(&rec, 32);
                 cd_size = le64(&rec, 40);
@@ -151,13 +159,18 @@ impl Archive {
             .and_then(|real| real.checked_sub(cd_at))
             .ok_or(Error::Corrupt("central directory size or offset"))?;
         let cd_start = cd_at + shift;
+        if cd_start.checked_add(cd_size).is_none_or(|e| e > len) {
+            return Err(Error::Corrupt("central directory size or offset"));
+        }
         let cd_len = usize::try_from(cd_size).map_err(|_| Error::Corrupt("central directory size"))?;
         let cd = read_at(&mut file, cd_start, cd_len)?;
         let mut entries = Vec::with_capacity(count.min(1 << 20) as usize);
         let mut at = 0usize;
         while at + 46 <= cd.len() && le32(&cd, at) == SIG_CENTRAL {
             let (entry, next) = parse_central(&cd, at)?;
-            entries.push(ZipEntry { local_at: entry.local_at + shift, ..entry });
+            let local_at = entry.local_at.checked_add(shift).filter(|&a| a < len);
+            let local_at = local_at.ok_or(Error::Corrupt("local header offset"))?;
+            entries.push(ZipEntry { local_at, ..entry });
             at = next;
         }
         if entries.len() as u64 != count {

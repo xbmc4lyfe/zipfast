@@ -18,6 +18,8 @@ struct Z<'a> {
     mtime: Option<u32>,
     crc: Option<u32>,
     size: Option<u32>,
+    /// a local header offset given only through a ZIP64 extra field
+    offset64: Option<u64>,
 }
 
 impl<'a> Z<'a> {
@@ -32,11 +34,17 @@ impl<'a> Z<'a> {
             mtime: None,
             crc: None,
             size: None,
+            offset64: None,
         }
     }
 }
 
 fn zip(entries: &[Z<'_>]) -> Vec<u8> {
+    zip_with(entries, false, b"")
+}
+
+/// `zip64`: end with a ZIP64 end record and locator, the plain record's fields saturated.
+fn zip_with(entries: &[Z<'_>], zip64: bool, comment: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
     for e in entries {
@@ -51,6 +59,11 @@ fn zip(entries: &[Z<'_>]) -> Vec<u8> {
         let crc = e.crc.unwrap_or_else(|| crc32fast::hash(e.data));
         let size = e.size.unwrap_or(e.data.len() as u32);
         let mut extra = Vec::new();
+        if let Some(off) = e.offset64 {
+            extra.extend_from_slice(&1u16.to_le_bytes());
+            extra.extend_from_slice(&8u16.to_le_bytes());
+            extra.extend_from_slice(&off.to_le_bytes());
+        }
         if let Some(t) = e.mtime {
             extra.extend_from_slice(&0x5455u16.to_le_bytes());
             extra.extend_from_slice(&5u16.to_le_bytes());
@@ -84,19 +97,39 @@ fn zip(entries: &[Z<'_>]) -> Vec<u8> {
         central.extend_from_slice(&(extra.len() as u16).to_le_bytes());
         central.extend_from_slice(&[0; 6]); // comment length, disk, internal attributes
         central.extend_from_slice(&(e.mode.unwrap_or(0) << 16).to_le_bytes());
-        central.extend_from_slice(&local_at.to_le_bytes());
+        let stored_at = if e.offset64.is_some() { u32::MAX } else { local_at };
+        central.extend_from_slice(&stored_at.to_le_bytes());
         central.extend_from_slice(e.name);
         central.extend_from_slice(&extra);
     }
     let cd_at = out.len() as u32;
     out.extend_from_slice(&central);
+    let (count, size, at) = if zip64 {
+        let rec_at = out.len() as u64;
+        out.extend_from_slice(&0x0606_4b50u32.to_le_bytes());
+        out.extend_from_slice(&44u64.to_le_bytes());
+        out.extend_from_slice(&[45, 0, 45, 0]);
+        out.extend_from_slice(&[0; 8]); // this disk, the directory's disk
+        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u64).to_le_bytes());
+        out.extend_from_slice(&u64::from(cd_at).to_le_bytes());
+        out.extend_from_slice(&0x0706_4b50u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&rec_at.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        (u16::MAX, u32::MAX, u32::MAX)
+    } else {
+        (entries.len() as u16, central.len() as u32, cd_at)
+    };
     out.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
     out.extend_from_slice(&[0; 4]);
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
-    out.extend_from_slice(&(central.len() as u32).to_le_bytes());
-    out.extend_from_slice(&cd_at.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    out.extend_from_slice(&size.to_le_bytes());
+    out.extend_from_slice(&at.to_le_bytes());
+    out.extend_from_slice(&(comment.len() as u16).to_le_bytes());
+    out.extend_from_slice(comment);
     out
 }
 
@@ -251,4 +284,43 @@ fn existing_files_are_skipped_unless_overwriting() {
     assert_eq!(fs::read(out.join("f")).unwrap(), b"old");
     extract::run(&arc, &Options { overwrite: Overwrite::Always, ..opts(&out) }, |_| {}).unwrap();
     assert_eq!(fs::read(out.join("f")).unwrap(), b"new");
+}
+
+#[test]
+fn zip64_behind_a_stub_is_found() {
+    let dir = tmp("zip64-sfx");
+    let arc = dir.join("a.exe");
+    let plain = zip_with(&[Z { deflate: true, ..Z::new("f.txt", b"sixty-four") }], true, b"");
+    fs::write(dir.join("plain.zip"), &plain).unwrap();
+    let s = extract::run(&dir.join("plain.zip"), &test_opts(&dir), |_| {}).unwrap();
+    assert_eq!((s.files, s.errors.len()), (1, 0));
+    let mut bytes = b"MZ".to_vec();
+    bytes.resize(100, 0);
+    bytes.extend(plain);
+    fs::write(&arc, bytes).unwrap();
+    let out = dir.join("out");
+    let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert_eq!((s.files, s.errors.len()), (1, 0));
+    assert_eq!(fs::read(out.join("f.txt")).unwrap(), b"sixty-four");
+}
+
+#[test]
+fn an_end_record_inside_the_comment_is_not_taken_for_the_real_one() {
+    let dir = tmp("comment");
+    let arc = dir.join("a.zip");
+    let mut comment = b"PK\x05\x06".to_vec();
+    comment.extend_from_slice(&[0; 18]);
+    comment.extend_from_slice(b"more comment");
+    fs::write(&arc, zip_with(&[Z::new("f", b"x")], false, &comment)).unwrap();
+    assert_eq!(extract::list(&arc).unwrap().len(), 1);
+}
+
+#[test]
+fn an_impossible_local_header_offset_is_an_error() {
+    let dir = tmp("offset");
+    let arc = dir.join("a.zip");
+    let mut bytes = b"XX".to_vec();
+    bytes.extend(zip(&[Z { offset64: Some(u64::MAX), ..Z::new("f", b"x") }]));
+    fs::write(&arc, bytes).unwrap();
+    assert!(extract::list(&arc).is_err());
 }
