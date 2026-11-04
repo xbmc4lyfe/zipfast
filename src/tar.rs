@@ -307,7 +307,7 @@ fn parse_time(v: &[u8]) -> Option<(i64, u32)> {
     let mut secs = secs;
     // "-1.5" is half a second before -1, so a negative time with a fraction borrows a second
     if whole.starts_with('-') && nanos > 0 {
-        secs -= 1;
+        secs = secs.checked_sub(1)?;
         nanos = 1_000_000_000 - nanos;
     }
     Some((secs, nanos))
@@ -850,6 +850,9 @@ mod tests {
         assert_eq!(p.size, Some(12_345_678_901));
         assert_eq!(p.mtime, Some((-2, 750_000_000)));
         assert!(Pax::default().parse(b"99 path=x\n").is_err());
+        // a time whose borrowed second doesn't fit is dropped, not wrapped
+        assert_eq!(parse_time(b"-9223372036854775808.1"), None);
+        assert_eq!(parse_time(b"-9223372036854775808"), Some((i64::MIN, 0)));
     }
 
     #[test]
