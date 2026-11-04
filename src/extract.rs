@@ -269,6 +269,8 @@ struct Pending {
     /// decoded only to keep a solid stream going: not counted, not written
     passive: bool,
     compressed: bool,
+    /// where it is written, folded as `batch_paths` is
+    key: Option<String>,
 }
 
 impl Pending {
@@ -284,6 +286,7 @@ impl Pending {
             failed: false,
             passive: false,
             compressed: h.method != 0,
+            key: None,
         }
     }
 
@@ -706,10 +709,8 @@ impl<R: FnMut(&str)> Run<'_, R> {
             }
             return self.send_to_batch(vol, h, out.zip(path));
         }
-        if self.opts.mode == Mode::Extract {
-            self.queued_paths.insert(key);
-        }
-        let p = Pending::new(h, out, path);
+        let mut p = Pending::new(h, out, path);
+        p.key = (self.opts.mode == Mode::Extract).then_some(key);
         self.begin_decoding(vol, h, p)
     }
 
@@ -809,6 +810,10 @@ impl<R: FnMut(&str)> Run<'_, R> {
 
     /// Feeds a whole file to the decoder behind the queued ones. Its bytes go to it once the ones before are done.
     fn decode_queued(&mut self, vol: &mut Volume, h: &FileHeader, p: Pending) -> Result<()> {
+        // registered only now, after any stream before was drained, so a later file at the same place waits for it
+        if let Some(key) = p.key.clone() {
+            self.queued_paths.insert(key);
+        }
         self.queued.push_back((p, Checks::from(h)));
         let mut buf = std::mem::take(&mut self.buf);
         let mut stream = self.stream.take();

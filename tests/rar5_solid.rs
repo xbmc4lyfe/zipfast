@@ -194,3 +194,34 @@ fn skipped_and_repeated_files_keep_their_place_in_a_solid_archive() {
     }
     assert_eq!(seen[0], seen[1]);
 }
+
+#[test]
+fn a_repeated_name_waits_for_a_queued_copy_from_an_earlier_stream() {
+    let dir = tmp("restart");
+    // a, then b starting a stream of its own with a bad checksum, then b again carrying that stream on
+    let first = named(solid_stream(1, false)).remove(0);
+    let second = named(solid_stream(2, false));
+    let mut files = vec![first];
+    files.extend(second);
+    files[1].0 = "b".into();
+    files[2].0 = "b".into();
+    files[1].3 ^= 1;
+    let specs: Vec<(FileSpec<'_>, u32)> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (name, stream, plain, crc))| {
+            let spec =
+                FileSpec { method: 3, size: Some(plain.len() as u64), solid: i == 2, ..FileSpec::new(name, stream) };
+            (spec, *crc)
+        })
+        .collect();
+    let arc = dir.join("s.rar");
+    fs::write(&arc, archive_with(&specs, true)).unwrap();
+    for (name, threads) in [("one", 1), ("four", 4)] {
+        let out = dir.join(name);
+        let o = Options { overwrite: Overwrite::Always, ..opts(&out, threads) };
+        let (s, _) = run(&arc, &o);
+        assert_eq!((s.files, s.errors.len()), (2, 1), "{name}: {:?}", s.errors);
+        assert!(fs::read(out.join("b")).unwrap() == files[2].2, "{name}: the later b is kept");
+    }
+}
