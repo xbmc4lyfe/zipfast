@@ -17,14 +17,23 @@ pub(super) struct Job {
     pub lits: Vec<u8>,
 }
 
-/// A worker's output for one block: every token read before the end of the block or the first error.
+/// A worker's output for one block: every token read before the end of the block, the first error, or the memory
+/// budget. `result` holds the bit to go on from when the budget stopped it.
 pub(super) struct Done {
     pub seq: u64,
     pub buf: Vec<u8>,
     pub toks: Vec<Tok>,
     pub lits: Vec<u8>,
-    pub result: Result<()>,
+    pub result: Result<Option<usize>>,
+    pub tables: Arc<Tables>,
+    pub end_bits: usize,
 }
+
+/// A worker's tokens and literals for a block may take this many times the block's packed bytes, plus [`SLACK`].
+/// Short codes can stand for far more tokens than that; past it the worker stops and the calling thread decodes the
+/// rest of the block itself.
+pub(super) const BUDGET: usize = 4;
+const SLACK: usize = 1 << 20;
 
 pub(super) struct Pool {
     jobs: Option<mpsc::Sender<Job>>,
@@ -48,9 +57,25 @@ impl Pool {
                     let Ok(Ok(mut job)) = next else { break };
                     job.toks.clear();
                     job.lits.clear();
-                    let result =
-                        tokenize(&job.buf, job.start_bit, job.end_bits, &job.tables, &mut job.toks, &mut job.lits);
-                    let done = Done { seq: job.seq, buf: job.buf, toks: job.toks, lits: job.lits, result };
+                    let budget = job.buf.len() * BUDGET + SLACK;
+                    let result = tokenize(
+                        &job.buf,
+                        job.start_bit,
+                        job.end_bits,
+                        &job.tables,
+                        &mut job.toks,
+                        &mut job.lits,
+                        budget,
+                    );
+                    let done = Done {
+                        seq: job.seq,
+                        buf: job.buf,
+                        toks: job.toks,
+                        lits: job.lits,
+                        result,
+                        tables: job.tables,
+                        end_bits: job.end_bits,
+                    };
                     if done_tx.send(done).is_err() {
                         break;
                     }
@@ -92,7 +117,8 @@ impl Drop for Pool {
 }
 
 /// A block's symbols, from `start_bit` to `end_bits`, as tokens. Literals go to `lits`, each run of them counted
-/// by one `Lits` token. On an error, what was read before it is kept.
+/// by one `Lits` token. On an error, what was read before it is kept. Once the tokens and literals take more than
+/// `budget` bytes it stops between symbols and returns the bit to go on from.
 fn tokenize(
     buf: &[u8],
     start_bit: usize,
@@ -100,7 +126,8 @@ fn tokenize(
     t: &Tables,
     toks: &mut Vec<Tok>,
     lits: &mut Vec<u8>,
-) -> Result<()> {
+    budget: usize,
+) -> Result<Option<usize>> {
     let mut bits = Bits::at(buf, start_bit);
     lits.reserve((end_bits - start_bit) / 8);
     let mut run = 0u32;
@@ -113,6 +140,9 @@ fn tokenize(
         };
     }
     let result = loop {
+        if lits.len() + toks.len() * std::mem::size_of::<Tok>() > budget {
+            break Ok(Some(bits.pos()));
+        }
         let sym;
         if bits.pos() + 128 <= end_bits {
             // three codes of at most 15 bits fit in one refill
@@ -141,7 +171,7 @@ fn tokenize(
             }
         } else {
             if bits.pos() >= end_bits {
-                break Ok(());
+                break Ok(None);
             }
             bits.refill();
             let s = decode!(t.main);
@@ -165,9 +195,8 @@ fn tokenize(
     if run > 0 {
         toks.push(Tok::Lits(run));
     }
-    result?;
-    if bits.pos() > end_bits {
+    if result.as_ref().is_ok_and(Option::is_none) && bits.pos() > end_bits {
         return Err(corrupt("a symbol runs past the end of its block"));
     }
-    Ok(())
+    result
 }

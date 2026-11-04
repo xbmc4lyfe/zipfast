@@ -248,3 +248,39 @@ fn workers_agree_with_the_calling_thread_on_damaged_streams() {
     let _ = decode(&stream, data.len() as u64 - 1, 1 << 17, usize::MAX);
     let _ = decode(&stream, data.len() as u64 + 1, 1 << 17, usize::MAX);
 }
+
+#[test]
+fn an_earlier_blocks_error_comes_before_a_later_damaged_header() {
+    let mut first: Vec<Op> = (0..100_000u32).map(|i| Op::Lit((i % 251) as u8)).collect();
+    first.push(Op::Match(10, 500_000)); // reaches before the start of the data
+    let mut stream = block(&first, true, false);
+    let mut second = block(&[Op::Lit(1), Op::Lit(2)], false, true);
+    second[1] ^= 0xff; // its header checksum
+    stream.extend(second);
+    for piece in [usize::MAX, 1 << 16, 1000, 1] {
+        let err = decode(&stream, 200_000, 1 << 20, piece).unwrap_err();
+        assert_eq!(err.to_string(), corrupt("match reaches before the start of the data").to_string(), "{piece}");
+    }
+}
+
+#[test]
+fn a_block_of_tiny_codes_is_finished_on_the_calling_thread() {
+    // nine-bit codes that each stand for a 24-byte token: far past a worker's budget for this many packed bytes
+    let mut ops = vec![Op::Lit(b'a'), Op::Lit(b'b'), Op::Match(2, 2)];
+    ops.extend(std::iter::repeat_n(Op::Last, 400_000));
+    let want = model(&ops);
+    let stream = block(&ops, true, true);
+    assert_eq!(decode(&stream, want.len() as u64, 1 << 21, usize::MAX).unwrap(), want);
+    let mut u = Unpacker::new(1 << 21).unwrap();
+    u.set_threads(2, 0);
+    u.reset(Some(want.len() as u64));
+    let mut out = Vec::new();
+    let mut sink = |b: &[u8]| -> Result<()> {
+        out.extend_from_slice(b);
+        Ok(())
+    };
+    u.feed(&stream, &mut sink).unwrap();
+    u.finish(&mut sink).unwrap();
+    assert!(out == want);
+    assert!(u.resumed > 0, "the worker should have stopped at its budget");
+}

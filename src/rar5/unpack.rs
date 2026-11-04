@@ -239,9 +239,9 @@ enum Tok {
     },
 }
 
-/// Packed bytes that may wait with the workers before the calling thread stops handing them more. Their output
-/// can be several times this.
-const MAX_QUEUED: usize = 64 << 20;
+/// Packed bytes that may wait with the workers before the calling thread stops handing them more. A worker's
+/// tokens for a block stay within [`parallel::BUDGET`] times its packed size, so this also bounds their memory.
+const MAX_QUEUED: usize = 32 << 20;
 
 /// Big files are decoded on worker threads from this size up, unless told otherwise.
 const PARALLEL_MIN: u64 = 4 << 20;
@@ -281,6 +281,8 @@ pub struct Unpacker {
     applied: u64,
     /// packed bytes of the blocks not yet applied
     queued: usize,
+    /// blocks a worker stopped early on, at its memory budget, and this thread finished
+    resumed: u64,
     /// finished blocks waiting for the ones before them
     ready: BTreeMap<u64, Done>,
     /// buffers from finished blocks, for reuse
@@ -331,6 +333,7 @@ impl Unpacker {
             submitted: 0,
             applied: 0,
             queued: 0,
+            resumed: 0,
             ready: BTreeMap::new(),
             spare: Vec::new(),
         })
@@ -445,13 +448,20 @@ impl Unpacker {
         loop {
             while let Some(done) = self.ready.remove(&self.applied) {
                 self.applied += 1;
-                let Done { buf, toks, lits, result, .. } = done;
+                let Done { buf, toks, lits, result, tables, end_bits, .. } = done;
                 self.queued -= buf.len();
-                if failed.is_none()
-                    && let Err(e) = self.apply(&toks, &lits, sink).and(result)
-                {
-                    failed = Some(e);
-                    max = 0;
+                if failed.is_none() {
+                    let mut applied = self.apply(&toks, &lits, sink).and(result);
+                    // the worker stopped at its memory budget: the rest of the block is decoded here
+                    if let Ok(Some(bit)) = applied {
+                        let mut bits = Bits::at(&buf, bit);
+                        self.resumed += 1;
+                        applied = self.decode_rest(&mut bits, end_bits, &tables, sink).map(|()| None);
+                    }
+                    if let Err(e) = applied {
+                        failed = Some(e);
+                        max = 0;
+                    }
                 }
                 self.spare.push((buf, toks, lits));
             }
@@ -472,6 +482,14 @@ impl Unpacker {
             self.ready.insert(done.seq, done);
         }
         failed.map_or(Ok(()), Err)
+    }
+
+    /// An error found reading ahead of the workers waits for theirs: an earlier block's error comes first.
+    fn ordered<T>(&mut self, r: Result<T>, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<T> {
+        if r.is_err() && self.submitted > self.applied {
+            self.settle(0, sink)?;
+        }
+        r
     }
 
     /// Waits out blocks still with the workers and drops them: the file they belong to was abandoned.
@@ -556,7 +574,8 @@ impl Unpacker {
         while !self.input.is_empty() {
             let flags = self.input[0];
             let header_len = 2 + usize::from((flags >> 3) & 7) + 1;
-            let need = match block_header(&self.input)? {
+            let header = block_header(&self.input);
+            let need = match self.ordered(header, sink)? {
                 Some((header_len, payload, _)) => header_len + payload,
                 None => header_len,
             };
@@ -566,7 +585,8 @@ impl Unpacker {
             if self.input.len() < need {
                 return Ok(());
             }
-            if let Some((header_len, payload, flags)) = block_header(&self.input)?
+            let header = block_header(&self.input);
+            if let Some((header_len, payload, flags)) = self.ordered(header, sink)?
                 && self.input.len() == header_len + payload
             {
                 let mut block = std::mem::take(&mut self.input);
@@ -580,7 +600,8 @@ impl Unpacker {
         let mut at = 0;
         loop {
             let rest = &data[at..];
-            let Some((header_len, payload, flags)) = block_header(rest)? else { break };
+            let header = block_header(rest);
+            let Some((header_len, payload, flags)) = self.ordered(header, sink)? else { break };
             if rest.len() < header_len + payload {
                 break;
             }
@@ -640,6 +661,18 @@ impl Unpacker {
         } else if !self.tables_ready && payload > 0 {
             return Err(corrupt("block without tables at the start of a stream"));
         }
+        let tables = Arc::clone(&self.tables);
+        self.decode_rest(&mut bits, end_bits, &tables, sink)
+    }
+
+    /// Decodes a block's symbols from where `bits` stands to its end on this thread.
+    fn decode_rest(
+        &mut self,
+        bits: &mut Bits<'_>,
+        end_bits: usize,
+        tables: &Tables,
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
         let flush_at = self.window_size() / 2;
         while bits.pos() < end_bits {
             if self.sp - self.file_base - self.emitted > flush_at {
@@ -647,7 +680,7 @@ impl Unpacker {
             }
             // decode until the block ends or the window holds as much unflushed output as it may
             let stop = self.file_base + self.emitted + flush_at + 1;
-            self.run(&mut bits, end_bits, stop)?;
+            self.run(bits, end_bits, stop, tables)?;
         }
         if bits.pos() > end_bits {
             return Err(corrupt("a symbol runs past the end of its block"));
@@ -729,8 +762,8 @@ impl Unpacker {
 
     /// The decoding loop: symbols until the block's bits run out or the stream position reaches `stop`. The state
     /// it touches on every symbol lives in locals, so the window writes can't make the compiler reload it.
-    fn run(&mut self, bits: &mut Bits<'_>, end_bits: usize, stop: u64) -> Result<()> {
-        let Unpacker { window, mask, sp: sp_ref, file_base, size, tables, history, last_len, filters, .. } = self;
+    fn run(&mut self, bits: &mut Bits<'_>, end_bits: usize, stop: u64, t: &Tables) -> Result<()> {
+        let Unpacker { window, mask, sp: sp_ref, file_base, size, history, last_len, filters, .. } = self;
         let mask = *mask;
         let file_base = *file_base;
         let size_end = size.map_or(u64::MAX, |s| file_base.saturating_add(s));
@@ -739,7 +772,6 @@ impl Unpacker {
         let mut hist = *history;
         let mut last = *last_len;
         let window = &mut window[..=mask as usize];
-        let t = Arc::clone(tables);
         let main = &t.main;
         macro_rules! decode {
             ($table:expr) => {
@@ -796,7 +828,7 @@ impl Unpacker {
                 sym = s;
             }
             bits.refill();
-            let tok = match read_op(sym, bits, &t) {
+            let tok = match read_op(sym, bits, t) {
                 Ok(tok) => tok,
                 Err(e) => break Err(e),
             };
