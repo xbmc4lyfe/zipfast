@@ -1,12 +1,12 @@
 //! Lists, tests and extracts a RAR 5.0 archive, following its volumes in order and decoding compressed files.
 
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::blake2sp::Blake2sp;
 use crate::error::{Error, Result};
+use crate::output::Output;
 use crate::path::sanitize;
 use crate::rar5::reader::{Block, Volume};
 use crate::rar5::unpack::{Unpacker, window_for};
@@ -236,7 +236,7 @@ fn rar_list(first: &Path) -> Result<Vec<Entry>> {
 /// A file being read, whose data may run on into later volumes.
 struct Pending {
     name: String,
-    out: Option<File>,
+    out: Option<Output>,
     path: Option<PathBuf>,
     hasher: crc32fast::Hasher,
     /// kept only when the archive stores a BLAKE2sp hash for this file
@@ -252,9 +252,10 @@ struct Pending {
 
 impl Pending {
     fn new(h: &FileHeader, out: Option<File>, path: Option<PathBuf>) -> Self {
+        let size = (!h.size_unknown()).then_some(h.unpacked_size);
         Pending {
             name: h.name.clone(),
-            out,
+            out: out.map(|f| Output::new(f, size)),
             path,
             hasher: crc32fast::Hasher::new(),
             blake: h.blake2sp.map(|_| Blake2sp::new()),
@@ -282,7 +283,7 @@ impl Pending {
                 b.update(chunk);
             }
             if let Some(out) = self.out.as_mut() {
-                out.write_all(chunk)?;
+                out.write(chunk)?;
             }
             self.bytes += chunk.len() as u64;
             Ok(())
@@ -587,7 +588,14 @@ impl<R: FnMut(&str)> Run<'_, R> {
             return Ok(());
         }
         if let Some(out) = p.out.take() {
-            finish_file(&out, &Meta::from(h));
+            // the last of a big file may still be on its way to the disk
+            match out.finish() {
+                Ok(file) => finish_file(&file, &Meta::from(h)),
+                Err(e) => {
+                    p.discard();
+                    return Err(e.into());
+                }
+            }
         }
         self.summary.files += 1;
         self.summary.bytes += p.bytes;
