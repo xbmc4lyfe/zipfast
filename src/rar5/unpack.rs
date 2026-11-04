@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod parallel;
-use parallel::{Done, Job, Part, Pool, Slot};
+use parallel::{Boundary, Done, Job, Part, Pool, Slot};
 
 pub(crate) const NC: usize = 306;
 pub(crate) const DC: usize = 64;
@@ -386,6 +386,12 @@ pub struct Unpacker {
     ready: BTreeMap<u64, Done>,
     /// finished jobs, for their buffers
     spare: Vec<Job>,
+    /// files queued behind the one before, and how many of those have begun in the window, both over the decoder's
+    /// life
+    files_queued: u64,
+    files_begun: u64,
+    /// [`Self::settle`] waits for the workers until this many queued files have begun
+    files_goal: u64,
 }
 
 /// The window a file needs: its declared dictionary, but no more than twice the file when nothing before or after it
@@ -441,6 +447,9 @@ impl Unpacker {
             resumed: 0,
             ready: BTreeMap::new(),
             spare: Vec::new(),
+            files_queued: 0,
+            files_begun: 0,
+            files_goal: 0,
         })
     }
 
@@ -478,6 +487,44 @@ impl Unpacker {
     pub fn fits(&self, window: u64) -> bool {
         let have = self.window_size();
         have >= window && have <= window.saturating_mul(4).max(4 << 20)
+    }
+
+    /// Decodes the current file's blocks on the workers whatever its size, when there are any: for a file that
+    /// [`Self::queue_file`] will follow.
+    pub fn force_parallel(&mut self) {
+        self.parallel = self.threads > 0;
+    }
+
+    /// Starts the next file of a solid stream without waiting for the one before: its blocks may still be with the
+    /// workers. Where the files meet, the earlier one is checked as [`Self::finish`] would, then the sink is called
+    /// with an empty slice; the sink is never called with one otherwise. The earlier file's errors come out of later
+    /// calls, in stream order, and a caller tells whose they are by the empty slices it has seen. The blocks before
+    /// must have gone to the workers ([`Self::force_parallel`]), and so do this file's.
+    pub fn queue_file(&mut self, size: Option<u64>) {
+        debug_assert!(self.parallel, "queued files are decoded on the workers");
+        let boundary = Boundary { size, truncated: !self.input.is_empty() };
+        self.input.clear();
+        let at = self.batch.buf.len();
+        self.batch.parts.push(Part {
+            at,
+            end_bits: 0,
+            read_tables: false,
+            slot: Arc::clone(&self.slot),
+            boundary: Some(boundary),
+        });
+        self.files_queued += 1;
+        self.parallel = self.threads > 0;
+    }
+
+    /// Decodes until no more than `behind` queued files are still waiting for the ones before them to end.
+    pub fn catch_up(&mut self, behind: u64, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        self.files_goal = self.files_queued.saturating_sub(behind);
+        if self.files_begun < self.files_goal {
+            self.send_batch();
+        }
+        let r = self.settle(u64::MAX, sink);
+        self.files_goal = 0;
+        r
     }
 
     /// Starts the next file of a solid stream: the window, tables and history carry on.
@@ -534,7 +581,7 @@ impl Unpacker {
         }
         let at = self.batch.buf.len();
         self.batch.buf.extend_from_slice(&buf[..payload + PAD]);
-        self.batch.parts.push(Part { at, end_bits, read_tables, slot: Arc::clone(&self.slot) });
+        self.batch.parts.push(Part { at, end_bits, read_tables, slot: Arc::clone(&self.slot), boundary: None });
         if self.batch.buf.len() >= JOB_BYTES {
             self.send_batch();
             self.settle(4 * self.threads as u64, sink)?;
@@ -572,7 +619,7 @@ impl Unpacker {
                 let Done { job, result, tables } = done;
                 self.queued -= job.buf.len();
                 if failed.is_none() {
-                    let mut applied = self.apply(&job.toks, &job.lits, sink).and(result);
+                    let mut applied = self.apply_job(&job, sink).and(result);
                     // the worker stopped at its memory budget: the rest of the job is decoded here
                     if let Ok(Some((part, bit))) = applied {
                         self.resumed += 1;
@@ -590,7 +637,7 @@ impl Unpacker {
                 break;
             }
             let Some(pool) = self.pool.as_ref() else { break };
-            let done = if in_flight <= max && self.queued <= MAX_QUEUED {
+            let done = if in_flight <= max && self.queued <= MAX_QUEUED && self.files_begun >= self.files_goal {
                 // take what's finished, but don't wait
                 match pool.try_next() {
                     Some(done) => done,
@@ -615,6 +662,10 @@ impl Unpacker {
         sink: &mut dyn FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
         for (i, p) in job.parts.iter().enumerate().skip(part) {
+            if let Some(b) = p.boundary {
+                self.end_file(b, sink)?;
+                continue;
+            }
             let buf = &job.buf[p.at..];
             let mut bits = if i == part { Bits::at(buf, bit) } else { Bits::new(buf) };
             if i > part && p.read_tables {
@@ -658,7 +709,48 @@ impl Unpacker {
         self.queued = 0;
     }
 
-    /// One block's tokens, applied to the window with the same checks the decoding loop makes.
+    /// A job's tokens, part by part, with the file boundaries between them, as far as the worker got.
+    fn apply_job(&mut self, job: &Job, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        let mut from = (0, 0);
+        for (p, &to) in job.parts.iter().zip(&job.ends) {
+            if let Some(b) = p.boundary {
+                self.end_file(b, sink)?;
+            }
+            self.apply(&job.toks[from.0..to.0], &job.lits[from.1..to.1], sink)?;
+            from = to;
+        }
+        Ok(())
+    }
+
+    /// Where one queued file ends and the next begins: the first is checked and done with.
+    fn end_file(&mut self, b: Boundary, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        if b.truncated {
+            return Err(Error::Truncated);
+        }
+        self.check_end(sink)?;
+        sink(&[])?;
+        self.files_begun += 1;
+        self.file_base = self.sp;
+        self.emitted = 0;
+        self.size = b.size;
+        Ok(())
+    }
+
+    /// Emits the rest of the current file and checks it ended where it should.
+    fn check_end(&mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        self.flush(sink)?;
+        if !self.filters.is_empty() {
+            return Err(corrupt("a filter runs past the end of the file"));
+        }
+        if let Some(size) = self.size
+            && self.emitted != size
+        {
+            return Err(corrupt("decoded size differs from the header"));
+        }
+        Ok(())
+    }
+
+    /// Some of a block's tokens, applied to the window with the same checks the decoding loop makes.
     fn apply(&mut self, toks: &[Tok], lits: &[u8], sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
         let flush_at = self.window_size() / 2;
         let size_end = self.size.map_or(u64::MAX, |s| self.file_base.saturating_add(s));
@@ -771,22 +863,18 @@ impl Unpacker {
         Ok(())
     }
 
+    /// Applies everything handed to the workers so far, leaving a block still coming in as it is.
+    pub fn wait(&mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        self.settle(0, sink)
+    }
+
     /// The file's packed bytes are all in. Emits what is left and checks the stream ended where it should.
     pub fn finish(&mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
         self.settle(0, sink)?;
         if !self.input.is_empty() {
             return Err(Error::Truncated);
         }
-        self.flush(sink)?;
-        if !self.filters.is_empty() {
-            return Err(corrupt("a filter runs past the end of the file"));
-        }
-        if let Some(size) = self.size
-            && self.emitted != size
-        {
-            return Err(corrupt("decoded size differs from the header"));
-        }
-        Ok(())
+        self.check_end(sink)
     }
 
     fn block(

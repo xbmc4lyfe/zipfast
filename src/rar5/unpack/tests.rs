@@ -391,3 +391,179 @@ fn quick_literals_agree_with_workers_on_damage() {
         let _ = decode(&bad, data.len() as u64, 1 << 20, 1 << 14);
     }
 }
+
+/// A file's packed bytes and declared size.
+type SolidFile = (Vec<u8>, u64);
+
+/// What each file of a solid stream decodes to, file by file, up to the first error and whose it is. Serially
+/// (`threads` 0) each file is finished before the next starts; otherwise every file after the first is queued.
+fn solid_run(files: &[SolidFile], threads: usize, piece: usize) -> (Vec<Vec<u8>>, Option<(usize, String)>, u64) {
+    let mut u = Unpacker::new(1 << 22).unwrap();
+    u.set_threads(threads, u64::MAX);
+    let mut outs: Vec<Vec<u8>> = vec![Vec::new()];
+    let mut sink = |b: &[u8]| -> Result<()> {
+        if b.is_empty() {
+            outs.push(Vec::new());
+        } else {
+            outs.last_mut().unwrap().extend_from_slice(b);
+        }
+        Ok(())
+    };
+    let mut run = || -> Result<()> {
+        for (i, (stream, size)) in files.iter().enumerate() {
+            if i == 0 {
+                u.reset(Some(*size));
+            } else if threads == 0 {
+                u.next_file(Some(*size));
+            } else {
+                if i % 10 == 0 {
+                    u.catch_up(4, &mut sink)?;
+                    assert!(u.files_queued - u.files_begun <= 4);
+                }
+                u.queue_file(Some(*size));
+            }
+            if threads > 0 {
+                u.force_parallel();
+            }
+            for chunk in stream.chunks(piece.max(1)) {
+                u.feed(chunk, &mut sink)?;
+            }
+            if threads == 0 {
+                u.finish(&mut sink)?;
+                sink(&[])?;
+            }
+        }
+        if threads > 0 {
+            u.finish(&mut sink)?;
+            sink(&[])?;
+        }
+        Ok(())
+    };
+    let err = run().err().map(|e| e.to_string());
+    let resumed = u.resumed;
+    drop(u);
+    // the last entry is the file being decoded when it stopped, or an empty one after the last file
+    let failed_at = outs.len() - 1;
+    outs.pop();
+    (outs, err.map(|e| (failed_at, e)), resumed)
+}
+
+fn noise_ops(n: usize, seed: u64) -> Vec<Op> {
+    let mut x = seed | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            Op::Lit((x >> 24) as u8)
+        })
+        .collect()
+}
+
+/// A solid stream of small and big files: fixed codes and tuned ones, files that keep the tables before them, files
+/// that copy from earlier ones, an empty one, and one whose tokens are far past a worker's budget.
+fn solid_files() -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut all: Vec<Op> = Vec::new();
+    let mut files: Vec<(Vec<u8>, Vec<Op>)> = Vec::new();
+    let mut fixed_before = false;
+    for i in 0..60usize {
+        let mut ops = match i % 7 {
+            0 => noise_ops(3 + i * 11, i as u64),
+            1 => noise_ops(40_000, i as u64),
+            2 => lits(format!("file {i} says hello ").as_bytes()),
+            3 if !all.is_empty() => {
+                // copies from the files before
+                let total = model(&all).len() as u64;
+                vec![Op::Match(300, total.min(5000)), Op::Lit(b'.'), Op::Rep(0, 40)]
+            }
+            4 => Vec::new(),
+            5 if i == 12 => {
+                let mut v = vec![Op::Lit(b'a'), Op::Lit(b'b'), Op::Match(2, 2)];
+                v.extend(std::iter::repeat_n(Op::Last, 150_000));
+                v
+            }
+            _ => noise_ops(500, i as u64),
+        };
+        if ops.is_empty() && i % 7 != 4 {
+            ops = lits(b"x");
+        }
+        let stream = match i % 3 {
+            // fixed codes, keeping the tables before when they are fixed too
+            0 => {
+                let s = block(&ops, !fixed_before || i % 2 == 0, true);
+                fixed_before = true;
+                s
+            }
+            1 if ops.len() > 2_000 => {
+                fixed_before = false;
+                tuned_stream(&ops, 1_500)
+            }
+            _ => {
+                fixed_before = true;
+                block(&ops, true, true)
+            }
+        };
+        all.extend(ops.iter().cloned());
+        files.push((stream, ops));
+    }
+    let plain = model(&all);
+    let mut at = 0;
+    let mut out = Vec::new();
+    let mut so_far = Vec::new();
+    for (stream, ops) in files {
+        so_far.extend(ops);
+        let end = model(&so_far).len();
+        out.push((stream, plain[at..end].to_vec()));
+        at = end;
+    }
+    out
+}
+
+#[test]
+fn queued_files_of_a_solid_stream_come_out_as_if_each_waited_for_the_one_before() {
+    let files = solid_files();
+    let input: Vec<SolidFile> = files.iter().map(|(s, p)| (s.clone(), p.len() as u64)).collect();
+    let want: Vec<Vec<u8>> = files.iter().map(|(_, p)| p.clone()).collect();
+    let (serial, err, _) = solid_run(&input, 0, usize::MAX);
+    assert_eq!(err, None);
+    assert!(serial == want);
+    for piece in [usize::MAX, 4_093] {
+        let (queued, err, resumed) = solid_run(&input, 3, piece);
+        assert_eq!(err, None, "{piece}");
+        assert!(queued == want, "{piece}");
+        assert!(resumed > 0, "a worker should have stopped at its budget, with files after it in the run");
+    }
+}
+
+#[test]
+fn a_queued_files_trouble_is_its_own_and_stops_the_files_after_it() {
+    let files = solid_files();
+    let good: Vec<SolidFile> = files.iter().map(|(s, p)| (s.clone(), p.len() as u64)).collect();
+    let mut cases: Vec<(&str, Vec<SolidFile>)> = Vec::new();
+    for k in [0, 8, 13, 30, 59] {
+        let mut c = good.clone();
+        let mid = c[k].0.len() / 2;
+        c[k].0[mid.max(5)] ^= 0x5a;
+        cases.push(("damaged", c));
+        let mut c = good.clone();
+        c[k].1 += 1;
+        cases.push(("longer", c));
+        let mut c = good.clone();
+        c[k].1 = c[k].1.saturating_sub(1);
+        cases.push(("shorter", c));
+        let mut c = good.clone();
+        let n = c[k].0.len();
+        c[k].0.truncate(n - 2);
+        cases.push(("cut short", c));
+    }
+    for (what, case) in &cases {
+        for piece in [usize::MAX, 777] {
+            let (s_out, s_err, _) = solid_run(case, 0, piece);
+            let (q_out, q_err, _) = solid_run(case, 3, piece);
+            // a flipped bit may only change a byte, which the file's checksum catches later
+            assert!(s_err.is_some() || *what == "damaged", "{what}: the serial run should fail");
+            assert_eq!(q_err, s_err, "{what} {piece}");
+            assert!(q_out == s_out, "{what} {piece}");
+        }
+    }
+}
