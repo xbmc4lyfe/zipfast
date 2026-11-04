@@ -38,6 +38,7 @@ pub const EOAFL_MORE_VOLUMES: u64 = 0x0001;
 pub const FHEXTRA_CRYPT: u64 = 0x01;
 pub const FHEXTRA_HASH: u64 = 0x02;
 pub const FHEXTRA_HTIME: u64 = 0x03;
+pub const FHEXTRA_VERSION: u64 = 0x04;
 pub const FHEXTRA_REDIR: u64 = 0x05;
 
 /// A cursor over one header's bytes. Every read is checked; running off the end is corruption, since the header's
@@ -164,6 +165,8 @@ pub struct FileHeader {
     pub name: String,
     pub encrypted: bool,
     pub redirection: Option<Redirection>,
+    /// set on an older revision of a file kept alongside the current one
+    pub version: Option<u64>,
 }
 
 impl FileHeader {
@@ -244,6 +247,10 @@ fn parse_file_extra(f: &mut FileHeader, extra: &[u8]) -> Result<()> {
                 }
             }
             FHEXTRA_HTIME => parse_htime(f, &mut r)?,
+            FHEXTRA_VERSION => {
+                let _flags = r.vint()?;
+                f.version = Some(r.vint()?);
+            }
             FHEXTRA_REDIR => {
                 let kind = r.vint()?;
                 let _flags = r.vint()?;

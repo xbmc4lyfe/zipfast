@@ -264,3 +264,29 @@ fn restores_folder_permissions_after_their_files() {
     // let the temp folder be cleaned up
     fs::set_permissions(out.join("locked"), fs::Permissions::from_mode(0o700)).unwrap();
 }
+
+#[test]
+fn a_size_that_disagrees_with_the_header_fails() {
+    let dir = tmp("size");
+    let arc = dir.join("t.rar");
+    fs::write(&arc, archive(&[FileSpec { size: Some(1000), ..FileSpec::new("short", b"abc") }])).unwrap();
+    let out = dir.join("out");
+    let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert_eq!((s.files, s.errors.len()), (0, 1));
+    assert!(!out.join("short").exists());
+    let t = extract::run(&arc, &Options { mode: Mode::Test, ..opts(&out) }, |_| {}).unwrap();
+    assert_eq!((t.files, t.errors.len()), (0, 1));
+}
+
+#[test]
+fn older_versions_are_skipped_and_the_current_file_kept() {
+    let dir = tmp("versions");
+    let arc = dir.join("t.rar");
+    // file version record: type 4, flags 0, version 1
+    let old = FileSpec { extra: vec![3, 4, 0, 1], ..FileSpec::new("f.txt", b"old") };
+    fs::write(&arc, archive(&[old, FileSpec::new("f.txt", b"new")])).unwrap();
+    let out = dir.join("out");
+    let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert_eq!((s.files, s.skipped, s.errors.len()), (1, 1, 0));
+    assert_eq!(fs::read(out.join("f.txt")).unwrap(), b"new");
+}

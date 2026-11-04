@@ -52,6 +52,8 @@ pub struct FileSpec<'a> {
     pub unix_mode: Option<u64>,
     pub extra: Vec<u8>,
     pub method: u64,
+    /// the unpacked size when `data` is packed
+    pub size: Option<u64>,
 }
 
 impl<'a> FileSpec<'a> {
@@ -65,6 +67,7 @@ impl<'a> FileSpec<'a> {
             unix_mode: Some(0o644),
             extra: Vec::new(),
             method: 0,
+            size: None,
         }
     }
 }
@@ -80,7 +83,7 @@ pub fn file_block(spec: &FileSpec<'_>, part: &[u8], crc: u32, split_before: bool
         file_flags |= 2;
     }
     vint(file_flags, &mut fields);
-    vint(spec.data.len() as u64, &mut fields);
+    vint(spec.size.unwrap_or(spec.data.len() as u64), &mut fields);
     vint(spec.unix_mode.unwrap_or(0x20), &mut fields);
     if let Some(t) = spec.mtime {
         fields.extend_from_slice(&t.to_le_bytes());

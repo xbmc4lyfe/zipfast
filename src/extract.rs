@@ -272,6 +272,13 @@ fn start_file(
             *pending = Some(Pending::skipping(&h.name));
         }
     };
+    // an older revision shares the current file's name: only the current one is written
+    if let Some(v) = h.version {
+        report(&format!("{}: older version {v}, skipped", h.name));
+        summary.skipped += 1;
+        skip_rest(pending);
+        return Ok(());
+    }
     let rel = match sanitize(&h.name, !h.is_unix()) {
         Ok(rel) => rel,
         Err(e) => {
@@ -421,10 +428,14 @@ fn continue_file(
         p.discard();
         return Ok(());
     }
+    // a matching checksum doesn't vouch for the size the header states
+    if !h.size_unknown() && p.bytes != h.unpacked_size {
+        let why = format!("{} bytes where the header says {}", p.bytes, h.unpacked_size);
+        fail(summary, report, &p.name, &why);
+        p.discard();
+        return Ok(());
+    }
     if let Some(out) = p.out.take() {
-        if !h.size_unknown() && p.bytes != h.unpacked_size {
-            out.set_len(p.bytes)?;
-        }
         finish_file(&out, h);
     }
     summary.files += 1;
