@@ -2,13 +2,14 @@
 //! the central directory, and each entry's local header. Entries are stored or deflated.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use flate2::{Decompress, FlushDecompress, Status};
 
 use crate::error::{Error, Result};
 use crate::extract::{Entry, Meta, Mode, Options, Summary, Target, finish_dirs, finish_file, make_dirs, open_target};
+use crate::output::Output;
 use crate::path::sanitize;
 use crate::rar5::Redirection;
 
@@ -452,7 +453,7 @@ pub fn run(path: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<
         let mut target = None;
         if opts.mode == Mode::Extract {
             match open_target(opts, &rel, Some(e.size))? {
-                Target::Write(file, path) => target = Some((file, path)),
+                Target::Write(file, path) => target = Some((Output::new(file, Some(e.size)), path)),
                 Target::Exists => {
                     report(&format!("{}: exists, skipped", e.name));
                     summary.skipped += 1;
@@ -465,20 +466,29 @@ pub fn run(path: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<
             }
         }
         let read = match target.as_mut() {
-            Some((file, _)) => archive.read_entry(e, &mut buf, &mut |chunk| Ok(file.write_all(chunk)?)),
+            Some((out, _)) => archive.read_entry(e, &mut buf, &mut |chunk| Ok(out.write(chunk)?)),
             None => archive.read_entry(e, &mut buf, &mut |_| Ok(())),
         };
         match read {
             Ok(()) => {
-                if let Some((file, _)) = &target {
-                    finish_file(file, &e.meta());
+                if let Some((out, path)) = target.take() {
+                    // the last of a big entry may still be on its way to the disk
+                    match out.finish() {
+                        Ok(file) => finish_file(&file, &e.meta()),
+                        Err(io) => {
+                            let _ = std::fs::remove_file(path);
+                            finish_dirs(&mut summary);
+                            return Err(Error::Io(io));
+                        }
+                    }
                 }
                 summary.files += 1;
                 summary.bytes += e.size;
             }
             Err(err) => {
-                if let Some((file, path)) = target.take() {
-                    drop(file);
+                if let Some((out, path)) = target.take() {
+                    // waits for anything still being written, so the removal is the last word
+                    drop(out);
                     let _ = std::fs::remove_file(path);
                 }
                 match err {

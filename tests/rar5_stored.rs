@@ -323,3 +323,23 @@ fn a_name_with_mapped_non_utf8_bytes_is_refused() {
     assert_eq!((s.files, s.errors.len()), (0, 1));
     assert_eq!(fs::read_dir(&out).unwrap().count(), 0);
 }
+
+#[test]
+fn a_big_file_is_written_whole() {
+    // big enough to be written on a thread of its own
+    let dir = tmp("big");
+    let data: Vec<u8> = (0..9_000_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
+    let arc = dir.join("t.rar");
+    fs::write(&arc, archive_with(&[(FileSpec::new("big.bin", &data), crc32fast::hash(&data))], false)).unwrap();
+    let out = dir.join("out");
+    let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+    assert!(fs::read(out.join("big.bin")).unwrap() == data);
+    // a wrong checksum still removes it
+    let arc2 = dir.join("bad.rar");
+    fs::write(&arc2, archive_with(&[(FileSpec::new("big.bin", &data), 1)], false)).unwrap();
+    let out2 = dir.join("out2");
+    let s = extract::run(&arc2, &opts(&out2), |_| {}).unwrap();
+    assert_eq!(s.errors.len(), 1);
+    assert!(!out2.join("big.bin").exists());
+}
