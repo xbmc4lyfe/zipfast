@@ -15,6 +15,8 @@ pub enum Error {
     Truncated,
     /// The next volume of a multi-volume set is not on disk.
     MissingVolume(PathBuf),
+    /// The set has more volumes, but this volume's name doesn't say what the next one is called.
+    UnnamedVolume(PathBuf),
     /// A feature the archive uses that this build cannot handle yet.
     Unsupported(String),
     /// The archive or a file in it is encrypted.
@@ -35,6 +37,9 @@ impl fmt::Display for Error {
             Error::Corrupt(what) => write!(f, "corrupt archive: {what}"),
             Error::Truncated => f.write_str("archive is truncated"),
             Error::MissingVolume(p) => write!(f, "missing volume {}", p.display()),
+            Error::UnnamedVolume(p) => {
+                write!(f, "{} says more volumes follow, but its name has no volume number to find them by", p.display())
+            }
             Error::Unsupported(what) => write!(f, "unsupported: {what}"),
             Error::Encrypted => f.write_str("encrypted (passwords are not supported yet)"),
             Error::BadChecksum(name) => write!(f, "checksum error in {name}"),

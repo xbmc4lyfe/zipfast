@@ -3,6 +3,7 @@
 //! The first format is RAR 5.0, read from the published archive layout. Each format lives in its own module and
 //! hands the extractor a stream of entries; the extractor owns paths, overwrite rules and checksums.
 
+pub mod blake2sp;
 pub mod error;
 pub mod extract;
 pub mod path;

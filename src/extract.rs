@@ -5,6 +5,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::blake2sp::Blake2sp;
 use crate::error::{Error, Result};
 use crate::path::sanitize;
 use crate::rar5::reader::{Block, Volume};
@@ -91,7 +92,13 @@ fn walk(first: &Path, mut on_block: impl FnMut(&mut Volume, Block) -> Result<()>
         if !more {
             return Ok(volumes);
         }
-        let Some(next) = next_volume(&path) else { return Ok(volumes) };
+        let Some(next) = next_volume(&path) else {
+            // the set says it goes on, but this name has no volume number to step
+            if saw_end {
+                return Err(Error::UnnamedVolume(path));
+            }
+            return Ok(volumes);
+        };
         if !next.exists() {
             // without an end header a volume flag alone doesn't prove another volume was made
             if saw_end {
@@ -139,9 +146,34 @@ struct Pending {
     out: Option<File>,
     path: Option<PathBuf>,
     hasher: crc32fast::Hasher,
+    /// kept only when the archive stores a BLAKE2sp hash for this file
+    blake: Option<Blake2sp>,
     bytes: u64,
     /// something already went wrong: read past the rest of it
     failed: bool,
+}
+
+impl Pending {
+    fn skipping(name: &str) -> Self {
+        Pending {
+            name: name.to_string(),
+            out: None,
+            path: None,
+            hasher: Default::default(),
+            blake: None,
+            bytes: 0,
+            failed: true,
+        }
+    }
+
+    /// Gives up on this file: what was written of it is removed, so a later run doesn't take it for finished.
+    fn discard(&mut self) {
+        self.failed = true;
+        drop(self.out.take());
+        if let Some(path) = self.path.take() {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 pub fn run(first: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<Summary> {
@@ -158,8 +190,9 @@ pub fn run(first: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result
                 Some(p) if p.name == h.name => {
                     return continue_file(vol, &h, p, &mut pending, &mut buf, opts, &mut summary, &mut report);
                 }
-                Some(p) => {
+                Some(mut p) => {
                     fail(&mut summary, &mut report, &p.name, "next part is missing");
+                    p.discard();
                 }
                 // the set was opened past the start of this file
                 None => {
@@ -167,14 +200,16 @@ pub fn run(first: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result
                     return Ok(());
                 }
             }
-        } else if let Some(p) = pending.take() {
+        } else if let Some(mut p) = pending.take() {
             fail(&mut summary, &mut report, &p.name, "next part is missing");
+            p.discard();
         }
         start_file(vol, &h, &mut pending, &mut buf, opts, &mut summary, &mut report)
     })?;
     summary.volumes = volumes;
-    if let Some(p) = pending.take() {
+    if let Some(mut p) = pending.take() {
         fail(&mut summary, &mut report, &p.name, "archive ends before this file does");
+        p.discard();
     }
     Ok(summary)
 }
@@ -197,14 +232,7 @@ fn start_file(
 ) -> Result<()> {
     let skip_rest = |pending: &mut Option<Pending>| {
         if h.split_after() {
-            *pending = Some(Pending {
-                name: h.name.clone(),
-                out: None,
-                path: None,
-                hasher: Default::default(),
-                bytes: 0,
-                failed: true,
-            });
+            *pending = Some(Pending::skipping(&h.name));
         }
     };
     let rel = match sanitize(&h.name, !h.is_unix()) {
@@ -266,7 +294,15 @@ fn start_file(
     } else {
         (None, None)
     };
-    let p = Pending { name: h.name.clone(), out, path, hasher: crc32fast::Hasher::new(), bytes: 0, failed: false };
+    let p = Pending {
+        name: h.name.clone(),
+        out,
+        path,
+        hasher: crc32fast::Hasher::new(),
+        blake: h.blake2sp.map(|_| Blake2sp::new()),
+        bytes: 0,
+        failed: false,
+    };
     continue_file(vol, h, p, pending, buf, opts, summary, report)
 }
 
@@ -290,18 +326,25 @@ fn continue_file(
     }
     if h.method != 0 || h.encrypted {
         fail(summary, report, &p.name, "a later part is packed differently");
-        p.failed = true;
+        p.discard();
         if h.split_after() {
             *pending = Some(p);
         }
         return Ok(());
     }
-    let mut part = crc32fast::Hasher::new();
     let split_after = h.split_after();
+    let mut part = crc32fast::Hasher::new();
+    let mut part_blake = h.blake2sp.filter(|_| split_after).map(|_| Blake2sp::new());
     vol.read_data(h.data_at, h.packed_size, buf, |chunk| {
         p.hasher.update(chunk);
+        if let Some(b) = p.blake.as_mut() {
+            b.update(chunk);
+        }
         if split_after {
             part.update(chunk);
+            if let Some(b) = part_blake.as_mut() {
+                b.update(chunk);
+            }
         }
         if let Some(out) = p.out.as_mut() {
             out.write_all(chunk)?;
@@ -310,21 +353,30 @@ fn continue_file(
     })?;
     p.bytes += h.packed_size;
     if split_after {
-        // a part's checksum covers only its own packed bytes
-        if let Some(want) = h.crc32
-            && part.finalize() != want
-        {
+        // a part's checksums cover only its own packed bytes
+        let crc_bad = h.crc32.is_some_and(|want| part.finalize() != want);
+        let blake_bad = h.blake2sp.zip(part_blake).is_some_and(|(want, got)| got.finish() != want);
+        if crc_bad || blake_bad {
             fail(summary, report, &p.name, "checksum error in a volume's part");
-            p.failed = true;
+            p.discard();
         }
         *pending = Some(p);
         return Ok(());
     }
-    let got = p.hasher.clone().finalize();
-    if let Some(want) = h.crc32
-        && got != want
-    {
+    let crc_bad = h.crc32.is_some_and(|want| p.hasher.clone().finalize() != want);
+    let blake_bad = match (h.blake2sp, p.blake.take()) {
+        (Some(want), Some(got)) => got.finish() != want,
+        // a hash that only the last part states can't be checked from here: say so rather than pass it
+        (Some(_), None) if h.crc32.is_none() => {
+            fail(summary, report, &p.name, "its BLAKE2sp hash starts only in a later part, so it can't be checked");
+            p.discard();
+            return Ok(());
+        }
+        _ => false,
+    };
+    if crc_bad || blake_bad {
         fail(summary, report, &p.name, "checksum error");
+        p.discard();
         return Ok(());
     }
     if let Some(out) = p.out.take() {
@@ -333,7 +385,6 @@ fn continue_file(
         }
         finish_file(&out, h);
     }
-    let _ = p.path;
     summary.files += 1;
     summary.bytes += p.bytes;
     Ok(())
@@ -355,10 +406,9 @@ fn finish_file(out: &File, h: &FileHeader) {
     if h.is_unix() {
         use std::os::unix::fs::PermissionsExt;
         // set-id and sticky bits are never restored from an archive
+        // zero is a real mode, not a missing one
         let mode = (h.attributes as u32) & 0o777;
-        if mode != 0 {
-            let _ = out.set_permissions(fs::Permissions::from_mode(mode));
-        }
+        let _ = out.set_permissions(fs::Permissions::from_mode(mode));
     }
 }
 

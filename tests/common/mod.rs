@@ -43,6 +43,8 @@ pub fn block(kind: u64, flags: u64, fields: &[u8], extra: &[u8], data: &[u8], da
 }
 
 pub struct FileSpec<'a> {
+    /// leave the CRC32 out of the header, as an archive using BLAKE2sp instead does
+    pub no_crc: bool,
     pub name: &'a str,
     pub data: &'a [u8],
     pub dir: bool,
@@ -55,6 +57,7 @@ pub struct FileSpec<'a> {
 impl<'a> FileSpec<'a> {
     pub fn new(name: &'a str, data: &'a [u8]) -> Self {
         FileSpec {
+            no_crc: false,
             name,
             data,
             dir: false,
@@ -69,7 +72,7 @@ impl<'a> FileSpec<'a> {
 /// A file header for one part. `crc` is the part's or the file's, as the caller decides.
 pub fn file_block(spec: &FileSpec<'_>, part: &[u8], crc: u32, split_before: bool, split_after: bool) -> Vec<u8> {
     let mut fields = Vec::new();
-    let mut file_flags = 0x4; // crc present
+    let mut file_flags = if spec.no_crc { 0 } else { 0x4 };
     if spec.dir {
         file_flags |= 1;
     }
@@ -82,7 +85,9 @@ pub fn file_block(spec: &FileSpec<'_>, part: &[u8], crc: u32, split_before: bool
     if let Some(t) = spec.mtime {
         fields.extend_from_slice(&t.to_le_bytes());
     }
-    fields.extend_from_slice(&crc.to_le_bytes());
+    if !spec.no_crc {
+        fields.extend_from_slice(&crc.to_le_bytes());
+    }
     vint(spec.method << 7, &mut fields);
     vint(if spec.unix_mode.is_some() { 1 } else { 0 }, &mut fields);
     vint(spec.name.len() as u64, &mut fields);
@@ -149,4 +154,22 @@ pub fn volumes(spec: &FileSpec<'_>, chunk: usize) -> Vec<Vec<u8>> {
             out
         })
         .collect()
+}
+
+/// An extra-area hash record holding `hash` as BLAKE2sp.
+pub fn blake_record(hash: [u8; 32]) -> Vec<u8> {
+    let mut rec = Vec::new();
+    vint(2, &mut rec);
+    vint(0, &mut rec);
+    rec.extend_from_slice(&hash);
+    let mut out = Vec::new();
+    vint(rec.len() as u64, &mut out);
+    out.extend(rec);
+    out
+}
+
+pub fn blake(data: &[u8]) -> [u8; 32] {
+    let mut h = zipfast::blake2sp::Blake2sp::new();
+    h.update(data);
+    h.finish()
 }

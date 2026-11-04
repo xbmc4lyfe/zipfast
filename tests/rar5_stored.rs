@@ -173,3 +173,63 @@ fn compressed_files_are_reported_not_mangled() {
     assert_eq!((s.files, s.errors.len()), (1, 1));
     assert!(!out.join("p").exists());
 }
+
+#[test]
+fn checks_blake2sp_when_there_is_no_crc() {
+    let dir = tmp("blake");
+    let data = b"hashed with BLAKE2sp only".to_vec();
+    let good = FileSpec { no_crc: true, extra: blake_record(blake(&data)), ..FileSpec::new("f", &data) };
+    let arc = dir.join("good.rar");
+    fs::write(&arc, archive(&[good])).unwrap();
+    let s = extract::run(&arc, &Options { mode: Mode::Test, ..opts(&dir) }, |_| {}).unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+
+    let wrong = FileSpec { no_crc: true, extra: blake_record(blake(b"other")), ..FileSpec::new("f", &data) };
+    let arc = dir.join("bad.rar");
+    fs::write(&arc, archive(&[wrong])).unwrap();
+    let s = extract::run(&arc, &Options { mode: Mode::Test, ..opts(&dir) }, |_| {}).unwrap();
+    assert_eq!(s.errors.len(), 1);
+}
+
+#[test]
+fn a_file_that_fails_its_checksum_is_removed() {
+    let dir = tmp("crc-remove");
+    let mut bytes = archive(&[FileSpec::new("f", b"0123456789")]);
+    let at = bytes.windows(10).position(|w| w == b"0123456789").unwrap();
+    bytes[at] = b'X';
+    let arc = dir.join("t.rar");
+    fs::write(&arc, bytes).unwrap();
+    let out = dir.join("out");
+    let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert_eq!(s.errors.len(), 1);
+    assert!(!out.join("f").exists());
+}
+
+#[test]
+fn a_set_under_a_name_without_a_volume_number_is_an_error() {
+    let dir = tmp("unnamed");
+    let data = vec![1u8; 1000];
+    // two whole files, so the first volume ends between them and nothing is left half-written
+    let first = FileSpec::new("a", &data);
+    let mut vol = SIG.to_vec();
+    vol.extend(main_block(true, None));
+    vol.extend(file_block(&first, &data, crc32fast::hash(&data), false, false));
+    vol.extend(end_block(true));
+    let arc = dir.join("download.bin");
+    fs::write(&arc, vol).unwrap();
+    let err = extract::run(&arc, &Options { mode: Mode::Test, ..opts(&dir) }, |_| {}).unwrap_err();
+    assert!(matches!(err, zipfast::Error::UnnamedVolume(_)), "{err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn restores_a_zero_mode() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp("mode0");
+    let arc = dir.join("t.rar");
+    fs::write(&arc, archive(&[FileSpec { unix_mode: Some(0o100000), ..FileSpec::new("locked", b"x") }])).unwrap();
+    let out = dir.join("out");
+    extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    let mode = fs::metadata(out.join("locked")).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0);
+}
