@@ -149,6 +149,21 @@ impl Volume {
     }
 
     /// Reads `len` bytes of a data area starting at `at` into `out`, in pieces, calling `sink` on each.
+    /// `len` bytes at `at`, appended to `out` with no buffer in between.
+    pub fn read_data_into(&mut self, at: u64, len: u64, out: &mut Vec<u8>) -> Result<()> {
+        if at.checked_add(len).is_none_or(|end| end > self.len) {
+            return Err(Error::Truncated);
+        }
+        self.file.seek(SeekFrom::Start(at))?;
+        let want = out.len() + len as usize;
+        // seeking emptied the buffer, so reading the file underneath keeps the reader's place and saves a copy
+        self.file.get_mut().take(len).read_to_end(out)?;
+        if out.len() != want {
+            return Err(Error::Truncated);
+        }
+        Ok(())
+    }
+
     pub fn read_data(
         &mut self,
         at: u64,

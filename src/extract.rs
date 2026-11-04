@@ -433,13 +433,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
     /// Reads `h`'s data and hands it to the workers.
     fn send_to_batch(&mut self, vol: &mut Volume, h: &FileHeader, out: Option<(File, PathBuf)>) -> Result<()> {
         let mut packed = Vec::with_capacity(h.packed_size as usize);
-        let mut buf = std::mem::take(&mut self.buf);
-        let read = vol.read_data(h.data_at, h.packed_size, &mut buf, |chunk| {
-            packed.extend_from_slice(chunk);
-            Ok(())
-        });
-        self.buf = buf;
-        if let Err(e) = read {
+        if let Err(e) = vol.read_data_into(h.data_at, h.packed_size, &mut packed) {
             if let Some((file, path)) = out {
                 drop(file);
                 let _ = fs::remove_file(path);
