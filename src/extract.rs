@@ -1,4 +1,5 @@
-//! Lists, tests and extracts a RAR 5.0 archive, following its volumes in order and decoding compressed files.
+//! Lists, tests and extracts an archive. RAR 5.0 lives here: its volumes are followed in order and compressed files
+//! decoded. Other formats have modules of their own.
 
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
@@ -165,19 +166,35 @@ fn walk(first: &Path, mut on_block: impl FnMut(&mut Volume, Block) -> Result<()>
     }
 }
 
-/// Which reader a file needs, from its first bytes. RAR is tried for anything else, since a self-extracting RAR
-/// starts with a program; a file that turns out not to be RAR gets one more try as a ZIP, which is found from
-/// its end.
-fn is_zip(path: &Path) -> Result<bool> {
-    let mut head = [0u8; 4];
-    let n = std::io::Read::read(&mut File::open(path)?, &mut head)?;
-    Ok(crate::zip::sniff(&head[..n]))
+/// The formats found by their first bytes. Anything else is tried as RAR, since a self-extracting RAR starts with
+/// a program; a file that turns out not to be RAR gets one more try as a ZIP, which is found from its end.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Format {
+    Zip,
+    /// tar, gzip-compressed tar, or a lone gzip-compressed file
+    Tar,
+    Other,
+}
+
+fn sniff(path: &Path) -> Result<Format> {
+    let mut head = [0u8; 1024];
+    let n = crate::tar::read_full(&mut File::open(path)?, &mut head)?;
+    let head = &head[..n];
+    Ok(if crate::zip::sniff(head) {
+        Format::Zip
+    } else if crate::tar::sniff_gzip(head) || crate::tar::sniff_tar(head) {
+        Format::Tar
+    } else {
+        Format::Other
+    })
 }
 
 /// The entries of an archive, whatever its format.
 pub fn list(first: &Path) -> Result<Vec<Entry>> {
-    if is_zip(first)? {
-        return crate::zip::list(first);
+    match sniff(first)? {
+        Format::Zip => return crate::zip::list(first),
+        Format::Tar => return crate::tar::list(first),
+        Format::Other => {}
     }
     match rar_list(first) {
         Err(Error::NotAnArchive) => crate::zip::list(first),
@@ -187,8 +204,10 @@ pub fn list(first: &Path) -> Result<Vec<Entry>> {
 
 /// Tests or extracts an archive, whatever its format.
 pub fn run(first: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<Summary> {
-    if is_zip(first)? {
-        return zip_run(first, opts, &mut report);
+    match sniff(first)? {
+        Format::Zip => return zip_run(first, opts, &mut report),
+        Format::Tar => return crate::tar::run(first, opts, &mut report),
+        Format::Other => {}
     }
     match rar_run(first, opts, &mut report) {
         Err(Error::NotAnArchive) => zip_run(first, opts, &mut report),
