@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod parallel;
-use parallel::{Done, Job, Pool};
+use parallel::{Done, Job, Part, Pool, Slot};
 
 pub(crate) const NC: usize = 306;
 pub(crate) const DC: usize = 64;
@@ -21,6 +21,8 @@ const TABLES: usize = NC + DC + LDC + RC;
 const PAD: usize = 32;
 const MAX_FILTERS: usize = 8192;
 const MAX_FILTER_LEN: u64 = 0x40_0000;
+/// Quick literals gathered before they go to the window.
+const STAGE: usize = 256;
 /// Bits of a code looked up in one step; longer codes take the slow path.
 const LUT_BITS: u32 = 11;
 
@@ -107,6 +109,10 @@ struct Huff {
     sorted: Vec<u16>,
     /// no codes at all
     empty: bool,
+    /// the length most literals have, when it is short enough for [`Huff::quick`]; 0 otherwise
+    common: u32,
+    /// entries of `lut` past this are zero already
+    dirty: usize,
 }
 
 impl Huff {
@@ -118,6 +124,8 @@ impl Huff {
             start: [0; 16],
             sorted: Vec::new(),
             empty: true,
+            common: 0,
+            dirty: 1 << LUT_BITS,
         }
     }
 
@@ -156,16 +164,32 @@ impl Huff {
             }
         }
         self.empty = index == 0;
-        self.lut.fill(0);
+        // incompressible data comes out as literals nearly all of one length: worth guessing at
+        let mut by_len = [0u32; 16];
+        for &l in lengths.iter().take(256) {
+            by_len[l as usize] += 1;
+        }
+        by_len[0] = 0;
+        let (len, n) = by_len.iter().enumerate().max_by_key(|&(l, &n)| (n, std::cmp::Reverse(l))).unwrap();
+        self.common = if lengths.len() >= 256 && *n >= 64 && len <= LUT_BITS as usize { len as u32 } else { 0 };
+        // canonical codes up to the table's width fill it from the start, in order; the rest belongs to longer codes
+        // or to none, and is marked for the slow path
+        let mut covered = 0;
         for l in 1..=LUT_BITS as usize {
             let from = self.start[l] as usize;
             let first = self.first[l] >> (16 - l);
+            let span = 1 << (LUT_BITS as usize - l);
             for (rank, &sym) in self.sorted[from..from + count[l] as usize].iter().enumerate() {
                 let code = first + rank as u32;
                 let at = (code << (LUT_BITS as usize - l)) as usize;
-                self.lut[at..at + (1 << (LUT_BITS as usize - l))].fill((sym << 4) | l as u16);
+                self.lut[at..at + span].fill((sym << 4) | l as u16);
+                covered = at + span;
             }
         }
+        if covered < self.dirty {
+            self.lut[covered..self.dirty].fill(0);
+        }
+        self.dirty = covered;
         Ok(())
     }
 
@@ -178,6 +202,54 @@ impl Huff {
             return Ok(entry >> 4);
         }
         self.decode_slow(peek, bits)
+    }
+
+    /// Up to six literals of the common length from one refill. All the lookups are made at once, as if every
+    /// code had that length, and kept for as long as that holds. Returns them with how many there are (none when
+    /// the first code isn't such a literal). Needs 56 bits in the accumulator.
+    #[inline(always)]
+    fn quick(&self, bits: &mut Bits<'_>) -> ([u8; 6], usize) {
+        let g = self.common;
+        let a = bits.acc;
+        let sh = 64 - LUT_BITS;
+        let at = |k: u32| self.lut[((a << (k * g)) >> sh) as usize];
+        // a literal (symbol below 256, so the top four bits clear) of length g
+        let hit = |e: u16| u32::from(e & 0xF00F) == g;
+        let e = [at(0), at(1), at(2), at(3), at(4), at(5)];
+        let lits = e.map(|e| (e >> 4) as u8);
+        if g == 0 || !hit(e[0]) {
+            return (lits, 0);
+        }
+        // six codes fit in a refill only when they are short; four always do
+        let most = if g <= 9 { 6 } else { 4 };
+        let mut n = 1;
+        while n < most && hit(e[n]) {
+            n += 1;
+        }
+        bits.skip(n as u32 * g);
+        (lits, n)
+    }
+
+    /// Quick literals for as long as they keep coming, into `stage`, while the bits stay at least 128 short of
+    /// `end_bits` and fewer than `room` are out. Returns how many.
+    #[inline(always)]
+    fn quick_run(&self, bits: &mut Bits<'_>, end_bits: usize, stage: &mut [u8; STAGE + 6], room: usize) -> usize {
+        let room = room.min(STAGE);
+        let mut k = 0;
+        if self.common == 0 {
+            return 0;
+        }
+        while k < room && bits.pos() + 128 <= end_bits {
+            bits.refill();
+            let (lits, n) = self.quick(bits);
+            stage[k..k + 6].copy_from_slice(&lits);
+            k += n;
+            // a code of some other kind stopped them
+            if n < 5 {
+                break;
+            }
+        }
+        k
     }
 
     #[cold]
@@ -218,6 +290,22 @@ struct Tables {
     rep: Huff,
 }
 
+/// Every code length a block's tables give, main table first.
+type Lengths = [u8; TABLES];
+
+impl Tables {
+    fn empty() -> Tables {
+        Tables { main: Huff::new(), dist: Huff::new(), low: Huff::new(), rep: Huff::new() }
+    }
+
+    fn build(&mut self, lens: &Lengths) -> Result<()> {
+        self.main.build(&lens[..NC])?;
+        self.dist.build(&lens[NC..NC + DC])?;
+        self.low.build(&lens[NC + DC..NC + DC + LDC])?;
+        self.rep.build(&lens[NC + DC + LDC..])
+    }
+}
+
 /// A decoded operation. Literals travel separately; `Lits` says how many come next.
 #[derive(Clone, Copy, Debug)]
 enum Tok {
@@ -243,6 +331,9 @@ enum Tok {
 /// tokens for a block stay within [`parallel::BUDGET`] times its packed size, so this also bounds their memory.
 const MAX_QUEUED: usize = 32 << 20;
 
+/// Blocks are handed to workers in runs of about this many packed bytes.
+const JOB_BYTES: usize = 256 << 10;
+
 /// Big files are decoded on worker threads from this size up, unless told otherwise.
 const PARALLEL_MIN: u64 = 4 << 20;
 
@@ -259,6 +350,12 @@ pub struct Unpacker {
     /// the current file's declared size, None when unknown
     size: Option<u64>,
     tables_ready: bool,
+    /// the code lengths the next block without tables is read with, which a worker may still be reading, and the
+    /// lengths `tables` was last built from
+    slot: Arc<Slot>,
+    built: Option<Arc<Slot>>,
+    /// the code the lengths themselves are read with, kept so each block needn't allocate one
+    pre: Huff,
     tables: Arc<Tables>,
     history: [u64; 4],
     last_len: u32,
@@ -276,17 +373,19 @@ pub struct Unpacker {
     /// whether the current file's blocks go to workers
     parallel: bool,
     pool: Option<Pool>,
-    /// blocks handed to workers, and blocks applied to the window, both counted over the decoder's life
+    /// blocks gathered for the next job
+    batch: Job,
+    /// jobs handed to workers, and jobs applied to the window, both counted over the decoder's life
     submitted: u64,
     applied: u64,
-    /// packed bytes of the blocks not yet applied
+    /// packed bytes of the jobs not yet applied
     queued: usize,
     /// blocks a worker stopped early on, at its memory budget, and this thread finished
     resumed: u64,
-    /// finished blocks waiting for the ones before them
+    /// finished jobs waiting for the ones before them
     ready: BTreeMap<u64, Done>,
-    /// buffers from finished blocks, for reuse
-    spare: Vec<(Vec<u8>, Vec<Tok>, Vec<u8>)>,
+    /// finished jobs, for their buffers
+    spare: Vec<Job>,
 }
 
 /// The window a file needs: its declared dictionary, but no more than twice the file when nothing before or after it
@@ -308,18 +407,23 @@ impl Unpacker {
     /// A fresh stream with a window of `window` bytes (a power of two).
     pub fn new(window: u64) -> Result<Self> {
         let size = usize::try_from(window).map_err(|_| Error::Unsupported("dictionary too large".into()))?;
-        let mut v = Vec::new();
-        v.try_reserve_exact(size).map_err(|_| Error::Unsupported(format!("can't allocate a {window} byte window")))?;
-        v.resize(size, 0);
+        // asked first so an absurd size is an error, not an abort; the window itself comes zeroed from the system,
+        // so its pages cost nothing until they are written
+        Vec::<u8>::new()
+            .try_reserve_exact(size)
+            .map_err(|_| Error::Unsupported(format!("can't allocate a {window} byte window")))?;
         Ok(Unpacker {
-            window: v,
+            window: vec![0; size],
             mask: window - 1,
             sp: 0,
             file_base: 0,
             emitted: 0,
             size: None,
             tables_ready: false,
-            tables: Arc::new(Tables { main: Huff::new(), dist: Huff::new(), low: Huff::new(), rep: Huff::new() }),
+            slot: Slot::filled(None),
+            built: None,
+            pre: Huff::new(),
+            tables: Arc::new(Tables::empty()),
             history: [0; 4],
             last_len: 0,
             filters: Vec::new(),
@@ -330,6 +434,7 @@ impl Unpacker {
             parallel_min: PARALLEL_MIN,
             parallel: false,
             pool: None,
+            batch: Job::default(),
             submitted: 0,
             applied: 0,
             queued: 0,
@@ -368,6 +473,13 @@ impl Unpacker {
         self.mask + 1
     }
 
+    /// Whether this decoder can take a stream that needs a `window` byte window: its own is big enough, and not so
+    /// much bigger that keeping it wastes memory. Reusing one saves allocating a window for every file.
+    pub fn fits(&self, window: u64) -> bool {
+        let have = self.window_size();
+        have >= window && have <= window.saturating_mul(4).max(4 << 20)
+    }
+
     /// Starts the next file of a solid stream: the window, tables and history carry on.
     pub fn next_file(&mut self, size: Option<u64>) {
         self.discard_in_flight();
@@ -393,8 +505,9 @@ impl Unpacker {
         self.sp - self.file_base
     }
 
-    /// Hands a block to the workers. Its tables are read here, since later blocks may reuse them; the symbols are
-    /// read on a worker and applied to the window in order by [`Self::settle`].
+    /// Hands a block to the workers. A worker reads its code lengths, builds the tables and reads its symbols; the
+    /// tokens are applied to the window in order by [`Self::settle`]. Later blocks without tables of their own wait
+    /// for the lengths, on the worker that has them.
     fn submit(
         &mut self,
         buf: &[u8],
@@ -404,66 +517,73 @@ impl Unpacker {
     ) -> Result<()> {
         let valid_bits = usize::from(flags & 7) + 1;
         let end_bits = if payload == 0 { 0 } else { (payload - 1) * 8 + valid_bits };
-        let (mut block, toks, lits) = self.spare.pop().unwrap_or_default();
-        block.clear();
-        block.extend_from_slice(&buf[..payload + PAD]);
-        let mut bits = Bits::new(&block);
-        let tables = if flags & 0x80 != 0 {
-            self.read_tables(&mut bits, end_bits)
-        } else if !self.tables_ready && payload > 0 {
-            Err(corrupt("block without tables at the start of a stream"))
-        } else {
-            Ok(())
-        };
-        let start_bit = bits.pos();
-        if let Err(e) = tables {
-            // an earlier block's error comes first
-            self.settle(0, sink)?;
-            return Err(e);
-        }
-        if start_bit >= end_bits {
-            self.spare.push((block, toks, lits));
-            if start_bit > end_bits {
-                self.settle(0, sink)?;
-                return Err(corrupt("a symbol runs past the end of its block"));
+        let read_tables = flags & 0x80 != 0;
+        if !read_tables {
+            if payload == 0 {
+                return Ok(());
             }
-            return Ok(());
+            if !self.tables_ready {
+                // an earlier block's error comes first
+                self.settle(0, sink)?;
+                return Err(corrupt("block without tables at the start of a stream"));
+            }
         }
-        if self.pool.is_none() {
-            self.pool = Some(Pool::new(self.threads));
+        if read_tables {
+            self.slot = Slot::pending();
+            self.tables_ready = true;
         }
-        let job =
-            Job { seq: self.submitted, buf: block, start_bit, end_bits, tables: Arc::clone(&self.tables), toks, lits };
-        self.queued += job.buf.len();
-        self.pool.as_ref().unwrap().submit(job);
-        self.submitted += 1;
-        self.settle(2 * self.threads as u64, sink)
+        let at = self.batch.buf.len();
+        self.batch.buf.extend_from_slice(&buf[..payload + PAD]);
+        self.batch.parts.push(Part { at, end_bits, read_tables, slot: Arc::clone(&self.slot) });
+        if self.batch.buf.len() >= JOB_BYTES {
+            self.send_batch();
+            self.settle(4 * self.threads as u64, sink)?;
+        }
+        Ok(())
     }
 
-    /// Applies finished blocks in order until no more than `max` are still with the workers. The first error in
-    /// stream order is returned; after one, the rest are collected and dropped.
+    /// Hands the blocks gathered so far to a worker.
+    fn send_batch(&mut self) {
+        if self.batch.parts.is_empty() {
+            return;
+        }
+        let pool = self.pool.get_or_insert_with(|| Pool::new(self.threads));
+        let mut job = std::mem::replace(&mut self.batch, self.spare.pop().unwrap_or_default());
+        self.batch.buf.clear();
+        self.batch.parts.clear();
+        job.seq = self.submitted;
+        self.queued += job.buf.len();
+        pool.submit(job);
+        self.submitted += 1;
+    }
+
+    /// Applies finished jobs in order until no more than `max` are still with the workers; with `max` 0 the blocks
+    /// still being gathered go first. The first error in stream order is returned; after one, the rest are collected
+    /// and dropped.
     fn settle(&mut self, max: u64, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        if max == 0 {
+            self.send_batch();
+        }
         let mut max = max;
         let mut failed = None;
         loop {
             while let Some(done) = self.ready.remove(&self.applied) {
                 self.applied += 1;
-                let Done { buf, toks, lits, result, tables, end_bits, .. } = done;
-                self.queued -= buf.len();
+                let Done { job, result, tables } = done;
+                self.queued -= job.buf.len();
                 if failed.is_none() {
-                    let mut applied = self.apply(&toks, &lits, sink).and(result);
-                    // the worker stopped at its memory budget: the rest of the block is decoded here
-                    if let Ok(Some(bit)) = applied {
-                        let mut bits = Bits::at(&buf, bit);
+                    let mut applied = self.apply(&job.toks, &job.lits, sink).and(result);
+                    // the worker stopped at its memory budget: the rest of the job is decoded here
+                    if let Ok(Some((part, bit))) = applied {
                         self.resumed += 1;
-                        applied = self.decode_rest(&mut bits, end_bits, &tables, sink).map(|()| None);
+                        applied = self.resume(&job, part, bit, tables, sink).map(|()| None);
                     }
                     if let Err(e) = applied {
                         failed = Some(e);
                         max = 0;
                     }
                 }
-                self.spare.push((buf, toks, lits));
+                self.spare.push(job);
             }
             let in_flight = self.submitted - self.applied;
             if in_flight == 0 {
@@ -479,31 +599,57 @@ impl Unpacker {
             } else {
                 pool.next()
             };
-            self.ready.insert(done.seq, done);
+            self.ready.insert(done.job.seq, done);
         }
         failed.map_or(Ok(()), Err)
     }
 
+    /// Decodes the rest of a job a worker stopped at its budget: block `part` from `bit` on, with `tables`, then the
+    /// blocks after it.
+    fn resume(
+        &mut self,
+        job: &Job,
+        part: usize,
+        bit: usize,
+        mut tables: Arc<Tables>,
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        for (i, p) in job.parts.iter().enumerate().skip(part) {
+            let buf = &job.buf[p.at..];
+            let mut bits = if i == part { Bits::at(buf, bit) } else { Bits::new(buf) };
+            if i > part && p.read_tables {
+                let lens = read_lengths(&mut self.pre, &mut bits, p.end_bits)?;
+                let mut t = Tables::empty();
+                t.build(&lens)?;
+                tables = Arc::new(t);
+            }
+            self.decode_rest(&mut bits, p.end_bits, &tables, sink)?;
+        }
+        Ok(())
+    }
+
     /// An error found reading ahead of the workers waits for theirs: an earlier block's error comes first.
     fn ordered<T>(&mut self, r: Result<T>, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<T> {
-        if r.is_err() && self.submitted > self.applied {
+        if r.is_err() && (self.submitted > self.applied || !self.batch.parts.is_empty()) {
             self.settle(0, sink)?;
         }
         r
     }
 
-    /// Waits out blocks still with the workers and drops them: the file they belong to was abandoned.
+    /// Waits out blocks still with the workers and drops them: the file they belong to was abandoned. The blocks
+    /// being gathered go to the workers too, since later blocks may wait on the lengths they carry.
     fn discard_in_flight(&mut self) {
+        self.send_batch();
         while self.applied < self.submitted {
             if !self.ready.contains_key(&self.applied) {
                 let Some(pool) = self.pool.as_ref() else { break };
                 let done = pool.next();
-                self.ready.insert(done.seq, done);
+                self.ready.insert(done.job.seq, done);
                 continue;
             }
-            if let Some(Done { buf, toks, lits, .. }) = self.ready.remove(&self.applied) {
-                self.queued -= buf.len();
-                self.spare.push((buf, toks, lits));
+            if let Some(Done { job, .. }) = self.ready.remove(&self.applied) {
+                self.queued -= job.buf.len();
+                self.spare.push(job);
             }
             self.applied += 1;
         }
@@ -657,9 +803,18 @@ impl Unpacker {
         let end_bits = if payload == 0 { 0 } else { (payload - 1) * 8 + valid_bits };
         let mut bits = Bits::new(buf);
         if flags & 0x80 != 0 {
-            self.read_tables(&mut bits, end_bits)?;
+            let lens = read_lengths(&mut self.pre, &mut bits, end_bits)?;
+            self.slot = Slot::filled(Some(lens));
+            self.tables_ready = true;
         } else if !self.tables_ready && payload > 0 {
             return Err(corrupt("block without tables at the start of a stream"));
+        }
+        // after blocks on workers, the tables here may lag behind the lengths last read
+        if self.tables_ready && !self.built.as_ref().is_some_and(|b| Arc::ptr_eq(b, &self.slot)) {
+            let lens = self.slot.wait().ok_or_else(|| corrupt("the tables before this block were damaged"))?;
+            // blocks still decoding on the main thread's behalf keep the tables they were handed
+            Arc::make_mut(&mut self.tables).build(&lens)?;
+            self.built = Some(Arc::clone(&self.slot));
         }
         let tables = Arc::clone(&self.tables);
         self.decode_rest(&mut bits, end_bits, &tables, sink)
@@ -685,78 +840,6 @@ impl Unpacker {
         if bits.pos() > end_bits {
             return Err(corrupt("a symbol runs past the end of its block"));
         }
-        Ok(())
-    }
-
-    fn read_tables(&mut self, bits: &mut Bits<'_>, end: usize) -> Result<()> {
-        let mut bl = [0u8; BC];
-        let mut i = 0;
-        while i < BC {
-            bits.refill();
-            if bits.pos() + 4 > end {
-                return Err(corrupt("table runs past its block"));
-            }
-            let n = bits.get(4) as u8;
-            if n == 15 {
-                if bits.pos() + 4 > end {
-                    return Err(corrupt("table runs past its block"));
-                }
-                let z = bits.get(4) as usize;
-                if z == 0 {
-                    bl[i] = 15;
-                    i += 1;
-                } else {
-                    let run = (z + 2).min(BC - i);
-                    i += run;
-                }
-            } else {
-                bl[i] = n;
-                i += 1;
-            }
-        }
-        let mut pre = Huff::new();
-        pre.build(&bl)?;
-        let mut lens = [0u8; TABLES];
-        let mut i = 0;
-        while i < TABLES {
-            bits.refill();
-            if bits.pos() >= end {
-                return Err(corrupt("table runs past its block"));
-            }
-            let sym = pre.decode(bits)?;
-            match sym {
-                0..=15 => {
-                    lens[i] = sym as u8;
-                    i += 1;
-                }
-                16 | 17 => {
-                    if i == 0 {
-                        return Err(corrupt("table repeats a length before the first"));
-                    }
-                    let n = if sym == 16 { 3 + bits.get(3) } else { 11 + bits.get(7) } as usize;
-                    let prev = lens[i - 1];
-                    let run = n.min(TABLES - i);
-                    lens[i..i + run].fill(prev);
-                    i += run;
-                }
-                _ => {
-                    let n = if sym == 18 { 3 + bits.get(3) } else { 11 + bits.get(7) } as usize;
-                    let run = n.min(TABLES - i);
-                    lens[i..i + run].fill(0);
-                    i += run;
-                }
-            }
-        }
-        if bits.pos() > end {
-            return Err(corrupt("table runs past its block"));
-        }
-        // blocks still with the workers keep the tables they were sent with
-        let t = Arc::make_mut(&mut self.tables);
-        t.main.build(&lens[..NC])?;
-        t.dist.build(&lens[NC..NC + DC])?;
-        t.low.build(&lens[NC + DC..NC + DC + LDC])?;
-        t.rep.build(&lens[NC + DC + LDC..])?;
-        self.tables_ready = true;
         Ok(())
     }
 
@@ -787,12 +870,26 @@ impl Unpacker {
                 sp += 1;
             };
         }
+        // a run of quick literals is gathered here, where whole groups can be written past the ones kept, and then
+        // copied to the window in one go
+        let mut stage = [0u8; STAGE + 6];
         let result = loop {
             let sym;
-            if bits.pos() + 128 <= end_bits && sp + 3 <= limit {
+            if bits.pos() + 128 <= end_bits && sp + 6 <= limit {
+                // room for every literal the stage can take, each run of quick ones ending at most six past it
+                let room = usize::try_from(limit - sp - 5).unwrap_or(usize::MAX);
+                let k = main.quick_run(bits, end_bits, &mut stage, room);
+                if k > 0 {
+                    let at = (sp & mask) as usize;
+                    let first = k.min(window.len() - at);
+                    window[at..at + first].copy_from_slice(&stage[..first]);
+                    window[..k - first].copy_from_slice(&stage[first..k]);
+                    sp += k as u64;
+                    continue;
+                }
+                bits.refill();
                 // well inside the block and the output limits: a refill holds at least 56 bits and a code is at
                 // most 15, so up to three literals go without another refill or any limit check
-                bits.refill();
                 let s1 = decode!(main);
                 if s1 >= 256 {
                     sym = s1;
@@ -899,6 +996,71 @@ impl Unpacker {
         self.scratch = src;
         Ok(())
     }
+}
+
+/// A block's code lengths, read with the precode, which `pre` is rebuilt as.
+fn read_lengths(pre: &mut Huff, bits: &mut Bits<'_>, end: usize) -> Result<Lengths> {
+    let mut bl = [0u8; BC];
+    let mut i = 0;
+    while i < BC {
+        bits.refill();
+        if bits.pos() + 4 > end {
+            return Err(corrupt("table runs past its block"));
+        }
+        let n = bits.get(4) as u8;
+        if n == 15 {
+            if bits.pos() + 4 > end {
+                return Err(corrupt("table runs past its block"));
+            }
+            let z = bits.get(4) as usize;
+            if z == 0 {
+                bl[i] = 15;
+                i += 1;
+            } else {
+                let run = (z + 2).min(BC - i);
+                i += run;
+            }
+        } else {
+            bl[i] = n;
+            i += 1;
+        }
+    }
+    pre.build(&bl)?;
+    let mut lens = [0u8; TABLES];
+    let mut i = 0;
+    while i < TABLES {
+        bits.refill();
+        if bits.pos() >= end {
+            return Err(corrupt("table runs past its block"));
+        }
+        let sym = pre.decode(bits)?;
+        match sym {
+            0..=15 => {
+                lens[i] = sym as u8;
+                i += 1;
+            }
+            16 | 17 => {
+                if i == 0 {
+                    return Err(corrupt("table repeats a length before the first"));
+                }
+                let n = if sym == 16 { 3 + bits.get(3) } else { 11 + bits.get(7) } as usize;
+                let prev = lens[i - 1];
+                let run = n.min(TABLES - i);
+                lens[i..i + run].fill(prev);
+                i += run;
+            }
+            _ => {
+                let n = if sym == 18 { 3 + bits.get(3) } else { 11 + bits.get(7) } as usize;
+                let run = n.min(TABLES - i);
+                lens[i..i + run].fill(0);
+                i += run;
+            }
+        }
+    }
+    if bits.pos() > end {
+        return Err(corrupt("table runs past its block"));
+    }
+    Ok(lens)
 }
 
 /// A block header at the start of `b`: its length, its payload's length and its flags. None until all of the
