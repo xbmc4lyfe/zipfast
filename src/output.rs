@@ -8,8 +8,9 @@ use std::thread::{self, JoinHandle};
 
 /// Files from this size up (or of unknown size) get a writer thread.
 const BACKGROUND_MIN: u64 = 4 << 20;
-/// Bytes gathered before they go to the writer.
-const CHUNK: usize = 4 << 20;
+/// Bytes gathered before they go to the writer. With the queue below, a file being written holds at most about
+/// six of these: big enough to keep the disk busy, small enough to keep memory near what a direct write uses.
+const CHUNK: usize = 1 << 20;
 /// Chunks that may wait for the writer before writes block.
 const DEPTH: usize = 4;
 
