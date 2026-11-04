@@ -7,6 +7,8 @@ A fast, universal archive extractor written in Rust. Work in progress.
 - RAR 5.0 archives: listing, testing and extracting **stored** (`-m0`) files, including files split across
   `name.partNN.rar` or `name.rar`/`name.r00` volume sets, self-extracting stubs, header and data CRC32 checks,
   modification times and Unix permissions.
+- ZIP archives: stored and deflated entries, ZIP64, self-extracting stubs, UTF-8 and code page 437 names,
+  Unix permissions, and extended or NTFS timestamps.
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
   refused.
 
@@ -27,4 +29,4 @@ Exit status: 0 all good, 1 some files failed, 2 the archive couldn't be read.
 
 ## Sources
 
-The RAR 5.0 block layout follows RARLAB's published "RAR 5.0 archive format" technical note.
+ZIP follows PKWARE's published APPNOTE. The RAR 5.0 block layout follows RARLAB's published "RAR 5.0 archive format" technical note.
