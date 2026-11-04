@@ -135,6 +135,10 @@ pub(crate) fn check_target(opts: &Options, rel: &Path, made: Option<&mut HashSet
     })
 }
 
+/// Files from this size up are given their full length when created. A small file gains nothing from it, and the
+/// call costs as much as closing the file.
+const PREALLOCATE_MIN: u64 = 1 << 20;
+
 /// The second half of [`open_target`].
 pub(crate) fn create_target(place: &Place, size: Option<u64>) -> Result<File> {
     if place.replace {
@@ -146,7 +150,7 @@ pub(crate) fn create_target(place: &Place, size: Option<u64>) -> Result<File> {
         }
     }
     let file = OpenOptions::new().write(true).create_new(true).open(&place.path)?;
-    if let Some(size) = size.filter(|&s| s > 0) {
+    if let Some(size) = size.filter(|&s| s >= PREALLOCATE_MIN) {
         // one allocation up front keeps a big file in few extents; failure here is harmless
         let _ = file.set_len(size);
     }
@@ -767,9 +771,12 @@ impl<R: FnMut(&str)> Run<'_, R> {
             self.drain()?;
         }
         if h.is_dir() {
-            if self.opts.mode == Mode::Extract && !self.opts.flatten && !self.made_dirs.contains(&rel) {
-                make_dirs(&self.opts.dest, &rel)?;
-                self.made_dirs.insert(rel.clone());
+            if self.opts.mode == Mode::Extract && !self.opts.flatten {
+                // a folder made earlier for a file inside it still gets its own times and permissions
+                if !self.made_dirs.contains(&rel) {
+                    make_dirs(&self.opts.dest, &rel)?;
+                    self.made_dirs.insert(rel.clone());
+                }
                 self.summary.dir_meta.push((self.opts.dest.join(&rel), Meta::from(h)));
             }
             self.summary.dirs += 1;

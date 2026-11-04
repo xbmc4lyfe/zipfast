@@ -272,6 +272,25 @@ fn restores_folder_permissions_after_their_files() {
     fs::set_permissions(out.join("locked"), fs::Permissions::from_mode(0o700)).unwrap();
 }
 
+#[cfg(unix)]
+#[test]
+fn a_folder_listed_after_its_file_still_gets_its_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp("dirmode-late");
+    let arc = dir.join("t.rar");
+    let files =
+        [FileSpec::new("late/f", b"x"), FileSpec { dir: true, unix_mode: Some(0o510), ..FileSpec::new("late", b"") }];
+    fs::write(&arc, archive(&files)).unwrap();
+    let out = dir.join("out");
+    let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+    let meta = fs::metadata(out.join("late")).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o510);
+    let mtime = meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    assert_eq!(mtime, 1_700_000_000, "the folder's own time, not the time its file was written");
+    fs::set_permissions(out.join("late"), fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 #[test]
 fn a_size_that_disagrees_with_the_header_fails() {
     let dir = tmp("size");
