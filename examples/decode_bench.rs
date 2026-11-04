@@ -1,6 +1,7 @@
 //! Times the RAR 5.0 decoder on a stream made from a local file by the test encoder.
 //! `cargo run --release --example decode_bench -- <input> [window_log2] [runs]`
-//! The encoded stream is cached next to the input as `<input>.r5s`.
+//! The encoded stream is cached next to the input as `<input>.w<window_log2>.r5s`, one per window size, since a
+//! stream made for a big window may reach back farther than a smaller one allows.
 
 use std::time::Instant;
 use zipfast::rar5::testenc::{lz, tuned_stream};
@@ -12,7 +13,7 @@ fn main() {
     let wlog: u32 = args.get(2).map_or(22, |s| s.parse().unwrap());
     let runs: usize = args.get(3).map_or(5, |s| s.parse().unwrap());
     let data = std::fs::read(input).unwrap();
-    let cache = format!("{input}.r5s");
+    let cache = format!("{input}.w{wlog}.r5s");
     let stream = match std::fs::read(&cache) {
         Ok(s) => s,
         Err(_) => {
