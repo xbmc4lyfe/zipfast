@@ -19,6 +19,7 @@ switches:
   -o- skip files that already exist (default)
   -y  same as -o+
   -q  quiet: report only errors
+  -mt<n>  use up to n threads (default: one per core)
 ";
 
 fn main() -> ExitCode {
@@ -29,6 +30,7 @@ fn main() -> ExitCode {
     };
     let mut overwrite = Overwrite::Skip;
     let mut quiet = false;
+    let mut threads = None;
     let mut paths = Vec::new();
     for arg in &args[1..] {
         match arg.as_str() {
@@ -36,6 +38,13 @@ fn main() -> ExitCode {
             "-o-" => overwrite = Overwrite::Skip,
             "-q" | "-idq" => quiet = true,
             "--" => {}
+            s if s.starts_with("-mt") => match s[3..].parse::<usize>() {
+                Ok(n) if n >= 1 => threads = Some(n),
+                _ => {
+                    eprintln!("bad switch {s}: give a thread count of at least 1, like -mt4");
+                    return ExitCode::from(2);
+                }
+            },
             s if s.starts_with('-') && s.len() > 1 => {
                 eprintln!("unknown switch {s}");
                 return ExitCode::from(2);
@@ -52,7 +61,7 @@ fn main() -> ExitCode {
         "l" | "v" => list(&archive),
         "t" | "x" | "e" => {
             let mode = if command == "t" { Mode::Test } else { Mode::Extract };
-            let opts = Options { mode, dest, overwrite, flatten: command == "e" };
+            let opts = Options { mode, dest, overwrite, flatten: command == "e", threads, parallel_min: None };
             run(&archive, &opts, quiet)
         }
         other => {

@@ -39,6 +39,11 @@ pub struct Options {
     pub overwrite: Overwrite,
     /// drop the stored folders and write every file straight into the destination
     pub flatten: bool,
+    /// threads to decode with, counting the one that writes the output; None for one per core
+    pub threads: Option<usize>,
+    /// the smallest file decoded on several threads; None for the decoder's default
+    #[doc(hidden)]
+    pub parallel_min: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -453,6 +458,10 @@ impl<R: FnMut(&str)> Run<'_, R> {
                             Ok(())
                         }
                         None => Unpacker::new(window).map(|mut u| {
+                            if self.opts.threads.is_some() || self.opts.parallel_min.is_some() {
+                                let workers = self.opts.threads.map_or_else(|| u.threads(), |n| n.saturating_sub(1));
+                                u.set_threads(workers, self.opts.parallel_min.unwrap_or(u.parallel_min()));
+                            }
                             u.reset(size);
                             self.stream = Some(u);
                         }),

@@ -5,6 +5,11 @@
 //! filters over them have run.
 
 use crate::error::{Error, Result};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+mod parallel;
+use parallel::{Done, Job, Pool};
 
 pub(crate) const NC: usize = 306;
 pub(crate) const DC: usize = 64;
@@ -38,6 +43,14 @@ impl<'a> Bits<'a> {
     fn new(buf: &'a [u8]) -> Self {
         let mut b = Bits { buf, next: 0, acc: 0, cnt: 0 };
         b.refill();
+        b
+    }
+
+    /// Bits from bit `bit` of `buf` on.
+    fn at(buf: &'a [u8], bit: usize) -> Self {
+        let mut b = Bits { buf, next: bit / 8, acc: 0, cnt: 0 };
+        b.refill();
+        b.skip((bit % 8) as u32);
         b
     }
 
@@ -196,6 +209,43 @@ struct Filter {
     kind: FilterKind,
 }
 
+/// The four prefix codes a block's symbols are read with.
+#[derive(Clone)]
+struct Tables {
+    main: Huff,
+    dist: Huff,
+    low: Huff,
+    rep: Huff,
+}
+
+/// A decoded operation. Literals travel separately; `Lits` says how many come next.
+#[derive(Clone, Copy, Debug)]
+enum Tok {
+    Lits(u32),
+    /// `offset` is from the file position the filter record was read at
+    Filter {
+        offset: u64,
+        len: u64,
+        kind: FilterKind,
+    },
+    Last,
+    Rep {
+        k: u8,
+        len: u32,
+    },
+    Match {
+        len: u32,
+        dist: u64,
+    },
+}
+
+/// Packed bytes that may wait with the workers before the calling thread stops handing them more. Their output
+/// can be several times this.
+const MAX_QUEUED: usize = 64 << 20;
+
+/// Big files are decoded on worker threads from this size up, unless told otherwise.
+const PARALLEL_MIN: u64 = 4 << 20;
+
 /// The decoder's state. A solid stream keeps one of these across files.
 pub struct Unpacker {
     window: Vec<u8>,
@@ -209,10 +259,7 @@ pub struct Unpacker {
     /// the current file's declared size, None when unknown
     size: Option<u64>,
     tables_ready: bool,
-    main: Huff,
-    dist: Huff,
-    low: Huff,
-    rep: Huff,
+    tables: Arc<Tables>,
     history: [u64; 4],
     last_len: u32,
     filters: Vec<Filter>,
@@ -222,6 +269,22 @@ pub struct Unpacker {
     input: Vec<u8>,
     /// a whole block copied out with zero padding after it, when nothing follows it to pad it
     padded: Vec<u8>,
+    /// worker threads for big files; 0 decodes everything on the calling thread
+    threads: usize,
+    /// the smallest file decoded on workers
+    parallel_min: u64,
+    /// whether the current file's blocks go to workers
+    parallel: bool,
+    pool: Option<Pool>,
+    /// blocks handed to workers, and blocks applied to the window, both counted over the decoder's life
+    submitted: u64,
+    applied: u64,
+    /// packed bytes of the blocks not yet applied
+    queued: usize,
+    /// finished blocks waiting for the ones before them
+    ready: BTreeMap<u64, Done>,
+    /// buffers from finished blocks, for reuse
+    spare: Vec<(Vec<u8>, Vec<Tok>, Vec<u8>)>,
 }
 
 /// The window a file needs: its declared dictionary, but no more than twice the file when nothing before or after it
@@ -254,17 +317,48 @@ impl Unpacker {
             emitted: 0,
             size: None,
             tables_ready: false,
-            main: Huff::new(),
-            dist: Huff::new(),
-            low: Huff::new(),
-            rep: Huff::new(),
+            tables: Arc::new(Tables { main: Huff::new(), dist: Huff::new(), low: Huff::new(), rep: Huff::new() }),
             history: [0; 4],
             last_len: 0,
             filters: Vec::new(),
             scratch: Vec::new(),
             input: Vec::new(),
             padded: Vec::new(),
+            threads: default_threads(),
+            parallel_min: PARALLEL_MIN,
+            parallel: false,
+            pool: None,
+            submitted: 0,
+            applied: 0,
+            queued: 0,
+            ready: BTreeMap::new(),
+            spare: Vec::new(),
         })
+    }
+
+    /// How many worker threads big files are decoded on (0 for none), and from what file size.
+    pub fn set_threads(&mut self, threads: usize, min_size: u64) {
+        self.discard_in_flight();
+        if threads != self.threads {
+            self.pool = None;
+        }
+        self.threads = threads;
+        self.parallel_min = min_size;
+        self.parallel = self.wants_parallel();
+    }
+
+    /// Worker threads big files are decoded on.
+    pub fn threads(&self) -> usize {
+        self.threads
+    }
+
+    /// The smallest file decoded on workers.
+    pub fn parallel_min(&self) -> u64 {
+        self.parallel_min
+    }
+
+    fn wants_parallel(&self) -> bool {
+        self.threads > 0 && self.size.is_none_or(|s| s >= self.parallel_min)
     }
 
     pub fn window_size(&self) -> u64 {
@@ -273,11 +367,13 @@ impl Unpacker {
 
     /// Starts the next file of a solid stream: the window, tables and history carry on.
     pub fn next_file(&mut self, size: Option<u64>) {
+        self.discard_in_flight();
         self.file_base = self.sp;
         self.emitted = 0;
         self.size = size;
         self.filters.clear();
         self.input.clear();
+        self.parallel = self.wants_parallel();
     }
 
     /// Starts a file that stands alone in a stream this decoder already decoded into: everything resets.
@@ -292,6 +388,165 @@ impl Unpacker {
 
     fn op(&self) -> u64 {
         self.sp - self.file_base
+    }
+
+    /// Hands a block to the workers. Its tables are read here, since later blocks may reuse them; the symbols are
+    /// read on a worker and applied to the window in order by [`Self::settle`].
+    fn submit(
+        &mut self,
+        buf: &[u8],
+        payload: usize,
+        flags: u8,
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let valid_bits = usize::from(flags & 7) + 1;
+        let end_bits = if payload == 0 { 0 } else { (payload - 1) * 8 + valid_bits };
+        let (mut block, toks, lits) = self.spare.pop().unwrap_or_default();
+        block.clear();
+        block.extend_from_slice(&buf[..payload + PAD]);
+        let mut bits = Bits::new(&block);
+        let tables = if flags & 0x80 != 0 {
+            self.read_tables(&mut bits, end_bits)
+        } else if !self.tables_ready && payload > 0 {
+            Err(corrupt("block without tables at the start of a stream"))
+        } else {
+            Ok(())
+        };
+        let start_bit = bits.pos();
+        if let Err(e) = tables {
+            // an earlier block's error comes first
+            self.settle(0, sink)?;
+            return Err(e);
+        }
+        if start_bit >= end_bits {
+            self.spare.push((block, toks, lits));
+            if start_bit > end_bits {
+                self.settle(0, sink)?;
+                return Err(corrupt("a symbol runs past the end of its block"));
+            }
+            return Ok(());
+        }
+        if self.pool.is_none() {
+            self.pool = Some(Pool::new(self.threads));
+        }
+        let job =
+            Job { seq: self.submitted, buf: block, start_bit, end_bits, tables: Arc::clone(&self.tables), toks, lits };
+        self.queued += job.buf.len();
+        self.pool.as_ref().unwrap().submit(job);
+        self.submitted += 1;
+        self.settle(2 * self.threads as u64, sink)
+    }
+
+    /// Applies finished blocks in order until no more than `max` are still with the workers. The first error in
+    /// stream order is returned; after one, the rest are collected and dropped.
+    fn settle(&mut self, max: u64, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        let mut max = max;
+        let mut failed = None;
+        loop {
+            while let Some(done) = self.ready.remove(&self.applied) {
+                self.applied += 1;
+                let Done { buf, toks, lits, result, .. } = done;
+                self.queued -= buf.len();
+                if failed.is_none()
+                    && let Err(e) = self.apply(&toks, &lits, sink).and(result)
+                {
+                    failed = Some(e);
+                    max = 0;
+                }
+                self.spare.push((buf, toks, lits));
+            }
+            let in_flight = self.submitted - self.applied;
+            if in_flight == 0 {
+                break;
+            }
+            let Some(pool) = self.pool.as_ref() else { break };
+            let done = if in_flight <= max && self.queued <= MAX_QUEUED {
+                // take what's finished, but don't wait
+                match pool.try_next() {
+                    Some(done) => done,
+                    None => break,
+                }
+            } else {
+                pool.next()
+            };
+            self.ready.insert(done.seq, done);
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// Waits out blocks still with the workers and drops them: the file they belong to was abandoned.
+    fn discard_in_flight(&mut self) {
+        while self.applied < self.submitted {
+            if !self.ready.contains_key(&self.applied) {
+                let Some(pool) = self.pool.as_ref() else { break };
+                let done = pool.next();
+                self.ready.insert(done.seq, done);
+                continue;
+            }
+            if let Some(Done { buf, toks, lits, .. }) = self.ready.remove(&self.applied) {
+                self.queued -= buf.len();
+                self.spare.push((buf, toks, lits));
+            }
+            self.applied += 1;
+        }
+        self.applied = self.submitted;
+        self.ready.clear();
+        self.queued = 0;
+    }
+
+    /// One block's tokens, applied to the window with the same checks the decoding loop makes.
+    fn apply(&mut self, toks: &[Tok], lits: &[u8], sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        let flush_at = self.window_size() / 2;
+        let size_end = self.size.map_or(u64::MAX, |s| self.file_base.saturating_add(s));
+        let mut li = 0usize;
+        for &tok in toks {
+            if self.sp - self.file_base - self.emitted > flush_at {
+                self.flush(sink)?;
+            }
+            match tok {
+                Tok::Lits(n) => {
+                    let mut n = n as usize;
+                    while n > 0 {
+                        if self.sp - self.file_base - self.emitted > flush_at {
+                            self.flush(sink)?;
+                        }
+                        if self.sp >= size_end {
+                            return Err(corrupt("more data than the header says"));
+                        }
+                        let stop = self.file_base + self.emitted + flush_at + 1;
+                        let room = stop.min(size_end).saturating_sub(self.sp);
+                        let take = n.min(usize::try_from(room).unwrap_or(usize::MAX));
+                        if take == 0 {
+                            return Err(corrupt("the window can't hold the pending output"));
+                        }
+                        self.put(&lits[li..li + take]);
+                        li += take;
+                        n -= take;
+                    }
+                }
+                Tok::Filter { offset, len, kind } => {
+                    let op = self.op();
+                    let window = self.window_size();
+                    add_filter(&mut self.filters, op, offset, len, kind, window)?;
+                }
+                _ => {
+                    if let Some((len, d)) = resolve(tok, &mut self.history, &mut self.last_len) {
+                        copy(&mut self.window, self.mask, self.sp, len, d, size_end)?;
+                        self.sp += u64::from(len);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Literal bytes into the window at the stream position.
+    fn put(&mut self, bytes: &[u8]) {
+        let at = (self.sp & self.mask) as usize;
+        let first = bytes.len().min(self.window.len() - at);
+        self.window[at..at + first].copy_from_slice(&bytes[..first]);
+        self.window[..bytes.len() - first].copy_from_slice(&bytes[first..]);
+        self.sp += bytes.len() as u64;
     }
 
     /// More of the file's packed bytes. Every block that is now complete is decoded and its output emitted. Blocks
@@ -351,6 +606,7 @@ impl Unpacker {
 
     /// The file's packed bytes are all in. Emits what is left and checks the stream ended where it should.
     pub fn finish(&mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        self.settle(0, sink)?;
         if !self.input.is_empty() {
             return Err(Error::Truncated);
         }
@@ -373,6 +629,9 @@ impl Unpacker {
         flags: u8,
         sink: &mut dyn FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
+        if self.parallel {
+            return self.submit(buf, payload, flags, sink);
+        }
         let valid_bits = usize::from(flags & 7) + 1;
         let end_bits = if payload == 0 { 0 } else { (payload - 1) * 8 + valid_bits };
         let mut bits = Bits::new(buf);
@@ -458,10 +717,12 @@ impl Unpacker {
         if bits.pos() > end {
             return Err(corrupt("table runs past its block"));
         }
-        self.main.build(&lens[..NC])?;
-        self.dist.build(&lens[NC..NC + DC])?;
-        self.low.build(&lens[NC + DC..NC + DC + LDC])?;
-        self.rep.build(&lens[NC + DC + LDC..])?;
+        // blocks still with the workers keep the tables they were sent with
+        let t = Arc::make_mut(&mut self.tables);
+        t.main.build(&lens[..NC])?;
+        t.dist.build(&lens[NC..NC + DC])?;
+        t.low.build(&lens[NC + DC..NC + DC + LDC])?;
+        t.rep.build(&lens[NC + DC + LDC..])?;
         self.tables_ready = true;
         Ok(())
     }
@@ -469,21 +730,7 @@ impl Unpacker {
     /// The decoding loop: symbols until the block's bits run out or the stream position reaches `stop`. The state
     /// it touches on every symbol lives in locals, so the window writes can't make the compiler reload it.
     fn run(&mut self, bits: &mut Bits<'_>, end_bits: usize, stop: u64) -> Result<()> {
-        let Unpacker {
-            window,
-            mask,
-            sp: sp_ref,
-            file_base,
-            size,
-            main,
-            dist,
-            low,
-            rep,
-            history,
-            last_len,
-            filters,
-            ..
-        } = self;
+        let Unpacker { window, mask, sp: sp_ref, file_base, size, tables, history, last_len, filters, .. } = self;
         let mask = *mask;
         let file_base = *file_base;
         let size_end = size.map_or(u64::MAX, |s| file_base.saturating_add(s));
@@ -492,6 +739,8 @@ impl Unpacker {
         let mut hist = *history;
         let mut last = *last_len;
         let window = &mut window[..=mask as usize];
+        let t = Arc::clone(tables);
+        let main = &t.main;
         macro_rules! decode {
             ($table:expr) => {
                 match $table.decode(bits) {
@@ -547,61 +796,17 @@ impl Unpacker {
                 sym = s;
             }
             bits.refill();
-            let (len, d) = match sym {
-                256 => {
-                    let r = read_filter(bits, filters, sp - file_base, mask + 1);
-                    if r.is_err() {
-                        break r;
-                    }
-                    continue;
-                }
-                257 => {
-                    if last == 0 {
-                        continue;
-                    }
-                    (last, hist[0])
-                }
-                258..=261 => {
-                    let k = (sym - 258) as usize;
-                    let d = hist[k];
-                    hist.copy_within(0..k, 1);
-                    hist[0] = d;
-                    let slot = match rep.decode(bits) {
-                        Ok(slot) => slot,
-                        Err(e) => break Err(e),
-                    };
-                    last = length(u32::from(slot), bits);
-                    (last, d)
-                }
-                _ => {
-                    let mut len = length(u32::from(sym - 262), bits);
-                    let slot = match dist.decode(bits) {
-                        Ok(slot) => u32::from(slot),
-                        Err(e) => break Err(e),
-                    };
-                    let d = if slot < 4 {
-                        1 + u64::from(slot)
-                    } else {
-                        let n = slot / 2 - 1;
-                        let base = 1 + ((2 + u64::from(slot & 1)) << n);
-                        if n < 4 {
-                            base + u64::from(bits.get(n))
-                        } else {
-                            bits.refill();
-                            let high = if n > 4 { u64::from(bits.get(n - 4)) << 4 } else { 0 };
-                            match low.decode(bits) {
-                                Ok(l) => base + high + u64::from(l),
-                                Err(e) => break Err(e),
-                            }
-                        }
-                    };
-                    len += u32::from(d > 0x100) + u32::from(d > 0x2000) + u32::from(d > 0x40000);
-                    hist.copy_within(0..3, 1);
-                    hist[0] = d;
-                    last = len;
-                    (len, d)
-                }
+            let tok = match read_op(sym, bits, &t) {
+                Ok(tok) => tok,
+                Err(e) => break Err(e),
             };
+            if let Tok::Filter { offset, len, kind } = tok {
+                if let Err(e) = add_filter(filters, sp - file_base, offset, len, kind, mask + 1) {
+                    break Err(e);
+                }
+                continue;
+            }
+            let Some((len, d)) = resolve(tok, &mut hist, &mut last) else { continue };
             if let Err(e) = copy(window, mask, sp, len, d, size_end) {
                 break Err(e);
             }
@@ -700,6 +905,19 @@ fn copy(window: &mut [u8], mask: u64, sp: u64, len: u32, dist: u64, size_end: u6
     let dst = (sp & mask) as usize;
     let src = ((sp - dist) & mask) as usize;
     let w = window.len();
+    if n <= 32 && dist >= n as u64 && dst + 32 <= w && src + 32 <= w {
+        // a short copy that doesn't overlap: whole 16-byte words, keeping the destination's bytes past the match
+        let mut i = 0;
+        while i < n {
+            let k = (n - i).min(16);
+            let s = u128::from_le_bytes(window[src + i..src + i + 16].try_into().unwrap());
+            let d = u128::from_le_bytes(window[dst + i..dst + i + 16].try_into().unwrap());
+            let keep = if k == 16 { 0 } else { !0u128 << (8 * k) };
+            window[dst + i..dst + i + 16].copy_from_slice(&((s & !keep) | (d & keep)).to_le_bytes());
+            i += 16;
+        }
+        return Ok(());
+    }
     if dst + n <= w && src + n <= w {
         if dist >= 8 {
             if dist >= n as u64 {
@@ -734,8 +952,63 @@ fn copy(window: &mut [u8], mask: u64, sp: u64, len: u32, dist: u64, size_end: u6
     Ok(())
 }
 
-/// A filter record; `op` is the file position the decoder has reached.
-fn read_filter(bits: &mut Bits<'_>, filters: &mut Vec<Filter>, op: u64, window_size: u64) -> Result<()> {
+/// What follows a main-table symbol of 256 or more, read right after a refill.
+#[inline(always)]
+fn read_op(sym: u16, bits: &mut Bits<'_>, t: &Tables) -> Result<Tok> {
+    Ok(match sym {
+        256 => read_filter(bits)?,
+        257 => Tok::Last,
+        258..=261 => {
+            let slot = t.rep.decode(bits)?;
+            Tok::Rep { k: (sym - 258) as u8, len: length(u32::from(slot), bits) }
+        }
+        _ => {
+            let len = length(u32::from(sym - 262), bits);
+            let slot = u32::from(t.dist.decode(bits)?);
+            let dist = if slot < 4 {
+                1 + u64::from(slot)
+            } else {
+                let n = slot / 2 - 1;
+                let base = 1 + ((2 + u64::from(slot & 1)) << n);
+                if n < 4 {
+                    base + u64::from(bits.get(n))
+                } else {
+                    bits.refill();
+                    let high = if n > 4 { u64::from(bits.get(n - 4)) << 4 } else { 0 };
+                    base + high + u64::from(t.low.decode(bits)?)
+                }
+            };
+            let len = len + u32::from(dist > 0x100) + u32::from(dist > 0x2000) + u32::from(dist > 0x40000);
+            Tok::Match { len, dist }
+        }
+    })
+}
+
+/// Applies a token to the distance history and last length; the copy it asks for, if any.
+#[inline(always)]
+fn resolve(tok: Tok, hist: &mut [u64; 4], last: &mut u32) -> Option<(u32, u64)> {
+    match tok {
+        Tok::Last => (*last != 0).then(|| (*last, hist[0])),
+        Tok::Rep { k, len } => {
+            let k = usize::from(k);
+            let d = hist[k];
+            hist.copy_within(0..k, 1);
+            hist[0] = d;
+            *last = len;
+            Some((len, d))
+        }
+        Tok::Match { len, dist } => {
+            hist.copy_within(0..3, 1);
+            hist[0] = dist;
+            *last = len;
+            Some((len, dist))
+        }
+        Tok::Lits(_) | Tok::Filter { .. } => None,
+    }
+}
+
+/// A filter record's fields.
+fn read_filter(bits: &mut Bits<'_>) -> Result<Tok> {
     let number = |bits: &mut Bits<'_>| -> u64 {
         bits.refill();
         let n = bits.get(2) + 1;
@@ -745,7 +1018,7 @@ fn read_filter(bits: &mut Bits<'_>, filters: &mut Vec<Filter>, op: u64, window_s
         }
         v
     };
-    let start = op + number(bits);
+    let offset = number(bits);
     let len = number(bits);
     bits.refill();
     let kind = match bits.get(3) {
@@ -755,7 +1028,13 @@ fn read_filter(bits: &mut Bits<'_>, filters: &mut Vec<Filter>, op: u64, window_s
         3 => FilterKind::Arm,
         _ => return Err(corrupt("unknown filter type")),
     };
-    if !(4..=MAX_FILTER_LEN).contains(&len) || len > window_size / 2 {
+    Ok(Tok::Filter { offset, len, kind })
+}
+
+/// Queues a filter read at file position `op`.
+fn add_filter(filters: &mut Vec<Filter>, op: u64, offset: u64, len: u64, kind: FilterKind, window: u64) -> Result<()> {
+    let start = op + offset;
+    if !(4..=MAX_FILTER_LEN).contains(&len) || len > window / 2 {
         return Err(corrupt("filter length"));
     }
     if let Some(prev) = filters.last()
@@ -768,6 +1047,12 @@ fn read_filter(bits: &mut Bits<'_>, filters: &mut Vec<Filter>, op: u64, window_s
     }
     filters.push(Filter { start, len, kind });
     Ok(())
+}
+
+/// Workers to decode big files on: one fewer than the cores, so the calling thread keeps one for the window and
+/// the output.
+fn default_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, |n| n.get()).saturating_sub(1).min(16)
 }
 
 /// A length from its slot and extra bits: 2 to 4097.

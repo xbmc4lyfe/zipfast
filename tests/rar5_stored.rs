@@ -7,7 +7,14 @@ use common::*;
 use zipfast::extract::{self, Mode, Options, Overwrite};
 
 fn opts(dest: &Path) -> Options {
-    Options { mode: Mode::Extract, dest: dest.to_path_buf(), overwrite: Overwrite::Skip, flatten: false }
+    Options {
+        mode: Mode::Extract,
+        dest: dest.to_path_buf(),
+        overwrite: Overwrite::Skip,
+        flatten: false,
+        threads: None,
+        parallel_min: None,
+    }
 }
 
 fn tmp(name: &str) -> std::path::PathBuf {

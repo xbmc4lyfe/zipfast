@@ -3,8 +3,23 @@
 use super::*;
 use crate::rar5::testenc::*;
 
+/// Decodes on the calling thread and on workers, and checks both give the same output or the same error.
 fn decode(stream: &[u8], size: u64, window: u64, piece: usize) -> Result<Vec<u8>> {
+    let serial = decode_with(stream, size, window, piece, 0);
+    let parallel = decode_with(stream, size, window, piece, 3);
+    match (&serial, &parallel) {
+        (Ok(a), Ok(b)) => assert!(a == b, "workers decoded different bytes"),
+        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "workers failed differently"),
+        _ => {
+            panic!("serial {:?} vs workers {:?}", serial.as_ref().map(|v| v.len()), parallel.as_ref().map(|v| v.len()))
+        }
+    }
+    serial
+}
+
+fn decode_with(stream: &[u8], size: u64, window: u64, piece: usize, threads: usize) -> Result<Vec<u8>> {
     let mut u = Unpacker::new(window)?;
+    u.set_threads(threads, 0);
     u.reset(Some(size));
     let mut out = Vec::new();
     let mut sink = |b: &[u8]| -> Result<()> {
@@ -204,4 +219,32 @@ fn tuned_codes_from_a_real_matcher_round_trip() {
     for piece in [usize::MAX, 4096, 7, 1] {
         assert_eq!(decode(&stream, data.len() as u64, 1 << 21, piece).unwrap(), data, "pieces of {piece}");
     }
+}
+
+#[test]
+fn workers_agree_with_the_calling_thread_on_damaged_streams() {
+    let mut data = Vec::new();
+    let mut x = 99u32;
+    for i in 0..30_000u32 {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        if i % 500 < 300 {
+            data.extend_from_slice(format!("{} {} ", i % 31, (x >> 22) % 7).as_bytes());
+        } else {
+            data.push((x >> 16) as u8);
+        }
+    }
+    let ops = lz(&data, 1 << 16, 4);
+    let stream = tuned_stream(&ops, 3000);
+    let mut y = 7u64;
+    for _ in 0..300 {
+        y = y.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut bad = stream.clone();
+        let at = (y >> 33) as usize % bad.len();
+        bad[at] ^= 1 << ((y >> 20) % 8);
+        // decode() itself checks the two agree
+        let _ = decode(&bad, data.len() as u64, 1 << 17, 1 << 12);
+    }
+    // a wrong stated size, both ways
+    let _ = decode(&stream, data.len() as u64 - 1, 1 << 17, usize::MAX);
+    let _ = decode(&stream, data.len() as u64 + 1, 1 << 17, usize::MAX);
 }

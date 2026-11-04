@@ -1,5 +1,5 @@
 //! Times the RAR 5.0 decoder on a stream made from a local file by the test encoder.
-//! `cargo run --release --example decode_bench -- <input> [window_log2] [runs]`
+//! `cargo run --release --example decode_bench -- <input> [window_log2] [runs] [threads]`
 //! The encoded stream is cached next to the input as `<input>.w<window_log2>.r5s`, one per window size, since a
 //! stream made for a big window may reach back farther than a smaller one allows.
 
@@ -12,6 +12,7 @@ fn main() {
     let input = &args[1];
     let wlog: u32 = args.get(2).map_or(22, |s| s.parse().unwrap());
     let runs: usize = args.get(3).map_or(5, |s| s.parse().unwrap());
+    let threads: usize = args.get(4).map_or(0, |s| s.parse().unwrap());
     let data = std::fs::read(input).unwrap();
     let cache = format!("{input}.w{wlog}.r5s");
     let stream = match std::fs::read(&cache) {
@@ -28,6 +29,7 @@ fn main() {
     let mut best = f64::MAX;
     for _ in 0..runs {
         let mut u = Unpacker::new(1 << wlog).unwrap();
+        u.set_threads(threads, 0);
         u.reset(Some(data.len() as u64));
         let mut crc = crc32fast::Hasher::new();
         let mut n = 0usize;
@@ -47,7 +49,7 @@ fn main() {
         best = best.min(s);
     }
     println!(
-        "{input}: {} MB, packed {:.1}%, best {:.3}s, {:.0} MB/s",
+        "{input} ({threads} workers): {} MB, packed {:.1}%, best {:.3}s, {:.0} MB/s",
         data.len() >> 20,
         100.0 * stream.len() as f64 / data.len() as f64,
         best,
