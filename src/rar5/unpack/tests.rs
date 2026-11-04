@@ -284,3 +284,65 @@ fn a_block_of_tiny_codes_is_finished_on_the_calling_thread() {
     assert!(out == want);
     assert!(u.resumed > 0, "the worker should have stopped at its budget");
 }
+
+/// Incompressible data with a few skewed bytes and short matches: most literals share one code length, some are
+/// shorter or longer, so the guess at four literals of that length is kept, cut short and refused in turn.
+fn mostly_noise(n: usize, seed: u64) -> Vec<Op> {
+    let mut x = seed | 1;
+    let mut ops = Vec::new();
+    let mut made = 0u64;
+    while (made as usize) < n {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let r = (x >> 24) as u32;
+        if r.is_multiple_of(211) && made > 1000 {
+            let len = 3 + r % 40;
+            ops.push(Op::Match(len, 1 + u64::from(r >> 8) % 900));
+            made += u64::from(len);
+        } else {
+            // byte 7 a little more often, so it gets a shorter code; the rest share one length or near it
+            let b = if r.is_multiple_of(37) { 7 } else { (r >> 8) as u8 };
+            ops.push(Op::Lit(b));
+            made += 1;
+        }
+    }
+    ops
+}
+
+#[test]
+fn quick_literals_round_trip_with_mixed_lengths() {
+    for seed in [1, 2, 3] {
+        let ops = mostly_noise(300_000, seed);
+        let data = model(&ops);
+        let stream = tuned_stream(&ops, 20_000);
+        for piece in [usize::MAX, 10_000, 3] {
+            assert!(decode(&stream, data.len() as u64, 1 << 20, piece).unwrap() == data, "seed {seed} piece {piece}");
+        }
+    }
+    // the tables these blocks get do have a common literal length to guess with
+    let ops = mostly_noise(50_000, 9);
+    let block = tuned_block(&ops, true);
+    let mut u = Unpacker::new(1 << 20).unwrap();
+    u.set_threads(0, 0);
+    u.reset(Some(model(&ops).len() as u64));
+    let mut sink = |_: &[u8]| Ok(());
+    u.feed(&block, &mut sink).unwrap();
+    u.finish(&mut sink).unwrap();
+    assert_eq!(u.tables.main.common, 8);
+}
+
+#[test]
+fn quick_literals_agree_with_workers_on_damage() {
+    let ops = mostly_noise(120_000, 5);
+    let data = model(&ops);
+    let stream = tuned_stream(&ops, 9_000);
+    let mut y = 3u64;
+    for _ in 0..200 {
+        y = y.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut bad = stream.clone();
+        let at = (y >> 33) as usize % bad.len();
+        bad[at] ^= 1 << ((y >> 20) % 8);
+        let _ = decode(&bad, data.len() as u64, 1 << 20, 1 << 14);
+    }
+}

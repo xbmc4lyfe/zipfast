@@ -147,8 +147,12 @@ fn tokenize(
         if bits.pos() + 128 <= end_bits {
             // three codes of at most 15 bits fit in one refill
             bits.refill();
-            if let Some((quick, n)) = t.main.quick(&mut bits) {
-                lits.extend_from_slice(&quick[..n]);
+            let (quick, n) = t.main.quick(&mut bits);
+            if n > 0 {
+                // all six go in and the ones not kept come off again, which is cheaper than a copy of n
+                let len = lits.len();
+                lits.extend_from_slice(&quick);
+                lits.truncate(len + n);
                 run += n as u32;
                 continue;
             }

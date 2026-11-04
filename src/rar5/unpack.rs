@@ -21,6 +21,8 @@ const TABLES: usize = NC + DC + LDC + RC;
 const PAD: usize = 32;
 const MAX_FILTERS: usize = 8192;
 const MAX_FILTER_LEN: u64 = 0x40_0000;
+/// Quick literals gathered before they go to the window.
+const STAGE: usize = 256;
 /// Bits of a code looked up in one step; longer codes take the slow path.
 const LUT_BITS: u32 = 11;
 
@@ -191,34 +193,30 @@ impl Huff {
         self.decode_slow(peek, bits)
     }
 
-    /// Up to four literals of the common length from one refill. All four lookups are made at once, as if every
-    /// code had that length, and kept for as long as that holds; the first code is known to be such a literal.
-    /// Returns them with how many there are. Needs `4 * common` bits in the accumulator.
+    /// Up to six literals of the common length from one refill. All the lookups are made at once, as if every
+    /// code had that length, and kept for as long as that holds. Returns them with how many there are (none when
+    /// the first code isn't such a literal). Needs 56 bits in the accumulator.
     #[inline(always)]
-    fn quick(&self, bits: &mut Bits<'_>) -> Option<([u8; 4], usize)> {
+    fn quick(&self, bits: &mut Bits<'_>) -> ([u8; 6], usize) {
         let g = self.common;
         let a = bits.acc;
         let sh = 64 - LUT_BITS;
-        let e1 = self.lut[(a >> sh) as usize];
+        let at = |k: u32| self.lut[((a << (k * g)) >> sh) as usize];
         // a literal (symbol below 256, so the top four bits clear) of length g
         let hit = |e: u16| u32::from(e & 0xF00F) == g;
-        if g == 0 || !hit(e1) {
-            return None;
+        let e = [at(0), at(1), at(2), at(3), at(4), at(5)];
+        let lits = e.map(|e| (e >> 4) as u8);
+        if g == 0 || !hit(e[0]) {
+            return (lits, 0);
         }
-        let e2 = self.lut[((a << g) >> sh) as usize];
-        let e3 = self.lut[((a << (2 * g)) >> sh) as usize];
-        let e4 = self.lut[((a << (3 * g)) >> sh) as usize];
-        let n = if !hit(e2) {
-            1
-        } else if !hit(e3) {
-            2
-        } else if !hit(e4) {
-            3
-        } else {
-            4
-        };
+        // six codes fit in a refill only when they are short; four always do
+        let most = if g <= 9 { 6 } else { 4 };
+        let mut n = 1;
+        while n < most && hit(e[n]) {
+            n += 1;
+        }
         bits.skip(n as u32 * g);
-        Some(([(e1 >> 4) as u8, (e2 >> 4) as u8, (e3 >> 4) as u8, (e4 >> 4) as u8], n))
+        (lits, n)
     }
 
     #[cold]
@@ -828,21 +826,31 @@ impl Unpacker {
                 sp += 1;
             };
         }
+        // a run of quick literals is gathered here, where whole groups can be written past the ones kept, and then
+        // copied to the window in one go
+        let mut stage = [0u8; STAGE + 6];
         let result = loop {
             let sym;
-            if bits.pos() + 128 <= end_bits && sp + 4 <= limit {
+            if bits.pos() + 128 <= end_bits && sp + 6 <= limit {
                 bits.refill();
-                if let Some((lits, n)) = main.quick(bits) {
-                    put!(lits[0]);
-                    if n > 1 {
-                        put!(lits[1]);
-                        if n > 2 {
-                            put!(lits[2]);
-                            if n > 3 {
-                                put!(lits[3]);
-                            }
+                let (lits, n) = main.quick(bits);
+                if n > 0 {
+                    stage[..6].copy_from_slice(&lits);
+                    let mut k = n;
+                    while k <= STAGE && bits.pos() + 128 <= end_bits && sp + k as u64 + 6 <= limit {
+                        bits.refill();
+                        let (lits, n) = main.quick(bits);
+                        if n == 0 {
+                            break;
                         }
+                        stage[k..k + 6].copy_from_slice(&lits);
+                        k += n;
                     }
+                    let at = (sp & mask) as usize;
+                    let first = k.min(window.len() - at);
+                    window[at..at + first].copy_from_slice(&stage[..first]);
+                    window[..k - first].copy_from_slice(&stage[first..k]);
+                    sp += k as u64;
                     continue;
                 }
                 // well inside the block and the output limits: a refill holds at least 56 bits and a code is at
