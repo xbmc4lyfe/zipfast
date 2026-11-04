@@ -537,7 +537,7 @@ impl Unpacker {
         self.batch.parts.push(Part { at, end_bits, read_tables, slot: Arc::clone(&self.slot) });
         if self.batch.buf.len() >= JOB_BYTES {
             self.send_batch();
-            self.settle(2 * self.threads as u64, sink)?;
+            self.settle(4 * self.threads as u64, sink)?;
         }
         Ok(())
     }
