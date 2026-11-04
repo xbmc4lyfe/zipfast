@@ -3,8 +3,23 @@
 use super::*;
 use crate::rar5::testenc::*;
 
+/// Decodes on the calling thread and on workers, and checks both give the same output or the same error.
 fn decode(stream: &[u8], size: u64, window: u64, piece: usize) -> Result<Vec<u8>> {
+    let serial = decode_with(stream, size, window, piece, 0);
+    let parallel = decode_with(stream, size, window, piece, 3);
+    match (&serial, &parallel) {
+        (Ok(a), Ok(b)) => assert!(a == b, "workers decoded different bytes"),
+        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "workers failed differently"),
+        _ => {
+            panic!("serial {:?} vs workers {:?}", serial.as_ref().map(|v| v.len()), parallel.as_ref().map(|v| v.len()))
+        }
+    }
+    serial
+}
+
+fn decode_with(stream: &[u8], size: u64, window: u64, piece: usize, threads: usize) -> Result<Vec<u8>> {
     let mut u = Unpacker::new(window)?;
+    u.set_threads(threads, 0);
     u.reset(Some(size));
     let mut out = Vec::new();
     let mut sink = |b: &[u8]| -> Result<()> {
@@ -204,4 +219,68 @@ fn tuned_codes_from_a_real_matcher_round_trip() {
     for piece in [usize::MAX, 4096, 7, 1] {
         assert_eq!(decode(&stream, data.len() as u64, 1 << 21, piece).unwrap(), data, "pieces of {piece}");
     }
+}
+
+#[test]
+fn workers_agree_with_the_calling_thread_on_damaged_streams() {
+    let mut data = Vec::new();
+    let mut x = 99u32;
+    for i in 0..30_000u32 {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        if i % 500 < 300 {
+            data.extend_from_slice(format!("{} {} ", i % 31, (x >> 22) % 7).as_bytes());
+        } else {
+            data.push((x >> 16) as u8);
+        }
+    }
+    let ops = lz(&data, 1 << 16, 4);
+    let stream = tuned_stream(&ops, 3000);
+    let mut y = 7u64;
+    for _ in 0..300 {
+        y = y.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let mut bad = stream.clone();
+        let at = (y >> 33) as usize % bad.len();
+        bad[at] ^= 1 << ((y >> 20) % 8);
+        // decode() itself checks the two agree
+        let _ = decode(&bad, data.len() as u64, 1 << 17, 1 << 12);
+    }
+    // a wrong stated size, both ways
+    let _ = decode(&stream, data.len() as u64 - 1, 1 << 17, usize::MAX);
+    let _ = decode(&stream, data.len() as u64 + 1, 1 << 17, usize::MAX);
+}
+
+#[test]
+fn an_earlier_blocks_error_comes_before_a_later_damaged_header() {
+    let mut first: Vec<Op> = (0..100_000u32).map(|i| Op::Lit((i % 251) as u8)).collect();
+    first.push(Op::Match(10, 500_000)); // reaches before the start of the data
+    let mut stream = block(&first, true, false);
+    let mut second = block(&[Op::Lit(1), Op::Lit(2)], false, true);
+    second[1] ^= 0xff; // its header checksum
+    stream.extend(second);
+    for piece in [usize::MAX, 1 << 16, 1000, 1] {
+        let err = decode(&stream, 200_000, 1 << 20, piece).unwrap_err();
+        assert_eq!(err.to_string(), corrupt("match reaches before the start of the data").to_string(), "{piece}");
+    }
+}
+
+#[test]
+fn a_block_of_tiny_codes_is_finished_on_the_calling_thread() {
+    // nine-bit codes that each stand for a 24-byte token: far past a worker's budget for this many packed bytes
+    let mut ops = vec![Op::Lit(b'a'), Op::Lit(b'b'), Op::Match(2, 2)];
+    ops.extend(std::iter::repeat_n(Op::Last, 400_000));
+    let want = model(&ops);
+    let stream = block(&ops, true, true);
+    assert_eq!(decode(&stream, want.len() as u64, 1 << 21, usize::MAX).unwrap(), want);
+    let mut u = Unpacker::new(1 << 21).unwrap();
+    u.set_threads(2, 0);
+    u.reset(Some(want.len() as u64));
+    let mut out = Vec::new();
+    let mut sink = |b: &[u8]| -> Result<()> {
+        out.extend_from_slice(b);
+        Ok(())
+    };
+    u.feed(&stream, &mut sink).unwrap();
+    u.finish(&mut sink).unwrap();
+    assert!(out == want);
+    assert!(u.resumed > 0, "the worker should have stopped at its budget");
 }

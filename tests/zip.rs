@@ -141,7 +141,14 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 fn opts(dest: &Path) -> Options {
-    Options { mode: Mode::Extract, dest: dest.to_path_buf(), overwrite: Overwrite::Skip, flatten: false }
+    Options {
+        mode: Mode::Extract,
+        dest: dest.to_path_buf(),
+        overwrite: Overwrite::Skip,
+        flatten: false,
+        threads: None,
+        parallel_min: None,
+    }
 }
 
 fn test_opts(dest: &Path) -> Options {
