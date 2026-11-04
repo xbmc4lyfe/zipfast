@@ -374,3 +374,30 @@ fn a_pax_size_with_no_room_for_padding_is_refused() {
     assert_eq!(s.errors.len(), 1, "{:?}", s.errors);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_refused_gnu_sparse_member_with_map_extensions_does_not_hide_what_follows() {
+    let dir = tmp("sparse");
+    let mut h = header(b"sparse.bin", b'S', 512, 0o644, 0, b"", false);
+    h[257..265].copy_from_slice(b"ustar  \0");
+    h[482] = 1; // the sparse map goes on in an extension block
+    h[148..156].fill(b' ');
+    let sum: u64 = h.iter().map(|&b| b as u64).sum();
+    h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+    let mut ext = [0u8; 512];
+    ext[..12].copy_from_slice(b"00000000000\0"); // one map entry, and no further extension
+    let mut tar = Tar::default();
+    tar.out.extend_from_slice(&h);
+    tar.out.extend_from_slice(&ext);
+    tar.out.extend_from_slice(&[b'x'; 512]);
+    let tar = tar.file("after.txt", b"after").end();
+    let archive = dir.join("s.tar");
+    fs::write(&archive, tar).unwrap();
+    let out = dir.join("out");
+    let s = extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
+    assert_eq!(s.files, 1, "{:?}", s.errors);
+    assert_eq!(s.errors.len(), 1);
+    assert!(s.errors[0].contains("sparse"), "{:?}", s.errors);
+    assert_eq!(fs::read(out.join("after.txt")).unwrap(), b"after");
+    let _ = fs::remove_dir_all(&dir);
+}

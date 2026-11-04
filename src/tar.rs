@@ -461,6 +461,19 @@ impl Reader {
                 // POSIX: a type this reader doesn't know is read as a regular file
                 _ => Kind::File,
             };
+            // an old GNU sparse member's map can go on in extension blocks between the header and the data;
+            // they are passed over so the member after it is still found
+            if h[156] == b'S' && &h[257..263] != b"ustar\0" && h[482] != 0 {
+                loop {
+                    let mut ext = [0u8; BLOCK];
+                    if self.src.read(&mut ext)? < BLOCK {
+                        return Err(Error::Truncated);
+                    }
+                    if ext[504] == 0 {
+                        break;
+                    }
+                }
+            }
             // links and folders carry no data, whatever the size field says, except GNU's dump folders
             let has_data = !matches!(kind, Kind::HardLink | Kind::Symlink) && !(kind == Kind::Dir && h[156] == b'5');
             self.unread = if has_data { size + padding(size) } else { 0 };
