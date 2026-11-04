@@ -212,7 +212,7 @@ fn decode(
     sink: &mut dyn FnMut(&[u8]) -> Result<()>,
 ) -> Result<()> {
     let window = window_for(dictionary, Some(size), false)?;
-    let u = match unpacker.as_mut().filter(|u| u.window_size() == window) {
+    let u = match unpacker.as_mut().filter(|u| u.fits(window)) {
         Some(u) => u,
         None => {
             let mut u = Unpacker::new(window)?;

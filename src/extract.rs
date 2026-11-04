@@ -569,7 +569,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
                 }
             } else {
                 match window_for(h.dictionary, size, solid_archive) {
-                    Ok(window) => match self.stream.as_mut().filter(|u| u.window_size() == window) {
+                    Ok(window) => match self.stream.as_mut().filter(|u| u.fits(window)) {
                         Some(u) => {
                             u.reset(size);
                             Ok(())

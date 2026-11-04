@@ -407,11 +407,13 @@ impl Unpacker {
     /// A fresh stream with a window of `window` bytes (a power of two).
     pub fn new(window: u64) -> Result<Self> {
         let size = usize::try_from(window).map_err(|_| Error::Unsupported("dictionary too large".into()))?;
-        let mut v = Vec::new();
-        v.try_reserve_exact(size).map_err(|_| Error::Unsupported(format!("can't allocate a {window} byte window")))?;
-        v.resize(size, 0);
+        // asked first so an absurd size is an error, not an abort; the window itself comes zeroed from the system,
+        // so its pages cost nothing until they are written
+        Vec::<u8>::new()
+            .try_reserve_exact(size)
+            .map_err(|_| Error::Unsupported(format!("can't allocate a {window} byte window")))?;
         Ok(Unpacker {
-            window: v,
+            window: vec![0; size],
             mask: window - 1,
             sp: 0,
             file_base: 0,
@@ -469,6 +471,13 @@ impl Unpacker {
 
     pub fn window_size(&self) -> u64 {
         self.mask + 1
+    }
+
+    /// Whether this decoder can take a stream that needs a `window` byte window: its own is big enough, and not so
+    /// much bigger that keeping it wastes memory. Reusing one saves allocating a window for every file.
+    pub fn fits(&self, window: u64) -> bool {
+        let have = self.window_size();
+        have >= window && have <= window.saturating_mul(4).max(4 << 20)
     }
 
     /// Starts the next file of a solid stream: the window, tables and history carry on.
