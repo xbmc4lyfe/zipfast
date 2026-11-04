@@ -17,35 +17,55 @@ const PAD: usize = 32;
 const MAX_FILTERS: usize = 8192;
 const MAX_FILTER_LEN: u64 = 0x40_0000;
 /// Bits of a code looked up in one step; longer codes take the slow path.
-const LUT_BITS: u32 = 10;
+const LUT_BITS: u32 = 11;
 
 fn corrupt(what: &'static str) -> Error {
     Error::Corrupt(what)
 }
 
-/// MSB-first bits over one block's payload, followed by [`PAD`] zero bytes.
+/// MSB-first bits over one block's payload, followed by [`PAD`] zero bytes. Bits are taken from a 64-bit
+/// accumulator that [`Bits::refill`] tops up to at least 56 bits; every read must fit in what a refill guarantees.
 struct Bits<'a> {
     buf: &'a [u8],
-    pos: usize,
+    /// the next byte not yet in `acc`
+    next: usize,
+    /// unread bits, left-aligned; everything below the top `cnt` bits is zero
+    acc: u64,
+    cnt: u32,
 }
 
-impl Bits<'_> {
+impl<'a> Bits<'a> {
+    fn new(buf: &'a [u8]) -> Self {
+        let mut b = Bits { buf, next: 0, acc: 0, cnt: 0 };
+        b.refill();
+        b
+    }
+
+    /// At least 56 bits in the accumulator afterwards.
     #[inline(always)]
-    fn word(&self) -> u64 {
-        let at = self.pos >> 3;
-        // the padding keeps `at + 8` inside the buffer for any read that starts inside the payload
-        let bytes: [u8; 8] = self.buf[at..at + 8].try_into().unwrap();
-        u64::from_be_bytes(bytes) << (self.pos & 7)
+    fn refill(&mut self) {
+        // the padding keeps `next + 8` inside the buffer while the position is within a symbol of the payload's end
+        let bytes: [u8; 8] = self.buf[self.next..self.next + 8].try_into().unwrap();
+        self.acc |= u64::from_be_bytes(bytes) >> self.cnt;
+        self.next += ((63 - self.cnt) >> 3) as usize;
+        self.cnt |= 56;
+    }
+
+    /// Bits read so far.
+    #[inline(always)]
+    fn pos(&self) -> usize {
+        self.next * 8 - self.cnt as usize
     }
 
     #[inline(always)]
     fn peek16(&self) -> u32 {
-        (self.word() >> 48) as u32
+        (self.acc >> 48) as u32
     }
 
     #[inline(always)]
     fn skip(&mut self, n: u32) {
-        self.pos += n as usize;
+        self.acc <<= n;
+        self.cnt -= n;
     }
 
     /// Up to 32 bits.
@@ -54,8 +74,8 @@ impl Bits<'_> {
         if n == 0 {
             return 0;
         }
-        let v = (self.word() >> (64 - n)) as u32;
-        self.pos += n as usize;
+        let v = (self.acc >> (64 - n)) as u32;
+        self.skip(n);
         v
     }
 }
@@ -64,7 +84,7 @@ impl Bits<'_> {
 #[derive(Clone)]
 struct Huff {
     /// symbol << 4 | length, or 0 when the code is longer than the table
-    lut: Vec<u16>,
+    lut: Box<[u16; 1 << LUT_BITS]>,
     /// for each length, the first 16-bit left-aligned value past every code of that length or shorter
     limit: [u32; 16],
     /// for each length, the left-aligned first code of that length
@@ -79,7 +99,7 @@ struct Huff {
 impl Huff {
     fn new() -> Self {
         Huff {
-            lut: vec![0; 1 << LUT_BITS],
+            lut: Box::new([0; 1 << LUT_BITS]),
             limit: [0; 16],
             first: [0; 16],
             start: [0; 16],
@@ -149,7 +169,7 @@ impl Huff {
 
     #[cold]
     fn decode_slow(&self, peek: u32, bits: &mut Bits<'_>) -> Result<u16> {
-        for l in 1..16usize {
+        for l in LUT_BITS as usize + 1..16 {
             if peek < self.limit[l] && peek >= self.first[l] {
                 let idx = self.start[l] as u32 + ((peek - self.first[l]) >> (16 - l));
                 bits.skip(l as u32);
@@ -200,6 +220,8 @@ pub struct Unpacker {
     scratch: Vec<u8>,
     /// packed bytes not yet decoded: always the start of a block
     input: Vec<u8>,
+    /// a whole block copied out with zero padding after it, when nothing follows it to pad it
+    padded: Vec<u8>,
 }
 
 /// The window a file needs: its declared dictionary, but no more than twice the file when nothing before or after it
@@ -241,6 +263,7 @@ impl Unpacker {
             filters: Vec::new(),
             scratch: Vec::new(),
             input: Vec::new(),
+            padded: Vec::new(),
         })
     }
 
@@ -271,34 +294,58 @@ impl Unpacker {
         self.sp - self.file_base
     }
 
-    /// More of the file's packed bytes. Every block that is now complete is decoded and its output emitted.
-    pub fn feed(&mut self, data: &[u8], sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
-        self.input.extend_from_slice(data);
+    /// More of the file's packed bytes. Every block that is now complete is decoded and its output emitted. Blocks
+    /// that arrive whole are decoded where they lie; only a block split across calls is gathered first.
+    pub fn feed(&mut self, mut data: &[u8], sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        // finish the block an earlier call left incomplete
+        while !self.input.is_empty() {
+            let flags = self.input[0];
+            let header_len = 2 + usize::from((flags >> 3) & 7) + 1;
+            let need = match block_header(&self.input)? {
+                Some((header_len, payload, _)) => header_len + payload,
+                None => header_len,
+            };
+            let take = need.saturating_sub(self.input.len()).min(data.len());
+            self.input.extend_from_slice(&data[..take]);
+            data = &data[take..];
+            if self.input.len() < need {
+                return Ok(());
+            }
+            if let Some((header_len, payload, flags)) = block_header(&self.input)?
+                && self.input.len() == header_len + payload
+            {
+                let mut block = std::mem::take(&mut self.input);
+                block.resize(header_len + payload + PAD, 0);
+                let result = self.block(&block[header_len..], payload, flags, sink);
+                block.clear();
+                self.input = block;
+                result?;
+            }
+        }
         let mut at = 0;
         loop {
-            let rest = &self.input[at..];
+            let rest = &data[at..];
             let Some((header_len, payload, flags)) = block_header(rest)? else { break };
             if rest.len() < header_len + payload {
                 break;
             }
-            let mut block = std::mem::take(&mut self.input);
             let start = at + header_len;
-            // padding goes past the payload, into what follows it or past the end of the buffer
             let end = start + payload;
-            let mut padded;
-            let buf: &[u8] = if block.len() >= end + PAD {
-                &block[..end + PAD]
+            if data.len() >= end + PAD {
+                // the bytes after the block serve as its padding
+                self.block(&data[start..end + PAD], payload, flags, sink)?;
             } else {
-                padded = block[..end].to_vec();
-                padded.resize(end + PAD, 0);
-                &padded
-            };
-            let result = self.block(&buf[start..], payload, flags, sink);
+                let mut padded = std::mem::take(&mut self.padded);
+                padded.clear();
+                padded.extend_from_slice(&data[start..end]);
+                padded.resize(payload + PAD, 0);
+                let result = self.block(&padded, payload, flags, sink);
+                self.padded = padded;
+                result?;
+            }
             at = end;
-            self.input = std::mem::take(&mut block);
-            result?;
         }
-        self.input.drain(..at);
+        self.input.extend_from_slice(&data[at..]);
         Ok(())
     }
 
@@ -328,20 +375,22 @@ impl Unpacker {
     ) -> Result<()> {
         let valid_bits = usize::from(flags & 7) + 1;
         let end_bits = if payload == 0 { 0 } else { (payload - 1) * 8 + valid_bits };
-        let mut bits = Bits { buf, pos: 0 };
+        let mut bits = Bits::new(buf);
         if flags & 0x80 != 0 {
             self.read_tables(&mut bits, end_bits)?;
         } else if !self.tables_ready && payload > 0 {
             return Err(corrupt("block without tables at the start of a stream"));
         }
         let flush_at = self.window_size() / 2;
-        while bits.pos < end_bits {
+        while bits.pos() < end_bits {
             if self.sp - self.file_base - self.emitted > flush_at {
                 self.flush(sink)?;
             }
-            self.symbol(&mut bits)?;
+            // decode until the block ends or the window holds as much unflushed output as it may
+            let stop = self.file_base + self.emitted + flush_at + 1;
+            self.run(&mut bits, end_bits, stop)?;
         }
-        if bits.pos > end_bits {
+        if bits.pos() > end_bits {
             return Err(corrupt("a symbol runs past the end of its block"));
         }
         Ok(())
@@ -351,12 +400,13 @@ impl Unpacker {
         let mut bl = [0u8; BC];
         let mut i = 0;
         while i < BC {
-            if bits.pos + 4 > end {
+            bits.refill();
+            if bits.pos() + 4 > end {
                 return Err(corrupt("table runs past its block"));
             }
             let n = bits.get(4) as u8;
             if n == 15 {
-                if bits.pos + 4 > end {
+                if bits.pos() + 4 > end {
                     return Err(corrupt("table runs past its block"));
                 }
                 let z = bits.get(4) as usize;
@@ -377,7 +427,8 @@ impl Unpacker {
         let mut lens = [0u8; TABLES];
         let mut i = 0;
         while i < TABLES {
-            if bits.pos >= end {
+            bits.refill();
+            if bits.pos() >= end {
                 return Err(corrupt("table runs past its block"));
             }
             let sym = pre.decode(bits)?;
@@ -404,7 +455,7 @@ impl Unpacker {
                 }
             }
         }
-        if bits.pos > end {
+        if bits.pos() > end {
             return Err(corrupt("table runs past its block"));
         }
         self.main.build(&lens[..NC])?;
@@ -415,121 +466,151 @@ impl Unpacker {
         Ok(())
     }
 
-    #[inline(always)]
-    fn symbol(&mut self, bits: &mut Bits<'_>) -> Result<()> {
-        let sym = self.main.decode(bits)?;
-        if sym < 256 {
-            if self.size.is_some_and(|s| self.op() >= s) {
-                return Err(corrupt("more data than the header says"));
-            }
-            let at = (self.sp & self.mask) as usize;
-            self.window[at] = sym as u8;
-            self.sp += 1;
-            return Ok(());
-        }
-        match sym {
-            256 => self.read_filter(bits),
-            257 => {
-                if self.last_len != 0 {
-                    self.copy(self.last_len, self.history[0])?;
+    /// The decoding loop: symbols until the block's bits run out or the stream position reaches `stop`. The state
+    /// it touches on every symbol lives in locals, so the window writes can't make the compiler reload it.
+    fn run(&mut self, bits: &mut Bits<'_>, end_bits: usize, stop: u64) -> Result<()> {
+        let Unpacker {
+            window,
+            mask,
+            sp: sp_ref,
+            file_base,
+            size,
+            main,
+            dist,
+            low,
+            rep,
+            history,
+            last_len,
+            filters,
+            ..
+        } = self;
+        let mask = *mask;
+        let file_base = *file_base;
+        let size_end = size.map_or(u64::MAX, |s| file_base.saturating_add(s));
+        let limit = stop.min(size_end);
+        let mut sp = *sp_ref;
+        let mut hist = *history;
+        let mut last = *last_len;
+        let window = &mut window[..=mask as usize];
+        macro_rules! decode {
+            ($table:expr) => {
+                match $table.decode(bits) {
+                    Ok(sym) => sym,
+                    Err(e) => break Err(e),
                 }
-                Ok(())
-            }
-            258..=261 => {
-                let k = (sym - 258) as usize;
-                let dist = self.history[k];
-                self.history.copy_within(0..k, 1);
-                self.history[0] = dist;
-                let slot = self.rep.decode(bits)?;
-                let len = length(slot as u32, bits);
-                self.last_len = len;
-                self.copy(len, dist)
-            }
-            _ => {
-                let mut len = length(u32::from(sym - 262), bits);
-                let slot = u32::from(self.dist.decode(bits)?);
-                let dist = if slot < 4 {
-                    1 + u64::from(slot)
+            };
+        }
+        macro_rules! put {
+            ($sym:expr) => {
+                window[(sp & mask) as usize] = $sym as u8;
+                sp += 1;
+            };
+        }
+        let result = loop {
+            let sym;
+            if bits.pos() + 128 <= end_bits && sp + 3 <= limit {
+                // well inside the block and the output limits: a refill holds at least 56 bits and a code is at
+                // most 15, so up to three literals go without another refill or any limit check
+                bits.refill();
+                let s1 = decode!(main);
+                if s1 >= 256 {
+                    sym = s1;
                 } else {
-                    let d = slot / 2 - 1;
-                    let base = 1 + ((2 + u64::from(slot & 1)) << d);
-                    if d < 4 {
-                        base + u64::from(bits.get(d))
+                    put!(s1);
+                    let s2 = decode!(main);
+                    if s2 >= 256 {
+                        sym = s2;
                     } else {
-                        let high = if d > 4 { u64::from(bits.get(d - 4)) << 4 } else { 0 };
-                        base + high + u64::from(self.low.decode(bits)?)
+                        put!(s2);
+                        let s3 = decode!(main);
+                        if s3 >= 256 {
+                            sym = s3;
+                        } else {
+                            put!(s3);
+                            continue;
+                        }
                     }
-                };
-                len += u32::from(dist > 0x100) + u32::from(dist > 0x2000) + u32::from(dist > 0x40000);
-                self.history.copy_within(0..3, 1);
-                self.history[0] = dist;
-                self.last_len = len;
-                self.copy(len, dist)
+                }
+            } else {
+                if bits.pos() >= end_bits || sp >= stop {
+                    break Ok(());
+                }
+                bits.refill();
+                let s = decode!(main);
+                if s < 256 {
+                    if sp >= size_end {
+                        break Err(corrupt("more data than the header says"));
+                    }
+                    put!(s);
+                    continue;
+                }
+                sym = s;
             }
-        }
-    }
-
-    #[inline(always)]
-    fn copy(&mut self, len: u32, dist: u64) -> Result<()> {
-        if dist == 0 || dist > self.sp || dist > self.mask + 1 {
-            return Err(corrupt("match reaches before the start of the data"));
-        }
-        let len64 = u64::from(len);
-        if let Some(size) = self.size
-            && len64 > size.saturating_sub(self.op())
-        {
-            return Err(corrupt("more data than the header says"));
-        }
-        let size = self.mask + 1;
-        let dst = (self.sp & self.mask) as usize;
-        let src = ((self.sp - dist) & self.mask) as usize;
-        let n = len as usize;
-        if dst + n <= size as usize && src + n <= size as usize && (dist >= len64) {
-            self.window.copy_within(src..src + n, dst);
-        } else if dist == 1 && dst + n <= size as usize {
-            let b = self.window[src];
-            self.window[dst..dst + n].fill(b);
-        } else {
-            let mask = self.mask as usize;
-            for i in 0..n {
-                self.window[(dst + i) & mask] = self.window[(src + i) & mask];
+            bits.refill();
+            let (len, d) = match sym {
+                256 => {
+                    let r = read_filter(bits, filters, sp - file_base, mask + 1);
+                    if r.is_err() {
+                        break r;
+                    }
+                    continue;
+                }
+                257 => {
+                    if last == 0 {
+                        continue;
+                    }
+                    (last, hist[0])
+                }
+                258..=261 => {
+                    let k = (sym - 258) as usize;
+                    let d = hist[k];
+                    hist.copy_within(0..k, 1);
+                    hist[0] = d;
+                    let slot = match rep.decode(bits) {
+                        Ok(slot) => slot,
+                        Err(e) => break Err(e),
+                    };
+                    last = length(u32::from(slot), bits);
+                    (last, d)
+                }
+                _ => {
+                    let mut len = length(u32::from(sym - 262), bits);
+                    let slot = match dist.decode(bits) {
+                        Ok(slot) => u32::from(slot),
+                        Err(e) => break Err(e),
+                    };
+                    let d = if slot < 4 {
+                        1 + u64::from(slot)
+                    } else {
+                        let n = slot / 2 - 1;
+                        let base = 1 + ((2 + u64::from(slot & 1)) << n);
+                        if n < 4 {
+                            base + u64::from(bits.get(n))
+                        } else {
+                            bits.refill();
+                            let high = if n > 4 { u64::from(bits.get(n - 4)) << 4 } else { 0 };
+                            match low.decode(bits) {
+                                Ok(l) => base + high + u64::from(l),
+                                Err(e) => break Err(e),
+                            }
+                        }
+                    };
+                    len += u32::from(d > 0x100) + u32::from(d > 0x2000) + u32::from(d > 0x40000);
+                    hist.copy_within(0..3, 1);
+                    hist[0] = d;
+                    last = len;
+                    (len, d)
+                }
+            };
+            if let Err(e) = copy(window, mask, sp, len, d, size_end) {
+                break Err(e);
             }
-        }
-        self.sp += len64;
-        Ok(())
-    }
-
-    fn read_filter(&mut self, bits: &mut Bits<'_>) -> Result<()> {
-        let number = |bits: &mut Bits<'_>| -> u64 {
-            let n = bits.get(2) + 1;
-            let mut v = 0u64;
-            for i in 0..n {
-                v |= u64::from(bits.get(8)) << (8 * i);
-            }
-            v
+            sp += u64::from(len);
         };
-        let start = self.op() + number(bits);
-        let len = number(bits);
-        let kind = match bits.get(3) {
-            0 => FilterKind::Delta(bits.get(5) as u8 + 1),
-            1 => FilterKind::E8,
-            2 => FilterKind::E8E9,
-            3 => FilterKind::Arm,
-            _ => return Err(corrupt("unknown filter type")),
-        };
-        if !(4..=MAX_FILTER_LEN).contains(&len) || len > self.window_size() / 2 {
-            return Err(corrupt("filter length"));
-        }
-        if let Some(prev) = self.filters.last()
-            && start < prev.start + prev.len
-        {
-            return Err(corrupt("filters overlap"));
-        }
-        if self.filters.len() >= MAX_FILTERS {
-            return Err(corrupt("too many filters"));
-        }
-        self.filters.push(Filter { start, len, kind });
-        Ok(())
+        *sp_ref = sp;
+        *history = hist;
+        *last_len = last;
+        result
     }
 
     /// Emits everything decoded so far that no pending filter still needs, running filters whose input is complete.
@@ -603,6 +684,90 @@ fn block_header(b: &[u8]) -> Result<Option<(usize, usize, u8)>> {
         return Err(corrupt("block header checksum"));
     }
     Ok(Some((2 + size_len, size, flags)))
+}
+
+/// Copies a match inside the window. `sp` is the stream position the copy starts at; nothing may land at or past
+/// `size_end`.
+#[inline(always)]
+fn copy(window: &mut [u8], mask: u64, sp: u64, len: u32, dist: u64, size_end: u64) -> Result<()> {
+    if dist == 0 || dist > sp || dist > mask + 1 {
+        return Err(corrupt("match reaches before the start of the data"));
+    }
+    if u64::from(len) > size_end - sp {
+        return Err(corrupt("more data than the header says"));
+    }
+    let n = len as usize;
+    let dst = (sp & mask) as usize;
+    let src = ((sp - dist) & mask) as usize;
+    let w = window.len();
+    if dst + n <= w && src + n <= w {
+        if dist >= 8 {
+            if dist >= n as u64 {
+                window.copy_within(src..src + n, dst);
+                return Ok(());
+            }
+            // eight bytes at a time: with the source at least eight behind, each chunk reads only finished bytes
+            let mut i = 0;
+            while i + 8 <= n {
+                let v: [u8; 8] = window[src + i..src + i + 8].try_into().unwrap();
+                window[dst + i..dst + i + 8].copy_from_slice(&v);
+                i += 8;
+            }
+            while i < n {
+                window[dst + i] = window[src + i];
+                i += 1;
+            }
+        } else if dist == 1 {
+            let b = window[src];
+            window[dst..dst + n].fill(b);
+        } else {
+            for i in 0..n {
+                window[dst + i] = window[src + i];
+            }
+        }
+    } else {
+        let m = mask as usize;
+        for i in 0..n {
+            window[(dst + i) & m] = window[(src + i) & m];
+        }
+    }
+    Ok(())
+}
+
+/// A filter record; `op` is the file position the decoder has reached.
+fn read_filter(bits: &mut Bits<'_>, filters: &mut Vec<Filter>, op: u64, window_size: u64) -> Result<()> {
+    let number = |bits: &mut Bits<'_>| -> u64 {
+        bits.refill();
+        let n = bits.get(2) + 1;
+        let mut v = 0u64;
+        for i in 0..n {
+            v |= u64::from(bits.get(8)) << (8 * i);
+        }
+        v
+    };
+    let start = op + number(bits);
+    let len = number(bits);
+    bits.refill();
+    let kind = match bits.get(3) {
+        0 => FilterKind::Delta(bits.get(5) as u8 + 1),
+        1 => FilterKind::E8,
+        2 => FilterKind::E8E9,
+        3 => FilterKind::Arm,
+        _ => return Err(corrupt("unknown filter type")),
+    };
+    if !(4..=MAX_FILTER_LEN).contains(&len) || len > window_size / 2 {
+        return Err(corrupt("filter length"));
+    }
+    if let Some(prev) = filters.last()
+        && start < prev.start + prev.len
+    {
+        return Err(corrupt("filters overlap"));
+    }
+    if filters.len() >= MAX_FILTERS {
+        return Err(corrupt("too many filters"));
+    }
+    filters.push(Filter { start, len, kind });
+    Ok(())
 }
 
 /// A length from its slot and extra bits: 2 to 4097.
