@@ -13,7 +13,11 @@ pub fn next_volume(path: &Path) -> Option<PathBuf> {
                 let digits = format!("{:0width$}", n + 1, width = width);
                 format!("{}{}{}", &name[..digits_at], digits, &name[digits_at + width..])
             }
-            None => format!("{}.r00", &name[..name.len() - 4]),
+            // keep the extension's case: set.RAR goes on in set.R00
+            None => {
+                let r = if name.ends_with(".RAR") || name.ends_with(".Rar") { 'R' } else { 'r' };
+                format!("{}.{r}00", &name[..name.len() - 4])
+            }
         }
     } else {
         // .r00 .. .r99, then .s00 and onwards
@@ -66,6 +70,8 @@ mod tests {
         assert_eq!(next("dir/Movie.2026.PART001.RAR"), "dir/Movie.2026.PART002.RAR");
         assert_eq!(next("a.rar"), "a.r00");
         assert_eq!(next("a.r00"), "a.r01");
+        assert_eq!(next("SET.RAR"), "SET.R00");
+        assert_eq!(next("SET.R00"), "SET.R01");
         assert_eq!(next("a.r99"), "a.s00");
     }
 }

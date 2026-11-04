@@ -233,3 +233,34 @@ fn restores_a_zero_mode() {
     let mode = fs::metadata(out.join("locked")).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0);
 }
+
+#[test]
+fn a_missing_volume_removes_the_half_written_file() {
+    let dir = tmp("missing-clean");
+    let data = vec![7u8; 1000];
+    let vols = volumes(&FileSpec::new("f", &data), 400);
+    fs::write(dir.join("s.part1.rar"), &vols[0]).unwrap();
+    let out = dir.join("out");
+    assert!(extract::run(&dir.join("s.part1.rar"), &opts(&out), |_| {}).is_err());
+    assert!(!out.join("f").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn restores_folder_permissions_after_their_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp("dirmode");
+    let arc = dir.join("t.rar");
+    let files = [
+        FileSpec { dir: true, unix_mode: Some(0o500), ..FileSpec::new("locked", b"") },
+        FileSpec::new("locked/f", b"x"),
+    ];
+    fs::write(&arc, archive(&files)).unwrap();
+    let out = dir.join("out");
+    let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+    assert_eq!(fs::read(out.join("locked/f")).unwrap(), b"x");
+    assert_eq!(fs::metadata(out.join("locked")).unwrap().permissions().mode() & 0o777, 0o500);
+    // let the temp folder be cleaned up
+    fs::set_permissions(out.join("locked"), fs::Permissions::from_mode(0o700)).unwrap();
+}

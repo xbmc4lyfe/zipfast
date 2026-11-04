@@ -49,6 +49,8 @@ pub struct Summary {
     /// one line per file that failed
     pub errors: Vec<String>,
     pub volumes: u64,
+    /// folders whose times and permissions are set once everything inside them is written
+    dir_meta: Vec<(PathBuf, FileHeader)>,
 }
 
 /// One entry for a listing.
@@ -183,7 +185,7 @@ pub fn run(first: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result
     if opts.mode == Mode::Extract {
         fs::create_dir_all(&opts.dest)?;
     }
-    let volumes = walk(first, |vol, block| {
+    let walked = walk(first, |vol, block| {
         let Block::File(h) = block else { return Ok(()) };
         if h.split_before() {
             match pending.take() {
@@ -205,13 +207,48 @@ pub fn run(first: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result
             p.discard();
         }
         start_file(vol, &h, &mut pending, &mut buf, opts, &mut summary, &mut report)
-    })?;
+    });
+    // whatever stopped the walk, a file left half-written is removed
+    let volumes = match walked {
+        Ok(v) => v,
+        Err(e) => {
+            if let Some(mut p) = pending.take() {
+                p.discard();
+            }
+            finish_dirs(&mut summary);
+            return Err(e);
+        }
+    };
     summary.volumes = volumes;
     if let Some(mut p) = pending.take() {
         fail(&mut summary, &mut report, &p.name, "archive ends before this file does");
         p.discard();
     }
+    finish_dirs(&mut summary);
     Ok(summary)
+}
+
+/// Restores folders' permissions and times, deepest first, after their contents are written: a read-only folder
+/// set first would stop its own files from being created.
+fn finish_dirs(summary: &mut Summary) {
+    let mut dirs = std::mem::take(&mut summary.dir_meta);
+    dirs.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
+    #[cfg(unix)]
+    for (path, h) in &dirs {
+        use std::os::unix::fs::PermissionsExt;
+        // only a real folder: never follow something that replaced it since
+        if !fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()) {
+            continue;
+        }
+        if let Ok(dir) = File::open(path) {
+            set_time(&dir, h);
+        }
+        if h.is_unix() {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode((h.attributes as u32) & 0o777));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = dirs;
 }
 
 fn fail(summary: &mut Summary, report: &mut impl FnMut(&str), name: &str, why: &str) {
@@ -247,6 +284,7 @@ fn start_file(
     if h.is_dir() {
         if opts.mode == Mode::Extract && !opts.flatten {
             make_dirs(&opts.dest, &rel)?;
+            summary.dir_meta.push((opts.dest.join(&rel), h.clone()));
         }
         summary.dirs += 1;
         return Ok(());
@@ -335,7 +373,7 @@ fn continue_file(
     let split_after = h.split_after();
     let mut part = crc32fast::Hasher::new();
     let mut part_blake = h.blake2sp.filter(|_| split_after).map(|_| Blake2sp::new());
-    vol.read_data(h.data_at, h.packed_size, buf, |chunk| {
+    let read = vol.read_data(h.data_at, h.packed_size, buf, |chunk| {
         p.hasher.update(chunk);
         if let Some(b) = p.blake.as_mut() {
             b.update(chunk);
@@ -350,7 +388,11 @@ fn continue_file(
             out.write_all(chunk)?;
         }
         Ok(())
-    })?;
+    });
+    if let Err(e) = read {
+        p.discard();
+        return Err(e);
+    }
     p.bytes += h.packed_size;
     if split_after {
         // a part's checksums cover only its own packed bytes
@@ -392,6 +434,17 @@ fn continue_file(
 
 /// Times and permissions, best effort: a file system that can't keep them still gets the data.
 fn finish_file(out: &File, h: &FileHeader) {
+    set_time(out, h);
+    #[cfg(unix)]
+    if h.is_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        // set-id and sticky bits are never restored from an archive; zero is a real mode, not a missing one
+        let mode = (h.attributes as u32) & 0o777;
+        let _ = out.set_permissions(fs::Permissions::from_mode(mode));
+    }
+}
+
+fn set_time(out: &File, h: &FileHeader) {
     if let Some(secs) = h.mtime {
         let at = if secs >= 0 {
             UNIX_EPOCH.checked_add(Duration::new(secs as u64, h.mtime_nanos))
@@ -401,14 +454,6 @@ fn finish_file(out: &File, h: &FileHeader) {
         if let Some(at) = at.filter(|t| *t != SystemTime::UNIX_EPOCH || secs == 0) {
             let _ = out.set_modified(at);
         }
-    }
-    #[cfg(unix)]
-    if h.is_unix() {
-        use std::os::unix::fs::PermissionsExt;
-        // set-id and sticky bits are never restored from an archive
-        // zero is a real mode, not a missing one
-        let mode = (h.attributes as u32) & 0o777;
-        let _ = out.set_permissions(fs::Permissions::from_mode(mode));
     }
 }
 
