@@ -22,7 +22,10 @@ impl Codec {
             Some(Codec::Gzip)
         } else if head.starts_with(&[0xfd, b'7', b'z', b'X', b'Z', 0]) {
             Some(Codec::Xz)
-        } else if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        } else if head.starts_with(&[0x28, 0xb5, 0x2f, 0xfd])
+            // a skippable frame (magic 0x184D2A50 to 0x184D2A5F) may come before the first compressed one
+            || (head.len() >= 4 && head[0] & 0xf0 == 0x50 && head[1..4] == [0x2a, 0x4d, 0x18])
+        {
             Some(Codec::Zstd)
         } else if head.len() >= 4 && head.starts_with(b"BZh") && (b'1'..=b'9').contains(&head[3]) {
             Some(Codec::Bzip2)
@@ -105,26 +108,34 @@ impl Read for XzStreams {
     }
 }
 
-/// The file name stored in a gzip header (RFC 1952's FNAME field), if there is one.
+/// The file name stored in a gzip header (RFC 1952's FNAME field), if there is one. The header is read field by
+/// field, so an extra field of any size before the name is passed over.
 pub fn gzip_name(path: &Path) -> Option<String> {
-    let mut head = vec![0u8; 64 << 10];
-    let n = File::open(path).ok()?.read(&mut head).ok()?;
-    let h = &head[..n];
-    let flags = *h.get(3)?;
-    let mut at = 10;
+    let mut r = BufReader::new(File::open(path).ok()?);
+    let mut fixed = [0u8; 10];
+    r.read_exact(&mut fixed).ok()?;
+    let flags = fixed[3];
     if flags & 0x04 != 0 {
-        let len = u16::from_le_bytes([*h.get(at)?, *h.get(at + 1)?]) as usize;
-        at += 2 + len;
+        let mut len = [0u8; 2];
+        r.read_exact(&mut len).ok()?;
+        let len = u16::from_le_bytes(len) as u64;
+        if io::copy(&mut r.by_ref().take(len), &mut io::sink()).ok()? != len {
+            return None;
+        }
     }
     if flags & 0x08 == 0 {
         return None;
     }
-    let rest = h.get(at..)?;
-    let end = rest.iter().position(|&b| b == 0)?;
+    let mut name = Vec::new();
+    // a name runs to a NUL; one longer than any real file name is not taken
+    r.take(64 << 10).read_until(0, &mut name).ok()?;
+    if name.pop() != Some(0) {
+        return None;
+    }
     // ISO 8859-1 by the RFC; UTF-8 in practice
-    Some(match std::str::from_utf8(&rest[..end]) {
+    Some(match std::str::from_utf8(&name) {
         Ok(s) => s.to_string(),
-        Err(_) => rest[..end].iter().map(|&b| b as char).collect(),
+        Err(_) => name.iter().map(|&b| b as char).collect(),
     })
 }
 
@@ -137,6 +148,8 @@ mod tests {
         assert_eq!(Codec::sniff(&[0x1f, 0x8b, 8, 0]), Some(Codec::Gzip));
         assert_eq!(Codec::sniff(b"\xfd7zXZ\0\0"), Some(Codec::Xz));
         assert_eq!(Codec::sniff(&[0x28, 0xb5, 0x2f, 0xfd, 0]), Some(Codec::Zstd));
+        assert_eq!(Codec::sniff(&[0x5a, 0x2a, 0x4d, 0x18, 0]), Some(Codec::Zstd));
+        assert_eq!(Codec::sniff(&[0x60, 0x2a, 0x4d, 0x18, 0]), None);
         assert_eq!(Codec::sniff(b"BZh91AY"), Some(Codec::Bzip2));
         assert_eq!(Codec::sniff(b"BZh0"), None);
         assert_eq!(Codec::sniff(b"Rar!\x1a\x07"), None);

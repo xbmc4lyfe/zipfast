@@ -261,6 +261,28 @@ fn a_lone_gzip_file_comes_out_under_its_stored_or_archive_name() {
         assert!(fs::read(o.join("notes.txt")).unwrap() == body, "{name}");
     }
 
+    // a zstd stream may open with a skippable frame
+    let mut skip = vec![0x53, 0x2a, 0x4d, 0x18];
+    skip.extend_from_slice(&5u32.to_le_bytes());
+    skip.extend_from_slice(b"meta!");
+    skip.extend_from_slice(&zstd(&body));
+    let archive = dir.join("skip.txt.zst");
+    fs::write(&archive, skip).unwrap();
+    let s = extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+    assert!(fs::read(out.join("skip.txt")).unwrap() == body);
+
+    // a stored name after an extra field of the largest size is still found
+    let mut enc = flate2::GzBuilder::new()
+        .extra(vec![7u8; 65535])
+        .filename("after-extra.txt")
+        .write(Vec::new(), Compression::fast());
+    enc.write_all(b"extra").unwrap();
+    let archive = dir.join("extra.gz");
+    fs::write(&archive, enc.finish().unwrap()).unwrap();
+    extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
+    assert_eq!(fs::read(out.join("after-extra.txt")).unwrap(), b"extra");
+
     // xz streams back to back, with stream padding between them, are one file
     let mut two = xz(b"one ");
     two.extend_from_slice(&[0; 8]);
