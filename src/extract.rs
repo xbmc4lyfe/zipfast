@@ -51,7 +51,54 @@ pub struct Summary {
     pub errors: Vec<String>,
     pub volumes: u64,
     /// folders whose times and permissions are set once everything inside them is written
-    dir_meta: Vec<(PathBuf, FileHeader)>,
+    pub(crate) dir_meta: Vec<(PathBuf, Meta)>,
+}
+
+/// What is restored on an extracted file or folder besides its data.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Meta {
+    /// seconds since 1970
+    pub mtime: Option<i64>,
+    pub nanos: u32,
+    /// Unix permission bits, when the archive was made on a Unix system
+    pub mode: Option<u32>,
+}
+
+impl From<&FileHeader> for Meta {
+    fn from(h: &FileHeader) -> Self {
+        Meta { mtime: h.mtime, nanos: h.mtime_nanos, mode: h.is_unix().then_some(h.attributes as u32) }
+    }
+}
+
+/// Where a file's data is to go, once the destination has been checked.
+pub(crate) enum Target {
+    Write(File, PathBuf),
+    /// already there and not to be overwritten
+    Exists,
+    /// something else stands in the way
+    Blocked(&'static str),
+}
+
+/// Prepares the output file for `rel`: makes its folders, honours the overwrite choice, and never writes through a
+/// link left at the target. `size` is preallocated when known.
+pub(crate) fn open_target(opts: &Options, rel: &Path, size: Option<u64>) -> Result<Target> {
+    let target = opts.dest.join(rel);
+    if let Some(parent) = rel.parent() {
+        make_dirs(&opts.dest, parent)?;
+    }
+    match fs::symlink_metadata(&target) {
+        Ok(_) if opts.overwrite == Overwrite::Skip => return Ok(Target::Exists),
+        Ok(meta) if meta.is_dir() => return Ok(Target::Blocked("a folder is in the way")),
+        // removing first means a link left at the target is replaced, never written through
+        Ok(_) => fs::remove_file(&target)?,
+        Err(_) => {}
+    }
+    let file = OpenOptions::new().write(true).create_new(true).open(&target)?;
+    if let Some(size) = size.filter(|&s| s > 0) {
+        // one allocation up front keeps a big file in few extents; failure here is harmless
+        let _ = file.set_len(size);
+    }
+    Ok(Target::Write(file, target))
 }
 
 /// One entry for a listing.
@@ -113,7 +160,45 @@ fn walk(first: &Path, mut on_block: impl FnMut(&mut Volume, Block) -> Result<()>
     }
 }
 
+/// Which reader a file needs, from its first bytes. RAR is tried for anything else, since a self-extracting RAR
+/// starts with a program; a file that turns out not to be RAR gets one more try as a ZIP, which is found from
+/// its end.
+fn is_zip(path: &Path) -> Result<bool> {
+    let mut head = [0u8; 4];
+    let n = std::io::Read::read(&mut File::open(path)?, &mut head)?;
+    Ok(crate::zip::sniff(&head[..n]))
+}
+
+/// The entries of an archive, whatever its format.
 pub fn list(first: &Path) -> Result<Vec<Entry>> {
+    if is_zip(first)? {
+        return crate::zip::list(first);
+    }
+    match rar_list(first) {
+        Err(Error::NotAnArchive) => crate::zip::list(first),
+        other => other,
+    }
+}
+
+/// Tests or extracts an archive, whatever its format.
+pub fn run(first: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<Summary> {
+    if is_zip(first)? {
+        return zip_run(first, opts, &mut report);
+    }
+    match rar_run(first, opts, &mut report) {
+        Err(Error::NotAnArchive) => zip_run(first, opts, &mut report),
+        other => other,
+    }
+}
+
+fn zip_run(path: &Path, opts: &Options, report: &mut impl FnMut(&str)) -> Result<Summary> {
+    if opts.mode == Mode::Extract {
+        fs::create_dir_all(&opts.dest)?;
+    }
+    crate::zip::run(path, opts, report)
+}
+
+fn rar_list(first: &Path) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
     walk(first, |_, block| {
         let Block::File(h) = block else { return Ok(()) };
@@ -210,7 +295,7 @@ struct Run<'a, R: FnMut(&str)> {
     report: R,
 }
 
-pub fn run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Summary> {
+fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Summary> {
     if opts.mode == Mode::Extract {
         fs::create_dir_all(&opts.dest)?;
     }
@@ -310,7 +395,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
         if h.is_dir() {
             if self.opts.mode == Mode::Extract && !self.opts.flatten {
                 make_dirs(&self.opts.dest, &rel)?;
-                self.summary.dir_meta.push((self.opts.dest.join(&rel), h.clone()));
+                self.summary.dir_meta.push((self.opts.dest.join(&rel), Meta::from(h)));
             }
             self.summary.dirs += 1;
             return Ok(());
@@ -328,30 +413,18 @@ impl<R: FnMut(&str)> Run<'_, R> {
         }
 
         let (out, path) = if self.opts.mode == Mode::Extract {
-            let target = self.opts.dest.join(&rel);
-            if let Some(parent) = rel.parent() {
-                make_dirs(&self.opts.dest, parent)?;
-            }
-            match fs::symlink_metadata(&target) {
-                Ok(_) if self.opts.overwrite == Overwrite::Skip => {
+            match open_target(self.opts, &rel, (!h.size_unknown()).then_some(h.unpacked_size))? {
+                Target::Write(file, target) => (Some(file), Some(target)),
+                Target::Exists => {
                     (self.report)(&format!("{}: exists, skipped", h.name));
                     self.summary.skipped += 1;
                     return self.pass_over(vol, h);
                 }
-                Ok(meta) if meta.is_dir() => {
-                    self.fail(&h.name, "a folder is in the way");
+                Target::Blocked(why) => {
+                    self.fail(&h.name, why);
                     return self.pass_over(vol, h);
                 }
-                // removing first means a link left at the target is replaced, never written through
-                Ok(_) => fs::remove_file(&target)?,
-                Err(_) => {}
             }
-            let file = OpenOptions::new().write(true).create_new(true).open(&target)?;
-            if h.unpacked_size > 0 && !h.size_unknown() {
-                // one allocation up front keeps a big file in few extents; failure here is harmless
-                let _ = file.set_len(h.unpacked_size);
-            }
-            (Some(file), Some(target))
         } else {
             (None, None)
         };
@@ -505,7 +578,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
             return Ok(());
         }
         if let Some(out) = p.out.take() {
-            finish_file(&out, h);
+            finish_file(&out, &Meta::from(h));
         }
         self.summary.files += 1;
         self.summary.bytes += p.bytes;
@@ -515,7 +588,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
 
 /// Restores folders' permissions and times, deepest first, after their contents are written: a read-only folder
 /// set first would stop its own files from being created.
-fn finish_dirs(summary: &mut Summary) {
+pub(crate) fn finish_dirs(summary: &mut Summary) {
     let mut dirs = std::mem::take(&mut summary.dir_meta);
     dirs.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
     #[cfg(unix)]
@@ -528,8 +601,8 @@ fn finish_dirs(summary: &mut Summary) {
         if let Ok(dir) = File::open(path) {
             set_time(&dir, h);
         }
-        if h.is_unix() {
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode((h.attributes as u32) & 0o777));
+        if let Some(mode) = h.mode {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777));
         }
     }
     #[cfg(not(unix))]
@@ -537,21 +610,20 @@ fn finish_dirs(summary: &mut Summary) {
 }
 
 /// Times and permissions, best effort: a file system that can't keep them still gets the data.
-fn finish_file(out: &File, h: &FileHeader) {
+pub(crate) fn finish_file(out: &File, h: &Meta) {
     set_time(out, h);
     #[cfg(unix)]
-    if h.is_unix() {
+    if let Some(mode) = h.mode {
         use std::os::unix::fs::PermissionsExt;
         // set-id and sticky bits are never restored from an archive; zero is a real mode, not a missing one
-        let mode = (h.attributes as u32) & 0o777;
-        let _ = out.set_permissions(fs::Permissions::from_mode(mode));
+        let _ = out.set_permissions(fs::Permissions::from_mode(mode & 0o777));
     }
 }
 
-fn set_time(out: &File, h: &FileHeader) {
+fn set_time(out: &File, h: &Meta) {
     if let Some(secs) = h.mtime {
         let at = if secs >= 0 {
-            UNIX_EPOCH.checked_add(Duration::new(secs as u64, h.mtime_nanos))
+            UNIX_EPOCH.checked_add(Duration::new(secs as u64, h.nanos))
         } else {
             UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))
         };
@@ -562,7 +634,7 @@ fn set_time(out: &File, h: &FileHeader) {
 }
 
 /// Creates `rel` under `root` one folder at a time, refusing to pass through a link.
-fn make_dirs(root: &Path, rel: &Path) -> Result<()> {
+pub(crate) fn make_dirs(root: &Path, rel: &Path) -> Result<()> {
     let mut at = root.to_path_buf();
     for part in rel.components() {
         at.push(part);
