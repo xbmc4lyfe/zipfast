@@ -1,6 +1,7 @@
 //! Lists, tests and extracts an archive. RAR 5.0 lives here: its volumes are followed in order and compressed files
 //! decoded. Other formats have modules of their own.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -323,6 +324,9 @@ struct Run<'a, R: FnMut(&str)> {
     threads: usize,
     /// small files being decoded and written on other threads
     batch: Option<Batch>,
+    /// where the files handed to the workers since they last finished everything are written, folded to lower case
+    /// as a case-insensitive file system would; a later file going to one of these waits for them first
+    batch_paths: HashSet<String>,
 }
 
 /// A file finished on another thread, counted and reported as if done here.
@@ -359,6 +363,7 @@ fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Sum
         report,
         threads,
         batch: None,
+        batch_paths: HashSet::new(),
     };
     let walked = walk(first, |vol, block| {
         let Block::File(h) = block else { return Ok(()) };
@@ -396,7 +401,20 @@ impl<R: FnMut(&str)> Run<'_, R> {
         let (summary, report) = (&mut self.summary, &mut self.report);
         let result = batch.drain(&mut |done| apply_done(summary, report, done));
         self.batch = Some(batch);
+        self.batch_paths.clear();
         result
+    }
+
+    /// Whether `h` goes to the workers: it can, and at least one of them started.
+    fn goes_to_batch(&mut self, vol: &Volume, h: &FileHeader) -> bool {
+        self.batchable(vol, h) && self.batch.get_or_insert_with(|| Batch::new(self.threads)).usable()
+    }
+
+    /// Reports a failure after every file before it, so reports keep archive order.
+    fn fail_in_order(&mut self, name: &str, why: &str) -> Result<()> {
+        self.drain()?;
+        self.fail(name, why);
+        Ok(())
     }
 
     /// Whether `h` can go to the workers whole: a small file standing alone in one volume.
@@ -451,6 +469,10 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     fn file_block(&mut self, vol: &mut Volume, h: &FileHeader) -> Result<()> {
+        // a file done here reports as it goes, so the ones before it with the workers come in first
+        if !self.goes_to_batch(vol, h) {
+            self.drain()?;
+        }
         if h.split_before() {
             match self.pending.take() {
                 Some(p) if p.name == h.name => return self.continue_file(vol, h, p),
@@ -494,6 +516,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
         if let Some(v) = h.version
             && self.opts.mode == Mode::Extract
         {
+            self.drain()?;
             (self.report)(&format!("{}: older version {v}, skipped", h.name));
             self.summary.skipped += 1;
             return self.pass_over(vol, h);
@@ -501,16 +524,21 @@ impl<R: FnMut(&str)> Run<'_, R> {
         let rel = match sanitize(&h.name, !h.is_unix()) {
             Ok(rel) => rel,
             Err(e) => {
-                self.fail(&h.name, &e.to_string());
+                self.fail_in_order(&h.name, &e.to_string())?;
                 return self.pass_over(vol, h);
             }
         };
         // U+FFFE marks a Unix name holding bytes that aren't UTF-8, mapped into private-use characters
         if self.opts.mode == Mode::Extract && h.name.contains('\u{FFFE}') {
-            self.fail(&h.name, "the name holds bytes that aren't UTF-8, which isn't supported yet");
+            self.fail_in_order(&h.name, "the name holds bytes that aren't UTF-8, which isn't supported yet")?;
             return self.pass_over(vol, h);
         }
         let rel = if self.opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
+        // a file the workers still hold may be written, or removed, at the same place
+        let key = rel.to_string_lossy().to_lowercase();
+        if self.opts.mode == Mode::Extract && self.batch_paths.contains(&key) {
+            self.drain()?;
+        }
         if h.is_dir() {
             if self.opts.mode == Mode::Extract && !self.opts.flatten {
                 make_dirs(&self.opts.dest, &rel)?;
@@ -527,7 +555,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
             h.redirection.as_ref().map(|link| format!("links are not supported yet ({link:?})"))
         };
         if let Some(why) = refuse {
-            self.fail(&h.name, &why);
+            self.fail_in_order(&h.name, &why)?;
             return self.pass_over(vol, h);
         }
 
@@ -535,19 +563,23 @@ impl<R: FnMut(&str)> Run<'_, R> {
             match open_target(self.opts, &rel, (!h.size_unknown()).then_some(h.unpacked_size))? {
                 Target::Write(file, target) => (Some(file), Some(target)),
                 Target::Exists => {
+                    self.drain()?;
                     (self.report)(&format!("{}: exists, skipped", h.name));
                     self.summary.skipped += 1;
                     return self.pass_over(vol, h);
                 }
                 Target::Blocked(why) => {
-                    self.fail(&h.name, why);
+                    self.fail_in_order(&h.name, why)?;
                     return self.pass_over(vol, h);
                 }
             }
         } else {
             (None, None)
         };
-        if self.batchable(vol, h) && self.batch.as_ref().is_none_or(Batch::usable) {
+        if self.goes_to_batch(vol, h) {
+            if self.opts.mode == Mode::Extract {
+                self.batch_paths.insert(key);
+            }
             return self.send_to_batch(vol, h, out.zip(path));
         }
         let p = Pending::new(h, out, path);

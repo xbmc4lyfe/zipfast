@@ -145,3 +145,51 @@ fn a_big_stored_file_split_across_volumes_is_copied_in_pieces() {
     assert!(!out2.join("movie.mkv").exists());
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_later_entry_at_the_same_place_waits_for_the_earlier_one() {
+    let dir = tmp("same");
+    let good = noise(5000, 3);
+    // big enough that its worker is still at it when the later copies come up
+    let bad = noise(12 << 20, 4);
+    // the first copy fails its CRC and is removed; the second, at the same place, must survive
+    let entries = vec![
+        (FileSpec::new("dup.bin", &bad), 1),
+        (FileSpec::new("DUP.bin", &good), crc32fast::hash(&good)),
+        (FileSpec::new("dup.bin", &good), crc32fast::hash(&good)),
+    ];
+    let arc = dir.join("t.rar");
+    fs::write(&arc, archive_with(&entries, false)).unwrap();
+    for overwrite in [Overwrite::Skip, Overwrite::Always] {
+        let out = dir.join(format!("out{overwrite:?}"));
+        let s = extract::run(&arc, &Options { overwrite, ..opts(&out, 4) }, |_| {}).unwrap();
+        assert_eq!(s.errors, ["dup.bin: checksum error"], "{overwrite:?}");
+        assert_eq!(fs::read(out.join("dup.bin")).unwrap(), good, "{overwrite:?}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn reports_keep_archive_order_across_files_done_here_and_on_workers() {
+    let dir = tmp("order");
+    let a = noise(3000, 5);
+    let b = noise(3000, 6);
+    let entries = vec![
+        (FileSpec::new("a.bin", &a), 1),
+        (FileSpec::new("../escape.bin", &b), crc32fast::hash(&b)),
+        (FileSpec::new("b.bin", &b), 2),
+    ];
+    let arc = dir.join("t.rar");
+    fs::write(&arc, archive_with(&entries, false)).unwrap();
+    for mode in [Mode::Test, Mode::Extract] {
+        let mut lines = Vec::new();
+        let s =
+            extract::run(&arc, &Options { mode, ..opts(&dir.join("out"), 4) }, |l| lines.push(l.to_string())).unwrap();
+        assert_eq!(s.errors.len(), 3, "{:?}", s.errors);
+        assert!(s.errors[0].starts_with("a.bin: checksum error"), "{:?}", s.errors);
+        assert!(s.errors[1].starts_with("../escape.bin"), "{:?}", s.errors);
+        assert!(s.errors[2].starts_with("b.bin: checksum error"), "{:?}", s.errors);
+        assert_eq!(lines, s.errors);
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
