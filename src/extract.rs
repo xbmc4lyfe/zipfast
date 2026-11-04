@@ -535,8 +535,11 @@ impl<R: FnMut(&str)> Run<'_, R> {
         }
         let rel = if self.opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
         // a file the workers still hold may be written, or removed, at the same place
+        // (a folder on its way to it may still be such a file, too)
         let key = rel.to_string_lossy().to_lowercase();
-        if self.opts.mode == Mode::Extract && self.batch_paths.contains(&key) {
+        if self.opts.mode == Mode::Extract
+            && rel.ancestors().any(|a| self.batch_paths.contains(&a.to_string_lossy().to_lowercase()))
+        {
             self.drain()?;
         }
         if h.is_dir() {
@@ -780,7 +783,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
                 return Err(e.into());
             }
         };
-        let part = batch::stored(&vol.path, h.data_at, h.packed_size, file.as_ref(), p.bytes, self.threads);
+        let part = batch::stored(vol.file(), h.data_at, h.packed_size, file.as_ref(), p.bytes, self.threads);
         let part = match part {
             Ok(part) => part,
             Err(e) => {

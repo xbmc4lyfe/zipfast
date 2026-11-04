@@ -193,3 +193,33 @@ fn reports_keep_archive_order_across_files_done_here_and_on_workers() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_file_under_one_the_workers_still_hold_waits_for_it() {
+    let dir = tmp("parent");
+    let bad = noise(12 << 20, 8);
+    let good = noise(3000, 9);
+    // `a` fails its CRC and is removed, so `a/b` can then make the folder `a`, as on one thread
+    let entries = vec![(FileSpec::new("a", &bad), 1), (FileSpec::new("a/b", &good), crc32fast::hash(&good))];
+    let arc = dir.join("t.rar");
+    fs::write(&arc, archive_with(&entries, false)).unwrap();
+    let out = dir.join("out");
+    let s = extract::run(&arc, &opts(&out, 4), |_| {}).unwrap();
+    assert_eq!(s.errors, ["a: checksum error"]);
+    assert_eq!(fs::read(out.join("a/b")).unwrap(), good);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_big_stored_file_named_like_its_own_archive_is_read_from_the_open_archive() {
+    let dir = tmp("selfname");
+    let data = noise((66 << 20) + 5, 10);
+    let arc = dir.join("same.bin");
+    fs::write(&arc, archive(&[FileSpec::new("same.bin", &data)])).unwrap();
+    // extracting next to the archive replaces its name with the output while the archive is still open
+    let s = extract::run(&arc, &Options { overwrite: Overwrite::Always, ..opts(&dir, 4) }, |_| {}).unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+    assert!(fs::read(&arc).unwrap() == data);
+    let _ = fs::remove_dir_all(&dir);
+}

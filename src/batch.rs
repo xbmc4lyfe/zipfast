@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -241,10 +241,10 @@ fn decode(
     u.finish(sink)
 }
 
-/// Checks (and, given `out`, copies to `out` from `out_at` on) `len` stored bytes at `at` in `volume`, on
+/// Checks (and, given `out`, copies to `out` from `out_at` on) `len` stored bytes at `at` in the open `volume`, on
 /// `threads` threads. Returns the CRC32 of the bytes.
 pub(crate) fn stored(
-    volume: &Path,
+    volume: &File,
     at: u64,
     len: u64,
     out: Option<&File>,
@@ -260,7 +260,6 @@ pub(crate) fn stored(
         for _ in 0..threads.min(pieces).max(1) {
             s.spawn(|| {
                 let result = (|| -> Result<()> {
-                    let file = File::open(volume)?;
                     let mut buf = vec![0u8; PIECE as usize];
                     loop {
                         if stop.load(Ordering::Relaxed) {
@@ -272,7 +271,7 @@ pub(crate) fn stored(
                         }
                         let off = i as u64 * PIECE;
                         let n = PIECE.min(len - off) as usize;
-                        read_at(&file, &mut buf[..n], at + off)?;
+                        read_at(volume, &mut buf[..n], at + off)?;
                         let mut h = crc32fast::Hasher::new();
                         h.update(&buf[..n]);
                         if let Some(out) = out {

@@ -138,6 +138,11 @@ impl Volume {
     }
 
     /// The volume file's length.
+    /// The open volume, for reads by position that leave its own position alone.
+    pub fn file(&self) -> &File {
+        self.file.get_ref()
+    }
+
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {
         self.len
