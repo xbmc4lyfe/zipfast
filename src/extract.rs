@@ -1,4 +1,4 @@
-//! Lists, tests and extracts a RAR 5.0 archive, following its volumes in order.
+//! Lists, tests and extracts a RAR 5.0 archive, following its volumes in order and decoding compressed files.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -9,6 +9,7 @@ use crate::blake2sp::Blake2sp;
 use crate::error::{Error, Result};
 use crate::path::sanitize;
 use crate::rar5::reader::{Block, Volume};
+use crate::rar5::unpack::{Unpacker, window_for};
 use crate::rar5::{FileHeader, Redirection};
 use crate::volume::next_volume;
 
@@ -142,7 +143,7 @@ pub fn list(first: &Path) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
-/// A file whose data runs on into later volumes.
+/// A file being read, whose data may run on into later volumes.
 struct Pending {
     name: String,
     out: Option<File>,
@@ -150,21 +151,27 @@ struct Pending {
     hasher: crc32fast::Hasher,
     /// kept only when the archive stores a BLAKE2sp hash for this file
     blake: Option<Blake2sp>,
+    /// unpacked bytes so far
     bytes: u64,
     /// something already went wrong: read past the rest of it
     failed: bool,
+    /// decoded only to keep a solid stream going: not counted, not written
+    passive: bool,
+    compressed: bool,
 }
 
 impl Pending {
-    fn skipping(name: &str) -> Self {
+    fn new(h: &FileHeader, out: Option<File>, path: Option<PathBuf>) -> Self {
         Pending {
-            name: name.to_string(),
-            out: None,
-            path: None,
-            hasher: Default::default(),
-            blake: None,
+            name: h.name.clone(),
+            out,
+            path,
+            hasher: crc32fast::Hasher::new(),
+            blake: h.blake2sp.map(|_| Blake2sp::new()),
             bytes: 0,
-            failed: true,
+            failed: false,
+            passive: false,
+            compressed: h.method != 0,
         }
     }
 
@@ -176,56 +183,334 @@ impl Pending {
             let _ = fs::remove_file(path);
         }
     }
+
+    /// Where decoded bytes go: the checksums and the output file.
+    fn sink(&mut self) -> impl FnMut(&[u8]) -> Result<()> + '_ {
+        move |chunk: &[u8]| {
+            self.hasher.update(chunk);
+            if let Some(b) = self.blake.as_mut() {
+                b.update(chunk);
+            }
+            if let Some(out) = self.out.as_mut() {
+                out.write_all(chunk)?;
+            }
+            self.bytes += chunk.len() as u64;
+            Ok(())
+        }
+    }
 }
 
-pub fn run(first: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<Summary> {
-    let mut summary = Summary::default();
-    let mut pending: Option<Pending> = None;
-    let mut buf = vec![0u8; BUF];
+struct Run<'a, R: FnMut(&str)> {
+    opts: &'a Options,
+    summary: Summary,
+    pending: Option<Pending>,
+    /// the decoder, kept between files of a solid stream
+    stream: Option<Unpacker>,
+    buf: Vec<u8>,
+    report: R,
+}
+
+pub fn run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Summary> {
     if opts.mode == Mode::Extract {
         fs::create_dir_all(&opts.dest)?;
     }
+    let mut r = Run { opts, summary: Summary::default(), pending: None, stream: None, buf: vec![0u8; BUF], report };
     let walked = walk(first, |vol, block| {
         let Block::File(h) = block else { return Ok(()) };
-        if h.split_before() {
-            match pending.take() {
-                Some(p) if p.name == h.name => {
-                    return continue_file(vol, &h, p, &mut pending, &mut buf, opts, &mut summary, &mut report);
-                }
-                Some(mut p) => {
-                    fail(&mut summary, &mut report, &p.name, "next part is missing");
-                    p.discard();
-                }
-                // the set was opened past the start of this file
-                None => {
-                    summary.skipped += 1;
-                    return Ok(());
-                }
-            }
-        } else if let Some(mut p) = pending.take() {
-            fail(&mut summary, &mut report, &p.name, "next part is missing");
-            p.discard();
-        }
-        start_file(vol, &h, &mut pending, &mut buf, opts, &mut summary, &mut report)
+        r.file_block(vol, &h)
     });
     // whatever stopped the walk, a file left half-written is removed
     let volumes = match walked {
         Ok(v) => v,
         Err(e) => {
-            if let Some(mut p) = pending.take() {
+            if let Some(mut p) = r.pending.take() {
                 p.discard();
             }
-            finish_dirs(&mut summary);
+            finish_dirs(&mut r.summary);
             return Err(e);
         }
     };
-    summary.volumes = volumes;
-    if let Some(mut p) = pending.take() {
-        fail(&mut summary, &mut report, &p.name, "archive ends before this file does");
+    r.summary.volumes = volumes;
+    if let Some(mut p) = r.pending.take() {
+        r.fail(&p.name, "archive ends before this file does");
         p.discard();
     }
-    finish_dirs(&mut summary);
-    Ok(summary)
+    finish_dirs(&mut r.summary);
+    Ok(r.summary)
+}
+
+impl<R: FnMut(&str)> Run<'_, R> {
+    fn fail(&mut self, name: &str, why: &str) {
+        let line = format!("{name}: {why}");
+        (self.report)(&line);
+        self.summary.errors.push(line);
+    }
+
+    fn file_block(&mut self, vol: &mut Volume, h: &FileHeader) -> Result<()> {
+        if h.split_before() {
+            match self.pending.take() {
+                Some(p) if p.name == h.name => return self.continue_file(vol, h, p),
+                Some(mut p) => {
+                    self.fail(&p.name, "next part is missing");
+                    p.discard();
+                    self.stream = None;
+                }
+                // the set was opened past the start of this file
+                None => {
+                    self.summary.skipped += 1;
+                    return Ok(());
+                }
+            }
+        } else if let Some(mut p) = self.pending.take() {
+            self.fail(&p.name, "next part is missing");
+            p.discard();
+            self.stream = None;
+        }
+        self.start_file(vol, h)
+    }
+
+    /// Reads past a file this run won't write. In a solid archive its data is still decoded, since the files
+    /// after it build on it.
+    fn pass_over(&mut self, vol: &mut Volume, h: &FileHeader) -> Result<()> {
+        if vol.main.is_solid() && h.method != 0 && !h.encrypted {
+            let mut p = Pending::new(h, None, None);
+            p.passive = true;
+            return self.begin_decoding(vol, h, p);
+        }
+        if h.split_after() {
+            let mut p = Pending::new(h, None, None);
+            p.failed = true;
+            self.pending = Some(p);
+        }
+        Ok(())
+    }
+
+    fn start_file(&mut self, vol: &mut Volume, h: &FileHeader) -> Result<()> {
+        // an older revision shares the current file's name: only the current one is written, but a test checks all
+        if let Some(v) = h.version
+            && self.opts.mode == Mode::Extract
+        {
+            (self.report)(&format!("{}: older version {v}, skipped", h.name));
+            self.summary.skipped += 1;
+            return self.pass_over(vol, h);
+        }
+        let rel = match sanitize(&h.name, !h.is_unix()) {
+            Ok(rel) => rel,
+            Err(e) => {
+                self.fail(&h.name, &e.to_string());
+                return self.pass_over(vol, h);
+            }
+        };
+        // U+FFFE marks a Unix name holding bytes that aren't UTF-8, mapped into private-use characters
+        if self.opts.mode == Mode::Extract && h.name.contains('\u{FFFE}') {
+            self.fail(&h.name, "the name holds bytes that aren't UTF-8, which isn't supported yet");
+            return self.pass_over(vol, h);
+        }
+        let rel = if self.opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
+        if h.is_dir() {
+            if self.opts.mode == Mode::Extract && !self.opts.flatten {
+                make_dirs(&self.opts.dest, &rel)?;
+                self.summary.dir_meta.push((self.opts.dest.join(&rel), h.clone()));
+            }
+            self.summary.dirs += 1;
+            return Ok(());
+        }
+        let refuse = if h.encrypted {
+            Some("encrypted (passwords are not supported yet)".to_string())
+        } else if h.method != 0 && h.algorithm != 0 {
+            Some("RAR 7 compression is not supported yet".to_string())
+        } else {
+            h.redirection.as_ref().map(|link| format!("links are not supported yet ({link:?})"))
+        };
+        if let Some(why) = refuse {
+            self.fail(&h.name, &why);
+            return self.pass_over(vol, h);
+        }
+
+        let (out, path) = if self.opts.mode == Mode::Extract {
+            let target = self.opts.dest.join(&rel);
+            if let Some(parent) = rel.parent() {
+                make_dirs(&self.opts.dest, parent)?;
+            }
+            match fs::symlink_metadata(&target) {
+                Ok(_) if self.opts.overwrite == Overwrite::Skip => {
+                    (self.report)(&format!("{}: exists, skipped", h.name));
+                    self.summary.skipped += 1;
+                    return self.pass_over(vol, h);
+                }
+                Ok(meta) if meta.is_dir() => {
+                    self.fail(&h.name, "a folder is in the way");
+                    return self.pass_over(vol, h);
+                }
+                // removing first means a link left at the target is replaced, never written through
+                Ok(_) => fs::remove_file(&target)?,
+                Err(_) => {}
+            }
+            let file = OpenOptions::new().write(true).create_new(true).open(&target)?;
+            if h.unpacked_size > 0 && !h.size_unknown() {
+                // one allocation up front keeps a big file in few extents; failure here is harmless
+                let _ = file.set_len(h.unpacked_size);
+            }
+            (Some(file), Some(target))
+        } else {
+            (None, None)
+        };
+        let p = Pending::new(h, out, path);
+        self.begin_decoding(vol, h, p)
+    }
+
+    /// Sets the decoder up for a compressed file, then reads its first part.
+    fn begin_decoding(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending) -> Result<()> {
+        if h.method != 0 {
+            let size = (!h.size_unknown()).then_some(h.unpacked_size);
+            let solid_archive = vol.main.is_solid();
+            let ready = if h.solid {
+                match self.stream.as_mut() {
+                    Some(u) if h.dictionary <= u.window_size() => {
+                        u.next_file(size);
+                        Ok(())
+                    }
+                    _ => Err("needs the files before it in this solid archive, which weren't decoded".to_string()),
+                }
+            } else {
+                match window_for(h.dictionary, size, solid_archive) {
+                    Ok(window) => match self.stream.as_mut().filter(|u| u.window_size() == window) {
+                        Some(u) => {
+                            u.reset(size);
+                            Ok(())
+                        }
+                        None => Unpacker::new(window).map(|mut u| {
+                            u.reset(size);
+                            self.stream = Some(u);
+                        }),
+                    }
+                    .map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                }
+            };
+            if let Err(why) = ready {
+                if !p.passive {
+                    self.fail(&h.name, &why);
+                }
+                p.discard();
+                self.stream = None;
+            }
+        }
+        self.continue_file(vol, h, p)
+    }
+
+    /// Reads this volume's part of a file and, at its last part, checks and finishes it.
+    fn continue_file(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending) -> Result<()> {
+        let split_after = h.split_after();
+        if p.failed {
+            if split_after {
+                self.pending = Some(p);
+            }
+            return Ok(());
+        }
+        if (h.method != 0) != p.compressed || h.encrypted {
+            if !p.passive {
+                self.fail(&p.name, "a later part is packed differently");
+            }
+            p.discard();
+            self.stream = None;
+            if split_after {
+                self.pending = Some(p);
+            }
+            return Ok(());
+        }
+        // a part's checksums cover only its own packed bytes
+        let mut part = crc32fast::Hasher::new();
+        let mut part_blake = h.blake2sp.filter(|_| split_after).map(|_| Blake2sp::new());
+        let mut buf = std::mem::take(&mut self.buf);
+        let mut stream = if p.compressed { self.stream.take() } else { None };
+        let read = vol.read_data(h.data_at, h.packed_size, &mut buf, |chunk| {
+            if split_after {
+                part.update(chunk);
+                if let Some(b) = part_blake.as_mut() {
+                    b.update(chunk);
+                }
+            }
+            match stream.as_mut() {
+                Some(u) => u.feed(chunk, &mut p.sink()),
+                None => p.sink()(chunk),
+            }
+        });
+        self.buf = buf;
+        // a decoder error is this file's problem; an archive read error ends the run
+        let decoded = match read {
+            Ok(()) if !split_after => match stream.as_mut() {
+                Some(u) => u.finish(&mut p.sink()),
+                None => Ok(()),
+            },
+            Ok(()) => Ok(()),
+            Err(e @ (Error::Corrupt(_) | Error::Unsupported(_))) if p.compressed => Err(e),
+            Err(e) => {
+                p.discard();
+                return Err(e);
+            }
+        };
+        if let Err(e) = decoded {
+            if !p.passive {
+                self.fail(&p.name, &e.to_string());
+            }
+            p.discard();
+            // the stream's state is lost with it
+            if split_after {
+                self.pending = Some(p);
+            }
+            return Ok(());
+        }
+        self.stream = stream.or(self.stream.take());
+        if split_after {
+            let crc_bad = h.crc32.is_some_and(|want| part.finalize() != want);
+            let blake_bad = h.blake2sp.zip(part_blake).is_some_and(|(want, got)| got.finish() != want);
+            if crc_bad || blake_bad {
+                if !p.passive {
+                    self.fail(&p.name, "checksum error in a volume's part");
+                }
+                p.discard();
+                if p.compressed {
+                    self.stream = None;
+                }
+            }
+            self.pending = Some(p);
+            return Ok(());
+        }
+        let crc_bad = h.crc32.is_some_and(|want| p.hasher.clone().finalize() != want);
+        let blake_bad = match (h.blake2sp, p.blake.take()) {
+            (Some(want), Some(got)) => got.finish() != want,
+            // a hash that only the last part states can't be checked from here: say so rather than pass it
+            (Some(_), None) if h.crc32.is_none() => {
+                if !p.passive {
+                    self.fail(&p.name, "its BLAKE2sp hash starts only in a later part, so it can't be checked");
+                }
+                p.discard();
+                return Ok(());
+            }
+            _ => false,
+        };
+        if p.passive {
+            return Ok(());
+        }
+        if crc_bad || blake_bad {
+            self.fail(&p.name, "checksum error");
+            p.discard();
+            return Ok(());
+        }
+        // a matching checksum doesn't vouch for the size the header states
+        if !h.size_unknown() && p.bytes != h.unpacked_size {
+            self.fail(&p.name, &format!("{} bytes where the header says {}", p.bytes, h.unpacked_size));
+            p.discard();
+            return Ok(());
+        }
+        if let Some(out) = p.out.take() {
+            finish_file(&out, h);
+        }
+        self.summary.files += 1;
+        self.summary.bytes += p.bytes;
+        Ok(())
+    }
 }
 
 /// Restores folders' permissions and times, deepest first, after their contents are written: a read-only folder
@@ -249,206 +534,6 @@ fn finish_dirs(summary: &mut Summary) {
     }
     #[cfg(not(unix))]
     let _ = dirs;
-}
-
-fn fail(summary: &mut Summary, report: &mut impl FnMut(&str), name: &str, why: &str) {
-    let line = format!("{name}: {why}");
-    report(&line);
-    summary.errors.push(line);
-}
-
-#[allow(clippy::too_many_arguments)]
-fn start_file(
-    vol: &mut Volume,
-    h: &FileHeader,
-    pending: &mut Option<Pending>,
-    buf: &mut [u8],
-    opts: &Options,
-    summary: &mut Summary,
-    report: &mut impl FnMut(&str),
-) -> Result<()> {
-    let skip_rest = |pending: &mut Option<Pending>| {
-        if h.split_after() {
-            *pending = Some(Pending::skipping(&h.name));
-        }
-    };
-    // an older revision shares the current file's name: only the current one is written, but a test checks all
-    if let Some(v) = h.version
-        && opts.mode == Mode::Extract
-    {
-        report(&format!("{}: older version {v}, skipped", h.name));
-        summary.skipped += 1;
-        skip_rest(pending);
-        return Ok(());
-    }
-    let rel = match sanitize(&h.name, !h.is_unix()) {
-        Ok(rel) => rel,
-        Err(e) => {
-            fail(summary, report, &h.name, &e.to_string());
-            skip_rest(pending);
-            return Ok(());
-        }
-    };
-    // U+FFFE marks a Unix name holding bytes that aren't UTF-8, mapped into private-use characters
-    if opts.mode == Mode::Extract && h.name.contains('\u{FFFE}') {
-        fail(summary, report, &h.name, "the name holds bytes that aren't UTF-8, which isn't supported yet");
-        skip_rest(pending);
-        return Ok(());
-    }
-    let rel = if opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
-    if h.is_dir() {
-        if opts.mode == Mode::Extract && !opts.flatten {
-            make_dirs(&opts.dest, &rel)?;
-            summary.dir_meta.push((opts.dest.join(&rel), h.clone()));
-        }
-        summary.dirs += 1;
-        return Ok(());
-    }
-    let refuse = if h.encrypted {
-        Some("encrypted (passwords are not supported yet)".to_string())
-    } else if h.method != 0 {
-        Some(format!("compression method {} is not supported yet", h.method))
-    } else {
-        h.redirection.as_ref().map(|link| format!("links are not supported yet ({link:?})"))
-    };
-    if let Some(why) = refuse {
-        fail(summary, report, &h.name, &why);
-        skip_rest(pending);
-        return Ok(());
-    }
-
-    let (out, path) = if opts.mode == Mode::Extract {
-        let target = opts.dest.join(&rel);
-        if let Some(parent) = rel.parent() {
-            make_dirs(&opts.dest, parent)?;
-        }
-        match fs::symlink_metadata(&target) {
-            Ok(_) if opts.overwrite == Overwrite::Skip => {
-                report(&format!("{}: exists, skipped", h.name));
-                summary.skipped += 1;
-                skip_rest(pending);
-                return Ok(());
-            }
-            // removing first means a link left at the target is replaced, never written through
-            Ok(meta) if meta.is_dir() => {
-                fail(summary, report, &h.name, "a folder is in the way");
-                skip_rest(pending);
-                return Ok(());
-            }
-            Ok(_) => fs::remove_file(&target)?,
-            Err(_) => {}
-        }
-        let file = OpenOptions::new().write(true).create_new(true).open(&target)?;
-        if h.unpacked_size > 0 && !h.size_unknown() {
-            // one allocation up front keeps a big file in few extents; failure here is harmless
-            let _ = file.set_len(h.unpacked_size);
-        }
-        (Some(file), Some(target))
-    } else {
-        (None, None)
-    };
-    let p = Pending {
-        name: h.name.clone(),
-        out,
-        path,
-        hasher: crc32fast::Hasher::new(),
-        blake: h.blake2sp.map(|_| Blake2sp::new()),
-        bytes: 0,
-        failed: false,
-    };
-    continue_file(vol, h, p, pending, buf, opts, summary, report)
-}
-
-/// Copies this volume's part of a stored file and, at its last part, checks and finishes it.
-#[allow(clippy::too_many_arguments)]
-fn continue_file(
-    vol: &mut Volume,
-    h: &FileHeader,
-    mut p: Pending,
-    pending: &mut Option<Pending>,
-    buf: &mut [u8],
-    _opts: &Options,
-    summary: &mut Summary,
-    report: &mut impl FnMut(&str),
-) -> Result<()> {
-    if p.failed {
-        if h.split_after() {
-            *pending = Some(p);
-        }
-        return Ok(());
-    }
-    if h.method != 0 || h.encrypted {
-        fail(summary, report, &p.name, "a later part is packed differently");
-        p.discard();
-        if h.split_after() {
-            *pending = Some(p);
-        }
-        return Ok(());
-    }
-    let split_after = h.split_after();
-    let mut part = crc32fast::Hasher::new();
-    let mut part_blake = h.blake2sp.filter(|_| split_after).map(|_| Blake2sp::new());
-    let read = vol.read_data(h.data_at, h.packed_size, buf, |chunk| {
-        p.hasher.update(chunk);
-        if let Some(b) = p.blake.as_mut() {
-            b.update(chunk);
-        }
-        if split_after {
-            part.update(chunk);
-            if let Some(b) = part_blake.as_mut() {
-                b.update(chunk);
-            }
-        }
-        if let Some(out) = p.out.as_mut() {
-            out.write_all(chunk)?;
-        }
-        Ok(())
-    });
-    if let Err(e) = read {
-        p.discard();
-        return Err(e);
-    }
-    p.bytes += h.packed_size;
-    if split_after {
-        // a part's checksums cover only its own packed bytes
-        let crc_bad = h.crc32.is_some_and(|want| part.finalize() != want);
-        let blake_bad = h.blake2sp.zip(part_blake).is_some_and(|(want, got)| got.finish() != want);
-        if crc_bad || blake_bad {
-            fail(summary, report, &p.name, "checksum error in a volume's part");
-            p.discard();
-        }
-        *pending = Some(p);
-        return Ok(());
-    }
-    let crc_bad = h.crc32.is_some_and(|want| p.hasher.clone().finalize() != want);
-    let blake_bad = match (h.blake2sp, p.blake.take()) {
-        (Some(want), Some(got)) => got.finish() != want,
-        // a hash that only the last part states can't be checked from here: say so rather than pass it
-        (Some(_), None) if h.crc32.is_none() => {
-            fail(summary, report, &p.name, "its BLAKE2sp hash starts only in a later part, so it can't be checked");
-            p.discard();
-            return Ok(());
-        }
-        _ => false,
-    };
-    if crc_bad || blake_bad {
-        fail(summary, report, &p.name, "checksum error");
-        p.discard();
-        return Ok(());
-    }
-    // a matching checksum doesn't vouch for the size the header states
-    if !h.size_unknown() && p.bytes != h.unpacked_size {
-        let why = format!("{} bytes where the header says {}", p.bytes, h.unpacked_size);
-        fail(summary, report, &p.name, &why);
-        p.discard();
-        return Ok(());
-    }
-    if let Some(out) = p.out.take() {
-        finish_file(&out, h);
-    }
-    summary.files += 1;
-    summary.bytes += p.bytes;
-    Ok(())
 }
 
 /// Times and permissions, best effort: a file system that can't keep them still gets the data.

@@ -2,6 +2,9 @@
 //! headers with their extra records, and the end of archive header.
 
 pub mod reader;
+#[doc(hidden)]
+pub mod testenc;
+pub mod unpack;
 
 use crate::error::{Error, Result};
 
