@@ -109,16 +109,23 @@ impl Batch {
         while self.next - self.applied >= 4 * self.workers as u64
             || (self.next > self.applied && self.bytes + weight > BYTES_IN_FLIGHT)
         {
-            self.take_one(apply)?;
+            if let Err(e) = self.take_one(apply) {
+                discard(job);
+                return Err(e);
+            }
         }
-        self.bytes += weight;
         let seq = self.next;
-        self.next += 1;
-        let sent = self.tx.as_ref().is_some_and(|tx| tx.send((seq, job)).is_ok());
-        if !sent {
+        let Some(tx) = self.tx.as_ref() else {
+            discard(job);
+            return Err(Error::Io(std::io::Error::other("file workers stopped")));
+        };
+        if let Err(mpsc::SendError((_, job))) = tx.send((seq, job)) {
             // every worker is gone; can't happen while one is alive
+            discard(job);
             return Err(Error::Io(std::io::Error::other("file workers stopped")));
         }
+        self.bytes += weight;
+        self.next += 1;
         Ok(())
     }
 
@@ -150,6 +157,14 @@ impl Drop for Batch {
         for h in self.handles.drain(..) {
             let _ = h.join();
         }
+    }
+}
+
+/// Drops a job no worker will see, removing the file opened for it.
+fn discard(job: Job) {
+    if let Some((file, path)) = job.out {
+        drop(file);
+        let _ = std::fs::remove_file(path);
     }
 }
 
