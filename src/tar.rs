@@ -18,15 +18,23 @@ const BLOCK: usize = 512;
 const BUF: usize = 4 << 20;
 /// The longest name, link target or pax record set taken from an extension record.
 const MAX_EXT: u64 = 1 << 20;
+/// The most zero bytes an empty archive is taken to be: GNU tar pads one to 10 KiB, other writers to whole
+/// records of up to this much.
+const EMPTY_MAX: usize = 1 << 20;
 
 /// Whether the file starts with a gzip member.
 pub fn sniff_gzip(head: &[u8]) -> bool {
     head.len() >= 3 && head[..3] == [0x1f, 0x8b, 8]
 }
 
-/// Whether the file starts with a tar header: a block whose checksum adds up.
+/// Whether the file starts with a tar header: a block whose checksum adds up, or the two zero blocks that make an
+/// empty archive.
 pub fn sniff_tar(head: &[u8]) -> bool {
-    head.len() >= BLOCK && checksum_ok(&head[..BLOCK])
+    (head.len() >= BLOCK && checksum_ok(&head[..BLOCK])) || (head.len() >= 2 * BLOCK && zero(&head[..2 * BLOCK]))
+}
+
+fn zero(b: &[u8]) -> bool {
+    b.iter().all(|&b| b == 0)
 }
 
 /// The header checksum: every byte of the block added up, with the checksum field counted as spaces. Old writers
@@ -308,15 +316,15 @@ fn parse_time(v: &[u8]) -> Option<(i64, u32)> {
 /// What the archive turned out to hold.
 enum Content {
     Tar,
-    /// one gzip-compressed file; the first block of its data is in the reader's buffer
+    /// one gzip-compressed file; the start of its data is in the reader's buffer
     Single,
 }
 
 struct Reader {
     src: Source,
     content: Content,
-    /// the first block, read to tell tar from a lone compressed file
-    first: Option<([u8; BLOCK], usize)>,
+    /// the start of the data, read to tell tar from a lone compressed file: one header block for tar
+    first: Option<Vec<u8>>,
     /// data and padding of the current member not read yet
     unread: u64,
     global: Pax,
@@ -326,30 +334,39 @@ struct Reader {
 impl Reader {
     fn open(path: &Path) -> Result<Reader> {
         let (mut src, gzip) = Source::open(path)?;
-        let mut block = [0u8; BLOCK];
-        let n = src.read(&mut block)?;
-        let content = if n == BLOCK && checksum_ok(&block) {
-            Content::Tar
+        let mut first = vec![0u8; BLOCK];
+        let n = src.read(&mut first)?;
+        first.truncate(n);
+        let mut content = if n == BLOCK && checksum_ok(&first) {
+            Some(Content::Tar)
         } else if gzip {
-            Content::Single
+            Some(Content::Single)
         } else {
-            return Err(Error::NotAnArchive);
+            None
         };
-        Ok(Reader {
-            src,
-            content,
-            first: Some((block, n)),
-            unread: 0,
-            global: Pax::default(),
-            scratch: vec![0; 64 << 10],
-        })
+        if n == BLOCK && zero(&first) {
+            // an empty archive is zero blocks and nothing else; a compressed file that only starts with zeros is
+            // a file
+            first.resize(EMPTY_MAX + 1, 0);
+            let more = src.read(&mut first[BLOCK..])?;
+            first.truncate(BLOCK + more);
+            let len = first.len();
+            if (2 * BLOCK..=EMPTY_MAX).contains(&len) && len.is_multiple_of(BLOCK) && zero(&first) {
+                content = Some(Content::Tar);
+                // nothing is left for the first header: the archive ends at once
+                first.clear();
+            }
+        }
+        let Some(content) = content else { return Err(Error::NotAnArchive) };
+        Ok(Reader { src, content, first: Some(first), unread: 0, global: Pax::default(), scratch: vec![0; 64 << 10] })
     }
 
     /// The next header block, or None at the end of the archive: a zero block, or the end of the data exactly at
     /// a block boundary (some writers leave out the end marker).
     fn header_block(&mut self) -> Result<Option<[u8; BLOCK]>> {
-        if let Some((block, _)) = self.first.take() {
-            return Ok(Some(block));
+        if let Some(first) = self.first.take() {
+            // an empty archive leaves nothing here
+            return Ok(first.as_slice().try_into().ok());
         }
         let mut block = [0u8; BLOCK];
         match self.src.read(&mut block)? {
@@ -425,6 +442,10 @@ impl Reader {
             let name = p.path.clone().or(long_name).unwrap_or_else(|| name_of(&name));
             let link = p.linkpath.clone().or(long_link).unwrap_or_else(|| name_of(text(&h[157..257])));
             let size = p.size.unwrap_or(size);
+            // the size with its padding has to be a number too
+            if size > u64::MAX - BLOCK as u64 {
+                return Err(Error::Corrupt("a tar member's size is impossible"));
+            }
             let (mtime, nanos) = match p.mtime {
                 Some((s, n)) => (Some(s), n),
                 None => (number(&h[136..148]), 0),
@@ -474,9 +495,11 @@ impl Reader {
     /// The whole data of a lone compressed file, starting with the block read when the archive was opened.
     fn read_single(&mut self, buf: &mut [u8], sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<u64> {
         let mut total = 0u64;
-        if let Some((block, n)) = self.first.take() {
-            sink(&block[..n])?;
-            total += n as u64;
+        if let Some(first) = self.first.take() {
+            if !first.is_empty() {
+                sink(&first)?;
+            }
+            total += first.len() as u64;
         }
         loop {
             let got = self.src.read(buf)?;
@@ -494,35 +517,44 @@ fn padding(size: u64) -> u64 {
 }
 
 /// The name a lone compressed file comes out as: the one in its gzip header, or the archive's own name without
-/// its gzip ending.
+/// its gzip ending. Either is cleaned the way a member's name is, and only its last part is kept: a stored name is
+/// a file name, never a place to write to.
 fn single_name(reader: &Reader, path: &Path) -> String {
-    if let Some(stored) = reader.src.gzip_name() {
-        // only the last part: a stored name is a file name, never a place to write to
-        if let Some(last) = stored.rsplit(['/', '\\']).find(|s| !s.is_empty() && *s != "." && *s != "..") {
-            return last.to_string();
-        }
+    let clean = |name: &str| {
+        let last = name.rsplit(['/', '\\']).find(|s| !s.is_empty() && *s != "." && *s != "..")?;
+        // as a Windows name, so a drive prefix such as "C:" can't take the path out of the destination
+        let rel = sanitize(last, true).ok()?;
+        Some(rel.file_name()?.to_string_lossy().into_owned())
+    };
+    if let Some(name) = reader.src.gzip_name().as_deref().and_then(clean) {
+        return name;
     }
+    single_fallback(path, &clean)
+}
+
+fn single_fallback(path: &Path, clean: &dyn Fn(&str) -> Option<String>) -> String {
     let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     let lower = file.to_ascii_lowercase();
     if lower.ends_with(".tgz") {
-        return format!("{}.tar", &file[..file.len() - 4]);
+        return clean(&format!("{}.tar", &file[..file.len() - 4])).unwrap_or_else(|| "file".to_string());
     }
     for ending in [".gz", ".gzip", ".z"] {
         if lower.ends_with(ending) && lower.len() > ending.len() {
-            return file[..file.len() - ending.len()].to_string();
+            return clean(&file[..file.len() - ending.len()]).unwrap_or_else(|| "file".to_string());
         }
     }
-    format!("{file}.out")
+    clean(&format!("{file}.out")).unwrap_or_else(|| "file".to_string())
 }
 
-/// The archive's members. A lone compressed file is listed with its size from the gzip trailer, which is exact
-/// only below 4 GiB.
+/// The archive's members. A lone compressed file is decoded to find its size: the gzip trailer holds only the
+/// last member's size, and only below 4 GiB.
 pub fn list(path: &Path) -> Result<Vec<Entry>> {
     let mut reader = Reader::open(path)?;
     if let Content::Single = reader.content {
-        let size = gzip_trailer_size(path).unwrap_or(0);
         let packed = std::fs::metadata(path)?.len();
         let name = single_name(&reader, path);
+        let mut buf = vec![0u8; BUF];
+        let size = reader.read_single(&mut buf, &mut |_| Ok(()))?;
         return Ok(vec![Entry {
             name,
             size,
@@ -543,18 +575,6 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
         }
     }
     Ok(out)
-}
-
-fn gzip_trailer_size(path: &Path) -> Option<u64> {
-    let mut f = File::open(path).ok()?;
-    let len = f.metadata().ok()?.len();
-    if len < 18 {
-        return None;
-    }
-    f.seek(io::SeekFrom::Start(len - 4)).ok()?;
-    let mut b = [0u8; 4];
-    f.read_exact(&mut b).ok()?;
-    Some(u32::from_le_bytes(b) as u64)
 }
 
 pub fn run(path: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<Summary> {

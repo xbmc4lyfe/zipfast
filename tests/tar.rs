@@ -214,13 +214,31 @@ fn a_lone_gzip_file_comes_out_under_its_stored_or_archive_name() {
     assert!(s.errors.is_empty(), "{:?}", s.errors);
     assert_eq!(fs::read(out.join("stored.txt")).unwrap(), b"named");
 
-    // two members back to back are one file
+    // two members back to back are one file, listed with the size of both
     let mut two = gzip(b"first ");
     two.extend_from_slice(&gzip(b"second"));
     let archive = dir.join("two.txt.gz");
     fs::write(&archive, two).unwrap();
+    assert_eq!(extract::list(&archive).unwrap()[0].size, 12);
     extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
     assert_eq!(fs::read(out.join("two.txt")).unwrap(), b"first second");
+
+    // a stored name with a drive prefix stays inside the destination
+    let mut enc = flate2::GzBuilder::new().filename("C:escaped.txt").write(Vec::new(), Compression::fast());
+    enc.write_all(b"drive").unwrap();
+    let archive = dir.join("drive.gz");
+    fs::write(&archive, enc.finish().unwrap()).unwrap();
+    let s = extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
+    assert!(s.errors.is_empty(), "{:?}", s.errors);
+    assert_eq!(fs::read(out.join("C_escaped.txt")).unwrap(), b"drive");
+
+    // a file that only starts with zero bytes is still a file, not an empty archive
+    let mut zeros = vec![0u8; 4096];
+    zeros.extend_from_slice(b"tail");
+    let archive = dir.join("zeros.bin.gz");
+    fs::write(&archive, gzip(&zeros)).unwrap();
+    extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
+    assert_eq!(fs::read(out.join("zeros.bin")).unwrap(), zeros);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -323,5 +341,36 @@ fn a_size_past_eight_gib_is_read_from_the_base_256_field() {
     let s = extract::run(&archive, &opts(Mode::Test, &dir), |_| {}).unwrap();
     assert_eq!(s.errors.len(), 1);
     assert!(s.errors[0].contains("truncated"), "{:?}", s.errors);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn an_empty_archive_reads_as_empty() {
+    let dir = tmp("empty");
+    // GNU tar pads an empty archive to one 10 KiB record
+    let empty = vec![0u8; 10240];
+    for (name, bytes) in [("e.tar", empty.clone()), ("e.tar.gz", gzip(&empty))] {
+        let archive = dir.join(name);
+        fs::write(&archive, bytes).unwrap();
+        assert!(extract::list(&archive).unwrap().is_empty(), "{name}");
+        let out = dir.join(format!("out-{name}"));
+        let s = extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
+        assert!(s.errors.is_empty(), "{name}: {:?}", s.errors);
+        assert_eq!((s.files, s.dirs), (0, 0), "{name}");
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 0, "{name}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_pax_size_with_no_room_for_padding_is_refused() {
+    let dir = tmp("paxsize");
+    let tar = Tar::default().pax(&[("size", "18446744073709551615")], "huge", b"").end();
+    let archive = dir.join("p.tar");
+    fs::write(&archive, tar).unwrap();
+    assert!(extract::list(&archive).is_err());
+    let s = extract::run(&archive, &opts(Mode::Test, &dir), |_| {}).unwrap();
+    assert_eq!(s.files, 0);
+    assert_eq!(s.errors.len(), 1, "{:?}", s.errors);
     let _ = fs::remove_dir_all(&dir);
 }

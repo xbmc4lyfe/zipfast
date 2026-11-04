@@ -177,7 +177,7 @@ enum Format {
 }
 
 fn sniff(path: &Path) -> Result<Format> {
-    let mut head = [0u8; 512];
+    let mut head = [0u8; 1024];
     let n = crate::tar::read_full(&mut File::open(path)?, &mut head)?;
     let head = &head[..n];
     Ok(if crate::zip::sniff(head) {
