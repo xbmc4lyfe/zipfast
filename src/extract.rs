@@ -171,7 +171,7 @@ fn walk(first: &Path, mut on_block: impl FnMut(&mut Volume, Block) -> Result<()>
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Format {
     Zip,
-    /// tar, gzip-compressed tar, or a lone gzip-compressed file
+    /// tar, plain or compressed, or a lone compressed file
     Tar,
     Other,
 }
@@ -182,7 +182,7 @@ fn sniff(path: &Path) -> Result<Format> {
     let head = &head[..n];
     Ok(if crate::zip::sniff(head) {
         Format::Zip
-    } else if crate::tar::sniff_gzip(head) || crate::tar::sniff_tar(head) {
+    } else if crate::stream::Codec::sniff(head).is_some() || crate::tar::sniff_tar(head) {
         Format::Tar
     } else {
         Format::Other
