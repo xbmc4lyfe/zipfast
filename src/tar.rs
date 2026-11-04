@@ -1,17 +1,17 @@
-//! tar archives, read from the POSIX ustar and pax layouts plus GNU's long-name records, either plain or inside
-//! gzip. A gzip file that holds no tar archive is one compressed file, and comes out as that file.
+//! tar archives, read from the POSIX ustar and pax layouts plus GNU's long-name records, either plain or inside a
+//! gzip, xz, zstd or bzip2 stream. A compressed stream that holds no tar archive is one file, and comes out as that
+//! file.
 
 use std::fs::File;
 use std::io::{self, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
-
-use flate2::bufread::MultiGzDecoder;
 
 use crate::error::{Error, Result};
 use crate::extract::{Entry, Meta, Mode, Options, Summary, Target, finish_dirs, finish_file, make_dirs, open_target};
 use crate::output::Output;
 use crate::path::sanitize;
 use crate::rar5::Redirection;
+use crate::stream::{self, Codec};
 
 const BLOCK: usize = 512;
 /// Bytes moved per read.
@@ -21,11 +21,6 @@ const MAX_EXT: u64 = 1 << 20;
 /// The most zero bytes an empty archive is taken to be: GNU tar pads one to 10 KiB, other writers to whole
 /// records of up to this much.
 const EMPTY_MAX: usize = 1 << 20;
-
-/// Whether the file starts with a gzip member.
-pub fn sniff_gzip(head: &[u8]) -> bool {
-    head.len() >= 3 && head[..3] == [0x1f, 0x8b, 8]
-}
 
 /// Whether the file starts with a tar header: a block whose checksum adds up, or the two zero blocks that make an
 /// empty archive.
@@ -96,26 +91,25 @@ fn name_of(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Where the archive's bytes come from: the file itself, which can be skipped through, or a gzip stream, which
-/// has to be read.
+/// Where the archive's bytes come from: the file itself, which can be skipped through, or a compressed stream,
+/// which has to be read.
 enum Source {
     Plain { r: BufReader<File>, len: u64, pos: u64 },
-    Gzip(Box<MultiGzDecoder<BufReader<File>>>),
+    Packed(Box<dyn Read>, Codec),
 }
 
 impl Source {
-    fn open(path: &Path) -> Result<(Source, bool)> {
+    fn open(path: &Path, threads: usize) -> Result<Source> {
         let mut file = File::open(path)?;
-        let mut head = [0u8; 3];
+        let mut head = [0u8; 6];
         let n = read_full(&mut file, &mut head)?;
         file.rewind()?;
         let len = file.metadata()?.len();
         let r = BufReader::with_capacity(1 << 20, file);
-        if sniff_gzip(&head[..n]) {
-            Ok((Source::Gzip(Box::new(MultiGzDecoder::new(r))), true))
-        } else {
-            Ok((Source::Plain { r, len, pos: 0 }, false))
-        }
+        Ok(match Codec::sniff(&head[..n]) {
+            Some(codec) => Source::Packed(codec.open(r, threads).map_err(read_error)?, codec),
+            None => Source::Plain { r, len, pos: 0 },
+        })
     }
 
     /// Fills `buf` unless the stream ends first; returns how much was read.
@@ -126,7 +120,7 @@ impl Source {
                 *pos += n as u64;
                 n
             }
-            Source::Gzip(g) => read_full(g, buf).map_err(read_error)?,
+            Source::Packed(r, _) => read_full(r, buf).map_err(read_error)?,
         };
         Ok(n)
     }
@@ -142,7 +136,7 @@ impl Source {
                 *pos += n;
                 Ok(())
             }
-            Source::Gzip(_) => {
+            Source::Packed(..) => {
                 let mut left = n;
                 while left > 0 {
                     let want = left.min(buf.len() as u64) as usize;
@@ -157,10 +151,9 @@ impl Source {
         }
     }
 
-    /// The name stored in the gzip header, once the header has been read.
-    fn gzip_name(&self) -> Option<String> {
+    fn codec(&self) -> Option<Codec> {
         match self {
-            Source::Gzip(g) => g.header().and_then(|h| h.filename()).map(name_of),
+            Source::Packed(_, c) => Some(*c),
             Source::Plain { .. } => None,
         }
     }
@@ -179,12 +172,14 @@ pub(crate) fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> 
     Ok(n)
 }
 
-/// A failed read of the archive. Damaged compressed data is the archive's fault; anything else is the disk's.
+/// A failed read of the archive. The decoders report damage in different ways, so anything but a failure of the
+/// disk itself counts as damage.
 fn read_error(e: io::Error) -> Error {
     match e.kind() {
         io::ErrorKind::UnexpectedEof => Error::Truncated,
-        io::ErrorKind::InvalidData | io::ErrorKind::InvalidInput => Error::Corrupt("compressed data is damaged"),
-        _ => Error::Io(e),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound | io::ErrorKind::Interrupted => Error::Io(e),
+        _ if e.raw_os_error().is_some() => Error::Io(e),
+        _ => Error::Corrupt("compressed data is damaged"),
     }
 }
 
@@ -316,7 +311,7 @@ fn parse_time(v: &[u8]) -> Option<(i64, u32)> {
 /// What the archive turned out to hold.
 enum Content {
     Tar,
-    /// one gzip-compressed file; the start of its data is in the reader's buffer
+    /// one compressed file; the start of its data is in the reader's buffer
     Single,
 }
 
@@ -332,14 +327,14 @@ struct Reader {
 }
 
 impl Reader {
-    fn open(path: &Path) -> Result<Reader> {
-        let (mut src, gzip) = Source::open(path)?;
+    fn open(path: &Path, threads: usize) -> Result<Reader> {
+        let mut src = Source::open(path, threads)?;
         let mut first = vec![0u8; BLOCK];
         let n = src.read(&mut first)?;
         first.truncate(n);
         let mut content = if n == BLOCK && checksum_ok(&first) {
             Some(Content::Tar)
-        } else if gzip {
+        } else if src.codec().is_some() {
             Some(Content::Single)
         } else {
             None
@@ -499,7 +494,7 @@ impl Reader {
         Ok(())
     }
 
-    /// Reads to the end of the stream, so that every gzip member's checksum is checked.
+    /// Reads to the end of the stream, so that every checksum in it is checked.
     fn drain(&mut self, buf: &mut [u8]) -> Result<()> {
         while self.src.read(buf)? > 0 {}
         Ok(())
@@ -530,51 +525,51 @@ fn padding(size: u64) -> u64 {
 }
 
 /// The name a lone compressed file comes out as: the one in its gzip header, or the archive's own name without
-/// its gzip ending. Either is cleaned the way a member's name is, and only its last part is kept: a stored name is
-/// a file name, never a place to write to.
-fn single_name(reader: &Reader, path: &Path) -> String {
+/// its compression ending. Either is cleaned the way a member's name is, and only its last part is kept: a stored
+/// name is a file name, never a place to write to.
+fn single_name(codec: Codec, path: &Path) -> String {
     let clean = |name: &str| {
         let last = name.rsplit(['/', '\\']).find(|s| !s.is_empty() && *s != "." && *s != "..")?;
         // as a Windows name, so a drive prefix such as "C:" can't take the path out of the destination
         let rel = sanitize(last, true).ok()?;
         Some(rel.file_name()?.to_string_lossy().into_owned())
     };
-    if let Some(name) = reader.src.gzip_name().as_deref().and_then(clean) {
+    if codec == Codec::Gzip
+        && let Some(name) = stream::gzip_name(path).as_deref().and_then(clean)
+    {
         return name;
     }
-    single_fallback(path, &clean)
+    single_fallback(codec, path, &clean)
 }
 
-fn single_fallback(path: &Path, clean: &dyn Fn(&str) -> Option<String>) -> String {
+fn single_fallback(codec: Codec, path: &Path, clean: &dyn Fn(&str) -> Option<String>) -> String {
     let file = path.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_default();
     let lower = file.to_ascii_lowercase();
-    if lower.ends_with(".tgz") {
-        return clean(&format!("{}.tar", &file[..file.len() - 4])).unwrap_or_else(|| "file".to_string());
-    }
-    for ending in [".gz", ".gzip", ".z"] {
+    for (ending, becomes) in codec.endings() {
         if lower.ends_with(ending) && lower.len() > ending.len() {
-            return clean(&file[..file.len() - ending.len()]).unwrap_or_else(|| "file".to_string());
+            let stem = format!("{}{becomes}", &file[..file.len() - ending.len()]);
+            return clean(&stem).unwrap_or_else(|| "file".to_string());
         }
     }
     clean(&format!("{file}.out")).unwrap_or_else(|| "file".to_string())
 }
 
 /// The archive's members. A lone compressed file is decoded to find its size: the gzip trailer holds only the
-/// last member's size, and only below 4 GiB.
+/// last member's size, and only below 4 GiB, and other formats may not record it at all.
 pub fn list(path: &Path) -> Result<Vec<Entry>> {
-    let mut reader = Reader::open(path)?;
-    if let Content::Single = reader.content {
+    let mut reader = Reader::open(path, 1)?;
+    if let (Content::Single, Some(codec)) = (&reader.content, reader.src.codec()) {
+        let gzip = codec == Codec::Gzip;
         let packed = std::fs::metadata(path)?.len();
-        let name = single_name(&reader, path);
         let mut buf = vec![0u8; BUF];
         let size = reader.read_single(&mut buf, &mut |_| Ok(()))?;
         return Ok(vec![Entry {
-            name,
+            name: single_name(codec, path),
             size,
             packed,
             mtime: None,
             crc32: None,
-            method: 8,
+            method: if gzip { 8 } else { 0 },
             dir: false,
             encrypted: false,
             solid: false,
@@ -591,7 +586,8 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
 }
 
 pub fn run(path: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<Summary> {
-    let mut reader = Reader::open(path)?;
+    let threads = opts.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    let mut reader = Reader::open(path, threads)?;
     if opts.mode == Mode::Extract {
         std::fs::create_dir_all(&opts.dest)?;
     }
@@ -706,7 +702,7 @@ fn run_single(
     buf: &mut [u8],
     report: &mut impl FnMut(&str),
 ) -> Result<()> {
-    let name = single_name(reader, path);
+    let name = single_name(reader.src.codec().unwrap_or(Codec::Gzip), path);
     let mut out = None;
     if opts.mode == Mode::Extract {
         let rel = PathBuf::from(&name);
@@ -741,8 +737,8 @@ fn run_tar(
         let m = match reader.next() {
             Ok(Some(m)) => m,
             Ok(None) => {
-                // gzip checks its data only at the end of each member, which may lie past the end marker
-                if let Source::Gzip(_) = reader.src {
+                // compressed streams check their data at the end, which may lie past the end marker
+                if let Source::Packed(..) = reader.src {
                     match reader.drain(buf) {
                         Ok(()) => {}
                         Err(Error::Io(e)) => return Err(Error::Io(e)),

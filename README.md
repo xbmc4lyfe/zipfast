@@ -9,13 +9,14 @@ A fast, universal archive extractor written in Rust. Work in progress.
   stubs, CRC32 and BLAKE2sp checks, modification times and Unix permissions. Big files decode on several cores.
 - ZIP archives: stored and deflated entries, ZIP64, self-extracting stubs, UTF-8 and code page 437 names,
   Unix permissions, and extended or NTFS timestamps.
-- tar archives, plain or gzip-compressed (`.tar`, `.tar.gz`, `.tgz`): POSIX ustar and pax (long names, big sizes,
-  fractional times), GNU long names and base-256 sizes, and pre-POSIX headers. A `.gz` that holds no tar archive
-  comes out as the one file it compresses.
+- tar archives, plain or compressed with gzip, xz, zstd or bzip2 (`.tar.gz`, `.tgz`, `.tar.xz`, `.tar.zst`,
+  `.tar.bz2` and so on): POSIX ustar and pax (long names, big sizes, fractional times), GNU long names and base-256
+  sizes, and pre-POSIX headers. A compressed file that holds no tar archive comes out as the one file it
+  compresses. xz files written in blocks (`xz -T0`) decode on several cores.
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
   refused.
 
-Encrypted archives, links, RAR 4.x, 7z, more ZIP methods and xz, zstd and bzip2 streams are next.
+Encrypted archives, links, RAR 4.x, 7z and more ZIP methods are next.
 
 ## Usage
 

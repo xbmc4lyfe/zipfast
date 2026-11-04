@@ -107,6 +107,34 @@ fn gzip(data: &[u8]) -> Vec<u8> {
     enc.finish().unwrap()
 }
 
+fn xz(data: &[u8]) -> Vec<u8> {
+    let mut enc = liblzma::write::XzEncoder::new(Vec::new(), 1);
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+/// xz in independent blocks, the way `xz -T0` writes it, which can be decoded on several threads
+fn xz_blocks(data: &[u8]) -> Vec<u8> {
+    let stream = liblzma::stream::MtStreamBuilder::new().threads(4).block_size(1 << 20).preset(0).encoder().unwrap();
+    let mut enc = liblzma::write::XzEncoder::new_stream(Vec::new(), stream);
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+/// with a content checksum, as the zstd tool writes by default: without one, damage to stored data can't be seen
+fn zstd(data: &[u8]) -> Vec<u8> {
+    let mut enc = zstd::Encoder::new(Vec::new(), 1).unwrap();
+    enc.include_checksum(true).unwrap();
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+fn bzip2(data: &[u8]) -> Vec<u8> {
+    let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
 fn tmp(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("zipfast-tar-{name}-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
@@ -138,8 +166,8 @@ fn data(n: usize, seed: u32) -> Vec<u8> {
 }
 
 #[test]
-fn plain_and_gzip_tar_extract_the_same_tree() {
-    let big = data(9 << 20, 1);
+fn plain_and_compressed_tar_extract_the_same_tree() {
+    let big = data(5 << 20, 1);
     let long = format!("deep/{}/name.bin", "a".repeat(120));
     let tar = Tar::default()
         .dir("deep/", 0o750)
@@ -149,9 +177,17 @@ fn plain_and_gzip_tar_extract_the_same_tree() {
         .gnu_long(&long, b"gnu long")
         .pax(&[("path", "deep/pax é name.txt"), ("mtime", "1700000000.5")], "deep/placeholder", b"pax data")
         .end();
-    for (label, bytes) in [("plain", tar.clone()), ("gzip", gzip(&tar))] {
+    let forms = [
+        ("tar", tar.clone()),
+        ("tar.gz", gzip(&tar)),
+        ("tar.xz", xz(&tar)),
+        ("txz", xz_blocks(&tar)),
+        ("tar.zst", zstd(&tar)),
+        ("tar.bz2", bzip2(&tar)),
+    ];
+    for (label, bytes) in forms {
         let dir = tmp(&format!("tree-{label}"));
-        let archive = dir.join(if label == "gzip" { "a.tar.gz" } else { "a.tar" });
+        let archive = dir.join(format!("a.{label}"));
         fs::write(&archive, &bytes).unwrap();
 
         let listed = extract::list(&archive).unwrap();
@@ -214,6 +250,26 @@ fn a_lone_gzip_file_comes_out_under_its_stored_or_archive_name() {
     assert!(s.errors.is_empty(), "{:?}", s.errors);
     assert_eq!(fs::read(out.join("stored.txt")).unwrap(), b"named");
 
+    // the other codecs, named from the archive
+    for (name, bytes) in [("notes.txt.xz", xz(&body)), ("notes.txt.zst", zstd(&body)), ("notes.txt.bz2", bzip2(&body))]
+    {
+        let archive = dir.join(name);
+        fs::write(&archive, bytes).unwrap();
+        let o = dir.join(format!("out-{name}"));
+        let s = extract::run(&archive, &opts(Mode::Extract, &o), |_| {}).unwrap();
+        assert!(s.errors.is_empty(), "{name}: {:?}", s.errors);
+        assert!(fs::read(o.join("notes.txt")).unwrap() == body, "{name}");
+    }
+
+    // xz streams back to back, with stream padding between them, are one file
+    let mut two = xz(b"one ");
+    two.extend_from_slice(&[0; 8]);
+    two.extend_from_slice(&xz(b"two"));
+    let archive = dir.join("cat.txt.xz");
+    fs::write(&archive, two).unwrap();
+    extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).unwrap();
+    assert_eq!(fs::read(out.join("cat.txt")).unwrap(), b"one two");
+
     // two members back to back are one file, listed with the size of both
     let mut two = gzip(b"first ");
     two.extend_from_slice(&gzip(b"second"));
@@ -272,6 +328,20 @@ fn damage_is_reported_and_nothing_half_written_is_left() {
     assert!(!s.errors.is_empty());
     let s = extract::run(&bad, &opts(Mode::Test, &out), |_| {}).unwrap();
     assert!(!s.errors.is_empty());
+
+    for (label, mut packed) in [("xz", xz(&tar)), ("zst", zstd(&tar)), ("bz2", bzip2(&tar))] {
+        let at = packed.len() / 2;
+        packed[at] ^= 0x55;
+        let bad = dir.join(format!("bad.tar.{label}"));
+        fs::write(&bad, &packed).unwrap();
+        let s = extract::run(&bad, &opts(Mode::Test, &out), |_| {}).unwrap();
+        assert!(!s.errors.is_empty(), "{label}");
+        // cut short
+        let cut = dir.join(format!("cut.tar.{label}"));
+        fs::write(&cut, &packed[..packed.len() / 3]).unwrap();
+        let s = extract::run(&cut, &opts(Mode::Test, &out), |_| {}).unwrap();
+        assert!(!s.errors.is_empty(), "cut {label}");
+    }
 
     // a damaged header stops the run with an error, after what came before it
     let mut broken = tar.clone();
