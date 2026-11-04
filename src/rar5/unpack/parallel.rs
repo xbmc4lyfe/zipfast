@@ -12,7 +12,8 @@ pub(super) struct Job {
     pub buf: Vec<u8>,
     pub start_bit: usize,
     pub end_bits: usize,
-    pub tables: Arc<Tables>,
+    /// the code lengths the block is read with; the worker builds the tables
+    pub lengths: Arc<Lengths>,
     pub toks: Vec<Tok>,
     pub lits: Vec<u8>,
 }
@@ -51,6 +52,8 @@ impl Pool {
             let job_rx = Arc::clone(&job_rx);
             let done_tx = done_tx.clone();
             let spawned = thread::Builder::new().name(format!("rar5-decode-{i}")).spawn(move || {
+                // blocks often share lengths with the one before; the tables built for them are kept
+                let mut cache: Option<(Arc<Lengths>, Arc<Tables>)> = None;
                 loop {
                     // the lock is held only while waiting for the next job
                     let next = job_rx.lock().map(|rx| rx.recv());
@@ -58,22 +61,39 @@ impl Pool {
                     job.toks.clear();
                     job.lits.clear();
                     let budget = job.buf.len() * BUDGET + SLACK;
-                    let result = tokenize(
-                        &job.buf,
-                        job.start_bit,
-                        job.end_bits,
-                        &job.tables,
-                        &mut job.toks,
-                        &mut job.lits,
-                        budget,
-                    );
+                    let tables = match &cache {
+                        Some((lens, t)) if Arc::ptr_eq(lens, &job.lengths) => Ok(Arc::clone(t)),
+                        _ => {
+                            let mut t = Tables::empty();
+                            t.build(&job.lengths).map(|()| {
+                                let t = Arc::new(t);
+                                cache = Some((Arc::clone(&job.lengths), Arc::clone(&t)));
+                                t
+                            })
+                        }
+                    };
+                    let (result, tables) = match tables {
+                        Ok(t) => {
+                            let r = tokenize(
+                                &job.buf,
+                                job.start_bit,
+                                job.end_bits,
+                                &t,
+                                &mut job.toks,
+                                &mut job.lits,
+                                budget,
+                            );
+                            (r, t)
+                        }
+                        Err(e) => (Err(e), Arc::new(Tables::empty())),
+                    };
                     let done = Done {
                         seq: job.seq,
                         buf: job.buf,
                         toks: job.toks,
                         lits: job.lits,
                         result,
-                        tables: job.tables,
+                        tables,
                         end_bits: job.end_bits,
                     };
                     if done_tx.send(done).is_err() {
@@ -131,6 +151,7 @@ fn tokenize(
     let mut bits = Bits::at(buf, start_bit);
     lits.reserve((end_bits - start_bit) / 8);
     let mut run = 0u32;
+    let mut stage = [0u8; STAGE + 6];
     macro_rules! decode {
         ($table:expr) => {
             match $table.decode(&mut bits) {
@@ -147,13 +168,10 @@ fn tokenize(
         if bits.pos() + 128 <= end_bits {
             // three codes of at most 15 bits fit in one refill
             bits.refill();
-            let (quick, n) = t.main.quick(&mut bits);
-            if n > 0 {
-                // all six go in and the ones not kept come off again, which is cheaper than a copy of n
-                let len = lits.len();
-                lits.extend_from_slice(&quick);
-                lits.truncate(len + n);
-                run += n as u32;
+            let k = t.main.quick_run(&mut bits, end_bits, &mut stage, STAGE);
+            if k > 0 {
+                lits.extend_from_slice(&stage[..k]);
+                run += k as u32;
                 continue;
             }
             let s1 = decode!(t.main);

@@ -111,6 +111,10 @@ struct Huff {
     empty: bool,
     /// the length most literals have, when it is short enough for [`Huff::quick`]; 0 otherwise
     common: u32,
+    /// for each code of that length, its literal with bit 8 set, or 0 when the code is no such literal
+    quick: Box<[u16; 1 << LUT_BITS]>,
+    /// entries of `lut` past this are zero already
+    dirty: usize,
 }
 
 impl Huff {
@@ -123,6 +127,8 @@ impl Huff {
             sorted: Vec::new(),
             empty: true,
             common: 0,
+            quick: Box::new([0; 1 << LUT_BITS]),
+            dirty: 1 << LUT_BITS,
         }
     }
 
@@ -169,16 +175,36 @@ impl Huff {
         by_len[0] = 0;
         let (len, n) = by_len.iter().enumerate().max_by_key(|&(l, &n)| (n, std::cmp::Reverse(l))).unwrap();
         self.common = if lengths.len() >= 256 && *n >= 64 && len <= LUT_BITS as usize { len as u32 } else { 0 };
-        self.lut.fill(0);
+        if self.common != 0 {
+            let g = self.common as usize;
+            let quick = &mut self.quick[..1 << g];
+            quick.fill(0);
+            let first = self.first[g] >> (16 - g);
+            let from = self.start[g] as usize;
+            for (rank, &sym) in self.sorted[from..from + count[g] as usize].iter().enumerate() {
+                if sym < 256 {
+                    quick[(first + rank as u32) as usize] = sym | 0x100;
+                }
+            }
+        }
+        // canonical codes up to the table's width fill it from the start, in order; the rest belongs to longer codes
+        // or to none, and is marked for the slow path
+        let mut covered = 0;
         for l in 1..=LUT_BITS as usize {
             let from = self.start[l] as usize;
             let first = self.first[l] >> (16 - l);
+            let span = 1 << (LUT_BITS as usize - l);
             for (rank, &sym) in self.sorted[from..from + count[l] as usize].iter().enumerate() {
                 let code = first + rank as u32;
                 let at = (code << (LUT_BITS as usize - l)) as usize;
-                self.lut[at..at + (1 << (LUT_BITS as usize - l))].fill((sym << 4) | l as u16);
+                self.lut[at..at + span].fill((sym << 4) | l as u16);
+                covered = at + span;
             }
         }
+        if covered < self.dirty {
+            self.lut[covered..self.dirty].fill(0);
+        }
+        self.dirty = covered;
         Ok(())
     }
 
@@ -193,30 +219,52 @@ impl Huff {
         self.decode_slow(peek, bits)
     }
 
-    /// Up to six literals of the common length from one refill. All the lookups are made at once, as if every
-    /// code had that length, and kept for as long as that holds. Returns them with how many there are (none when
-    /// the first code isn't such a literal). Needs 56 bits in the accumulator.
+    /// Up to six literals of the common length from one refill, read as if every code had that length: each is
+    /// looked up on its own, none waiting on the one before, and they are kept up to the first that isn't such a
+    /// literal. Returns them with how many there are. Needs 56 bits in the accumulator.
     #[inline(always)]
     fn quick(&self, bits: &mut Bits<'_>) -> ([u8; 6], usize) {
         let g = self.common;
         let a = bits.acc;
-        let sh = 64 - LUT_BITS;
-        let at = |k: u32| self.lut[((a << (k * g)) >> sh) as usize];
-        // a literal (symbol below 256, so the top four bits clear) of length g
-        let hit = |e: u16| u32::from(e & 0xF00F) == g;
-        let e = [at(0), at(1), at(2), at(3), at(4), at(5)];
-        let lits = e.map(|e| (e >> 4) as u8);
-        if g == 0 || !hit(e[0]) {
-            return (lits, 0);
+        let e = if g == 8 {
+            // the usual case, codes on byte boundaries: no shifting at all
+            let b = a.to_be_bytes();
+            [b[0], b[1], b[2], b[3], b[4], b[5]].map(|c| self.quick[usize::from(c)])
+        } else {
+            let at = |k: u32| self.quick[((a << (k * g)) >> (64 - g)) as usize & ((1 << LUT_BITS) - 1)];
+            [at(0), at(1), at(2), at(3), at(4), at(5)]
+        };
+        let mut valid = 0u32;
+        for (i, &x) in e.iter().enumerate() {
+            valid |= u32::from(x >> 8) << i;
         }
-        // six codes fit in a refill only when they are short; four always do
-        let most = if g <= 9 { 6 } else { 4 };
-        let mut n = 1;
-        while n < most && hit(e[n]) {
-            n += 1;
+        // as many as fit in what a refill guarantees
+        let most = if g <= 9 { 6 } else { 5 };
+        let n = (!valid).trailing_zeros().min(most);
+        bits.skip(n * g);
+        (e.map(|x| x as u8), n as usize)
+    }
+
+    /// Quick literals for as long as they keep coming, into `stage`, while the bits stay at least 128 short of
+    /// `end_bits` and fewer than `room` are out. Returns how many.
+    #[inline(always)]
+    fn quick_run(&self, bits: &mut Bits<'_>, end_bits: usize, stage: &mut [u8; STAGE + 6], room: usize) -> usize {
+        let room = room.min(STAGE);
+        let mut k = 0;
+        if self.common == 0 {
+            return 0;
         }
-        bits.skip(n as u32 * g);
-        (lits, n)
+        while k < room && bits.pos() + 128 <= end_bits {
+            bits.refill();
+            let (lits, n) = self.quick(bits);
+            stage[k..k + 6].copy_from_slice(&lits);
+            k += n;
+            // a code of some other kind stopped them
+            if n < 5 {
+                break;
+            }
+        }
+        k
     }
 
     #[cold]
@@ -255,6 +303,22 @@ struct Tables {
     dist: Huff,
     low: Huff,
     rep: Huff,
+}
+
+/// Every code length a block's tables give, main table first.
+type Lengths = [u8; TABLES];
+
+impl Tables {
+    fn empty() -> Tables {
+        Tables { main: Huff::new(), dist: Huff::new(), low: Huff::new(), rep: Huff::new() }
+    }
+
+    fn build(&mut self, lens: &Lengths) -> Result<()> {
+        self.main.build(&lens[..NC])?;
+        self.dist.build(&lens[NC..NC + DC])?;
+        self.low.build(&lens[NC + DC..NC + DC + LDC])?;
+        self.rep.build(&lens[NC + DC + LDC..])
+    }
 }
 
 /// A decoded operation. Literals travel separately; `Lits` says how many come next.
@@ -298,6 +362,11 @@ pub struct Unpacker {
     /// the current file's declared size, None when unknown
     size: Option<u64>,
     tables_ready: bool,
+    /// the code lengths last read, and whether `tables` is still to be built from them
+    lengths: Arc<Lengths>,
+    stale: bool,
+    /// the code the lengths themselves are read with, kept so each block needn't allocate one
+    pre: Huff,
     tables: Arc<Tables>,
     history: [u64; 4],
     last_len: u32,
@@ -358,7 +427,10 @@ impl Unpacker {
             emitted: 0,
             size: None,
             tables_ready: false,
-            tables: Arc::new(Tables { main: Huff::new(), dist: Huff::new(), low: Huff::new(), rep: Huff::new() }),
+            lengths: Arc::new([0; TABLES]),
+            stale: false,
+            pre: Huff::new(),
+            tables: Arc::new(Tables::empty()),
             history: [0; 4],
             last_len: 0,
             filters: Vec::new(),
@@ -432,8 +504,8 @@ impl Unpacker {
         self.sp - self.file_base
     }
 
-    /// Hands a block to the workers. Its tables are read here, since later blocks may reuse them; the symbols are
-    /// read on a worker and applied to the window in order by [`Self::settle`].
+    /// Hands a block to the workers. Its code lengths are read here, since later blocks may reuse them; the tables
+    /// are built and the symbols read on a worker, and applied to the window in order by [`Self::settle`].
     fn submit(
         &mut self,
         buf: &[u8],
@@ -462,6 +534,13 @@ impl Unpacker {
         }
         if start_bit >= end_bits {
             self.spare.push((block, toks, lits));
+            // no worker sees these lengths now, so they are checked here as decoding them here would
+            if flags & 0x80 != 0
+                && let Err(e) = self.build_tables()
+            {
+                self.settle(0, sink)?;
+                return Err(e);
+            }
             if start_bit > end_bits {
                 self.settle(0, sink)?;
                 return Err(corrupt("a symbol runs past the end of its block"));
@@ -472,7 +551,7 @@ impl Unpacker {
             self.pool = Some(Pool::new(self.threads));
         }
         let job =
-            Job { seq: self.submitted, buf: block, start_bit, end_bits, tables: Arc::clone(&self.tables), toks, lits };
+            Job { seq: self.submitted, buf: block, start_bit, end_bits, lengths: Arc::clone(&self.lengths), toks, lits };
         self.queued += job.buf.len();
         self.pool.as_ref().unwrap().submit(job);
         self.submitted += 1;
@@ -700,6 +779,10 @@ impl Unpacker {
         } else if !self.tables_ready && payload > 0 {
             return Err(corrupt("block without tables at the start of a stream"));
         }
+        // after blocks on workers, the tables here may lag behind the lengths last read
+        if self.stale {
+            self.build_tables()?;
+        }
         let tables = Arc::clone(&self.tables);
         self.decode_rest(&mut bits, end_bits, &tables, sink)
     }
@@ -753,7 +836,7 @@ impl Unpacker {
                 i += 1;
             }
         }
-        let mut pre = Huff::new();
+        let pre = &mut self.pre;
         pre.build(&bl)?;
         let mut lens = [0u8; TABLES];
         let mut i = 0;
@@ -762,7 +845,7 @@ impl Unpacker {
             if bits.pos() >= end {
                 return Err(corrupt("table runs past its block"));
             }
-            let sym = pre.decode(bits)?;
+            let sym = self.pre.decode(bits)?;
             match sym {
                 0..=15 => {
                     lens[i] = sym as u8;
@@ -789,13 +872,17 @@ impl Unpacker {
         if bits.pos() > end {
             return Err(corrupt("table runs past its block"));
         }
-        // blocks still with the workers keep the tables they were sent with
-        let t = Arc::make_mut(&mut self.tables);
-        t.main.build(&lens[..NC])?;
-        t.dist.build(&lens[NC..NC + DC])?;
-        t.low.build(&lens[NC + DC..NC + DC + LDC])?;
-        t.rep.build(&lens[NC + DC + LDC..])?;
+        self.lengths = Arc::new(lens);
+        self.stale = true;
         self.tables_ready = true;
+        Ok(())
+    }
+
+    /// The tables for the lengths last read.
+    fn build_tables(&mut self) -> Result<()> {
+        // blocks still decoding on the main thread's behalf keep the tables they were handed
+        Arc::make_mut(&mut self.tables).build(&self.lengths)?;
+        self.stale = false;
         Ok(())
     }
 
@@ -832,20 +919,10 @@ impl Unpacker {
         let result = loop {
             let sym;
             if bits.pos() + 128 <= end_bits && sp + 6 <= limit {
-                bits.refill();
-                let (lits, n) = main.quick(bits);
-                if n > 0 {
-                    stage[..6].copy_from_slice(&lits);
-                    let mut k = n;
-                    while k <= STAGE && bits.pos() + 128 <= end_bits && sp + k as u64 + 6 <= limit {
-                        bits.refill();
-                        let (lits, n) = main.quick(bits);
-                        if n == 0 {
-                            break;
-                        }
-                        stage[k..k + 6].copy_from_slice(&lits);
-                        k += n;
-                    }
+                // room for every literal the stage can take, each run of quick ones ending at most six past it
+                let room = usize::try_from(limit - sp - 5).unwrap_or(usize::MAX);
+                let k = main.quick_run(bits, end_bits, &mut stage, room);
+                if k > 0 {
                     let at = (sp & mask) as usize;
                     let first = k.min(window.len() - at);
                     window[at..at + first].copy_from_slice(&stage[..first]);
@@ -853,6 +930,7 @@ impl Unpacker {
                     sp += k as u64;
                     continue;
                 }
+                bits.refill();
                 // well inside the block and the output limits: a refill holds at least 56 bits and a code is at
                 // most 15, so up to three literals go without another refill or any limit check
                 let s1 = decode!(main);
