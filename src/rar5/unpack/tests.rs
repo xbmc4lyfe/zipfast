@@ -182,3 +182,26 @@ fn window_sizes_stay_sane_for_any_stated_size() {
     assert_eq!(window_for(1 << 22, Some(10), false).unwrap(), 1 << 17);
     assert_eq!(window_for(1 << 22, Some(10), true).unwrap(), 1 << 22);
 }
+
+#[test]
+fn tuned_codes_from_a_real_matcher_round_trip() {
+    // text-like data with repeats near and far, plus a stretch of noise
+    let mut data = Vec::new();
+    let mut x = 12345u32;
+    for i in 0..40_000u32 {
+        x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        if i % 1000 < 700 {
+            data.extend_from_slice(format!("line {} of {} ", i % 97, (x >> 20) % 13).as_bytes());
+        } else {
+            data.push((x >> 16) as u8);
+        }
+    }
+    let ops = lz(&data, 1 << 20, 8);
+    assert_eq!(model(&ops), data);
+    assert!(ops.iter().any(|o| matches!(o, Op::Rep(..))) && ops.iter().any(|o| matches!(o, Op::Match(..))));
+    let stream = tuned_stream(&ops, 5000);
+    // whole, in pieces that split blocks and headers, and a byte at a time
+    for piece in [usize::MAX, 4096, 7, 1] {
+        assert_eq!(decode(&stream, data.len() as u64, 1 << 21, piece).unwrap(), data, "pieces of {piece}");
+    }
+}
