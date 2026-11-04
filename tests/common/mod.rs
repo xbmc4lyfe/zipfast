@@ -54,6 +54,7 @@ pub struct FileSpec<'a> {
     pub method: u64,
     /// the unpacked size when `data` is packed
     pub size: Option<u64>,
+    pub solid: bool,
 }
 
 impl<'a> FileSpec<'a> {
@@ -68,6 +69,7 @@ impl<'a> FileSpec<'a> {
             extra: Vec::new(),
             method: 0,
             size: None,
+            solid: false,
         }
     }
 }
@@ -91,7 +93,7 @@ pub fn file_block(spec: &FileSpec<'_>, part: &[u8], crc: u32, split_before: bool
     if !spec.no_crc {
         fields.extend_from_slice(&crc.to_le_bytes());
     }
-    vint(spec.method << 7, &mut fields);
+    vint((spec.method << 7) | if spec.solid { 0x40 } else { 0 }, &mut fields);
     vint(if spec.unix_mode.is_some() { 1 } else { 0 }, &mut fields);
     vint(spec.name.len() as u64, &mut fields);
     fields.extend_from_slice(spec.name.as_bytes());
@@ -106,8 +108,12 @@ pub fn file_block(spec: &FileSpec<'_>, part: &[u8], crc: u32, split_before: bool
 }
 
 pub fn main_block(volume: bool, number: Option<u64>) -> Vec<u8> {
+    main_block_flags(volume, number, false)
+}
+
+pub fn main_block_flags(volume: bool, number: Option<u64>, solid: bool) -> Vec<u8> {
     let mut fields = Vec::new();
-    let mut flags = 0;
+    let mut flags = if solid { 4 } else { 0 };
     if volume {
         flags |= 1;
     }
@@ -135,6 +141,22 @@ pub fn archive(files: &[FileSpec<'_>]) -> Vec<u8> {
     out.extend(main_block(false, None));
     for f in files {
         out.extend(file_block(f, f.data, crc32fast::hash(f.data), false, false));
+    }
+    out.extend(end_block(false));
+    out
+}
+
+/// A compressed file: `ops` packed into one block, with the header's size and CRC for what they decode to.
+pub fn packed(_name: &str, ops: &[zipfast::rar5::testenc::Op]) -> (Vec<u8>, Vec<u8>) {
+    (zipfast::rar5::testenc::block(ops, true, true), zipfast::rar5::testenc::model(ops))
+}
+
+/// An archive whose files may be packed: (spec, the CRC of the unpacked data).
+pub fn archive_with(files: &[(FileSpec<'_>, u32)], solid: bool) -> Vec<u8> {
+    let mut out = SIG.to_vec();
+    out.extend(main_block_flags(false, None, solid));
+    for (f, crc) in files {
+        out.extend(file_block(f, f.data, *crc, false, false));
     }
     out.extend(end_block(false));
     out

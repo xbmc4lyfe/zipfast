@@ -1,0 +1,184 @@
+//! Round trips through a small test-only encoder that writes blocks with fixed code lengths.
+
+use super::*;
+use crate::rar5::testenc::*;
+
+fn decode(stream: &[u8], size: u64, window: u64, piece: usize) -> Result<Vec<u8>> {
+    let mut u = Unpacker::new(window)?;
+    u.reset(Some(size));
+    let mut out = Vec::new();
+    let mut sink = |b: &[u8]| -> Result<()> {
+        out.extend_from_slice(b);
+        Ok(())
+    };
+    for chunk in stream.chunks(piece.max(1)) {
+        u.feed(chunk, &mut sink)?;
+    }
+    u.finish(&mut sink)?;
+    Ok(out)
+}
+
+fn lits(s: &[u8]) -> Vec<Op> {
+    s.iter().map(|&b| Op::Lit(b)).collect()
+}
+
+#[test]
+fn literals() {
+    let ops = lits(b"hello, world");
+    let stream = block(&ops, true, true);
+    assert_eq!(decode(&stream, 12, 1 << 17, usize::MAX).unwrap(), b"hello, world");
+}
+
+#[test]
+fn matches_repeats_and_low_distance_bits() {
+    let mut ops = lits(b"abcdefgh");
+    ops.push(Op::Match(20, 1)); // a run of h
+    ops.push(Op::Match(5, 8));
+    ops.push(Op::Last);
+    ops.extend((0..3000).map(|i| Op::Lit((i * 7 % 251) as u8)));
+    ops.push(Op::Match(300, 2900)); // low-distance table, with bonus
+    ops.push(Op::Rep(1, 10));
+    ops.push(Op::Rep(0, 4097));
+    ops.push(Op::Match(2, 37));
+    ops.push(Op::Rep(3, 3));
+    let want = model(&ops);
+    let stream = block(&ops, true, true);
+    assert_eq!(decode(&stream, want.len() as u64, 1 << 17, usize::MAX).unwrap(), want);
+    // the same stream a byte at a time
+    assert_eq!(decode(&stream, want.len() as u64, 1 << 17, 1).unwrap(), want);
+}
+
+#[test]
+fn later_blocks_reuse_tables() {
+    let a = lits(b"first block ");
+    let b = vec![Op::Match(6, 12), Op::Lit(b'!')];
+    let mut all = a.clone();
+    all.extend(b.clone());
+    let want = model(&all);
+    let mut stream = block(&a, true, false);
+    stream.extend(block(&b, false, true));
+    assert_eq!(decode(&stream, want.len() as u64, 1 << 17, 5).unwrap(), want);
+}
+
+#[test]
+fn the_window_wraps_and_flushes() {
+    // 1 MiB through a 128 KiB window, with matches reaching 64 KiB back
+    let mut ops = Vec::new();
+    let mut seed = 1u32;
+    for _ in 0..70_000 {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        ops.push(Op::Lit((seed >> 16) as u8));
+    }
+    let mut made = 70_000u64;
+    while made < 1 << 20 {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        let dist = 1 + u64::from(seed >> 16) % 65_536;
+        let len = 5 + (seed >> 8) % 4000;
+        ops.push(Op::Match(len, dist));
+        made += u64::from(len);
+        ops.push(Op::Lit(seed as u8));
+        made += 1;
+    }
+    let want = model(&ops);
+    let mut stream = Vec::new();
+    // blocks of a few thousand ops, tables only in the first
+    for (i, chunk) in ops.chunks(4000).enumerate() {
+        let last = (i + 1) * 4000 >= ops.len();
+        stream.extend(block(chunk, i == 0, last));
+    }
+    let got = decode(&stream, want.len() as u64, 1 << 17, 100_000).unwrap();
+    assert!(got == want, "mismatch");
+}
+
+#[test]
+fn e8_filter_example() {
+    // the spec's example: an E8 at offset 100 with operand 0x00000F00 becomes 0x00000E9B
+    let mut data = vec![0u8; 200];
+    data[100] = 0xe8;
+    data[101..105].copy_from_slice(&0x0000_0f00u32.to_le_bytes());
+    data[150] = 0xe8;
+    data[151..155].copy_from_slice(&0xffff_fff0u32.to_le_bytes());
+    let mut ops = vec![Op::Filter { start: 0, len: 200, kind: 1, channels: 0 }];
+    ops.extend(lits(&data));
+    let stream = block(&ops, true, true);
+    let got = decode(&stream, 200, 1 << 17, usize::MAX).unwrap();
+    assert_eq!(&got[101..105], &0x0000_0e9bu32.to_le_bytes());
+    // 0xFFFFFFF0 + 151 wraps to a small positive value, so the operand gains 0x1000000
+    assert_eq!(&got[151..155], &0x00ff_fff0u32.to_le_bytes());
+    assert_eq!(got[100], 0xe8);
+}
+
+#[test]
+fn filters_leave_gaps_unfiltered_and_count_from_the_file_start() {
+    let data: Vec<u8> = (0..400u32).map(|i| (i * 13) as u8).collect();
+    // a delta filter over 100..200, announced at position 0, and an ARM filter over 300..340 announced later
+    let mut ops = vec![Op::Filter { start: 100, len: 100, kind: 0, channels: 3 }];
+    ops.extend(lits(&data[..250]));
+    ops.push(Op::Filter { start: 50, len: 40, kind: 3, channels: 0 });
+    ops.extend(lits(&data[250..]));
+    let stream = block(&ops, true, true);
+    let got = decode(&stream, 400, 1 << 17, 7).unwrap();
+    assert_eq!(&got[..100], &data[..100]);
+    assert_eq!(&got[200..300], &data[200..300]);
+    assert_eq!(&got[340..], &data[340..]);
+    // delta: planar input, interleaved negated running sums
+    let src = &data[100..200];
+    let mut want = [0u8; 100];
+    let mut s = 0;
+    for c in 0..3 {
+        let mut acc = 0u8;
+        let mut j = c;
+        while j < 100 {
+            acc = acc.wrapping_sub(src[s]);
+            want[j] = acc;
+            s += 1;
+            j += 3;
+        }
+    }
+    assert_eq!(&got[100..200], &want[..]);
+    // ARM: words ending in 0xEB get their 24-bit field reduced by their position / 4
+    for j in (300..340).step_by(4) {
+        if data[j + 3] == 0xeb {
+            let v = u32::from_le_bytes(data[j..j + 4].try_into().unwrap()) & 0xff_ffff;
+            let v = (v.wrapping_sub(j as u32 / 4) & 0xff_ffff) | 0xeb00_0000;
+            assert_eq!(&got[j..j + 4], &v.to_le_bytes());
+        } else {
+            assert_eq!(&got[j..j + 4], &data[j..j + 4]);
+        }
+    }
+}
+
+#[test]
+fn rejects_bad_streams() {
+    let ok = block(&lits(b"abc"), true, true);
+    let mut bad = ok.clone();
+    bad[1] ^= 1;
+    assert!(decode(&bad, 3, 1 << 17, usize::MAX).is_err(), "header checksum");
+    let far = block(&[Op::Lit(1), Op::Match(4, 2)], true, true);
+    assert!(decode(&far, 5, 1 << 17, usize::MAX).is_err(), "match before the start");
+    assert!(decode(&ok, 2, 1 << 17, usize::MAX).is_err(), "more data than declared");
+    assert!(decode(&ok, 4, 1 << 17, usize::MAX).is_err(), "less data than declared");
+    assert!(decode(&ok[..ok.len() - 1], 3, 1 << 17, usize::MAX).is_err(), "truncated");
+    let no_tables = block(&lits(b"abc"), false, true);
+    assert!(decode(&no_tables, 3, 1 << 17, usize::MAX).is_err(), "no tables");
+}
+
+#[test]
+fn a_filter_over_the_whole_file_fits_the_window_chosen_for_it() {
+    let data: Vec<u8> = (0..100_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let mut ops = vec![Op::Filter { start: 0, len: 100_000, kind: 0, channels: 1 }];
+    ops.extend(lits(&data));
+    let stream = block(&ops, true, true);
+    let window = window_for(4 << 20, Some(100_000), false).unwrap();
+    let got = decode(&stream, 100_000, window, 4096).unwrap();
+    assert_eq!(got.len(), 100_000);
+}
+
+#[test]
+fn window_sizes_stay_sane_for_any_stated_size() {
+    assert_eq!(window_for(1 << 17, Some(u64::MAX - 1), false).unwrap(), 1 << 17);
+    assert_eq!(window_for(1 << 22, Some(u64::MAX), false).unwrap(), 1 << 22);
+    assert_eq!(window_for(1 << 22, Some(100_000), false).unwrap(), 1 << 18);
+    assert_eq!(window_for(1 << 22, Some(10), false).unwrap(), 1 << 17);
+    assert_eq!(window_for(1 << 22, Some(10), true).unwrap(), 1 << 22);
+}
