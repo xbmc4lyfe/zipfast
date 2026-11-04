@@ -1,8 +1,9 @@
 //! ZIP archives, read from PKWARE's published APPNOTE: the end of central directory record (and its ZIP64 form),
-//! the central directory, and each entry's local header. Entries are stored or deflated.
+//! the central directory, and each entry's local header. Entries are stored, deflated, or compressed with bzip2,
+//! LZMA, xz or zstd.
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use flate2::{Decompress, FlushDecompress, Status};
@@ -24,6 +25,17 @@ const FLAG_UTF8: u16 = 0x0800;
 
 const METHOD_STORED: u16 = 0;
 const METHOD_DEFLATE: u16 = 8;
+const METHOD_BZIP2: u16 = 12;
+const METHOD_LZMA: u16 = 14;
+const METHOD_ZSTD: u16 = 93;
+const METHOD_XZ: u16 = 95;
+/// An LZMA entry ends with an end marker instead of at its stated size.
+const FLAG_LZMA_EOS: u16 = 0x0002;
+
+/// Whether entries compressed with `method` can be read.
+fn supported(method: u16) -> bool {
+    matches!(method, METHOD_STORED | METHOD_DEFLATE | METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ)
+}
 
 const HOST_UNIX: u8 = 3;
 const S_IFMT: u32 = 0o170000;
@@ -261,6 +273,22 @@ impl Archive {
                     }
                 }
             }
+            METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
+                let packed = BufReader::with_capacity(1 << 20, (&mut self.file).take(e.packed));
+                let mut dec = stream_decoder(e, packed)?;
+                loop {
+                    let n = match dec.read(buf) {
+                        Ok(n) => n,
+                        Err(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => return Err(Error::Truncated),
+                        Err(io) if io.raw_os_error().is_some() => return Err(Error::Io(io)),
+                        Err(_) => return Err(Error::Corrupt("compressed data is damaged")),
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    emit(&buf[..n])?;
+                }
+            }
             m => return Err(Error::Unsupported(format!("compression method {m}"))),
         }
         if size != e.size {
@@ -271,6 +299,37 @@ impl Archive {
         }
         Ok(())
     }
+}
+
+/// A reader of an entry's data for the methods that have a stream decoder.
+fn stream_decoder<'a>(e: &ZipEntry, packed: BufReader<std::io::Take<&'a mut File>>) -> Result<Box<dyn Read + 'a>> {
+    Ok(match e.method {
+        METHOD_BZIP2 => Box::new(bzip2::bufread::MultiBzDecoder::new(packed)),
+        METHOD_ZSTD => Box::new(zstd::stream::read::Decoder::with_buffer(packed)?),
+        METHOD_XZ => {
+            let stream = liblzma::stream::Stream::new_stream_decoder(u64::MAX, liblzma::stream::CONCATENATED)
+                .map_err(|_| Error::Corrupt("xz data"))?;
+            Box::new(liblzma::bufread::XzDecoder::new_stream(packed, stream))
+        }
+        _ => {
+            // APPNOTE 5.8.8: a version, the length of the properties, then the properties and the raw LZMA data.
+            // Put back together with the size as the classic .lzma header, it reads with the stock decoder.
+            let mut packed = packed;
+            let mut head = [0u8; 4];
+            packed.read_exact(&mut head)?;
+            let props_len = u16::from_le_bytes([head[2], head[3]]) as usize;
+            if props_len != 5 {
+                return Err(Error::Corrupt("LZMA properties"));
+            }
+            let mut alone = vec![0u8; 13];
+            packed.read_exact(&mut alone[..5])?;
+            let size = if e.flags & FLAG_LZMA_EOS != 0 { u64::MAX } else { e.size };
+            alone[5..].copy_from_slice(&size.to_le_bytes());
+            let stream =
+                liblzma::stream::Stream::new_lzma_decoder(u64::MAX).map_err(|_| Error::Corrupt("LZMA data"))?;
+            Box::new(liblzma::bufread::XzDecoder::new_stream(BufReader::new(Cursor::new(alone).chain(packed)), stream))
+        }
+    })
 }
 
 /// One central directory record at `at`: the entry and where the next record starts.
@@ -439,7 +498,7 @@ pub fn run(path: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<
         }
         let refuse = if e.encrypted() {
             Some("encrypted (passwords are not supported yet)".to_string())
-        } else if e.method != METHOD_STORED && e.method != METHOD_DEFLATE {
+        } else if !supported(e.method) {
             Some(format!("compression method {} is not supported yet", e.method))
         } else if e.is_link() {
             Some("links are not supported yet".to_string())

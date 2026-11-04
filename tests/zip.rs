@@ -20,6 +20,8 @@ struct Z<'a> {
     size: Option<u32>,
     /// a local header offset given only through a ZIP64 extra field
     offset64: Option<u64>,
+    /// data already packed by the entry's method
+    raw: Option<Vec<u8>>,
 }
 
 impl<'a> Z<'a> {
@@ -35,6 +37,7 @@ impl<'a> Z<'a> {
             crc: None,
             size: None,
             offset64: None,
+            raw: None,
         }
     }
 }
@@ -48,7 +51,9 @@ fn zip_with(entries: &[Z<'_>], zip64: bool, comment: &[u8]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut central = Vec::new();
     for e in entries {
-        let packed = if e.deflate {
+        let packed = if let Some(raw) = &e.raw {
+            raw.clone()
+        } else if e.deflate {
             let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
             enc.write_all(e.data).unwrap();
             enc.finish().unwrap()
@@ -226,7 +231,7 @@ fn encrypted_unknown_methods_and_links_are_refused() {
         &arc,
         zip(&[
             Z { flags: 0x0801, ..Z::new("secret", b"x") },
-            Z { method: Some(14), ..Z::new("lzma", b"x") },
+            Z { method: Some(98), ..Z::new("ppmd", b"x") },
             Z { mode: Some(0o120777), ..Z::new("link", b"target") },
             Z::new("fine", b"x"),
         ]),
@@ -330,4 +335,108 @@ fn an_impossible_local_header_offset_is_an_error() {
     bytes.extend(zip(&[Z { offset64: Some(u64::MAX), ..Z::new("f", b"x") }]));
     fs::write(&arc, bytes).unwrap();
     assert!(extract::list(&arc).is_err());
+}
+
+fn bzip2_packed(data: &[u8]) -> Vec<u8> {
+    let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::default());
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+fn zstd_packed(data: &[u8]) -> Vec<u8> {
+    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+    enc.include_checksum(true).unwrap();
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+fn xz_packed(data: &[u8]) -> Vec<u8> {
+    let mut enc = liblzma::write::XzEncoder::new(Vec::new(), 6);
+    enc.write_all(data).unwrap();
+    enc.finish().unwrap()
+}
+
+/// APPNOTE's LZMA layout: version 9.20, a properties length of 5, the properties, then the data with an end marker.
+fn lzma_packed(data: &[u8]) -> Vec<u8> {
+    let opts = liblzma::stream::LzmaOptions::new_preset(6).unwrap();
+    let stream = liblzma::stream::Stream::new_lzma_encoder(&opts).unwrap();
+    let mut enc = liblzma::write::XzEncoder::new_stream(Vec::new(), stream);
+    enc.write_all(data).unwrap();
+    let alone = enc.finish().unwrap();
+    // the classic header: 5 property bytes, then an 8-byte size
+    let mut out = vec![9, 20, 5, 0];
+    out.extend_from_slice(&alone[..5]);
+    out.extend_from_slice(&alone[13..]);
+    out
+}
+
+fn sample() -> Vec<u8> {
+    let mut v = b"the quick brown fox jumps over the lazy dog ".repeat(20_000);
+    v.extend((0..200_000u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8));
+    v
+}
+
+#[test]
+fn bzip2_lzma_xz_and_zstd_entries_extract() {
+    let dir = tmp("methods");
+    let data = sample();
+    let arc = dir.join("a.zip");
+    fs::write(
+        &arc,
+        zip(&[
+            Z { method: Some(12), raw: Some(bzip2_packed(&data)), ..Z::new("b.bin", &data) },
+            Z { method: Some(14), flags: 0x0802, raw: Some(lzma_packed(&data)), ..Z::new("l-eos.bin", &data) },
+            Z { method: Some(14), raw: Some(lzma_packed(&data)), ..Z::new("l-sized.bin", &data) },
+            Z { method: Some(93), raw: Some(zstd_packed(&data)), ..Z::new("z.bin", &data) },
+            Z { method: Some(95), raw: Some(xz_packed(&data)), ..Z::new("x.bin", &data) },
+            Z { method: Some(14), flags: 0x0802, raw: Some(lzma_packed(b"")), ..Z::new("empty", b"") },
+        ]),
+    )
+    .unwrap();
+    let out = dir.join("out");
+    let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert_eq!((s.files, s.errors.len()), (6, 0), "{:?}", s.errors);
+    for name in ["b.bin", "l-eos.bin", "l-sized.bin", "z.bin", "x.bin"] {
+        assert_eq!(fs::read(out.join(name)).unwrap(), data, "{name}");
+    }
+    assert_eq!(fs::read(out.join("empty")).unwrap(), b"");
+}
+
+#[test]
+fn damaged_or_short_compressed_entries_fail() {
+    let dir = tmp("methods-bad");
+    let data = sample();
+    let flip = |mut v: Vec<u8>| {
+        let at = v.len() / 2;
+        v[at] ^= 0x55;
+        v
+    };
+    let cut = |mut v: Vec<u8>| {
+        v.truncate(v.len() / 2);
+        v
+    };
+    let mut entries = Vec::new();
+    for (method, flags, packed) in [
+        (12, 0x0800, bzip2_packed(&data)),
+        (14, 0x0802, lzma_packed(&data)),
+        (93, 0x0800, zstd_packed(&data)),
+        (95, 0x0800, xz_packed(&data)),
+    ] {
+        entries.push((method, flags, flip(packed.clone())));
+        entries.push((method, flags, cut(packed)));
+    }
+    // LZMA properties of the wrong length
+    let mut bad_props = lzma_packed(&data);
+    bad_props[2] = 4;
+    entries.push((14, 0x0802, bad_props));
+    let names: Vec<String> = (0..entries.len()).map(|i| format!("f{i}")).collect();
+    let zs: Vec<Z<'_>> = entries
+        .into_iter()
+        .zip(&names)
+        .map(|((method, flags, raw), name)| Z { method: Some(method), flags, raw: Some(raw), ..Z::new(name, &data) })
+        .collect();
+    let arc = dir.join("a.zip");
+    fs::write(&arc, zip(&zs)).unwrap();
+    let s = extract::run(&arc, &test_opts(&dir), |_| {}).unwrap();
+    assert_eq!((s.files, s.errors.len()), (0, 9), "{:?}", s.errors);
 }
