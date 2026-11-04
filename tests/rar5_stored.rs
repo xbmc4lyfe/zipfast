@@ -289,4 +289,30 @@ fn older_versions_are_skipped_and_the_current_file_kept() {
     let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
     assert_eq!((s.files, s.skipped, s.errors.len()), (1, 1, 0));
     assert_eq!(fs::read(out.join("f.txt")).unwrap(), b"new");
+    // a test still checks the older revision
+    let t = extract::run(&arc, &Options { mode: Mode::Test, ..opts(&out) }, |_| {}).unwrap();
+    assert_eq!((t.files, t.skipped, t.errors.len()), (2, 0, 0));
+}
+
+#[test]
+fn a_block_whose_data_runs_past_the_end_is_truncation() {
+    let dir = tmp("trunc-skip");
+    let arc = dir.join("t.rar");
+    let data = vec![1u8; 100];
+    // a file this run refuses, so its data is skipped rather than read
+    let full = archive(&[FileSpec::new("a", b"ok"), FileSpec { method: 3, ..FileSpec::new("b", &data) }]);
+    let cut = full.len() - end_block(false).len() - 97;
+    fs::write(&arc, &full[..cut]).unwrap();
+    assert!(extract::run(&arc, &Options { mode: Mode::Test, ..opts(&dir.join("out")) }, |_| {}).is_err());
+}
+
+#[test]
+fn a_name_with_mapped_non_utf8_bytes_is_refused() {
+    let dir = tmp("fffe");
+    let arc = dir.join("t.rar");
+    fs::write(&arc, archive(&[FileSpec::new("x\u{FFFE}\u{E0FF}", b"z")])).unwrap();
+    let out = dir.join("out");
+    let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert_eq!((s.files, s.errors.len()), (0, 1));
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 0);
 }

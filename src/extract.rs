@@ -272,8 +272,10 @@ fn start_file(
             *pending = Some(Pending::skipping(&h.name));
         }
     };
-    // an older revision shares the current file's name: only the current one is written
-    if let Some(v) = h.version {
+    // an older revision shares the current file's name: only the current one is written, but a test checks all
+    if let Some(v) = h.version
+        && opts.mode == Mode::Extract
+    {
         report(&format!("{}: older version {v}, skipped", h.name));
         summary.skipped += 1;
         skip_rest(pending);
@@ -287,6 +289,12 @@ fn start_file(
             return Ok(());
         }
     };
+    // U+FFFE marks a Unix name holding bytes that aren't UTF-8, mapped into private-use characters
+    if opts.mode == Mode::Extract && h.name.contains('\u{FFFE}') {
+        fail(summary, report, &h.name, "the name holds bytes that aren't UTF-8, which isn't supported yet");
+        skip_rest(pending);
+        return Ok(());
+    }
     let rel = if opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
     if h.is_dir() {
         if opts.mode == Mode::Extract && !opts.flatten {

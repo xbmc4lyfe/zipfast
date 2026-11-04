@@ -110,6 +110,10 @@ impl Volume {
         let fields = &body[c.pos()..fields_end];
         let extra = &body[fields_end..];
         let data_end = header_end.checked_add(data_size).ok_or(Error::Corrupt("data size"))?;
+        // checked here, not only when the data is read, since skipped blocks are never read
+        if data_end > self.len {
+            return Err(Error::Truncated);
+        }
         self.next = data_end;
         let head = BlockHead { kind, flags, data_size, data_at: header_end };
 
