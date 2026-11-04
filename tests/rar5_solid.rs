@@ -225,3 +225,41 @@ fn a_repeated_name_waits_for_a_queued_copy_from_an_earlier_stream() {
         assert!(fs::read(out.join("b")).unwrap() == files[2].2, "{name}: the later b is kept");
     }
 }
+
+#[test]
+fn a_stored_file_among_queued_ones_reports_after_them() {
+    let dir = tmp("stored");
+    let mut files = named(solid_stream(12, false));
+    files[4].3 ^= 1;
+    let stored = b"stored between packed files".to_vec();
+    let mut specs: Vec<(FileSpec<'_>, u32)> = files
+        .iter()
+        .enumerate()
+        .map(|(i, (name, stream, plain, crc))| {
+            let spec =
+                FileSpec { method: 3, size: Some(plain.len() as u64), solid: i > 0, ..FileSpec::new(name, stream) };
+            (spec, *crc)
+        })
+        .collect();
+    // a stored file with a wrong checksum after the bad packed one, and a folder
+    specs.insert(6, (FileSpec::new("plain.txt", &stored), crc32fast::hash(&stored) ^ 1));
+    specs.insert(8, (FileSpec { dir: true, ..FileSpec::new("d0/sub", b"") }, 0));
+    let arc = dir.join("s.rar");
+    fs::write(&arc, archive_with(&specs, true)).unwrap();
+    let mut seen = Vec::new();
+    for (name, threads) in [("one", 1), ("four", 4)] {
+        let out = dir.join(name);
+        let (s, lines) = run(&arc, &opts(&out, threads));
+        assert_eq!(s.errors.len(), 2, "{name}: {:?}", s.errors);
+        assert!(lines[0].contains(&files[4].0) && lines[1].contains("plain.txt"), "{name}: {lines:?}");
+        assert!(!out.join(&files[4].0).exists() && !out.join("plain.txt").exists(), "{name}");
+        assert!(out.join("d0/sub").is_dir(), "{name}");
+        for (i, (n, _, plain, _)) in files.iter().enumerate() {
+            if i != 4 {
+                assert!(fs::read(out.join(n)).unwrap() == *plain, "{name}: {n}");
+            }
+        }
+        seen.push(lines);
+    }
+    assert_eq!(seen[0], seen[1]);
+}
