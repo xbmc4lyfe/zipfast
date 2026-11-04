@@ -23,9 +23,9 @@ pub(crate) const JOB_MAX: u64 = 16 << 20;
 /// Stored data from this size up is copied on several threads.
 pub(crate) const STORED_PARALLEL_MIN: u64 = 64 << 20;
 /// The piece of stored data one thread checks and copies at a time.
-const PIECE: u64 = 8 << 20;
+const PIECE: u64 = 1 << 20;
 /// Bytes of files read ahead of the workers.
-const BYTES_IN_FLIGHT: usize = 256 << 20;
+const BYTES_IN_FLIGHT: usize = 64 << 20;
 
 /// One file, read whole, to be decoded, checked and written.
 pub(crate) struct Job {

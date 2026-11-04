@@ -111,8 +111,6 @@ struct Huff {
     empty: bool,
     /// the length most literals have, when it is short enough for [`Huff::quick`]; 0 otherwise
     common: u32,
-    /// for each code of that length, its literal with bit 8 set, or 0 when the code is no such literal
-    quick: Box<[u16; 1 << LUT_BITS]>,
     /// entries of `lut` past this are zero already
     dirty: usize,
 }
@@ -127,7 +125,6 @@ impl Huff {
             sorted: Vec::new(),
             empty: true,
             common: 0,
-            quick: Box::new([0; 1 << LUT_BITS]),
             dirty: 1 << LUT_BITS,
         }
     }
@@ -175,18 +172,6 @@ impl Huff {
         by_len[0] = 0;
         let (len, n) = by_len.iter().enumerate().max_by_key(|&(l, &n)| (n, std::cmp::Reverse(l))).unwrap();
         self.common = if lengths.len() >= 256 && *n >= 64 && len <= LUT_BITS as usize { len as u32 } else { 0 };
-        if self.common != 0 {
-            let g = self.common as usize;
-            let quick = &mut self.quick[..1 << g];
-            quick.fill(0);
-            let first = self.first[g] >> (16 - g);
-            let from = self.start[g] as usize;
-            for (rank, &sym) in self.sorted[from..from + count[g] as usize].iter().enumerate() {
-                if sym < 256 {
-                    quick[(first + rank as u32) as usize] = sym | 0x100;
-                }
-            }
-        }
         // canonical codes up to the table's width fill it from the start, in order; the rest belongs to longer codes
         // or to none, and is marked for the slow path
         let mut covered = 0;
@@ -219,30 +204,30 @@ impl Huff {
         self.decode_slow(peek, bits)
     }
 
-    /// Up to six literals of the common length from one refill, read as if every code had that length: each is
-    /// looked up on its own, none waiting on the one before, and they are kept up to the first that isn't such a
-    /// literal. Returns them with how many there are. Needs 56 bits in the accumulator.
+    /// Up to six literals of the common length from one refill. All the lookups are made at once, as if every
+    /// code had that length, and kept for as long as that holds. Returns them with how many there are (none when
+    /// the first code isn't such a literal). Needs 56 bits in the accumulator.
     #[inline(always)]
     fn quick(&self, bits: &mut Bits<'_>) -> ([u8; 6], usize) {
         let g = self.common;
         let a = bits.acc;
-        let e = if g == 8 {
-            // the usual case, codes on byte boundaries: no shifting at all
-            let b = a.to_be_bytes();
-            [b[0], b[1], b[2], b[3], b[4], b[5]].map(|c| self.quick[usize::from(c)])
-        } else {
-            let at = |k: u32| self.quick[((a << (k * g)) >> (64 - g)) as usize & ((1 << LUT_BITS) - 1)];
-            [at(0), at(1), at(2), at(3), at(4), at(5)]
-        };
-        let mut valid = 0u32;
-        for (i, &x) in e.iter().enumerate() {
-            valid |= u32::from(x >> 8) << i;
+        let sh = 64 - LUT_BITS;
+        let at = |k: u32| self.lut[((a << (k * g)) >> sh) as usize];
+        // a literal (symbol below 256, so the top four bits clear) of length g
+        let hit = |e: u16| u32::from(e & 0xF00F) == g;
+        let e = [at(0), at(1), at(2), at(3), at(4), at(5)];
+        let lits = e.map(|e| (e >> 4) as u8);
+        if g == 0 || !hit(e[0]) {
+            return (lits, 0);
         }
-        // as many as fit in what a refill guarantees
-        let most = if g <= 9 { 6 } else { 5 };
-        let n = (!valid).trailing_zeros().min(most);
-        bits.skip(n * g);
-        (e.map(|x| x as u8), n as usize)
+        // six codes fit in a refill only when they are short; four always do
+        let most = if g <= 9 { 6 } else { 4 };
+        let mut n = 1;
+        while n < most && hit(e[n]) {
+            n += 1;
+        }
+        bits.skip(n as u32 * g);
+        (lits, n)
     }
 
     /// Quick literals for as long as they keep coming, into `stage`, while the bits stay at least 128 short of
@@ -550,8 +535,15 @@ impl Unpacker {
         if self.pool.is_none() {
             self.pool = Some(Pool::new(self.threads));
         }
-        let job =
-            Job { seq: self.submitted, buf: block, start_bit, end_bits, lengths: Arc::clone(&self.lengths), toks, lits };
+        let job = Job {
+            seq: self.submitted,
+            buf: block,
+            start_bit,
+            end_bits,
+            lengths: Arc::clone(&self.lengths),
+            toks,
+            lits,
+        };
         self.queued += job.buf.len();
         self.pool.as_ref().unwrap().submit(job);
         self.submitted += 1;
