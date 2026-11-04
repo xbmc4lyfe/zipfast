@@ -285,6 +285,51 @@ fn a_block_of_tiny_codes_is_finished_on_the_calling_thread() {
     assert!(u.resumed > 0, "the worker should have stopped at its budget");
 }
 
+#[test]
+fn a_worker_stopped_mid_run_still_hands_on_the_lengths_after_it() {
+    // one run of blocks: tiny codes past the budget, then blocks without and with tables, then enough noise that
+    // more runs follow and wait on the lengths the first run carries
+    let mut ops = vec![Op::Lit(b'a'), Op::Lit(b'b'), Op::Match(2, 2)];
+    ops.extend(std::iter::repeat_n(Op::Last, 150_000));
+    let mut stream = block(&ops, true, false);
+    assert!(stream.len() < JOB_BYTES);
+    let mut all = ops;
+    let tail = lits(b"no tables here");
+    stream.extend(block(&tail, false, false));
+    all.extend(tail);
+    let mut x = 7u64;
+    for i in 0..40 {
+        let noise: Vec<Op> = (0..20_000)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                Op::Lit((x >> 24) as u8)
+            })
+            .collect();
+        // every other block keeps the tables before it
+        stream.extend(block(&noise, i % 2 == 0, i == 39));
+        all.extend(noise);
+    }
+    let want = model(&all);
+    for piece in [usize::MAX, 70_000] {
+        assert_eq!(decode(&stream, want.len() as u64, 1 << 22, piece).unwrap(), want, "{piece}");
+    }
+    let mut u = Unpacker::new(1 << 22).unwrap();
+    u.set_threads(2, 0);
+    u.reset(Some(want.len() as u64));
+    let mut n = 0;
+    let mut sink = |b: &[u8]| -> Result<()> {
+        n += b.len();
+        Ok(())
+    };
+    u.feed(&stream, &mut sink).unwrap();
+    u.finish(&mut sink).unwrap();
+    assert_eq!(n, want.len());
+    assert_eq!(u.resumed, 1, "the first run should have stopped at its budget");
+    assert!(u.submitted > 3);
+}
+
 /// Incompressible data with a few skewed bytes and short matches: most literals share one code length, some are
 /// shorter or longer, so the guess at four literals of that length is kept, cut short and refused in turn.
 fn mostly_noise(n: usize, seed: u64) -> Vec<Op> {
