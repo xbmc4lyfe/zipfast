@@ -162,3 +162,23 @@ fn rejects_bad_streams() {
     let no_tables = block(&lits(b"abc"), false, true);
     assert!(decode(&no_tables, 3, 1 << 17, usize::MAX).is_err(), "no tables");
 }
+
+#[test]
+fn a_filter_over_the_whole_file_fits_the_window_chosen_for_it() {
+    let data: Vec<u8> = (0..100_000u32).map(|i| (i * 7 % 251) as u8).collect();
+    let mut ops = vec![Op::Filter { start: 0, len: 100_000, kind: 0, channels: 1 }];
+    ops.extend(lits(&data));
+    let stream = block(&ops, true, true);
+    let window = window_for(4 << 20, Some(100_000), false).unwrap();
+    let got = decode(&stream, 100_000, window, 4096).unwrap();
+    assert_eq!(got.len(), 100_000);
+}
+
+#[test]
+fn window_sizes_stay_sane_for_any_stated_size() {
+    assert_eq!(window_for(1 << 17, Some(u64::MAX - 1), false).unwrap(), 1 << 17);
+    assert_eq!(window_for(1 << 22, Some(u64::MAX), false).unwrap(), 1 << 22);
+    assert_eq!(window_for(1 << 22, Some(100_000), false).unwrap(), 1 << 18);
+    assert_eq!(window_for(1 << 22, Some(10), false).unwrap(), 1 << 17);
+    assert_eq!(window_for(1 << 22, Some(10), true).unwrap(), 1 << 22);
+}

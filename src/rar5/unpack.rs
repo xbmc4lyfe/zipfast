@@ -202,14 +202,16 @@ pub struct Unpacker {
     input: Vec<u8>,
 }
 
-/// The window a file needs: its declared dictionary, but never more than the file itself when nothing before or
-/// after it can refer back into it.
+/// The window a file needs: its declared dictionary, but no more than twice the file when nothing before or after it
+/// can refer back into it. Twice, because a filter may cover up to half the window and a filter may cover the whole
+/// file.
 pub fn window_for(dictionary: u64, unpacked: Option<u64>, solid_stream: bool) -> Result<u64> {
     if dictionary == 0 || !dictionary.is_power_of_two() {
         return Err(Error::Unsupported(format!("dictionary size {dictionary}")));
     }
     let need = match unpacked {
-        Some(size) if !solid_stream => size.max(1).next_power_of_two().max(128 * 1024),
+        // bounded by the dictionary first, so an absurd stated size can't overflow the rounding
+        Some(size) if !solid_stream => (size.min(dictionary).max(1) * 2).next_power_of_two().max(128 * 1024),
         _ => dictionary,
     };
     Ok(need.min(dictionary))
