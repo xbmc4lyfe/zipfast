@@ -41,12 +41,23 @@ impl Slot {
 }
 
 /// One block in a job: where it starts in the job's bytes, where its bits end, whether it starts with tables, and
-/// the slot for the lengths it is read with, which it fills itself when it has tables.
+/// the slot for the lengths it is read with, which it fills itself when it has tables. A part with a boundary holds
+/// no block: it marks where one file of a solid stream ends and the next begins.
 pub(super) struct Part {
     pub at: usize,
     pub end_bits: usize,
     pub read_tables: bool,
     pub slot: Arc<Slot>,
+    pub boundary: Option<Boundary>,
+}
+
+/// The end of one file of a solid stream and the start of the next.
+#[derive(Clone, Copy)]
+pub(super) struct Boundary {
+    /// the next file's declared size
+    pub size: Option<u64>,
+    /// the file before it ended partway through a block
+    pub truncated: bool,
 }
 
 /// A run of blocks for a worker, each payload with padding after it. Blocks go in runs so that handing them over
@@ -58,6 +69,8 @@ pub(super) struct Job {
     pub parts: Vec<Part>,
     pub toks: Vec<Tok>,
     pub lits: Vec<u8>,
+    /// for each part the worker got to, where its tokens and literals end
+    pub ends: Vec<(usize, usize)>,
 }
 
 /// A worker's output for a job: every token read before the end of its blocks, the first error, or the memory
@@ -148,10 +161,17 @@ fn work(
 ) -> (Result<Option<(usize, usize)>>, Arc<Tables>) {
     job.toks.clear();
     job.lits.clear();
+    job.ends.clear();
     let budget = job.buf.len() * BUDGET + SLACK;
     let mut result = Ok(None);
     let mut last = None;
     for (i, p) in job.parts.iter().enumerate() {
+        if p.boundary.is_some() {
+            if matches!(result, Ok(None)) {
+                job.ends.push((job.toks.len(), job.lits.len()));
+            }
+            continue;
+        }
         let mut bits = Bits::new(&job.buf[p.at..]);
         if !matches!(result, Ok(None)) {
             if p.read_tables {
@@ -184,12 +204,14 @@ fn work(
             Ok(t) => t,
             Err(e) => {
                 result = Err(e);
+                job.ends.push((job.toks.len(), job.lits.len()));
                 continue;
             }
         };
         let start = bits.pos();
         result = tokenize(&job.buf[p.at..], start, p.end_bits, &tables, &mut job.toks, &mut job.lits, budget)
             .map(|stop| stop.map(|bit| (i, bit)));
+        job.ends.push((job.toks.len(), job.lits.len()));
         last = Some(tables);
     }
     (result, last.unwrap_or_else(|| Arc::new(Tables::empty())))

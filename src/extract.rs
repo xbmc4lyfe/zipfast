@@ -1,7 +1,7 @@
 //! Lists, tests and extracts an archive. RAR 5.0 lives here: its volumes are followed in order and compressed files
 //! decoded. Other formats have modules of their own.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -298,18 +298,130 @@ impl Pending {
 
     /// Where decoded bytes go: the checksums and the output file.
     fn sink(&mut self) -> impl FnMut(&[u8]) -> Result<()> + '_ {
-        move |chunk: &[u8]| {
-            self.hasher.update(chunk);
-            if let Some(b) = self.blake.as_mut() {
-                b.update(chunk);
-            }
-            if let Some(out) = self.out.as_mut() {
-                out.write(chunk)?;
-            }
-            self.bytes += chunk.len() as u64;
-            Ok(())
+        move |chunk: &[u8]| self.take(chunk)
+    }
+
+    fn take(&mut self, chunk: &[u8]) -> Result<()> {
+        self.hasher.update(chunk);
+        if let Some(b) = self.blake.as_mut() {
+            b.update(chunk);
+        }
+        if let Some(out) = self.out.as_mut() {
+            out.write(chunk)?;
+        }
+        self.bytes += chunk.len() as u64;
+        Ok(())
+    }
+}
+
+/// What a file is checked against once all of it is in.
+struct Checks {
+    crc32: Option<u32>,
+    blake2sp: Option<[u8; 32]>,
+    size: Option<u64>,
+    meta: Meta,
+}
+
+impl From<&FileHeader> for Checks {
+    fn from(h: &FileHeader) -> Self {
+        Checks {
+            crc32: h.crc32,
+            blake2sp: h.blake2sp,
+            size: (!h.size_unknown()).then_some(h.unpacked_size),
+            meta: Meta::from(h),
         }
     }
+}
+
+/// A file of a solid stream whose blocks went to the decoder behind the ones before it.
+type Queued = (Pending, Checks);
+
+/// Queued files of a solid stream held open at most, when extracting and when testing: past this, the decoder
+/// catches up to half as many.
+const MAX_OPEN_QUEUED: usize = 64;
+const MAX_TESTED_QUEUED: usize = 1024;
+
+const NEEDS_EARLIER: &str = "needs the files before it in this solid archive, which weren't decoded";
+
+fn fail_to(summary: &mut Summary, report: &mut impl FnMut(&str), name: &str, why: &str) {
+    let line = format!("{name}: {why}");
+    report(&line);
+    summary.errors.push(line);
+}
+
+/// A file's last part is in: checks it whole and finishes it.
+fn check_and_finish(summary: &mut Summary, report: &mut impl FnMut(&str), c: &Checks, mut p: Pending) -> Result<()> {
+    let crc_bad = c.crc32.is_some_and(|want| p.hasher.clone().finalize() != want);
+    let blake_bad = match (c.blake2sp, p.blake.take()) {
+        (Some(want), Some(got)) => got.finish() != want,
+        // a hash that only the last part states can't be checked from here: say so rather than pass it
+        (Some(_), None) if c.crc32.is_none() => {
+            if !p.passive {
+                fail_to(
+                    summary,
+                    report,
+                    &p.name,
+                    "its BLAKE2sp hash starts only in a later part, so it can't be checked",
+                );
+            }
+            p.discard();
+            return Ok(());
+        }
+        _ => false,
+    };
+    if p.passive {
+        return Ok(());
+    }
+    if crc_bad || blake_bad {
+        fail_to(summary, report, &p.name, "checksum error");
+        p.discard();
+        return Ok(());
+    }
+    // a matching checksum doesn't vouch for the size the header states
+    if let Some(size) = c.size
+        && p.bytes != size
+    {
+        fail_to(summary, report, &p.name, &format!("{} bytes where the header says {size}", p.bytes));
+        p.discard();
+        return Ok(());
+    }
+    if let Some(out) = p.out.take() {
+        // the last of a big file may still be on its way to the disk
+        match out.finish() {
+            Ok(file) => finish_file(&file, &c.meta),
+            Err(e) => {
+                p.discard();
+                return Err(e.into());
+            }
+        }
+    }
+    summary.files += 1;
+    summary.bytes += p.bytes;
+    Ok(())
+}
+
+/// Where a solid stream's queued files' bytes go: to the oldest file not yet finished, which an empty slice from the
+/// decoder finishes.
+fn route<'a>(
+    queued: &'a mut VecDeque<Queued>,
+    summary: &'a mut Summary,
+    report: &'a mut impl FnMut(&str),
+) -> impl FnMut(&[u8]) -> Result<()> + 'a {
+    move |chunk: &[u8]| {
+        if chunk.is_empty() {
+            let Some((p, c)) = queued.pop_front() else { return Err(Error::Corrupt("more files than were queued")) };
+            return check_and_finish(summary, report, &c, p);
+        }
+        match queued.front_mut() {
+            Some((p, _)) => p.take(chunk),
+            None => Err(Error::Corrupt("more files than were queued")),
+        }
+    }
+}
+
+/// Whether a decoder's error is the file's own trouble rather than the run's.
+fn decoding_error(e: &Error) -> bool {
+    matches!(e, Error::Corrupt(_) | Error::Unsupported(_) | Error::Truncated)
 }
 
 struct Run<'a, R: FnMut(&str)> {
@@ -327,6 +439,11 @@ struct Run<'a, R: FnMut(&str)> {
     /// where the files handed to the workers since they last finished everything are written, folded to lower case
     /// as a case-insensitive file system would; a later file going to one of these waits for them first
     batch_paths: HashSet<String>,
+    /// files of a solid stream fed to the decoder and not yet finished, oldest first: their blocks may still be with
+    /// its workers
+    queued: VecDeque<Queued>,
+    /// where the queued files are written, as `batch_paths`
+    queued_paths: HashSet<String>,
 }
 
 /// A file finished on another thread, counted and reported as if done here.
@@ -364,6 +481,8 @@ fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Sum
         threads,
         batch: None,
         batch_paths: HashSet::new(),
+        queued: VecDeque::new(),
+        queued_paths: HashSet::new(),
     };
     let walked = walk(first, |vol, block| {
         let Block::File(h) = block else { return Ok(()) };
@@ -396,7 +515,13 @@ fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Sum
 }
 
 impl<R: FnMut(&str)> Run<'_, R> {
+    /// Finishes everything still on other threads.
     fn drain(&mut self) -> Result<()> {
+        self.drain_solid()?;
+        self.drain_batch()
+    }
+
+    fn drain_batch(&mut self) -> Result<()> {
         let Some(mut batch) = self.batch.take() else { return Ok(()) };
         let (summary, report) = (&mut self.summary, &mut self.report);
         let result = batch.drain(&mut |done| apply_done(summary, report, done));
@@ -457,15 +582,14 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     fn fail(&mut self, name: &str, why: &str) {
-        let line = format!("{name}: {why}");
-        (self.report)(&line);
-        self.summary.errors.push(line);
+        fail_to(&mut self.summary, &mut self.report, name, why);
     }
 
     fn file_block(&mut self, vol: &mut Volume, h: &FileHeader) -> Result<()> {
-        // a file done here reports as it goes, so the ones before it with the workers come in first
+        // a file done here reports as it goes, so the ones before it with the workers come in first (a solid
+        // stream's queued files wait for the next file that can't join them)
         if !self.goes_to_batch(vol, h) {
-            self.drain()?;
+            self.drain_batch()?;
         }
         if h.split_before() {
             match self.pending.take() {
@@ -532,7 +656,10 @@ impl<R: FnMut(&str)> Run<'_, R> {
         // (a folder on its way to it may still be such a file, too)
         let key = rel.to_string_lossy().to_lowercase();
         if self.opts.mode == Mode::Extract
-            && rel.ancestors().any(|a| self.batch_paths.contains(&a.to_string_lossy().to_lowercase()))
+            && rel.ancestors().any(|a| {
+                let a = a.to_string_lossy().to_lowercase();
+                self.batch_paths.contains(&a) || self.queued_paths.contains(&a)
+            })
         {
             self.drain()?;
         }
@@ -579,14 +706,48 @@ impl<R: FnMut(&str)> Run<'_, R> {
             }
             return self.send_to_batch(vol, h, out.zip(path));
         }
+        if self.opts.mode == Mode::Extract {
+            self.queued_paths.insert(key);
+        }
         let p = Pending::new(h, out, path);
         self.begin_decoding(vol, h, p)
     }
 
     /// Sets the decoder up for a compressed file, then reads its first part.
     fn begin_decoding(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending) -> Result<()> {
+        let size = (!h.size_unknown()).then_some(h.unpacked_size);
+        let queues = self.queueable(vol, h);
+        if queues
+            && h.solid
+            && !self.queued.is_empty()
+            && let Some(u) = self.stream.as_mut()
+            && h.dictionary <= u.window_size()
+        {
+            // every queued file holds its output open
+            let most = if self.opts.mode == Mode::Extract { MAX_OPEN_QUEUED } else { MAX_TESTED_QUEUED };
+            if self.queued.len() >= most {
+                let (queued, summary, report) = (&mut self.queued, &mut self.summary, &mut self.report);
+                let caught_up = u.catch_up(most as u64 / 2, &mut route(queued, summary, report));
+                if let Err(e) = caught_up {
+                    if !decoding_error(&e) {
+                        p.discard();
+                        self.discard_queued();
+                        return Err(e);
+                    }
+                    // the stream is gone with the file that failed, so this one fails after it
+                    self.fail_queued(&e.to_string());
+                    return self.begin_decoding(vol, h, p);
+                }
+            }
+            u.queue_file(size);
+            return self.decode_queued(vol, h, p);
+        }
+        // anything else is done in order, after the queued files
+        if let Err(e) = self.drain_solid() {
+            p.discard();
+            return Err(e);
+        }
         if h.method != 0 {
-            let size = (!h.size_unknown()).then_some(h.unpacked_size);
             let solid_archive = vol.main.is_solid();
             let ready = if h.solid {
                 match self.stream.as_mut() {
@@ -594,7 +755,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
                         u.next_file(size);
                         Ok(())
                     }
-                    _ => Err("needs the files before it in this solid archive, which weren't decoded".to_string()),
+                    _ => Err(NEEDS_EARLIER.to_string()),
                 }
             } else {
                 match window_for(h.dictionary, size, solid_archive) {
@@ -622,9 +783,127 @@ impl<R: FnMut(&str)> Run<'_, R> {
                 }
                 p.discard();
                 self.stream = None;
+            } else if queues
+                && let Some(u) = self.stream.as_mut()
+                && u.threads() > 0
+            {
+                u.force_parallel();
+                return self.decode_queued(vol, h, p);
             }
         }
         self.continue_file(vol, h, p)
+    }
+
+    /// Whether `h` can be decoded behind the files before it in a solid stream: compressed, whole in this volume, of
+    /// known size, with threads to spare.
+    fn queueable(&self, vol: &Volume, h: &FileHeader) -> bool {
+        self.threads > 1
+            && vol.main.is_solid()
+            && h.method != 0
+            && h.algorithm == 0
+            && !h.encrypted
+            && !h.split_before()
+            && !h.split_after()
+            && !h.size_unknown()
+    }
+
+    /// Feeds a whole file to the decoder behind the queued ones. Its bytes go to it once the ones before are done.
+    fn decode_queued(&mut self, vol: &mut Volume, h: &FileHeader, p: Pending) -> Result<()> {
+        self.queued.push_back((p, Checks::from(h)));
+        let mut buf = std::mem::take(&mut self.buf);
+        let mut stream = self.stream.take();
+        let mut fed = false;
+        let (queued, summary, report) = (&mut self.queued, &mut self.summary, &mut self.report);
+        let read = vol.read_data(h.data_at, h.packed_size, &mut buf, |chunk| {
+            let Some(u) = stream.as_mut() else { return Err(Error::Corrupt("no decoder for a queued file")) };
+            let r = u.feed(chunk, &mut route(queued, summary, report));
+            fed = r.is_err();
+            r
+        });
+        self.buf = buf;
+        match read {
+            Ok(()) => {
+                self.stream = stream;
+                Ok(())
+            }
+            // the oldest file still queued is the one the decoder was on
+            Err(e) if fed && decoding_error(&e) => {
+                self.fail_queued(&e.to_string());
+                Ok(())
+            }
+            Err(e) if fed => {
+                self.discard_queued();
+                Err(e)
+            }
+            // the archive can't be read on: the files before this one are whole, so they are finished first
+            Err(e) => {
+                if let Some(u) = stream.as_mut() {
+                    let (queued, summary, report) = (&mut self.queued, &mut self.summary, &mut self.report);
+                    let waited = u.wait(&mut route(queued, summary, report));
+                    if let Err(d) = waited
+                        && decoding_error(&d)
+                    {
+                        self.fail_queued(&d.to_string());
+                    }
+                }
+                self.discard_queued();
+                Err(e)
+            }
+        }
+    }
+
+    /// Decodes the queued files to their end and finishes them.
+    fn drain_solid(&mut self) -> Result<()> {
+        if self.queued.is_empty() {
+            return Ok(());
+        }
+        let Some(mut u) = self.stream.take() else {
+            self.fail_queued(NEEDS_EARLIER);
+            return Ok(());
+        };
+        let (queued, summary, report) = (&mut self.queued, &mut self.summary, &mut self.report);
+        let finished = u.finish(&mut route(queued, summary, report));
+        match finished {
+            Ok(()) => {
+                self.stream = Some(u);
+                self.queued_paths.clear();
+                // every file but the last was finished where the next began
+                let Some((p, c)) = self.queued.pop_front() else { return Ok(()) };
+                debug_assert!(self.queued.is_empty());
+                check_and_finish(&mut self.summary, &mut self.report, &c, p)
+            }
+            Err(e) if decoding_error(&e) => {
+                self.fail_queued(&e.to_string());
+                Ok(())
+            }
+            Err(e) => {
+                self.discard_queued();
+                Err(e)
+            }
+        }
+    }
+
+    /// The decoder failed on the oldest queued file: the ones after it can't be decoded either.
+    fn fail_queued(&mut self, why: &str) {
+        let mut why = why;
+        while let Some((mut p, _)) = self.queued.pop_front() {
+            if !p.passive {
+                self.fail(&p.name, why);
+            }
+            p.discard();
+            why = NEEDS_EARLIER;
+        }
+        self.stream = None;
+        self.queued_paths.clear();
+    }
+
+    /// Drops the queued files and what was written of them, unreported: the run itself is failing.
+    fn discard_queued(&mut self) {
+        for (mut p, _) in self.queued.drain(..) {
+            p.discard();
+        }
+        self.stream = None;
+        self.queued_paths.clear();
     }
 
     /// Reads this volume's part of a file and, at its last part, checks and finishes it.
@@ -717,47 +996,8 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     /// A file's last part is in: checks it whole and finishes it.
-    fn finish_file_checks(&mut self, h: &FileHeader, mut p: Pending) -> Result<()> {
-        let crc_bad = h.crc32.is_some_and(|want| p.hasher.clone().finalize() != want);
-        let blake_bad = match (h.blake2sp, p.blake.take()) {
-            (Some(want), Some(got)) => got.finish() != want,
-            // a hash that only the last part states can't be checked from here: say so rather than pass it
-            (Some(_), None) if h.crc32.is_none() => {
-                if !p.passive {
-                    self.fail(&p.name, "its BLAKE2sp hash starts only in a later part, so it can't be checked");
-                }
-                p.discard();
-                return Ok(());
-            }
-            _ => false,
-        };
-        if p.passive {
-            return Ok(());
-        }
-        if crc_bad || blake_bad {
-            self.fail(&p.name, "checksum error");
-            p.discard();
-            return Ok(());
-        }
-        // a matching checksum doesn't vouch for the size the header states
-        if !h.size_unknown() && p.bytes != h.unpacked_size {
-            self.fail(&p.name, &format!("{} bytes where the header says {}", p.bytes, h.unpacked_size));
-            p.discard();
-            return Ok(());
-        }
-        if let Some(out) = p.out.take() {
-            // the last of a big file may still be on its way to the disk
-            match out.finish() {
-                Ok(file) => finish_file(&file, &Meta::from(h)),
-                Err(e) => {
-                    p.discard();
-                    return Err(e.into());
-                }
-            }
-        }
-        self.summary.files += 1;
-        self.summary.bytes += p.bytes;
-        Ok(())
+    fn finish_file_checks(&mut self, h: &FileHeader, p: Pending) -> Result<()> {
+        check_and_finish(&mut self.summary, &mut self.report, &Checks::from(h), p)
     }
 }
 
