@@ -107,6 +107,8 @@ struct Huff {
     sorted: Vec<u16>,
     /// no codes at all
     empty: bool,
+    /// the length most literals have, when it is short enough for [`Huff::quick`]; 0 otherwise
+    common: u32,
 }
 
 impl Huff {
@@ -118,6 +120,7 @@ impl Huff {
             start: [0; 16],
             sorted: Vec::new(),
             empty: true,
+            common: 0,
         }
     }
 
@@ -156,6 +159,14 @@ impl Huff {
             }
         }
         self.empty = index == 0;
+        // incompressible data comes out as literals nearly all of one length: worth guessing at
+        let mut by_len = [0u32; 16];
+        for &l in lengths.iter().take(256) {
+            by_len[l as usize] += 1;
+        }
+        by_len[0] = 0;
+        let (len, n) = by_len.iter().enumerate().max_by_key(|&(l, &n)| (n, std::cmp::Reverse(l))).unwrap();
+        self.common = if lengths.len() >= 256 && *n >= 64 && len <= LUT_BITS as usize { len as u32 } else { 0 };
         self.lut.fill(0);
         for l in 1..=LUT_BITS as usize {
             let from = self.start[l] as usize;
@@ -178,6 +189,36 @@ impl Huff {
             return Ok(entry >> 4);
         }
         self.decode_slow(peek, bits)
+    }
+
+    /// Up to four literals of the common length from one refill. All four lookups are made at once, as if every
+    /// code had that length, and kept for as long as that holds; the first code is known to be such a literal.
+    /// Returns them with how many there are. Needs `4 * common` bits in the accumulator.
+    #[inline(always)]
+    fn quick(&self, bits: &mut Bits<'_>) -> Option<([u8; 4], usize)> {
+        let g = self.common;
+        let a = bits.acc;
+        let sh = 64 - LUT_BITS;
+        let e1 = self.lut[(a >> sh) as usize];
+        // a literal (symbol below 256, so the top four bits clear) of length g
+        let hit = |e: u16| u32::from(e & 0xF00F) == g;
+        if g == 0 || !hit(e1) {
+            return None;
+        }
+        let e2 = self.lut[((a << g) >> sh) as usize];
+        let e3 = self.lut[((a << (2 * g)) >> sh) as usize];
+        let e4 = self.lut[((a << (3 * g)) >> sh) as usize];
+        let n = if !hit(e2) {
+            1
+        } else if !hit(e3) {
+            2
+        } else if !hit(e4) {
+            3
+        } else {
+            4
+        };
+        bits.skip(n as u32 * g);
+        Some(([(e1 >> 4) as u8, (e2 >> 4) as u8, (e3 >> 4) as u8, (e4 >> 4) as u8], n))
     }
 
     #[cold]
@@ -789,10 +830,23 @@ impl Unpacker {
         }
         let result = loop {
             let sym;
-            if bits.pos() + 128 <= end_bits && sp + 3 <= limit {
+            if bits.pos() + 128 <= end_bits && sp + 4 <= limit {
+                bits.refill();
+                if let Some((lits, n)) = main.quick(bits) {
+                    put!(lits[0]);
+                    if n > 1 {
+                        put!(lits[1]);
+                        if n > 2 {
+                            put!(lits[2]);
+                            if n > 3 {
+                                put!(lits[3]);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 // well inside the block and the output limits: a refill holds at least 56 bits and a code is at
                 // most 15, so up to three literals go without another refill or any limit check
-                bits.refill();
                 let s1 = decode!(main);
                 if s1 >= 256 {
                     sym = s1;

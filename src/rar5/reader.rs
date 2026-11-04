@@ -137,6 +137,12 @@ impl Volume {
         }))
     }
 
+    /// The volume file's length.
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+
     /// Reads `len` bytes of a data area starting at `at` into `out`, in pieces, calling `sink` on each.
     pub fn read_data(
         &mut self,

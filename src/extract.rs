@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::batch::{self, Batch, Done, Job, Outcome};
 use crate::blake2sp::Blake2sp;
 use crate::error::{Error, Result};
 use crate::output::Output;
@@ -318,17 +319,57 @@ struct Run<'a, R: FnMut(&str)> {
     stream: Option<Unpacker>,
     buf: Vec<u8>,
     report: R,
+    /// threads for work spread over files; 1 for none
+    threads: usize,
+    /// small files being decoded and written on other threads
+    batch: Option<Batch>,
+}
+
+/// A file finished on another thread, counted and reported as if done here.
+fn apply_done(summary: &mut Summary, report: &mut impl FnMut(&str), done: Done) -> Result<()> {
+    match done.outcome {
+        Outcome::Done(bytes) => {
+            summary.files += 1;
+            summary.bytes += bytes;
+            Ok(())
+        }
+        Outcome::Failed(why) => {
+            let line = format!("{}: {why}", done.name);
+            report(&line);
+            summary.errors.push(line);
+            Ok(())
+        }
+        Outcome::Fatal(e) => Err(e),
+    }
 }
 
 fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Summary> {
     if opts.mode == Mode::Extract {
         fs::create_dir_all(&opts.dest)?;
     }
-    let mut r = Run { opts, summary: Summary::default(), pending: None, stream: None, buf: vec![0u8; BUF], report };
+    let threads = opts.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+    // the hidden size knob is there to test decoding blocks on workers, which batching would bypass
+    let threads = if opts.parallel_min.is_some() { 1 } else { threads };
+    let mut r = Run {
+        opts,
+        summary: Summary::default(),
+        pending: None,
+        stream: None,
+        buf: vec![0u8; BUF],
+        report,
+        threads,
+        batch: None,
+    };
     let walked = walk(first, |vol, block| {
         let Block::File(h) = block else { return Ok(()) };
         r.file_block(vol, &h)
     });
+    // files still with the workers come in before anything is summed up or folders are finished
+    let walked = walked.and_then(|v| r.drain().map(|()| v));
+    if walked.is_err() {
+        // whatever went wrong, the workers finish (or remove) what they hold
+        let _ = r.drain();
+    }
     // whatever stopped the walk, a file left half-written is removed
     let volumes = match walked {
         Ok(v) => v,
@@ -350,6 +391,59 @@ fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Sum
 }
 
 impl<R: FnMut(&str)> Run<'_, R> {
+    fn drain(&mut self) -> Result<()> {
+        let Some(mut batch) = self.batch.take() else { return Ok(()) };
+        let (summary, report) = (&mut self.summary, &mut self.report);
+        let result = batch.drain(&mut |done| apply_done(summary, report, done));
+        self.batch = Some(batch);
+        result
+    }
+
+    /// Whether `h` can go to the workers whole: a small file standing alone in one volume.
+    fn batchable(&self, vol: &Volume, h: &FileHeader) -> bool {
+        self.threads > 1
+            && !vol.main.is_solid()
+            && !h.solid
+            && !h.split_before()
+            && !h.split_after()
+            && !h.size_unknown()
+            && h.unpacked_size <= batch::JOB_MAX
+            && h.packed_size <= batch::JOB_MAX
+            && (h.method == 0 || h.packed_size > 0)
+    }
+
+    /// Reads `h`'s data and hands it to the workers.
+    fn send_to_batch(&mut self, vol: &mut Volume, h: &FileHeader, out: Option<(File, PathBuf)>) -> Result<()> {
+        let mut packed = Vec::with_capacity(h.packed_size as usize);
+        let mut buf = std::mem::take(&mut self.buf);
+        let read = vol.read_data(h.data_at, h.packed_size, &mut buf, |chunk| {
+            packed.extend_from_slice(chunk);
+            Ok(())
+        });
+        self.buf = buf;
+        if let Err(e) = read {
+            if let Some((file, path)) = out {
+                drop(file);
+                let _ = fs::remove_file(path);
+            }
+            return Err(e);
+        }
+        let job = Job {
+            name: h.name.clone(),
+            packed,
+            method: h.method,
+            dictionary: h.dictionary,
+            size: h.unpacked_size,
+            crc32: h.crc32,
+            blake2sp: h.blake2sp,
+            out,
+            meta: Meta::from(h),
+        };
+        let batch = self.batch.get_or_insert_with(|| Batch::new(self.threads));
+        let (summary, report) = (&mut self.summary, &mut self.report);
+        batch.submit(job, &mut |done| apply_done(summary, report, done))
+    }
+
     fn fail(&mut self, name: &str, why: &str) {
         let line = format!("{name}: {why}");
         (self.report)(&line);
@@ -453,6 +547,9 @@ impl<R: FnMut(&str)> Run<'_, R> {
         } else {
             (None, None)
         };
+        if self.batchable(vol, h) && self.batch.as_ref().is_none_or(Batch::usable) {
+            return self.send_to_batch(vol, h, out.zip(path));
+        }
         let p = Pending::new(h, out, path);
         self.begin_decoding(vol, h, p)
     }
@@ -524,6 +621,14 @@ impl<R: FnMut(&str)> Run<'_, R> {
         // a part's checksums cover only its own packed bytes
         let mut part = crc32fast::Hasher::new();
         let mut part_blake = h.blake2sp.filter(|_| split_after).map(|_| Blake2sp::new());
+        if !p.compressed
+            && self.threads > 1
+            && h.packed_size >= batch::STORED_PARALLEL_MIN
+            && p.blake.is_none()
+            && part_blake.is_none()
+        {
+            return self.stored_parallel(vol, h, p);
+        }
         let mut buf = std::mem::take(&mut self.buf);
         let mut stream = if p.compressed { self.stream.take() } else { None };
         let read = vol.read_data(h.data_at, h.packed_size, &mut buf, |chunk| {
@@ -579,6 +684,11 @@ impl<R: FnMut(&str)> Run<'_, R> {
             self.pending = Some(p);
             return Ok(());
         }
+        self.finish_file_checks(h, p)
+    }
+
+    /// A file's last part is in: checks it whole and finishes it.
+    fn finish_file_checks(&mut self, h: &FileHeader, mut p: Pending) -> Result<()> {
         let crc_bad = h.crc32.is_some_and(|want| p.hasher.clone().finalize() != want);
         let blake_bad = match (h.blake2sp, p.blake.take()) {
             (Some(want), Some(got)) => got.finish() != want,
@@ -619,6 +729,57 @@ impl<R: FnMut(&str)> Run<'_, R> {
         self.summary.files += 1;
         self.summary.bytes += p.bytes;
         Ok(())
+    }
+}
+
+impl<R: FnMut(&str)> Run<'_, R> {
+    /// A big part of a stored file, checked (and copied) on several threads. Ends as [`Self::continue_file`] does.
+    fn stored_parallel(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending) -> Result<()> {
+        let split_after = h.split_after();
+        if h.data_at.checked_add(h.packed_size).is_none_or(|end| end > vol.len()) {
+            p.discard();
+            return Err(Error::Truncated);
+        }
+        // the pieces are written by position, so the writer thread hands the file over first
+        let file = match p.out.take().map(Output::finish).transpose() {
+            Ok(f) => f,
+            Err(e) => {
+                p.discard();
+                return Err(e.into());
+            }
+        };
+        let part = batch::stored(&vol.path, h.data_at, h.packed_size, file.as_ref(), p.bytes, self.threads);
+        let part = match part {
+            Ok(part) => part,
+            Err(e) => {
+                drop(file);
+                p.discard();
+                return Err(e);
+            }
+        };
+        p.hasher.combine(&part);
+        p.bytes += h.packed_size;
+        if let Some(mut file) = file {
+            use std::io::{Seek, SeekFrom};
+            if let Err(e) = file.seek(SeekFrom::Start(p.bytes)) {
+                drop(file);
+                p.discard();
+                return Err(e.into());
+            }
+            let left = (!h.size_unknown()).then(|| h.unpacked_size.saturating_sub(p.bytes));
+            p.out = Some(Output::new(file, left));
+        }
+        if split_after {
+            if h.crc32.is_some_and(|want| part.finalize() != want) {
+                if !p.passive {
+                    self.fail(&p.name, "checksum error in a volume's part");
+                }
+                p.discard();
+            }
+            self.pending = Some(p);
+            return Ok(());
+        }
+        self.finish_file_checks(h, p)
     }
 }
 

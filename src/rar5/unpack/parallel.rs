@@ -147,6 +147,11 @@ fn tokenize(
         if bits.pos() + 128 <= end_bits {
             // three codes of at most 15 bits fit in one refill
             bits.refill();
+            if let Some((quick, n)) = t.main.quick(&mut bits) {
+                lits.extend_from_slice(&quick[..n]);
+                run += n as u32;
+                continue;
+            }
             let s1 = decode!(t.main);
             if s1 >= 256 {
                 sym = s1;
