@@ -6,7 +6,6 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -14,7 +13,7 @@ use std::thread::{self, JoinHandle};
 
 use crate::blake2sp::Blake2sp;
 use crate::error::{Error, Result};
-use crate::extract::{Meta, finish_file};
+use crate::extract::{Meta, Place, create_target, finish_file};
 use crate::output::Output;
 use crate::rar5::unpack::{Unpacker, window_for};
 
@@ -37,7 +36,8 @@ pub(crate) struct Job {
     pub size: u64,
     pub crc32: Option<u32>,
     pub blake2sp: Option<[u8; 32]>,
-    pub out: Option<(File, PathBuf)>,
+    /// where it is written, created by the worker
+    pub out: Option<Place>,
     pub meta: Meta,
 }
 
@@ -160,12 +160,9 @@ impl Drop for Batch {
     }
 }
 
-/// Drops a job no worker will see, removing the file opened for it.
+/// Drops a job no worker will see. Its file was never created.
 fn discard(job: Job) {
-    if let Some((file, path)) = job.out {
-        drop(file);
-        let _ = std::fs::remove_file(path);
-    }
+    drop(job);
 }
 
 fn run(job: Job, unpacker: &mut Option<Unpacker>) -> Done {
@@ -173,7 +170,10 @@ fn run(job: Job, unpacker: &mut Option<Unpacker>) -> Done {
     let mut hasher = crc32fast::Hasher::new();
     let mut blake = blake2sp.map(|_| Blake2sp::new());
     let (mut out, path) = match out {
-        Some((file, path)) => (Some(Output::new(file, Some(size))), Some(path)),
+        Some(place) => match create_target(&place, Some(size)) {
+            Ok(file) => (Some(Output::new(file, Some(size))), Some(place.path)),
+            Err(e) => return Done { name, outcome: Outcome::Fatal(e) },
+        },
         None => (None, None),
     };
     let mut bytes = 0u64;

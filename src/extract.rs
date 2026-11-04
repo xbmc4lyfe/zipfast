@@ -87,26 +87,74 @@ pub(crate) enum Target {
     Blocked(&'static str),
 }
 
+/// A checked place for a file not created yet: `replace` when something there is to be removed first.
+pub(crate) struct Place {
+    pub path: PathBuf,
+    pub replace: bool,
+}
+
+/// What [`check_target`] found.
+pub(crate) enum Checked {
+    Write(Place),
+    Exists,
+    Blocked(&'static str),
+}
+
 /// Prepares the output file for `rel`: makes its folders, honours the overwrite choice, and never writes through a
 /// link left at the target. `size` is preallocated when known.
 pub(crate) fn open_target(opts: &Options, rel: &Path, size: Option<u64>) -> Result<Target> {
+    Ok(match check_target(opts, rel, None)? {
+        Checked::Write(place) => {
+            let file = create_target(&place, size)?;
+            Target::Write(file, place.path)
+        }
+        Checked::Exists => Target::Exists,
+        Checked::Blocked(why) => Target::Blocked(why),
+    })
+}
+
+/// The first half of [`open_target`]: makes the folders and checks the target, without creating it. Folders in
+/// `made` are known to be there already; the ones made are added.
+pub(crate) fn check_target(opts: &Options, rel: &Path, made: Option<&mut HashSet<PathBuf>>) -> Result<Checked> {
     let target = opts.dest.join(rel);
     if let Some(parent) = rel.parent() {
-        make_dirs(&opts.dest, parent)?;
+        match made {
+            Some(made) if made.contains(parent) => {}
+            Some(made) => {
+                make_dirs(&opts.dest, parent)?;
+                made.insert(parent.to_path_buf());
+            }
+            None => make_dirs(&opts.dest, parent)?,
+        }
     }
-    match fs::symlink_metadata(&target) {
-        Ok(_) if opts.overwrite == Overwrite::Skip => return Ok(Target::Exists),
-        Ok(meta) if meta.is_dir() => return Ok(Target::Blocked("a folder is in the way")),
+    Ok(match fs::symlink_metadata(&target) {
+        Ok(_) if opts.overwrite == Overwrite::Skip => Checked::Exists,
+        Ok(meta) if meta.is_dir() => Checked::Blocked("a folder is in the way"),
+        Ok(_) => Checked::Write(Place { path: target, replace: true }),
+        Err(_) => Checked::Write(Place { path: target, replace: false }),
+    })
+}
+
+/// Files from this size up are given their full length when created. A small file gains nothing from it, and the
+/// call costs as much as closing the file.
+const PREALLOCATE_MIN: u64 = 1 << 20;
+
+/// The second half of [`open_target`].
+pub(crate) fn create_target(place: &Place, size: Option<u64>) -> Result<File> {
+    if place.replace {
         // removing first means a link left at the target is replaced, never written through
-        Ok(_) => fs::remove_file(&target)?,
-        Err(_) => {}
+        match fs::remove_file(&place.path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
     }
-    let file = OpenOptions::new().write(true).create_new(true).open(&target)?;
-    if let Some(size) = size.filter(|&s| s > 0) {
+    let file = OpenOptions::new().write(true).create_new(true).open(&place.path)?;
+    if let Some(size) = size.filter(|&s| s >= PREALLOCATE_MIN) {
         // one allocation up front keeps a big file in few extents; failure here is harmless
         let _ = file.set_len(size);
     }
-    Ok(Target::Write(file, target))
+    Ok(file)
 }
 
 /// One entry for a listing.
@@ -271,6 +319,10 @@ struct Pending {
     compressed: bool,
     /// where it is written, folded as `batch_paths` is
     key: Option<String>,
+    /// where it is to be written, until the file is created there
+    place: Option<Place>,
+    /// its bytes, gathered to be checked and written whole on a worker
+    mem: Option<Vec<u8>>,
 }
 
 impl Pending {
@@ -287,12 +339,26 @@ impl Pending {
             passive: false,
             compressed: h.method != 0,
             key: None,
+            place: None,
+            mem: None,
         }
+    }
+
+    /// Creates the file at its place, if it has one and isn't created yet.
+    fn open(&mut self, size: Option<u64>) -> Result<()> {
+        if let Some(place) = self.place.take() {
+            let file = create_target(&place, size)?;
+            self.out = Some(Output::new(file, size));
+            self.path = Some(place.path);
+        }
+        Ok(())
     }
 
     /// Gives up on this file: what was written of it is removed, so a later run doesn't take it for finished.
     fn discard(&mut self) {
         self.failed = true;
+        self.place = None;
+        self.mem = None;
         drop(self.out.take());
         if let Some(path) = self.path.take() {
             let _ = fs::remove_file(path);
@@ -305,6 +371,11 @@ impl Pending {
     }
 
     fn take(&mut self, chunk: &[u8]) -> Result<()> {
+        if let Some(mem) = self.mem.as_mut() {
+            mem.extend_from_slice(chunk);
+            self.bytes += chunk.len() as u64;
+            return Ok(());
+        }
         self.hasher.update(chunk);
         if let Some(b) = self.blake.as_mut() {
             b.update(chunk);
@@ -344,6 +415,9 @@ type Queued = (Pending, Checks);
 const MAX_OPEN_QUEUED: usize = 64;
 const MAX_TESTED_QUEUED: usize = 1024;
 
+/// Queued files up to this size are gathered in memory and created, written and finished on a worker.
+const GATHER_MAX: u64 = 1 << 20;
+
 const NEEDS_EARLIER: &str = "needs the files before it in this solid archive, which weren't decoded";
 
 fn fail_to(summary: &mut Summary, report: &mut impl FnMut(&str), name: &str, why: &str) {
@@ -352,20 +426,55 @@ fn fail_to(summary: &mut Summary, report: &mut impl FnMut(&str), name: &str, why
     summary.errors.push(line);
 }
 
-/// A file's last part is in: checks it whole and finishes it.
-fn check_and_finish(summary: &mut Summary, report: &mut impl FnMut(&str), c: &Checks, mut p: Pending) -> Result<()> {
+/// Where finished files are counted and reported, and the workers files are written on. A report waits for the
+/// files the workers hold, so reports keep archive order.
+struct Books<'a, R: FnMut(&str)> {
+    summary: &'a mut Summary,
+    report: &'a mut R,
+    batch: &'a mut Option<Batch>,
+}
+
+impl<R: FnMut(&str)> Books<'_, R> {
+    /// Takes in every file the workers hold.
+    fn catch_up(&mut self) -> Result<()> {
+        let Some(batch) = self.batch.as_mut() else { return Ok(()) };
+        let (summary, report) = (&mut *self.summary, &mut *self.report);
+        batch.drain(&mut |done| apply_done(summary, report, done))
+    }
+
+    fn fail(&mut self, name: &str, why: &str) -> Result<()> {
+        self.catch_up()?;
+        fail_to(self.summary, self.report, name, why);
+        Ok(())
+    }
+}
+
+/// A file's last part is in: checks it whole and finishes it, or hands it to a worker for that when its bytes were
+/// gathered.
+fn check_and_finish<R: FnMut(&str)>(books: &mut Books<'_, R>, c: &Checks, mut p: Pending) -> Result<()> {
+    if let Some(packed) = p.mem.take() {
+        let job = Job {
+            name: std::mem::take(&mut p.name),
+            packed,
+            method: 0,
+            dictionary: 0,
+            size: c.size.unwrap_or(p.bytes),
+            crc32: c.crc32,
+            blake2sp: c.blake2sp,
+            out: p.place.take(),
+            meta: c.meta,
+        };
+        let Some(batch) = books.batch.as_mut() else { return Err(Error::Io(std::io::Error::other("no file workers"))) };
+        let (summary, report) = (&mut *books.summary, &mut *books.report);
+        return batch.submit(job, &mut |done| apply_done(summary, report, done));
+    }
     let crc_bad = c.crc32.is_some_and(|want| p.hasher.clone().finalize() != want);
     let blake_bad = match (c.blake2sp, p.blake.take()) {
         (Some(want), Some(got)) => got.finish() != want,
         // a hash that only the last part states can't be checked from here: say so rather than pass it
         (Some(_), None) if c.crc32.is_none() => {
             if !p.passive {
-                fail_to(
-                    summary,
-                    report,
-                    &p.name,
-                    "its BLAKE2sp hash starts only in a later part, so it can't be checked",
-                );
+                books.fail(&p.name, "its BLAKE2sp hash starts only in a later part, so it can't be checked")?;
             }
             p.discard();
             return Ok(());
@@ -376,17 +485,15 @@ fn check_and_finish(summary: &mut Summary, report: &mut impl FnMut(&str), c: &Ch
         return Ok(());
     }
     if crc_bad || blake_bad {
-        fail_to(summary, report, &p.name, "checksum error");
         p.discard();
-        return Ok(());
+        return books.fail(&p.name, "checksum error");
     }
     // a matching checksum doesn't vouch for the size the header states
     if let Some(size) = c.size
         && p.bytes != size
     {
-        fail_to(summary, report, &p.name, &format!("{} bytes where the header says {size}", p.bytes));
         p.discard();
-        return Ok(());
+        return books.fail(&p.name, &format!("{} bytes where the header says {size}", p.bytes));
     }
     if let Some(out) = p.out.take() {
         // the last of a big file may still be on its way to the disk
@@ -398,22 +505,21 @@ fn check_and_finish(summary: &mut Summary, report: &mut impl FnMut(&str), c: &Ch
             }
         }
     }
-    summary.files += 1;
-    summary.bytes += p.bytes;
+    books.summary.files += 1;
+    books.summary.bytes += p.bytes;
     Ok(())
 }
 
 /// Where a solid stream's queued files' bytes go: to the oldest file not yet finished, which an empty slice from the
 /// decoder finishes.
-fn route<'a>(
+fn route<'a, 'b: 'a, R: FnMut(&str)>(
     queued: &'a mut VecDeque<Queued>,
-    summary: &'a mut Summary,
-    report: &'a mut impl FnMut(&str),
+    books: &'a mut Books<'b, R>,
 ) -> impl FnMut(&[u8]) -> Result<()> + 'a {
     move |chunk: &[u8]| {
         if chunk.is_empty() {
             let Some((p, c)) = queued.pop_front() else { return Err(Error::Corrupt("more files than were queued")) };
-            return check_and_finish(summary, report, &c, p);
+            return check_and_finish(books, &c, p);
         }
         match queued.front_mut() {
             Some((p, _)) => p.take(chunk),
@@ -447,6 +553,8 @@ struct Run<'a, R: FnMut(&str)> {
     queued: VecDeque<Queued>,
     /// where the queued files are written, as `batch_paths`
     queued_paths: HashSet<String>,
+    /// folders under the destination made (or found) so far
+    made_dirs: HashSet<PathBuf>,
 }
 
 /// A file finished on another thread, counted and reported as if done here.
@@ -486,6 +594,7 @@ fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Sum
         batch_paths: HashSet::new(),
         queued: VecDeque::new(),
         queued_paths: HashSet::new(),
+        made_dirs: HashSet::new(),
     };
     let walked = walk(first, |vol, block| {
         let Block::File(h) = block else { return Ok(()) };
@@ -559,15 +668,9 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     /// Reads `h`'s data and hands it to the workers.
-    fn send_to_batch(&mut self, vol: &mut Volume, h: &FileHeader, out: Option<(File, PathBuf)>) -> Result<()> {
+    fn send_to_batch(&mut self, vol: &mut Volume, h: &FileHeader, out: Option<Place>) -> Result<()> {
         let mut packed = Vec::with_capacity(h.packed_size as usize);
-        if let Err(e) = vol.read_data_into(h.data_at, h.packed_size, &mut packed) {
-            if let Some((file, path)) = out {
-                drop(file);
-                let _ = fs::remove_file(path);
-            }
-            return Err(e);
-        }
+        vol.read_data_into(h.data_at, h.packed_size, &mut packed)?;
         let job = Job {
             name: h.name.clone(),
             packed,
@@ -590,8 +693,9 @@ impl<R: FnMut(&str)> Run<'_, R> {
 
     fn file_block(&mut self, vol: &mut Volume, h: &FileHeader) -> Result<()> {
         // a file done here reports as it goes, so the ones before it with the workers come in first (a solid
-        // stream's queued files wait for the next file that can't join them)
-        if !self.goes_to_batch(vol, h) {
+        // stream's queued files, and the ones the workers write for it, wait for the next file that can't join
+        // them)
+        if !self.goes_to_batch(vol, h) && !self.queueable(vol, h) {
             self.drain_batch()?;
         }
         if h.split_before() {
@@ -668,7 +772,11 @@ impl<R: FnMut(&str)> Run<'_, R> {
         }
         if h.is_dir() {
             if self.opts.mode == Mode::Extract && !self.opts.flatten {
-                make_dirs(&self.opts.dest, &rel)?;
+                // a folder made earlier for a file inside it still gets its own times and permissions
+                if !self.made_dirs.contains(&rel) {
+                    make_dirs(&self.opts.dest, &rel)?;
+                    self.made_dirs.insert(rel.clone());
+                }
                 self.summary.dir_meta.push((self.opts.dest.join(&rel), Meta::from(h)));
             }
             self.summary.dirs += 1;
@@ -686,31 +794,32 @@ impl<R: FnMut(&str)> Run<'_, R> {
             return self.pass_over(vol, h);
         }
 
-        let (out, path) = if self.opts.mode == Mode::Extract {
-            match open_target(self.opts, &rel, (!h.size_unknown()).then_some(h.unpacked_size))? {
-                Target::Write(file, target) => (Some(file), Some(target)),
-                Target::Exists => {
+        let place = if self.opts.mode == Mode::Extract {
+            match check_target(self.opts, &rel, Some(&mut self.made_dirs))? {
+                Checked::Write(place) => Some(place),
+                Checked::Exists => {
                     self.drain()?;
                     (self.report)(&format!("{}: exists, skipped", h.name));
                     self.summary.skipped += 1;
                     return self.pass_over(vol, h);
                 }
-                Target::Blocked(why) => {
+                Checked::Blocked(why) => {
                     self.fail_in_order(&h.name, why)?;
                     return self.pass_over(vol, h);
                 }
             }
         } else {
-            (None, None)
+            None
         };
         if self.goes_to_batch(vol, h) {
             if self.opts.mode == Mode::Extract {
                 self.batch_paths.insert(key);
             }
-            return self.send_to_batch(vol, h, out.zip(path));
+            return self.send_to_batch(vol, h, place);
         }
-        let mut p = Pending::new(h, out, path);
+        let mut p = Pending::new(h, None, None);
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
+        p.place = place;
         self.begin_decoding(vol, h, p)
     }
 
@@ -727,8 +836,8 @@ impl<R: FnMut(&str)> Run<'_, R> {
             // every queued file holds its output open
             let most = if self.opts.mode == Mode::Extract { MAX_OPEN_QUEUED } else { MAX_TESTED_QUEUED };
             if self.queued.len() >= most {
-                let (queued, summary, report) = (&mut self.queued, &mut self.summary, &mut self.report);
-                let caught_up = u.catch_up(most as u64 / 2, &mut route(queued, summary, report));
+                let mut books = Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch };
+                let caught_up = u.catch_up(most as u64 / 2, &mut route(&mut self.queued, &mut books));
                 if let Err(e) = caught_up {
                     if !decoding_error(&e) {
                         p.discard();
@@ -736,15 +845,18 @@ impl<R: FnMut(&str)> Run<'_, R> {
                         return Err(e);
                     }
                     // the stream is gone with the file that failed, so this one fails after it
-                    self.fail_queued(&e.to_string());
+                    if let Err(e) = self.fail_queued(&e.to_string()) {
+                        p.discard();
+                        return Err(e);
+                    }
                     return self.begin_decoding(vol, h, p);
                 }
             }
             u.queue_file(size);
             return self.decode_queued(vol, h, p);
         }
-        // anything else is done in order, after the queued files
-        if let Err(e) = self.drain_solid() {
+        // anything else is done in order, after the queued files and what the workers hold
+        if let Err(e) = self.drain() {
             p.discard();
             return Err(e);
         }
@@ -792,6 +904,10 @@ impl<R: FnMut(&str)> Run<'_, R> {
                 return self.decode_queued(vol, h, p);
             }
         }
+        if let Err(e) = p.open(size) {
+            p.discard();
+            return Err(e);
+        }
         self.continue_file(vol, h, p)
     }
 
@@ -809,7 +925,18 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     /// Feeds a whole file to the decoder behind the queued ones. Its bytes go to it once the ones before are done.
-    fn decode_queued(&mut self, vol: &mut Volume, h: &FileHeader, p: Pending) -> Result<()> {
+    fn decode_queued(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending) -> Result<()> {
+        // a small file is gathered and written whole on a worker; a bigger one is written as it comes
+        let size = h.unpacked_size;
+        if p.place.is_some()
+            && size <= GATHER_MAX
+            && self.batch.get_or_insert_with(|| Batch::new(self.threads)).usable()
+        {
+            p.mem = Some(Vec::with_capacity(size as usize));
+        } else if let Err(e) = p.open(Some(size)) {
+            p.discard();
+            return Err(e);
+        }
         // registered only now, after any stream before was drained, so a later file at the same place waits for it
         if let Some(key) = p.key.clone() {
             self.queued_paths.insert(key);
@@ -818,10 +945,11 @@ impl<R: FnMut(&str)> Run<'_, R> {
         let mut buf = std::mem::take(&mut self.buf);
         let mut stream = self.stream.take();
         let mut fed = false;
-        let (queued, summary, report) = (&mut self.queued, &mut self.summary, &mut self.report);
+        let mut books = Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch };
+        let queued = &mut self.queued;
         let read = vol.read_data(h.data_at, h.packed_size, &mut buf, |chunk| {
             let Some(u) = stream.as_mut() else { return Err(Error::Corrupt("no decoder for a queued file")) };
-            let r = u.feed(chunk, &mut route(queued, summary, report));
+            let r = u.feed(chunk, &mut route(queued, &mut books));
             fed = r.is_err();
             r
         });
@@ -832,10 +960,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
                 Ok(())
             }
             // the oldest file still queued is the one the decoder was on
-            Err(e) if fed && decoding_error(&e) => {
-                self.fail_queued(&e.to_string());
-                Ok(())
-            }
+            Err(e) if fed && decoding_error(&e) => self.fail_queued(&e.to_string()),
             Err(e) if fed => {
                 self.discard_queued();
                 Err(e)
@@ -843,12 +968,13 @@ impl<R: FnMut(&str)> Run<'_, R> {
             // the archive can't be read on: the files before this one are whole, so they are finished first
             Err(e) => {
                 if let Some(u) = stream.as_mut() {
-                    let (queued, summary, report) = (&mut self.queued, &mut self.summary, &mut self.report);
-                    let waited = u.wait(&mut route(queued, summary, report));
+                    let mut books =
+                        Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch };
+                    let waited = u.wait(&mut route(&mut self.queued, &mut books));
                     if let Err(d) = waited
                         && decoding_error(&d)
                     {
-                        self.fail_queued(&d.to_string());
+                        let _ = self.fail_queued(&d.to_string());
                     }
                 }
                 self.discard_queued();
@@ -862,25 +988,24 @@ impl<R: FnMut(&str)> Run<'_, R> {
         if self.queued.is_empty() {
             return Ok(());
         }
-        let Some(mut u) = self.stream.take() else {
-            self.fail_queued(NEEDS_EARLIER);
-            return Ok(());
-        };
-        let (queued, summary, report) = (&mut self.queued, &mut self.summary, &mut self.report);
-        let finished = u.finish(&mut route(queued, summary, report));
+        let Some(mut u) = self.stream.take() else { return self.fail_queued(NEEDS_EARLIER) };
+        let mut books = Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch };
+        let finished = u.finish(&mut route(&mut self.queued, &mut books));
         match finished {
             Ok(()) => {
                 self.stream = Some(u);
-                self.queued_paths.clear();
+                // files still being written on the workers keep their places guarded
+                self.batch_paths.extend(self.queued_paths.drain());
                 // every file but the last was finished where the next began
                 let Some((p, c)) = self.queued.pop_front() else { return Ok(()) };
                 debug_assert!(self.queued.is_empty());
-                check_and_finish(&mut self.summary, &mut self.report, &c, p)
+                check_and_finish(
+                    &mut Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch },
+                    &c,
+                    p,
+                )
             }
-            Err(e) if decoding_error(&e) => {
-                self.fail_queued(&e.to_string());
-                Ok(())
-            }
+            Err(e) if decoding_error(&e) => self.fail_queued(&e.to_string()),
             Err(e) => {
                 self.discard_queued();
                 Err(e)
@@ -889,7 +1014,12 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     /// The decoder failed on the oldest queued file: the ones after it can't be decoded either.
-    fn fail_queued(&mut self, why: &str) {
+    fn fail_queued(&mut self, why: &str) -> Result<()> {
+        // the files before them that the workers hold come in first
+        if let Err(e) = self.drain_batch() {
+            self.discard_queued();
+            return Err(e);
+        }
         let mut why = why;
         while let Some((mut p, _)) = self.queued.pop_front() {
             if !p.passive {
@@ -900,6 +1030,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
         }
         self.stream = None;
         self.queued_paths.clear();
+        Ok(())
     }
 
     /// Drops the queued files and what was written of them, unreported: the run itself is failing.
@@ -1002,7 +1133,11 @@ impl<R: FnMut(&str)> Run<'_, R> {
 
     /// A file's last part is in: checks it whole and finishes it.
     fn finish_file_checks(&mut self, h: &FileHeader, p: Pending) -> Result<()> {
-        check_and_finish(&mut self.summary, &mut self.report, &Checks::from(h), p)
+        check_and_finish(
+            &mut Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch },
+            &Checks::from(h),
+            p,
+        )
     }
 }
 
