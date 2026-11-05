@@ -1117,7 +1117,8 @@ impl Unpacker {
             if bits.pos() + 128 <= end_bits && sp + 7 <= limit {
                 // room for every literal the stage can take, each run of quick ones ending at most seven past it
                 let room = usize::try_from(limit - sp - 6).unwrap_or(usize::MAX);
-                let k = main.quick_run(bits, end_bits, &mut stage, room);
+                // a table with no common literal length (text, mostly) has no quick literals to try for
+                let k = if main.common == 0 { 0 } else { main.quick_run(bits, end_bits, &mut stage, room) };
                 if k > 0 {
                     let at = (sp & mask) as usize;
                     let first = k.min(window.len() - at);
