@@ -174,7 +174,7 @@ impl Huff {
         }
         by_len[0] = 0;
         let (len, n) = by_len.iter().enumerate().max_by_key(|&(l, &n)| (n, std::cmp::Reverse(l))).unwrap();
-        self.common = if lengths.len() >= 256 && *n >= 64 && len <= LUT_BITS as usize { len as u32 } else { 0 };
+        self.common = if lengths.len() >= 256 && *n >= 160 && len <= LUT_BITS as usize { len as u32 } else { 0 };
         // canonical codes up to the table's width fill it from the start, in order; the rest belongs to longer codes
         // or to none, and is marked for the slow path
         let mut covered = 0;
@@ -247,9 +247,16 @@ impl Huff {
             let (lits, n) = self.quick(bits);
             stage[k..k + 6].copy_from_slice(&lits);
             k += n;
-            // a code of some other kind stopped them
             if n < 5 {
-                break;
+                // a code of some other kind stopped them, with at least the table's width of bits still in the
+                // accumulator: a literal of another length joins them, anything else ends the run
+                let entry = self.lut[(bits.acc >> (64 - LUT_BITS)) as usize];
+                if entry == 0 || entry >> 4 >= 256 {
+                    break;
+                }
+                stage[k] = (entry >> 4) as u8;
+                k += 1;
+                bits.skip(u32::from(entry & 15));
             }
         }
         k
