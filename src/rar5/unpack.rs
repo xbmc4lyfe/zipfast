@@ -1547,9 +1547,24 @@ unsafe fn blend16(w: *mut u8, src: usize, dst: usize, k: usize) {
     #[cfg(not(target_arch = "aarch64"))]
     // SAFETY: as the caller promises
     unsafe {
+        blend16_words(w, src, dst, k)
+    }
+}
+
+/// [`blend16`] with plain 128-bit words, where there is no NEON.
+///
+/// # Safety
+///
+/// As for [`blend16`].
+#[cfg(any(test, not(target_arch = "aarch64")))]
+#[inline(always)]
+unsafe fn blend16_words(w: *mut u8, src: usize, dst: usize, k: usize) {
+    // SAFETY: as the caller promises
+    unsafe {
         let s = w.add(src).cast::<u128>().read_unaligned();
         let d = w.add(dst).cast::<u128>().read_unaligned();
-        let pick = u128::from_le_bytes(FIRST[16 - k..32 - k].try_into().unwrap());
+        // in the reads' own byte order, so each mask byte lines up with the window byte it picks
+        let pick = u128::from_ne_bytes(FIRST[16 - k..32 - k].try_into().unwrap());
         w.add(dst).cast::<u128>().write_unaligned((s & pick) | (d & !pick));
     }
 }

@@ -991,6 +991,26 @@ fn match_copies_equal_a_byte_at_a_time_and_touch_nothing_else() {
 }
 
 #[test]
+fn blends_take_the_first_k_bytes_and_keep_the_rest() {
+    let base: Vec<u8> = (0..64u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 11) as u8).collect();
+    for k in 1..=16 {
+        for (src, dst) in [(0, 32), (3, 40), (40, 1), (17, 33)] {
+            let mut want = base.clone();
+            want.copy_within(src..src + k, dst);
+            let mut words = base.clone();
+            let mut native = base.clone();
+            // SAFETY: 16 bytes from each of `src` and `dst` are inside the 64
+            unsafe {
+                blend16_words(words.as_mut_ptr(), src, dst, k);
+                blend16(native.as_mut_ptr(), src, dst, k);
+            }
+            assert_eq!(words, want, "words, k {k}, {src} to {dst}");
+            assert_eq!(native, want, "k {k}, {src} to {dst}");
+        }
+    }
+}
+
+#[test]
 fn packed_tokens_come_back_as_they_went_in() {
     let toks = [
         Tok::Lits(0),
