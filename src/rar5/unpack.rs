@@ -501,8 +501,9 @@ pub struct Unpacker {
     history: [u64; 4],
     last_len: u32,
     filters: Vec<Filter>,
-    /// filtered output for one filter at a time
+    /// filtered output for one filter at a time, and the delta filter's second buffer
     scratch: Vec<u8>,
+    scratch_delta: Vec<u8>,
     /// packed bytes not yet decoded: always the start of a block
     input: Vec<u8>,
     /// a whole block copied out with zero padding after it, when nothing follows it to pad it
@@ -575,6 +576,7 @@ impl Unpacker {
             last_len: 0,
             filters: Vec::new(),
             scratch: Vec::new(),
+            scratch_delta: Vec::new(),
             input: Vec::new(),
             padded: Vec::new(),
             threads: default_threads(),
@@ -1219,18 +1221,19 @@ impl Unpacker {
 
     fn run_filter(&mut self, f: Filter, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
         let n = f.len as usize;
-        let mut src = std::mem::take(&mut self.scratch);
-        src.clear();
+        let mut data = std::mem::take(&mut self.scratch);
+        data.clear();
         let mut at = ((self.file_base + f.start) & self.mask) as usize;
-        while src.len() < n {
-            let take = (n - src.len()).min(self.window.len() - at);
-            src.extend_from_slice(&self.window[at..at + take]);
+        while data.len() < n {
+            let take = (n - data.len()).min(self.window.len() - at);
+            data.extend_from_slice(&self.window[at..at + take]);
             at = 0;
         }
-        let out = apply_filter(f, &src);
-        sink(&out)?;
+        apply_filter(f, &mut data, &mut self.scratch_delta);
+        let sent = sink(&data);
+        self.scratch = data;
+        sent?;
         self.emitted += f.len;
-        self.scratch = src;
         Ok(())
     }
 }
@@ -1497,66 +1500,83 @@ fn length(slot: u32, bits: &mut Bits<'_>) -> u32 {
     }
 }
 
-fn apply_filter(f: Filter, src: &[u8]) -> Vec<u8> {
-    let n = src.len();
+/// Runs a filter over `data`. The address filters work in place; delta reads its input out of order, so it writes
+/// to `spare`, and the two are swapped after. The result is in `data`.
+fn apply_filter(f: Filter, data: &mut Vec<u8>, spare: &mut Vec<u8>) {
+    let n = data.len();
     match f.kind {
         FilterKind::Delta(channels) => {
-            let mut out = vec![0u8; n];
+            spare.clear();
+            spare.resize(n, 0);
             let mut s = 0;
             for c in 0..usize::from(channels) {
                 let mut acc = 0u8;
-                let mut j = c;
-                while j < n {
-                    acc = acc.wrapping_sub(src[s]);
-                    out[j] = acc;
+                for out in spare.iter_mut().skip(c).step_by(usize::from(channels)) {
+                    acc = acc.wrapping_sub(data[s]);
+                    *out = acc;
                     s += 1;
-                    j += usize::from(channels);
                 }
             }
-            out
+            std::mem::swap(data, spare);
         }
         FilterKind::E8 | FilterKind::E8E9 => {
-            let mut out = src.to_vec();
             let e9 = f.kind == FilterKind::E8E9;
+            // the four address bytes after an opcode are never scanned for one, so they can be rewritten in place
             let mut j = 0;
             while j + 4 < n {
-                let b = src[j];
-                if b == 0xe8 || (e9 && b == 0xe9) {
-                    let p = j + 1;
-                    let pos = ((f.start + p as u64) % 0x100_0000) as u32;
-                    let a = u32::from_le_bytes(src[p..p + 4].try_into().unwrap());
-                    let new = if a & 0x8000_0000 != 0 {
-                        if a.wrapping_add(pos) & 0x8000_0000 == 0 { Some(a.wrapping_add(0x100_0000)) } else { None }
-                    } else if a < 0x100_0000 {
-                        Some(a.wrapping_sub(pos))
-                    } else {
-                        None
-                    };
-                    if let Some(v) = new {
-                        out[p..p + 4].copy_from_slice(&v.to_le_bytes());
-                    }
-                    j = p + 4;
-                } else {
-                    j += 1;
+                j = find_call(data, j, n - 4, e9);
+                if j + 4 >= n {
+                    break;
                 }
+                let p = j + 1;
+                let pos = ((f.start + p as u64) % 0x100_0000) as u32;
+                let a = u32::from_le_bytes(data[p..p + 4].try_into().unwrap());
+                let new = if a & 0x8000_0000 != 0 {
+                    if a.wrapping_add(pos) & 0x8000_0000 == 0 { Some(a.wrapping_add(0x100_0000)) } else { None }
+                } else if a < 0x100_0000 {
+                    Some(a.wrapping_sub(pos))
+                } else {
+                    None
+                };
+                if let Some(v) = new {
+                    data[p..p + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                j = p + 4;
             }
-            out
         }
         FilterKind::Arm => {
-            let mut out = src.to_vec();
             let mut j = 0;
             while j + 3 < n {
-                if src[j + 3] == 0xeb {
-                    let v = u32::from_le_bytes(src[j..j + 4].try_into().unwrap()) & 0x00ff_ffff;
+                if data[j + 3] == 0xeb {
+                    let v = u32::from_le_bytes(data[j..j + 4].try_into().unwrap()) & 0x00ff_ffff;
                     let q = ((f.start + j as u64) / 4) as u32;
                     let v = (v.wrapping_sub(q) & 0x00ff_ffff) | 0xeb00_0000;
-                    out[j..j + 4].copy_from_slice(&v.to_le_bytes());
+                    data[j..j + 4].copy_from_slice(&v.to_le_bytes());
                 }
                 j += 4;
             }
-            out
         }
     }
+}
+
+/// The first place from `j` on, before `end`, that holds 0xE8 (or 0xE9, when `e9`); `end` when there is none. Eight
+/// bytes are checked at a time: with the low bit set in each, both opcodes read 0xE9, and a byte that matches comes
+/// out zero, which the borrow trick finds (any byte it flags above the first true zero is ignored).
+fn find_call(data: &[u8], mut j: usize, end: usize, e9: bool) -> usize {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    let (fold, want) = if e9 { (ONES, 0xe9 * ONES) } else { (0, 0xe8 * ONES) };
+    while j + 8 <= end {
+        let t = (u64::from_le_bytes(data[j..j + 8].try_into().unwrap()) | fold) ^ want;
+        let zero = t.wrapping_sub(ONES) & !t & (ONES << 7);
+        if zero != 0 {
+            return j + (zero.trailing_zeros() / 8) as usize;
+        }
+        j += 8;
+    }
+    while j < end && data[j] | fold as u8 != want as u8 {
+        j += 1;
+    }
+    j
 }
 
 #[cfg(test)]

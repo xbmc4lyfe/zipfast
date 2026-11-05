@@ -724,3 +724,91 @@ fn sixteen_literals_at_a_time_match_one_at_a_time() {
     // plenty of the starts are inside runs of literal codes
     assert!(total > 20_000, "{total}");
 }
+
+/// The filters as they read: a byte at a time, from the input into a copy of it.
+fn filter_reference(f: Filter, src: &[u8]) -> Vec<u8> {
+    let n = src.len();
+    let mut out = src.to_vec();
+    match f.kind {
+        FilterKind::Delta(channels) => {
+            let mut s = 0;
+            for c in 0..usize::from(channels) {
+                let mut acc = 0u8;
+                let mut j = c;
+                while j < n {
+                    acc = acc.wrapping_sub(src[s]);
+                    out[j] = acc;
+                    s += 1;
+                    j += usize::from(channels);
+                }
+            }
+        }
+        FilterKind::E8 | FilterKind::E8E9 => {
+            let mut j = 0;
+            while j + 4 < n {
+                if src[j] == 0xe8 || (f.kind == FilterKind::E8E9 && src[j] == 0xe9) {
+                    let p = j + 1;
+                    let pos = ((f.start + p as u64) % 0x100_0000) as u32;
+                    let a = u32::from_le_bytes(src[p..p + 4].try_into().unwrap());
+                    if a & 0x8000_0000 != 0 {
+                        if a.wrapping_add(pos) & 0x8000_0000 == 0 {
+                            out[p..p + 4].copy_from_slice(&a.wrapping_add(0x100_0000).to_le_bytes());
+                        }
+                    } else if a < 0x100_0000 {
+                        out[p..p + 4].copy_from_slice(&a.wrapping_sub(pos).to_le_bytes());
+                    }
+                    j = p + 4;
+                } else {
+                    j += 1;
+                }
+            }
+        }
+        FilterKind::Arm => {
+            let mut j = 0;
+            while j + 3 < n {
+                if src[j + 3] == 0xeb {
+                    let v = u32::from_le_bytes(src[j..j + 4].try_into().unwrap()) & 0x00ff_ffff;
+                    let q = ((f.start + j as u64) / 4) as u32;
+                    let v = (v.wrapping_sub(q) & 0x00ff_ffff) | 0xeb00_0000;
+                    out[j..j + 4].copy_from_slice(&v.to_le_bytes());
+                }
+                j += 4;
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn filters_in_place_match_the_byte_at_a_time_reading() {
+    // bytes heavy in opcodes and small addresses, at every length near the scan's word size
+    let mut x = 5u64;
+    let mut data = Vec::new();
+    for _ in 0..20_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let r = (x >> 24) as u32;
+        data.push(match r % 7 {
+            0 => 0xe8,
+            1 => 0xe9,
+            2 => 0xeb,
+            3 => 0,
+            4 => 0xff,
+            _ => (r >> 8) as u8,
+        });
+    }
+    let kinds = [FilterKind::E8, FilterKind::E8E9, FilterKind::Arm, FilterKind::Delta(1), FilterKind::Delta(3)];
+    let mut spare = Vec::new();
+    for kind in kinds {
+        for start in [0u64, 1, 0xff_fff0, 7_000_001] {
+            for len in (0..40).chain([255, 256, 257, 4097, 20_000]) {
+                let f = Filter { start, len: len as u64, kind };
+                let src = &data[data.len() - len..];
+                let mut got = src.to_vec();
+                apply_filter(f, &mut got, &mut spare);
+                assert!(got == filter_reference(f, src), "{kind:?} start {start} len {len}");
+            }
+        }
+    }
+}
