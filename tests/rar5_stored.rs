@@ -142,6 +142,57 @@ fn never_writes_through_a_link() {
     assert!(!outside.join("f").exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn never_writes_through_a_link_below_a_folder_it_made() {
+    let dir = tmp("deeplink");
+    let arc = dir.join("t.rar");
+    fs::write(&arc, archive(&[FileSpec::new("a/x", b"x"), FileSpec::new("a/b/c/f", b"y")])).unwrap();
+    let out = dir.join("out");
+    fs::create_dir_all(out.join("a")).unwrap();
+    let outside = dir.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, out.join("a/b")).unwrap();
+    let r = extract::run(&arc, &opts(&out), |_| {});
+    assert!(r.is_err());
+    assert_eq!(fs::read(out.join("a/x")).unwrap(), b"x");
+    assert!(!outside.join("c").exists());
+}
+
+#[test]
+fn a_file_in_the_way_of_a_folder_stops_the_run() {
+    let dir = tmp("fileway");
+    let arc = dir.join("t.rar");
+    fs::write(&arc, archive(&[FileSpec::new("a/b/f", b"y")])).unwrap();
+    let out = dir.join("out");
+    fs::create_dir_all(out.join("a")).unwrap();
+    fs::write(out.join("a/b"), b"old").unwrap();
+    assert!(extract::run(&arc, &opts(&out), |_| {}).is_err());
+    assert_eq!(fs::read(out.join("a/b")).unwrap(), b"old");
+}
+
+#[test]
+fn a_name_repeated_in_a_folder_the_run_made_is_still_seen_as_taken() {
+    let dir = tmp("repeat");
+    let arc = dir.join("t.rar");
+    let mut sub = FileSpec::new("d/x", b"");
+    sub.dir = true;
+    let files = [FileSpec::new("d/f", b"one"), FileSpec::new("d/f", b"two"), sub, FileSpec::new("d/x", b"three")];
+    fs::write(&arc, archive(&files)).unwrap();
+
+    let out = dir.join("skip");
+    let s = extract::run(&arc, &opts(&out), |_| {}).unwrap();
+    assert_eq!((s.files, s.skipped, s.errors.len()), (1, 2, 0));
+    assert_eq!(fs::read(out.join("d/f")).unwrap(), b"one");
+    assert!(out.join("d/x").is_dir());
+
+    let out = dir.join("always");
+    let s = extract::run(&arc, &Options { overwrite: Overwrite::Always, ..opts(&out) }, |_| {}).unwrap();
+    assert_eq!((s.files, s.errors.len()), (2, 1));
+    assert_eq!(fs::read(out.join("d/f")).unwrap(), b"two");
+    assert!(out.join("d/x").is_dir());
+}
+
 #[test]
 fn skips_or_overwrites_existing() {
     let dir = tmp("over");

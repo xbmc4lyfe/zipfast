@@ -1,9 +1,9 @@
 //! Lists, tests and extracts an archive. RAR 5.0 lives here: its volumes are followed in order and compressed files
 //! decoded. Other formats have modules of their own.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::batch::{self, Batch, Done, Job, Outcome};
@@ -110,16 +110,31 @@ pub(crate) fn open_target(opts: &Options, rel: &Path, size: Option<u64>) -> Resu
     })
 }
 
-/// The first half of [`open_target`]: makes the folders and checks the target, without creating it. Folders in
-/// `made` are known to be there already; the ones made are added.
-pub(crate) fn check_target(opts: &Options, rel: &Path, made: Option<&mut HashSet<PathBuf>>) -> Result<Checked> {
+/// The folders one run has made or checked, so each is looked at once.
+#[derive(Default)]
+pub(crate) struct Dirs {
+    /// each folder, and whether this run made it
+    known: HashMap<PathBuf, bool>,
+    /// every path this run has written or made, in lower case
+    taken: HashSet<String>,
+    /// a name was seen that a file system may take as another spelling of a different one, so from then on every
+    /// target is looked for
+    unsure: bool,
+}
+
+/// The first half of [`open_target`]: makes the folders and checks the target, without creating it. With `dirs`,
+/// folders are made only once, and a file in a folder this run made is not looked for, since nothing can be there
+/// that the run did not put there.
+pub(crate) fn check_target(opts: &Options, rel: &Path, dirs: Option<&mut Dirs>) -> Result<Checked> {
     let target = opts.dest.join(rel);
     if let Some(parent) = rel.parent() {
-        match made {
-            Some(made) if made.contains(parent) => {}
-            Some(made) => {
-                make_dirs(&opts.dest, parent)?;
-                made.insert(parent.to_path_buf());
+        match dirs {
+            Some(dirs) => {
+                make_dirs_known(&opts.dest, parent, dirs)?;
+                let first = dirs.note(rel);
+                if first && dirs.known.get(parent) == Some(&true) {
+                    return Ok(Checked::Write(Place { path: target, replace: false }));
+                }
             }
             None => make_dirs(&opts.dest, parent)?,
         }
@@ -550,7 +565,7 @@ struct Run<'a, R: FnMut(&str)> {
     /// where the queued files are written, as `batch_paths`
     queued_paths: HashSet<String>,
     /// folders under the destination made (or found) so far
-    made_dirs: HashSet<PathBuf>,
+    dirs: Dirs,
 }
 
 /// A file finished on another thread, counted and reported as if done here.
@@ -589,7 +604,7 @@ fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Sum
         batch_paths: HashSet::new(),
         queued: VecDeque::new(),
         queued_paths: HashSet::new(),
-        made_dirs: HashSet::new(),
+        dirs: Dirs::default(),
     };
     let walked = walk(first, |vol, block| {
         let Block::File(h) = block else { return Ok(()) };
@@ -768,10 +783,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
         if h.is_dir() {
             if self.opts.mode == Mode::Extract && !self.opts.flatten {
                 // a folder made earlier for a file inside it still gets its own times and permissions
-                if !self.made_dirs.contains(&rel) {
-                    make_dirs(&self.opts.dest, &rel)?;
-                    self.made_dirs.insert(rel.clone());
-                }
+                make_dirs_known(&self.opts.dest, &rel, &mut self.dirs)?;
                 self.summary.dir_meta.push((self.opts.dest.join(&rel), Meta::from(h)));
             }
             self.summary.dirs += 1;
@@ -790,7 +802,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
         }
 
         let place = if self.opts.mode == Mode::Extract {
-            match check_target(self.opts, &rel, Some(&mut self.made_dirs))? {
+            match check_target(self.opts, &rel, Some(&mut self.dirs))? {
                 Checked::Write(place) => Some(place),
                 Checked::Exists => {
                     self.drain()?;
@@ -1230,6 +1242,72 @@ fn set_time(out: &File, h: &Meta) {
     }
 }
 
+impl Dirs {
+    /// Records the path `rel` as used by this run. True when nothing this run wrote can be at `rel` under any
+    /// spelling: every part of it is a plain name, it was not used before in any letter case, and no name seen so
+    /// far could be another spelling of it. A plain name has only ASCII letters, digits and common punctuation, and
+    /// doesn't end in a dot or space. Anything else may be folded by some file system into a different name
+    /// (Unicode normalization, `~` short names, `\` or `:` on Windows, trailing dots and spaces), so it makes every
+    /// later answer false. (Opening the file still refuses to replace anything, should a name slip by.)
+    fn note(&mut self, rel: &Path) -> bool {
+        let mut key = String::new();
+        for part in rel.components() {
+            let plain = match part {
+                Component::Normal(name) => name.to_str().filter(|n| plain_name(n)),
+                _ => None,
+            };
+            let Some(name) = plain else {
+                self.unsure = true;
+                return false;
+            };
+            if !key.is_empty() {
+                key.push('/');
+            }
+            key.extend(name.chars().map(|c| c.to_ascii_lowercase()));
+        }
+        self.taken.insert(key) && !self.unsure
+    }
+}
+
+/// A name every file system keeps as it is, apart from letter case.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.ends_with(['.', ' '])
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b" -_.,+=()[]{}@#&!'$%^;".contains(&b))
+}
+
+/// [`make_dirs`] for a run that remembers the folders it has made or checked, in `dirs`. It starts below the
+/// deepest one already known, and tries to make each folder before looking at what is there, so a new folder costs
+/// one call.
+pub(crate) fn make_dirs_known(root: &Path, rel: &Path, dirs: &mut Dirs) -> Result<()> {
+    let known =
+        rel.ancestors().find(|a| a.as_os_str().is_empty() || dirs.known.contains_key(*a)).unwrap_or(Path::new(""));
+    let Ok(rest) = rel.strip_prefix(known) else { return make_dirs(root, rel) };
+    let mut at = root.join(known);
+    let mut sub = known.to_path_buf();
+    for part in rest.components() {
+        at.push(part);
+        sub.push(part);
+        let made = match fs::create_dir(&at) {
+            Ok(()) => true,
+            // something is there already: only a real folder will do, never a link to one
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match fs::symlink_metadata(&at) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(Error::UnsafePath(rel.display().to_string()));
+                }
+                Ok(meta) if meta.is_dir() => false,
+                Ok(_) => return Err(Error::UnsafePath(format!("{}: a file is in the way", rel.display()))),
+                Err(e) => return Err(e.into()),
+            },
+            Err(e) => return Err(e.into()),
+        };
+        // a folder takes its name, so no file is later created over it
+        dirs.note(&sub);
+        dirs.known.insert(sub.clone(), made);
+    }
+    Ok(())
+}
+
 /// Creates `rel` under `root` one folder at a time, refusing to pass through a link.
 pub(crate) fn make_dirs(root: &Path, rel: &Path) -> Result<()> {
     let mut at = root.to_path_buf();
@@ -1249,4 +1327,34 @@ pub(crate) fn make_dirs(root: &Path, rel: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_path_used_under_other_letter_case_is_not_new() {
+        let mut dirs = Dirs::default();
+        assert!(dirs.note(Path::new("d")));
+        assert!(dirs.note(Path::new("d/one")));
+        // `D` may be `d` itself, and what goes in it lands in `d`
+        assert!(!dirs.note(Path::new("D")));
+        assert!(dirs.note(Path::new("D/two")));
+        assert!(!dirs.note(Path::new("d/two")));
+        assert!(!dirs.note(Path::new("d/ONE")));
+        assert!(dirs.note(Path::new("d/three")));
+    }
+
+    #[test]
+    fn after_a_name_that_may_fold_into_another_nothing_is_new() {
+        for odd in ["d/\u{212A}", "d/e\u{301}", "d/LONGNA~1.TXT", "d/f.", "d/f ", "d./f", "d\\\\f", "d/f:s", "d/f*"] {
+            let mut dirs = Dirs::default();
+            assert!(dirs.note(Path::new("d/a")));
+            assert!(!dirs.note(Path::new(odd)), "{odd:?}");
+            // the Kelvin sign is `K` to a file system that normalizes names
+            assert!(!dirs.note(Path::new("d/K")), "after {odd:?}");
+            assert!(!dirs.note(Path::new("x/y")), "after {odd:?}");
+        }
+    }
 }
