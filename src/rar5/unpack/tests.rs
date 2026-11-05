@@ -3,34 +3,103 @@
 use super::*;
 use crate::rar5::testenc::*;
 
-/// Decodes on the calling thread and on workers, and checks both give the same output or the same error.
+/// Decodes on the calling thread and on workers, with and without the decoder working out the CRC32, and checks
+/// all give the same output or the same error.
 fn decode(stream: &[u8], size: u64, window: u64, piece: usize) -> Result<Vec<u8>> {
-    let serial = decode_with(stream, size, window, piece, 0);
-    let parallel = decode_with(stream, size, window, piece, 3);
-    match (&serial, &parallel) {
-        (Ok(a), Ok(b)) => assert!(a == b, "workers decoded different bytes"),
-        (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "workers failed differently"),
-        _ => {
-            panic!("serial {:?} vs workers {:?}", serial.as_ref().map(|v| v.len()), parallel.as_ref().map(|v| v.len()))
+    let serial = decode_with(stream, size, window, piece, 0, Hash::Off);
+    for (threads, hash) in [(3, Hash::Off), (0, Hash::Here), (3, Hash::Helper)] {
+        let other = decode_with(stream, size, window, piece, threads, hash);
+        match (&serial, &other) {
+            (Ok(a), Ok(b)) => assert!(a == b, "{threads} workers, {hash:?}: different bytes"),
+            (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{threads} workers, {hash:?}: another error"),
+            _ => panic!(
+                "serial {:?} vs {threads} workers, {hash:?}: {:?}",
+                serial.as_ref().map(|v| v.len()),
+                other.as_ref().map(|v| v.len())
+            ),
         }
     }
     serial
 }
 
-fn decode_with(stream: &[u8], size: u64, window: u64, piece: usize, threads: usize) -> Result<Vec<u8>> {
+/// How a test's decoder treats the output's CRC32: not at all, or working it out with every stretch it can handed
+/// over, either to wait until it is needed and be hashed on the calling thread, or to the helper thread.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Hash {
+    Off,
+    Here,
+    Helper,
+}
+
+fn hashing(u: &mut Unpacker, hash: Hash) {
+    if hash != Hash::Off {
+        u.hand_over_window = 0;
+        u.hand_over_min = 0;
+        u.crc.threaded = hash == Hash::Helper;
+    }
+}
+
+/// Output gathered file by file, an empty slice starting the next, with the CRC32 the decoder hands over for each.
+struct Hashed {
+    hash: bool,
+    files: Vec<(Vec<u8>, Option<u32>)>,
+}
+
+impl Hashed {
+    fn new(hash: Hash) -> Self {
+        Hashed { hash: hash != Hash::Off, files: vec![(Vec::new(), None)] }
+    }
+
+    /// The files and whatever was put after the last of them, each checked against the CRC32 handed over for it.
+    fn checked(self) -> Vec<Vec<u8>> {
+        let n = self.files.len();
+        self.files
+            .into_iter()
+            .enumerate()
+            .map(|(i, (bytes, crc))| {
+                if self.hash && i + 1 < n {
+                    assert_eq!(crc, Some(crc32fast::hash(&bytes)), "file {i}'s CRC");
+                }
+                bytes
+            })
+            .collect()
+    }
+}
+
+impl Sink for Hashed {
+    fn put(&mut self, b: &[u8]) -> Result<()> {
+        if b.is_empty() {
+            self.files.push((Vec::new(), None));
+        } else {
+            self.files.last_mut().unwrap().0.extend_from_slice(b);
+        }
+        Ok(())
+    }
+
+    fn wants_crc(&self) -> bool {
+        self.hash
+    }
+
+    fn crc(&mut self, crc: u32) {
+        let file = self.files.last_mut().unwrap();
+        assert!(file.1.replace(crc).is_none(), "a second CRC for one file");
+    }
+}
+
+fn decode_with(stream: &[u8], size: u64, window: u64, piece: usize, threads: usize, hash: Hash) -> Result<Vec<u8>> {
     let mut u = Unpacker::new(window)?;
     u.set_threads(threads, 0);
+    hashing(&mut u, hash);
     u.reset(Some(size));
-    let mut out = Vec::new();
-    let mut sink = |b: &[u8]| -> Result<()> {
-        out.extend_from_slice(b);
-        Ok(())
-    };
+    let mut sink = Hashed::new(hash);
     for chunk in stream.chunks(piece.max(1)) {
         u.feed(chunk, &mut sink)?;
     }
     u.finish(&mut sink)?;
-    Ok(out)
+    sink.put(&[])?;
+    let mut files = sink.checked();
+    files.pop();
+    Ok(files.pop().unwrap())
 }
 
 fn lits(s: &[u8]) -> Vec<Op> {
@@ -103,6 +172,52 @@ fn the_window_wraps_and_flushes() {
     }
     let got = decode(&stream, want.len() as u64, 1 << 17, 100_000).unwrap();
     assert!(got == want, "mismatch");
+}
+
+#[test]
+fn output_hashed_straight_from_the_window_matches_what_was_put() {
+    // eight windows of output with matches from up to a window back, so stretches handed over are soon due to be
+    // written over, and delta filters now and then, whose output is handed over too
+    let window = 1u64 << 20;
+    let mut seed = 7u32;
+    let mut ops = Vec::new();
+    let mut made = 0u64;
+    let mut next_filter = 300_000;
+    while made < 8 * window {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        if made >= next_filter {
+            ops.push(Op::Filter { start: 0, len: 100_000, kind: 0, channels: 3 });
+            next_filter += 1_500_000;
+        }
+        if made < 4096 || seed.is_multiple_of(3) {
+            ops.push(Op::Lit((seed >> 16) as u8));
+            made += 1;
+        } else {
+            let dist = 1 + u64::from(seed >> 8) % made.min(window);
+            let len = 5 + (seed >> 4) % 4000;
+            ops.push(Op::Match(len, dist));
+            made += u64::from(len);
+        }
+    }
+    let mut stream = Vec::new();
+    let chunks: Vec<_> = ops.chunks(4000).collect();
+    for (i, chunk) in chunks.iter().enumerate() {
+        stream.extend(block(chunk, i == 0, i + 1 == chunks.len()));
+    }
+    // every way of decoding agrees, and each hashing one hands over the CRC of what it put
+    let plain = decode(&stream, made, window, 70_000).unwrap();
+    assert_eq!(plain.len() as u64, made);
+    for (threads, hash) in [(0, Hash::Here), (3, Hash::Helper)] {
+        let mut u = Unpacker::new(window).unwrap();
+        u.set_threads(threads, 0);
+        hashing(&mut u, hash);
+        u.reset(Some(made));
+        let mut sink = Hashed::new(hash);
+        u.feed(&stream, &mut sink).unwrap();
+        u.finish(&mut sink).unwrap();
+        assert!(u.crc.handed_over > 20, "{hash:?}: {} stretches handed over", u.crc.handed_over);
+        assert_eq!(sink.files[0].1, Some(crc32fast::hash(&plain)), "{hash:?}");
+    }
 }
 
 #[test]
@@ -477,7 +592,7 @@ fn eight_bit_codes_of_other_symbols_end_a_quick_run() {
     let stream = tuned_stream(&ops, 20_000);
     for threads in [0, 3] {
         for piece in [usize::MAX, 4_096] {
-            assert!(decode_with(&stream, data.len() as u64, 1 << 20, piece, threads).unwrap() == data);
+            assert!(decode_with(&stream, data.len() as u64, 1 << 20, piece, threads, Hash::Off).unwrap() == data);
         }
     }
 }
@@ -502,18 +617,16 @@ type SolidFile = (Vec<u8>, u64);
 
 /// What each file of a solid stream decodes to, file by file, up to the first error and whose it is. Serially
 /// (`threads` 0) each file is finished before the next starts; otherwise every file after the first is queued.
-fn solid_run(files: &[SolidFile], threads: usize, piece: usize) -> (Vec<Vec<u8>>, Option<(usize, String)>, u64) {
+fn solid_run(
+    files: &[SolidFile],
+    threads: usize,
+    piece: usize,
+    hash: Hash,
+) -> (Vec<Vec<u8>>, Option<(usize, String)>, u64) {
     let mut u = Unpacker::new(1 << 22).unwrap();
     u.set_threads(threads, u64::MAX);
-    let mut outs: Vec<Vec<u8>> = vec![Vec::new()];
-    let mut sink = |b: &[u8]| -> Result<()> {
-        if b.is_empty() {
-            outs.push(Vec::new());
-        } else {
-            outs.last_mut().unwrap().extend_from_slice(b);
-        }
-        Ok(())
-    };
+    hashing(&mut u, hash);
+    let mut sink = Hashed::new(hash);
     let mut run = || -> Result<()> {
         for (i, (stream, size)) in files.iter().enumerate() {
             if i == 0 {
@@ -535,18 +648,19 @@ fn solid_run(files: &[SolidFile], threads: usize, piece: usize) -> (Vec<Vec<u8>>
             }
             if threads == 0 {
                 u.finish(&mut sink)?;
-                sink(&[])?;
+                sink.put(&[])?;
             }
         }
         if threads > 0 {
             u.finish(&mut sink)?;
-            sink(&[])?;
+            sink.put(&[])?;
         }
         Ok(())
     };
     let err = run().err().map(|e| e.to_string());
     let resumed = u.resumed;
     drop(u);
+    let mut outs = sink.checked();
     // the last entry is the file being decoded when it stopped, or an empty one after the last file
     let failed_at = outs.len() - 1;
     outs.pop();
@@ -629,14 +743,18 @@ fn queued_files_of_a_solid_stream_come_out_as_if_each_waited_for_the_one_before(
     let files = solid_files();
     let input: Vec<SolidFile> = files.iter().map(|(s, p)| (s.clone(), p.len() as u64)).collect();
     let want: Vec<Vec<u8>> = files.iter().map(|(_, p)| p.clone()).collect();
-    let (serial, err, _) = solid_run(&input, 0, usize::MAX);
-    assert_eq!(err, None);
-    assert!(serial == want);
-    for piece in [usize::MAX, 4_093] {
-        let (queued, err, resumed) = solid_run(&input, 3, piece);
-        assert_eq!(err, None, "{piece}");
-        assert!(queued == want, "{piece}");
-        assert!(resumed > 0, "a worker should have stopped at its budget, with files after it in the run");
+    for hash in [Hash::Off, Hash::Here] {
+        let (serial, err, _) = solid_run(&input, 0, usize::MAX, hash);
+        assert_eq!(err, None);
+        assert!(serial == want);
+    }
+    for hash in [Hash::Off, Hash::Helper] {
+        for piece in [usize::MAX, 4_093] {
+            let (queued, err, resumed) = solid_run(&input, 3, piece, hash);
+            assert_eq!(err, None, "{piece}");
+            assert!(queued == want, "{piece}");
+            assert!(resumed > 0, "a worker should have stopped at its budget, with files after it in the run");
+        }
     }
 }
 
@@ -662,9 +780,11 @@ fn a_queued_files_trouble_is_its_own_and_stops_the_files_after_it() {
         cases.push(("cut short", c));
     }
     for (what, case) in &cases {
-        for piece in [usize::MAX, 777] {
-            let (s_out, s_err, _) = solid_run(case, 0, piece);
-            let (q_out, q_err, _) = solid_run(case, 3, piece);
+        for (piece, serial_hash, queued_hash) in
+            [(usize::MAX, Hash::Off, Hash::Off), (777, Hash::Off, Hash::Off), (777, Hash::Here, Hash::Helper)]
+        {
+            let (s_out, s_err, _) = solid_run(case, 0, piece, serial_hash);
+            let (q_out, q_err, _) = solid_run(case, 3, piece, queued_hash);
             // a flipped bit may only change a byte, which the file's checksum catches later
             assert!(s_err.is_some() || *what == "damaged", "{what}: the serial run should fail");
             assert_eq!(q_err, s_err, "{what} {piece}");

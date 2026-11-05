@@ -8,8 +8,31 @@ use crate::error::{Error, Result};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+mod crc;
 mod parallel;
 use parallel::{Boundary, Done, Job, Packed, Part, Pool, Slot};
+
+/// Where decoded output goes.
+pub trait Sink {
+    /// The next bytes of the current file. An empty slice ends a queued file (see [`Unpacker::queue_file`]).
+    fn put(&mut self, bytes: &[u8]) -> Result<()>;
+
+    /// Whether the decoder is to work out the CRC32 of the current file's bytes and hand it to [`Sink::crc`], so
+    /// that `put` needn't. The answer must not change while a file's bytes are being put.
+    fn wants_crc(&self) -> bool {
+        false
+    }
+
+    /// The CRC32 of all the current file's bytes, when [`Sink::wants_crc`] says so: after the last of them are put,
+    /// before the empty slice that ends a queued file, and before [`Unpacker::finish`] returns.
+    fn crc(&mut self, _crc: u32) {}
+}
+
+impl<F: FnMut(&[u8]) -> Result<()>> Sink for F {
+    fn put(&mut self, bytes: &[u8]) -> Result<()> {
+        self(bytes)
+    }
+}
 
 pub(crate) const NC: usize = 306;
 pub(crate) const DC: usize = 64;
@@ -24,6 +47,14 @@ const MAX_FILTER_LEN: u64 = 0x40_0000;
 
 /// Output is emitted at least this often (see [`Unpacker::flush_at`]). It must not be less than [`MAX_FILTER_LEN`].
 const FLUSH_EVERY: u64 = MAX_FILTER_LEN;
+/// How far past [`Unpacker::flush_at`] unemitted bytes the window may be written before output is emitted again:
+/// the longest match, with the 32 bytes a short copy rewrites, and room to spare.
+const WRITE_SLACK: u64 = 64 << 10;
+/// Output is hashed on a helper thread straight from windows of this size up, where a stretch emitted stays in
+/// place for a while: other windows are reused too soon after.
+const HAND_OVER_WINDOW: usize = 4 * FLUSH_EVERY as usize;
+/// The shortest stretch of a file's output that starts handing its hashing to the helper.
+const HAND_OVER_MIN: usize = 64 << 10;
 /// Quick literals gathered before they go to the window.
 const STAGE: usize = 1024;
 /// Bits of a code looked up in one step; longer codes take the slow path.
@@ -534,6 +565,19 @@ pub struct Unpacker {
     files_begun: u64,
     /// [`Self::settle`] waits for the workers until this many queued files have begun
     files_goal: u64,
+    /// the current file's CRC32, when the sink wants it
+    crc: crc::FileCrc,
+    /// the smallest window, and the shortest stretch, whose hashing goes to the helper ([`HAND_OVER_WINDOW`],
+    /// [`HAND_OVER_MIN`])
+    hand_over_window: usize,
+    hand_over_min: usize,
+}
+
+impl Drop for Unpacker {
+    fn drop(&mut self) {
+        // the helper is done with the window before it goes
+        self.crc.reset();
+    }
 }
 
 /// The window a file needs: its declared dictionary, but no more than twice the file when nothing before or after it
@@ -593,6 +637,9 @@ impl Unpacker {
             files_queued: 0,
             files_begun: 0,
             files_goal: 0,
+            crc: crc::FileCrc::new(),
+            hand_over_window: HAND_OVER_WINDOW,
+            hand_over_min: HAND_OVER_MIN,
         })
     }
 
@@ -660,7 +707,7 @@ impl Unpacker {
     }
 
     /// Decodes until no more than `behind` queued files are still waiting for the ones before them to end.
-    pub fn catch_up(&mut self, behind: u64, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    pub fn catch_up(&mut self, behind: u64, sink: &mut dyn Sink) -> Result<()> {
         self.files_goal = self.files_queued.saturating_sub(behind);
         if self.files_begun < self.files_goal {
             self.send_batch();
@@ -673,6 +720,7 @@ impl Unpacker {
     /// Starts the next file of a solid stream: the window, tables and history carry on.
     pub fn next_file(&mut self, size: Option<u64>) {
         self.discard_in_flight();
+        self.crc.reset();
         self.file_base = self.sp;
         self.emitted = 0;
         self.size = size;
@@ -706,13 +754,7 @@ impl Unpacker {
     /// Hands a block to the workers. A worker reads its code lengths, builds the tables and reads its symbols; the
     /// tokens are applied to the window in order by [`Self::settle`]. Later blocks without tables of their own wait
     /// for the lengths, on the worker that has them.
-    fn submit(
-        &mut self,
-        buf: &[u8],
-        payload: usize,
-        flags: u8,
-        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
-    ) -> Result<()> {
+    fn submit(&mut self, buf: &[u8], payload: usize, flags: u8, sink: &mut dyn Sink) -> Result<()> {
         let valid_bits = usize::from(flags & 7) + 1;
         let end_bits = if payload == 0 { 0 } else { (payload - 1) * 8 + valid_bits };
         let read_tables = flags & 0x80 != 0;
@@ -758,7 +800,7 @@ impl Unpacker {
     /// Applies finished jobs in order until no more than `max` are still with the workers; with `max` 0 the blocks
     /// still being gathered go first. The first error in stream order is returned; after one, the rest are collected
     /// and dropped.
-    fn settle(&mut self, max: u64, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    fn settle(&mut self, max: u64, sink: &mut dyn Sink) -> Result<()> {
         if max == 0 {
             self.send_batch();
         }
@@ -810,7 +852,7 @@ impl Unpacker {
         part: usize,
         bit: usize,
         mut tables: Arc<Tables>,
-        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+        sink: &mut dyn Sink,
     ) -> Result<()> {
         for (i, p) in job.parts.iter().enumerate().skip(part) {
             if let Some(b) = p.boundary {
@@ -831,7 +873,7 @@ impl Unpacker {
     }
 
     /// An error found reading ahead of the workers waits for theirs: an earlier block's error comes first.
-    fn ordered<T>(&mut self, r: Result<T>, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<T> {
+    fn ordered<T>(&mut self, r: Result<T>, sink: &mut dyn Sink) -> Result<T> {
         if r.is_err() && (self.submitted > self.applied || !self.batch.parts.is_empty()) {
             self.settle(0, sink)?;
         }
@@ -861,7 +903,7 @@ impl Unpacker {
     }
 
     /// A job's tokens, part by part, with the file boundaries between them, as far as the worker got.
-    fn apply_job(&mut self, job: &Job, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    fn apply_job(&mut self, job: &Job, sink: &mut dyn Sink) -> Result<()> {
         let mut from = (0, 0);
         for (p, &to) in job.parts.iter().zip(&job.ends) {
             if let Some(b) = p.boundary {
@@ -874,12 +916,13 @@ impl Unpacker {
     }
 
     /// Where one queued file ends and the next begins: the first is checked and done with.
-    fn end_file(&mut self, b: Boundary, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    fn end_file(&mut self, b: Boundary, sink: &mut dyn Sink) -> Result<()> {
         if b.truncated {
             return Err(Error::Truncated);
         }
         self.check_end(sink)?;
-        sink(&[])?;
+        sink.put(&[])?;
+        self.crc.reset();
         self.files_begun += 1;
         self.file_base = self.sp;
         self.emitted = 0;
@@ -887,18 +930,26 @@ impl Unpacker {
         Ok(())
     }
 
-    /// Emits the rest of the current file and checks it ended where it should.
-    fn check_end(&mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
-        self.flush(sink)?;
-        if !self.filters.is_empty() {
-            return Err(corrupt("a filter runs past the end of the file"));
+    /// Emits the rest of the current file and checks it ended where it should, then hands the sink the file's
+    /// CRC32 if it wants it.
+    fn check_end(&mut self, sink: &mut dyn Sink) -> Result<()> {
+        // what is left is hashed here, since the CRC is needed now
+        let ended = self.flush_to(false, sink).and_then(|()| {
+            if !self.filters.is_empty() {
+                return Err(corrupt("a filter runs past the end of the file"));
+            }
+            match self.size {
+                Some(size) if self.emitted != size => Err(corrupt("decoded size differs from the header")),
+                _ => Ok(()),
+            }
+        });
+        if ended.is_ok() && sink.wants_crc() {
+            sink.crc(self.crc.finish());
+        } else {
+            // nothing of this file's is hashed into the next's, even if decoding goes on after a failure
+            self.crc.reset();
         }
-        if let Some(size) = self.size
-            && self.emitted != size
-        {
-            return Err(corrupt("decoded size differs from the header"));
-        }
-        Ok(())
+        ended
     }
 
     /// Some of a block's tokens, applied to the window with the same checks the decoding loop makes.
@@ -907,7 +958,7 @@ impl Unpacker {
         toks: &[Packed],
         filters: &[parallel::FilterFields],
         lits: &[u8],
-        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+        sink: &mut dyn Sink,
     ) -> Result<()> {
         let flush_at = self.flush_at();
         let size_end = self.size.map_or(u64::MAX, |s| self.file_base.saturating_add(s));
@@ -965,7 +1016,7 @@ impl Unpacker {
 
     /// More of the file's packed bytes. Every block that is now complete is decoded and its output emitted. Blocks
     /// that arrive whole are decoded where they lie; only a block split across calls is gathered first.
-    pub fn feed(&mut self, mut data: &[u8], sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    pub fn feed(&mut self, mut data: &[u8], sink: &mut dyn Sink) -> Result<()> {
         // finish the block an earlier call left incomplete
         while !self.input.is_empty() {
             let flags = self.input[0];
@@ -1022,12 +1073,12 @@ impl Unpacker {
     }
 
     /// Applies everything handed to the workers so far, leaving a block still coming in as it is.
-    pub fn wait(&mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    pub fn wait(&mut self, sink: &mut dyn Sink) -> Result<()> {
         self.settle(0, sink)
     }
 
     /// The file's packed bytes are all in. Emits what is left and checks the stream ended where it should.
-    pub fn finish(&mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    pub fn finish(&mut self, sink: &mut dyn Sink) -> Result<()> {
         self.settle(0, sink)?;
         if !self.input.is_empty() {
             return Err(Error::Truncated);
@@ -1035,13 +1086,7 @@ impl Unpacker {
         self.check_end(sink)
     }
 
-    fn block(
-        &mut self,
-        buf: &[u8],
-        payload: usize,
-        flags: u8,
-        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
-    ) -> Result<()> {
+    fn block(&mut self, buf: &[u8], payload: usize, flags: u8, sink: &mut dyn Sink) -> Result<()> {
         if self.parallel {
             return self.submit(buf, payload, flags, sink);
         }
@@ -1072,7 +1117,7 @@ impl Unpacker {
         bits: &mut Bits<'_>,
         end_bits: usize,
         tables: &Tables,
-        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+        sink: &mut dyn Sink,
     ) -> Result<()> {
         let flush_at = self.flush_at();
         while bits.pos() < end_bits {
@@ -1195,16 +1240,21 @@ impl Unpacker {
     }
 
     /// Emits everything decoded so far that no pending filter still needs, running filters whose input is complete.
-    fn flush(&mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    fn flush(&mut self, sink: &mut dyn Sink) -> Result<()> {
+        self.flush_to(true, sink)
+    }
+
+    /// [`Self::flush`], handing the hashing of long stretches to the helper if `hand_over`.
+    fn flush_to(&mut self, hand_over: bool, sink: &mut dyn Sink) -> Result<()> {
         let mut done = 0;
         loop {
             let op = self.op();
             let Some(f) = self.filters.get(done).copied() else {
-                self.emit(op, sink)?;
+                self.emit(op, hand_over, sink)?;
                 break;
             };
             if self.emitted < f.start {
-                self.emit(f.start.min(op), sink)?;
+                self.emit(f.start.min(op), hand_over, sink)?;
             }
             if self.emitted != f.start || op < f.start + f.len {
                 break;
@@ -1216,18 +1266,43 @@ impl Unpacker {
         Ok(())
     }
 
-    /// Unfiltered window bytes from `emitted` up to file position `to`.
-    fn emit(&mut self, to: u64, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    /// Unfiltered window bytes from `emitted` up to file position `to`. With `hand_over`, long stretches of them
+    /// are hashed on the helper, if the sink wants them hashed.
+    fn emit(&mut self, to: u64, hand_over: bool, sink: &mut dyn Sink) -> Result<()> {
+        if self.emitted >= to {
+            return Ok(());
+        }
+        let hashing = sink.wants_crc();
+        let hand_over = hand_over && self.window.len() >= self.hand_over_window;
         while self.emitted < to {
             let at = ((self.file_base + self.emitted) & self.mask) as usize;
             let n = ((to - self.emitted) as usize).min(self.window.len() - at);
-            sink(&self.window[at..at + n])?;
+            let bytes = &self.window[at..at + n];
+            sink.put(bytes)?;
+            if hashing {
+                // SAFETY: what goes to the helper stays in place until it is hashed: `keep_clear` waits for a
+                // stretch before decoding can reach it again, and `crc.reset` before the window is reused from its
+                // start or let go
+                unsafe { self.crc.window(self.file_base + self.emitted, bytes, hand_over && n >= self.hand_over_min) };
+            }
             self.emitted += n as u64;
         }
+        self.keep_clear();
         Ok(())
     }
 
-    fn run_filter(&mut self, f: Filter, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    /// Waits for the hashing of output that decoding up to the next emit could write over. Up to then, nothing is
+    /// written as far as [`Self::flush_at`] plus [`WRITE_SLACK`] past what is emitted.
+    fn keep_clear(&mut self) {
+        if self.crc.out() {
+            let window = self.window_size();
+            let reach = self.file_base + self.emitted + self.flush_at() + WRITE_SLACK;
+            // a short copy may have rewritten 32 bytes past the stream position
+            self.crc.clear_before(reach.saturating_sub(window), (self.sp + 32).saturating_sub(window));
+        }
+    }
+
+    fn run_filter(&mut self, f: Filter, sink: &mut dyn Sink) -> Result<()> {
         let n = f.len as usize;
         let mut data = std::mem::take(&mut self.scratch);
         data.clear();
@@ -1238,10 +1313,14 @@ impl Unpacker {
             at = 0;
         }
         apply_filter(f, &mut data, &mut self.scratch_delta);
-        let sent = sink(&data);
+        let sent = sink.put(&data);
+        if sent.is_ok() && sink.wants_crc() {
+            data = self.crc.owned(self.file_base + f.start, data);
+        }
         self.scratch = data;
         sent?;
         self.emitted += f.len;
+        self.keep_clear();
         Ok(())
     }
 }

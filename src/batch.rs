@@ -15,7 +15,7 @@ use crate::blake2sp::Blake2sp;
 use crate::error::{Error, Result};
 use crate::extract::{Meta, Place, create_target, finish_file};
 use crate::output::Output;
-use crate::rar5::unpack::{Unpacker, window_for};
+use crate::rar5::unpack::{Sink, Unpacker, window_for};
 
 /// Files up to this size, packed and unpacked, go to the workers whole.
 pub(crate) const JOB_MAX: u64 = 16 << 20;
@@ -274,7 +274,7 @@ fn decode(
     dictionary: u64,
     size: u64,
     unpacker: &mut Option<Unpacker>,
-    sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    sink: &mut dyn Sink,
 ) -> Result<()> {
     let window = window_for(dictionary, Some(size), false)?;
     let u = match unpacker.as_mut().filter(|u| u.fits(window)) {
