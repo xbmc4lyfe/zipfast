@@ -111,21 +111,34 @@ fn helper(shared: &Shared) {
     }
 }
 
+/// What hashes the stretches handed over.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) enum Helper {
+    /// nothing: none are handed over, and everything is hashed as it is given
+    Off,
+    /// a thread of their own
+    Thread,
+    /// the decoder, once it needs them hashed: for tests
+    #[cfg(test)]
+    Held,
+}
+
 /// The current file's CRC32, from its output as it leaves the window.
 pub(super) struct FileCrc {
     /// the file's hasher, while none of its stretches are with the helper
     here: Option<crc32fast::Hasher>,
     /// what this shares with the helper, once there is one
     shared: Option<Arc<Shared>>,
-    /// whether a helper thread hashes the stretches handed over; without one they are hashed here, when needed
-    pub threaded: bool,
+    pub helper: Helper,
     /// stretches handed over, over the decoder's life
     pub handed_over: u64,
 }
 
 impl FileCrc {
-    pub fn new() -> Self {
-        FileCrc { here: Some(crc32fast::Hasher::new()), shared: None, threaded: true, handed_over: 0 }
+    /// With a helper thread if `threaded`, otherwise hashing everything as it is given.
+    pub fn with_helper(threaded: bool) -> Self {
+        let helper = if threaded { Helper::Thread } else { Helper::Off };
+        FileCrc { here: Some(crc32fast::Hasher::new()), shared: None, helper, handed_over: 0 }
     }
 
     /// Whether stretches of the file are with the helper.
@@ -134,7 +147,7 @@ impl FileCrc {
     }
 
     /// The next of the file's bytes, `bytes` in the window, from stream position `start` on. With `hand_over`
-    /// they go to the helper; so do they when earlier ones are with it, to keep them in order.
+    /// they go to the helper, if there is to be one; so do they when earlier ones are with it, to keep them in order.
     ///
     /// # Safety
     ///
@@ -142,7 +155,7 @@ impl FileCrc {
     /// hashed: until [`Self::clear_before`] is called with a limit past `start`, or [`Self::finish`] or
     /// [`Self::reset`] is called.
     pub unsafe fn window(&mut self, start: u64, bytes: &[u8], hand_over: bool) {
-        if self.here.is_some() && !(hand_over && self.start()) {
+        if self.here.is_some() && !(hand_over && self.helper != Helper::Off && self.start()) {
             if let Some(h) = self.here.as_mut() {
                 h.update(bytes);
             }
@@ -233,14 +246,14 @@ impl FileCrc {
         self.here = Some(crc32fast::Hasher::new());
     }
 
-    /// Starts the helper, unless there is one or it can't be started. Without a thread (`threaded` false) stretches
+    /// Starts the helper, unless there is one or it can't be started. [`Helper::Held`] starts no thread: stretches
     /// handed over wait to be hashed here.
     fn start(&mut self) -> bool {
         if self.shared.is_some() {
             return true;
         }
         let shared = Arc::new(Shared::default());
-        if self.threaded {
+        if self.helper == Helper::Thread {
             let theirs = Arc::clone(&shared);
             if thread::Builder::new().name("zipfast-crc".into()).spawn(move || helper(&theirs)).is_err() {
                 return false;

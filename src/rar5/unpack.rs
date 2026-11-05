@@ -6,6 +6,8 @@
 
 use crate::error::{Error, Result};
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
+use std::ptr;
 use std::sync::Arc;
 
 mod crc;
@@ -637,7 +639,7 @@ impl Unpacker {
             files_queued: 0,
             files_begun: 0,
             files_goal: 0,
-            crc: crc::FileCrc::new(),
+            crc: crc::FileCrc::with_helper(default_threads() > 0),
             hand_over_window: HAND_OVER_WINDOW,
             hand_over_min: HAND_OVER_MIN,
         })
@@ -646,6 +648,9 @@ impl Unpacker {
     /// How many worker threads big files are decoded on (0 for none), and from what file size.
     pub fn set_threads(&mut self, threads: usize, min_size: u64) {
         self.discard_in_flight();
+        // the CRC helper is one more thread at work beside the decoder's, so it goes with them
+        self.crc.reset();
+        self.crc.helper = if threads > 0 { crc::Helper::Thread } else { crc::Helper::Off };
         if threads != self.threads {
             self.pool = None;
         }
@@ -996,7 +1001,7 @@ impl Unpacker {
                 }
                 _ => {
                     if let Some((len, d)) = resolve(tok, &mut self.history, &mut self.last_len) {
-                        copy(&mut self.window, self.mask, self.sp, len, d, size_end)?;
+                        copy(Win::of(&mut self.window), self.sp, len, d, size_end)?;
                         self.sp += u64::from(len);
                     }
                 }
@@ -1007,10 +1012,7 @@ impl Unpacker {
 
     /// Literal bytes into the window at the stream position.
     fn put(&mut self, bytes: &[u8]) {
-        let at = (self.sp & self.mask) as usize;
-        let first = bytes.len().min(self.window.len() - at);
-        self.window[at..at + first].copy_from_slice(&bytes[..first]);
-        self.window[..bytes.len() - first].copy_from_slice(&bytes[first..]);
+        Win::of(&mut self.window).write(self.sp, bytes);
         self.sp += bytes.len() as u64;
     }
 
@@ -1145,7 +1147,7 @@ impl Unpacker {
         let mut sp = *sp_ref;
         let mut hist = *history;
         let mut last = *last_len;
-        let window = &mut window[..=mask as usize];
+        let window = Win::of(window);
         let main = &t.main;
         macro_rules! decode {
             ($table:expr) => {
@@ -1157,7 +1159,7 @@ impl Unpacker {
         }
         macro_rules! put {
             ($sym:expr) => {
-                window[(sp & mask) as usize] = $sym as u8;
+                window.set(sp, $sym as u8);
                 sp += 1;
             };
         }
@@ -1172,10 +1174,7 @@ impl Unpacker {
                 // a table with no common literal length (text, mostly) has no quick literals to try for
                 let k = if main.common == 0 { 0 } else { main.quick_run(bits, end_bits, &mut stage, room) };
                 if k > 0 {
-                    let at = (sp & mask) as usize;
-                    let first = k.min(window.len() - at);
-                    window[at..at + first].copy_from_slice(&stage[..first]);
-                    window[..k - first].copy_from_slice(&stage[first..k]);
+                    window.write(sp, &stage[..k]);
                     sp += k as u64;
                     continue;
                 }
@@ -1228,7 +1227,7 @@ impl Unpacker {
                 continue;
             }
             let Some((len, d)) = resolve(tok, &mut hist, &mut last) else { continue };
-            if let Err(e) = copy(window, mask, sp, len, d, size_end) {
+            if let Err(e) = copy(window, sp, len, d, size_end) {
                 break Err(e);
             }
             sp += u64::from(len);
@@ -1412,10 +1411,56 @@ fn block_header(b: &[u8]) -> Result<Option<(usize, usize, u8)>> {
     Ok(Some((2 + size_len, size, flags)))
 }
 
+/// The window as the decoder writes it: through a pointer that makes no reference to its bytes, never through a
+/// `&mut` to all of them, since the CRC helper may be reading stretches of output from it meanwhile (see [`crc`]).
+/// Positions are stream positions, taken modulo the window's size, so every access is inside it.
+#[derive(Clone, Copy)]
+struct Win<'a> {
+    ptr: *mut u8,
+    mask: usize,
+    _window: PhantomData<&'a mut Vec<u8>>,
+}
+
+impl<'a> Win<'a> {
+    /// `window`'s length must be a power of two.
+    #[inline(always)]
+    fn of(window: &'a mut Vec<u8>) -> Self {
+        debug_assert!(window.len().is_power_of_two());
+        Win { ptr: window.as_mut_ptr(), mask: window.len() - 1, _window: PhantomData }
+    }
+
+    #[inline(always)]
+    fn len(self) -> usize {
+        self.mask + 1
+    }
+
+    /// The byte at stream position `pos`.
+    #[inline(always)]
+    fn set(self, pos: u64, b: u8) {
+        // SAFETY: masked to the window
+        unsafe { *self.ptr.add(pos as usize & self.mask) = b };
+    }
+
+    /// `bytes`, no more than the window holds, from stream position `pos` on.
+    #[inline(always)]
+    fn write(self, pos: u64, bytes: &[u8]) {
+        assert!(bytes.len() <= self.len());
+        let at = pos as usize & self.mask;
+        let first = bytes.len().min(self.len() - at);
+        // SAFETY: `first` bytes from `at` and the rest from the start are inside the window, which `bytes` (a
+        // shared slice) can't overlap while this holds it mutably
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), self.ptr.add(at), first);
+            ptr::copy_nonoverlapping(bytes.as_ptr().add(first), self.ptr, bytes.len() - first);
+        }
+    }
+}
+
 /// Copies a match inside the window. `sp` is the stream position the copy starts at; nothing may land at or past
 /// `size_end`.
 #[inline(always)]
-fn copy(window: &mut [u8], mask: u64, sp: u64, len: u32, dist: u64, size_end: u64) -> Result<()> {
+fn copy(window: Win<'_>, sp: u64, len: u32, dist: u64, size_end: u64) -> Result<()> {
+    let mask = window.mask as u64;
     if dist == 0 || dist > sp || dist > mask + 1 {
         return Err(corrupt("match reaches before the start of the data"));
     }
@@ -1426,47 +1471,48 @@ fn copy(window: &mut [u8], mask: u64, sp: u64, len: u32, dist: u64, size_end: u6
     let dst = (sp & mask) as usize;
     let src = ((sp - dist) & mask) as usize;
     let w = window.len();
+    let p = window.ptr;
     if n <= 32 && dist >= n as u64 && dst + 32 <= w && src + 32 <= w {
         // a short copy whose source ends before it: whole 16-byte words, keeping the destination's bytes past the
         // match, which a match from nearly a window back may still read
         // SAFETY: the 32 bytes at `src` and at `dst` are inside the window, and 1 <= n <= 32
         unsafe {
-            blend16(window, src, dst, n.min(16));
+            blend16(p, src, dst, n.min(16));
             if n > 16 {
-                blend16(window, src + 16, dst + 16, n - 16);
+                blend16(p, src + 16, dst + 16, n - 16);
             }
         }
         return Ok(());
     }
     if dst + n <= w && src + n <= w {
+        // SAFETY (all of this branch): the `n` bytes at `src` and at `dst` are inside the window
         if dist >= 8 {
             if dist >= n as u64 {
-                window.copy_within(src..src + n, dst);
+                unsafe { ptr::copy(p.add(src), p.add(dst), n) };
                 return Ok(());
             }
             // eight bytes at a time: with the source at least eight behind, each chunk reads only finished bytes
             let mut i = 0;
             while i + 8 <= n {
-                let v: [u8; 8] = window[src + i..src + i + 8].try_into().unwrap();
-                window[dst + i..dst + i + 8].copy_from_slice(&v);
+                unsafe { p.add(dst + i).cast::<u64>().write_unaligned(p.add(src + i).cast::<u64>().read_unaligned()) };
                 i += 8;
             }
             while i < n {
-                window[dst + i] = window[src + i];
+                unsafe { *p.add(dst + i) = *p.add(src + i) };
                 i += 1;
             }
         } else if dist == 1 {
-            let b = window[src];
-            window[dst..dst + n].fill(b);
+            unsafe { ptr::write_bytes(p.add(dst), *p.add(src), n) };
         } else {
             for i in 0..n {
-                window[dst + i] = window[src + i];
+                unsafe { *p.add(dst + i) = *p.add(src + i) };
             }
         }
     } else {
-        let m = mask as usize;
+        let m = window.mask;
         for i in 0..n {
-            window[(dst + i) & m] = window[(src + i) & m];
+            // SAFETY: masked to the window
+            unsafe { *p.add((dst + i) & m) = *p.add((src + i) & m) };
         }
     }
     Ok(())
@@ -1483,28 +1529,28 @@ static FIRST: [u8; 32] = {
     m
 };
 
-/// The first `k` of the 16 bytes at `src` written over those at `dst`, the rest of `dst` kept.
+/// The first `k` of the 16 bytes at `w + src` written over those at `w + dst`, the rest of `dst` kept.
 ///
 /// # Safety
 ///
-/// The 16 bytes at `src` and at `dst` must be inside `window`, and `k` must be 1 to 16.
+/// The 16 bytes at `w + src` and at `w + dst` must be valid to read and write, and `k` must be 1 to 16.
 #[inline(always)]
-unsafe fn blend16(window: &mut [u8], src: usize, dst: usize, k: usize) {
-    debug_assert!(src + 16 <= window.len() && dst + 16 <= window.len() && (1..=16).contains(&k));
+unsafe fn blend16(w: *mut u8, src: usize, dst: usize, k: usize) {
+    debug_assert!((1..=16).contains(&k));
     #[cfg(target_arch = "aarch64")]
     // SAFETY: as the caller promises; the 16 bytes at `16 - k` are inside `FIRST`
     unsafe {
         use std::arch::aarch64::*;
-        let w = window.as_mut_ptr();
         let pick = vld1q_u8(FIRST.as_ptr().add(16 - k));
         vst1q_u8(w.add(dst), vbslq_u8(pick, vld1q_u8(w.add(src)), vld1q_u8(w.add(dst))));
     }
     #[cfg(not(target_arch = "aarch64"))]
-    {
-        let s = u128::from_le_bytes(window[src..src + 16].try_into().unwrap());
-        let d = u128::from_le_bytes(window[dst..dst + 16].try_into().unwrap());
+    // SAFETY: as the caller promises
+    unsafe {
+        let s = w.add(src).cast::<u128>().read_unaligned();
+        let d = w.add(dst).cast::<u128>().read_unaligned();
         let pick = u128::from_le_bytes(FIRST[16 - k..32 - k].try_into().unwrap());
-        window[dst..dst + 16].copy_from_slice(&((s & pick) | (d & !pick)).to_le_bytes());
+        w.add(dst).cast::<u128>().write_unaligned((s & pick) | (d & !pick));
     }
 }
 

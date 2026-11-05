@@ -35,7 +35,7 @@ fn hashing(u: &mut Unpacker, hash: Hash) {
     if hash != Hash::Off {
         u.hand_over_window = 0;
         u.hand_over_min = 0;
-        u.crc.threaded = hash == Hash::Helper;
+        u.crc.helper = if hash == Hash::Helper { crc::Helper::Thread } else { crc::Helper::Held };
     }
 }
 
@@ -217,6 +217,30 @@ fn output_hashed_straight_from_the_window_matches_what_was_put() {
         u.finish(&mut sink).unwrap();
         assert!(u.crc.handed_over > 20, "{hash:?}: {} stretches handed over", u.crc.handed_over);
         assert_eq!(sink.files[0].1, Some(crc32fast::hash(&plain)), "{hash:?}");
+    }
+}
+
+#[test]
+fn the_crc_helper_runs_only_beside_decoding_workers() {
+    // a window big enough to hand output over, and more output than is emitted at once
+    let data: Vec<u8> = (0..10u32 << 20).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    let ops = lits(&data);
+    let chunks: Vec<_> = ops.chunks(1 << 19).collect();
+    let mut stream = Vec::new();
+    for (i, chunk) in chunks.iter().enumerate() {
+        stream.extend(block(chunk, i == 0, i + 1 == chunks.len()));
+    }
+    for threads in [0, 3] {
+        let mut u = Unpacker::new(16 << 20).unwrap();
+        u.set_threads(threads, 0);
+        u.reset(Some(data.len() as u64));
+        let mut sink = Hashed { hash: true, files: vec![(Vec::new(), None)] };
+        u.feed(&stream, &mut sink).unwrap();
+        u.finish(&mut sink).unwrap();
+        assert_eq!(sink.files[0].1, Some(crc32fast::hash(&data)), "{threads} workers");
+        assert!(sink.files[0].0 == data, "{threads} workers");
+        // with no workers, everything is hashed on the calling thread, as it is emitted
+        assert_eq!(u.crc.handed_over > 0, threads > 0, "{threads} workers: {} handed over", u.crc.handed_over);
     }
 }
 
@@ -956,7 +980,7 @@ fn match_copies_equal_a_byte_at_a_time_and_touch_nothing_else() {
                 _ => 1 + next() % size as u64,
             };
             let mut got = base.clone();
-            copy(&mut got, mask, sp, len, dist, sp + u64::from(len)).unwrap();
+            copy(Win::of(&mut got), sp, len, dist, sp + u64::from(len)).unwrap();
             let mut want = base.clone();
             for i in 0..u64::from(len) {
                 want[((sp + i) & mask) as usize] = want[((sp + i - dist) & mask) as usize];
