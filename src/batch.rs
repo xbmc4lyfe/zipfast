@@ -23,8 +23,9 @@ pub(crate) const JOB_MAX: u64 = 16 << 20;
 pub(crate) const STORED_PARALLEL_MIN: u64 = 64 << 20;
 /// The piece of stored data one thread checks and copies at a time.
 const PIECE: u64 = 1 << 20;
-/// Bytes of files read ahead of the workers.
-const BYTES_IN_FLIGHT: usize = 64 << 20;
+/// Bytes of files read ahead of the workers. Enough that the main thread gets well ahead of them: a file too big to
+/// hand them, which it decodes itself, then overlaps with theirs instead of being left to the end.
+const BYTES_IN_FLIGHT: usize = 256 << 20;
 /// Small files go to a worker in groups of up to this many bytes (packed and unpacked)...
 const GROUP_BYTES: usize = 256 << 10;
 /// ...or this many files, so that handing them over, which wakes a thread, costs little next to the work.
