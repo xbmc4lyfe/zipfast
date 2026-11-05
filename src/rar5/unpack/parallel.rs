@@ -67,7 +67,9 @@ pub(super) struct Job {
     pub seq: u64,
     pub buf: Vec<u8>,
     pub parts: Vec<Part>,
-    pub toks: Vec<Tok>,
+    pub toks: Vec<Packed>,
+    /// the fields of the filter records among the tokens, which don't fit in one
+    pub filters: Vec<FilterFields>,
     pub lits: Vec<u8>,
     /// for each part the worker got to, where its tokens and literals end
     pub ends: Vec<(usize, usize)>,
@@ -80,6 +82,58 @@ pub(super) struct Done {
     pub job: Job,
     pub result: Result<Option<(usize, usize)>>,
     pub tables: Arc<Tables>,
+}
+
+/// A token as a worker keeps it, in eight bytes: the kind in the low three bits, then its fields (a match's length in
+/// 16 bits, its distance above). A filter record's fields don't fit, so they go to the job's list and the token holds
+/// their place in it.
+#[derive(Clone, Copy)]
+pub(super) struct Packed(u64);
+
+/// A filter record's offset, length and kind.
+pub(super) type FilterFields = (u64, u64, FilterKind);
+
+/// Where [`tokenize`] puts what it reads: tokens, filter fields, literals.
+pub(super) type Out<'a> = (&'a mut Vec<Packed>, &'a mut Vec<FilterFields>, &'a mut Vec<u8>);
+
+impl Packed {
+    pub fn lits(n: u32) -> Packed {
+        Packed(u64::from(n) << 3)
+    }
+
+    /// `tok` packed; a filter's fields are added to `filters`.
+    pub fn new(tok: Tok, filters: &mut Vec<FilterFields>) -> Packed {
+        match tok {
+            Tok::Lits(n) => Packed::lits(n),
+            Tok::Filter { offset, len, kind } => {
+                filters.push((offset, len, kind));
+                Packed(((filters.len() - 1) as u64) << 3 | 1)
+            }
+            Tok::Last => Packed(2),
+            Tok::Rep { k, len } => Packed(u64::from(len) << 5 | u64::from(k) << 3 | 3),
+            Tok::Match { len, dist } => {
+                // a length is at most 4,100 and a distance under 2^33
+                debug_assert!(len <= 0xffff && dist < 1 << 45);
+                Packed(dist << 19 | u64::from(len & 0xffff) << 3 | 4)
+            }
+        }
+    }
+
+    /// The token, with a filter's fields from `filters`.
+    #[inline(always)]
+    pub fn get(self, filters: &[FilterFields]) -> Tok {
+        let v = self.0;
+        match v & 7 {
+            0 => Tok::Lits((v >> 3) as u32),
+            1 => {
+                let (offset, len, kind) = filters[(v >> 3) as usize];
+                Tok::Filter { offset, len, kind }
+            }
+            2 => Tok::Last,
+            3 => Tok::Rep { k: ((v >> 3) & 3) as u8, len: (v >> 5) as u32 },
+            _ => Tok::Match { len: ((v >> 3) & 0xffff) as u32, dist: v >> 19 },
+        }
+    }
 }
 
 /// A worker's tokens and literals for a block may take this many times the block's packed bytes, plus [`SLACK`].
@@ -160,6 +214,7 @@ fn work(
     pre: &mut Huff,
 ) -> (Result<Option<(usize, usize)>>, Arc<Tables>) {
     job.toks.clear();
+    job.filters.clear();
     job.lits.clear();
     job.ends.clear();
     let budget = job.buf.len() * BUDGET + SLACK;
@@ -209,8 +264,9 @@ fn work(
             }
         };
         let start = bits.pos();
-        result = tokenize(&job.buf[p.at..], start, p.end_bits, &tables, &mut job.toks, &mut job.lits, budget)
-            .map(|stop| stop.map(|bit| (i, bit)));
+        let out = (&mut job.toks, &mut job.filters, &mut job.lits);
+        result =
+            tokenize(&job.buf[p.at..], start, p.end_bits, &tables, out, budget).map(|stop| stop.map(|bit| (i, bit)));
         job.ends.push((job.toks.len(), job.lits.len()));
         last = Some(tables);
     }
@@ -220,13 +276,12 @@ fn work(
 /// A block's symbols, from `start_bit` to `end_bits`, as tokens. Literals go to `lits`, each run of them counted
 /// by one `Lits` token. On an error, what was read before it is kept. Once the tokens and literals take more than
 /// `budget` bytes it stops between symbols and returns the bit to go on from.
-fn tokenize(
+pub(super) fn tokenize(
     buf: &[u8],
     start_bit: usize,
     end_bits: usize,
     t: &Tables,
-    toks: &mut Vec<Tok>,
-    lits: &mut Vec<u8>,
+    (toks, filters, lits): Out<'_>,
     budget: usize,
 ) -> Result<Option<usize>> {
     let mut bits = Bits::at(buf, start_bit);
@@ -242,7 +297,8 @@ fn tokenize(
         };
     }
     let result = loop {
-        if lits.len() + toks.len() * std::mem::size_of::<Tok>() > budget {
+        let held = lits.len() + toks.len() * size_of::<Packed>() + filters.len() * size_of::<FilterFields>();
+        if held > budget {
             break Ok(Some(bits.pos()));
         }
         let sym;
@@ -291,17 +347,17 @@ fn tokenize(
             sym = s;
         }
         if run > 0 {
-            toks.push(Tok::Lits(run));
+            toks.push(Packed::lits(run));
             run = 0;
         }
         bits.refill();
         match read_op(sym, &mut bits, t) {
-            Ok(tok) => toks.push(tok),
+            Ok(tok) => toks.push(Packed::new(tok, filters)),
             Err(e) => break Err(e),
         }
     };
     if run > 0 {
-        toks.push(Tok::Lits(run));
+        toks.push(Packed::lits(run));
     }
     if result.as_ref().is_ok_and(Option::is_none) && bits.pos() > end_bits {
         return Err(corrupt("a symbol runs past the end of its block"));
