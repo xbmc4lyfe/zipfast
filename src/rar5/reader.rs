@@ -223,8 +223,7 @@ impl Volume {
                 let mut first_ct = [0u8; 16];
                 self.read_exact(&mut iv)?;
                 self.read_exact(&mut first_ct)?;
-                let first_dec =
-                    crate::crypto::decrypt_cbc(&key, &iv, &first_ct).ok_or(Error::Encrypted)?;
+                let first_dec = crate::crypto::decrypt_cbc(&key, &iv, &first_ct).ok_or(Error::Encrypted)?;
                 let mut size = 0u64;
                 let mut size_len = 0usize;
                 for i in 0..3 {
@@ -242,12 +241,8 @@ impl Volume {
                     return Err(Error::Encrypted);
                 }
                 let plain_need = 4 + size_len + size as usize;
-                let padded_len = plain_need
-                    .checked_next_multiple_of(16)
-                    .ok_or(Error::Encrypted)?;
-                let header_end = start
-                    .checked_add(16 + padded_len as u64)
-                    .ok_or(Error::Corrupt("header size"))?;
+                let padded_len = plain_need.checked_next_multiple_of(16).ok_or(Error::Encrypted)?;
+                let header_end = start.checked_add(16 + padded_len as u64).ok_or(Error::Corrupt("header size"))?;
                 if header_end > self.len {
                     return Err(Error::Truncated);
                 }
@@ -310,48 +305,28 @@ impl Volume {
             };
             let fields = &body[c.pos()..fields_end];
             let extra = &body[fields_end..];
-            let data_end = header_end
-                .checked_add(data_size)
-                .ok_or(Error::Corrupt("data size"))?;
+            let data_end = header_end.checked_add(data_size).ok_or(Error::Corrupt("data size"))?;
             // checked here, not only when the data is read, since skipped blocks are never read
             if data_end > self.len {
                 return Err(Error::Truncated);
             }
             self.next = data_end;
-            let head = BlockHead {
-                kind,
-                flags,
-                data_size,
-                data_at: header_end,
-            };
+            let head = BlockHead { kind, flags, data_size, data_at: header_end };
 
             match kind {
                 HEAD_MAIN => {
                     let mut f = Cursor::new(fields);
                     let flags = f.vint()?;
-                    let volume_number = if flags & MHFL_VOLNUMBER != 0 {
-                        f.vint()?
-                    } else {
-                        0
-                    };
-                    return Ok(Some(Block::Main(MainHeader {
-                        flags,
-                        volume_number,
-                    })));
+                    let volume_number = if flags & MHFL_VOLNUMBER != 0 { f.vint()? } else { 0 };
+                    return Ok(Some(Block::Main(MainHeader { flags, volume_number })));
                 }
                 HEAD_FILE => return Ok(Some(Block::File(parse_file(&head, fields, extra)?))),
                 HEAD_SERVICE => return Ok(Some(Block::Service(parse_file(&head, fields, extra)?))),
                 HEAD_CRYPT => {
                     if let Some(pw) = self.password.as_deref() {
-                        let params =
-                            crate::crypto::rar5_record_params(fields).ok_or(Error::Encrypted)?;
-                        let key = crate::crypto::derive_rar5_key(
-                            pw,
-                            params.kdf_count,
-                            &params.salt,
-                            params.check,
-                        )
-                        .ok_or(Error::Encrypted)?;
+                        let params = crate::crypto::rar5_record_params(fields).ok_or(Error::Encrypted)?;
+                        let key = crate::crypto::derive_rar5_key(pw, params.kdf_count, &params.salt, params.check)
+                            .ok_or(Error::Encrypted)?;
                         self.header_key = Some(key);
                         continue;
                     }
@@ -361,9 +336,7 @@ impl Volume {
                     let mut f = Cursor::new(fields);
                     let flags = f.vint().unwrap_or(0);
                     self.next = self.len;
-                    return Ok(Some(Block::End {
-                        more_volumes: flags & EOAFL_MORE_VOLUMES != 0,
-                    }));
+                    return Ok(Some(Block::End { more_volumes: flags & EOAFL_MORE_VOLUMES != 0 }));
                 }
                 _ => return Ok(Some(Block::Unknown)),
             }
