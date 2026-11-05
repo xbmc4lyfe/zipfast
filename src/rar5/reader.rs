@@ -1,7 +1,7 @@
 //! Walks one RAR 5.0 volume block by block.
 
 use std::fs::File;
-use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use super::*;
@@ -19,28 +19,36 @@ pub enum Block {
     Unknown,
 }
 
+/// Bytes read from a volume at a time. Headers and the data of small files after them come in together, so a
+/// run of small files takes one read for several of them.
+const READ: usize = 1 << 20;
+
 pub struct Volume {
     pub path: PathBuf,
     file: BufReader<File>,
+    /// where `file` stands, so moving within what it holds needs no system call
+    pos: u64,
     /// where the next block starts
     next: u64,
     len: u64,
     pub main: MainHeader,
 }
 
-/// Finds the signature within the first [`MAX_SFX`] bytes. Returns the offset just past it.
-fn find_signature(file: &mut BufReader<File>) -> Result<u64> {
+/// Finds the signature within the first [`MAX_SFX`] bytes. Returns the offset just past it, and how many bytes
+/// were read.
+fn find_signature(file: &mut BufReader<File>) -> Result<(u64, u64)> {
     let mut head = Vec::with_capacity(4096);
     file.by_ref().take(MAX_SFX + SIGNATURE.len() as u64).read_to_end(&mut head)?;
+    let read = head.len() as u64;
     if head.starts_with(SIGNATURE) {
-        return Ok(SIGNATURE.len() as u64);
+        return Ok((SIGNATURE.len() as u64, read));
     }
     if head.starts_with(SIGNATURE_V4) {
         return Err(Error::Unsupported("RAR 4.x archive".into()));
     }
     head.windows(SIGNATURE.len())
         .position(|w| w == SIGNATURE)
-        .map(|at| (at + SIGNATURE.len()) as u64)
+        .map(|at| ((at + SIGNATURE.len()) as u64, read))
         .ok_or(Error::NotAnArchive)
 }
 
@@ -48,9 +56,9 @@ impl Volume {
     pub fn open(path: &Path) -> Result<Volume> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
-        let mut file = BufReader::with_capacity(64 * 1024, file);
-        let next = find_signature(&mut file)?;
-        let mut vol = Volume { path: path.to_path_buf(), file, next, len, main: MainHeader::default() };
+        let mut file = BufReader::with_capacity(READ, file);
+        let (next, pos) = find_signature(&mut file)?;
+        let mut vol = Volume { path: path.to_path_buf(), file, pos, next, len, main: MainHeader::default() };
         match vol.next_block()? {
             Some(Block::Main(m)) => vol.main = m,
             Some(Block::Crypt) => return Err(Error::Encrypted),
@@ -64,17 +72,17 @@ impl Volume {
         if self.next >= self.len {
             return Ok(None);
         }
-        self.file.seek(SeekFrom::Start(self.next))?;
+        self.seek(self.next)?;
         let start = self.next;
         let mut crc_bytes = [0u8; 4];
-        self.file.read_exact(&mut crc_bytes)?;
+        self.read_exact(&mut crc_bytes)?;
         let stored_crc = u32::from_le_bytes(crc_bytes);
         // the size field is a vint of at most 3 bytes
         let mut size_field = Vec::with_capacity(3);
         let mut size = 0u64;
         for i in 0..3 {
             let mut b = [0u8; 1];
-            self.file.read_exact(&mut b)?;
+            self.read_exact(&mut b)?;
             size_field.push(b[0]);
             size |= u64::from(b[0] & 0x7f) << (7 * i);
             if b[0] & 0x80 == 0 {
@@ -92,7 +100,7 @@ impl Volume {
             return Err(Error::Truncated);
         }
         let mut body = vec![0u8; size as usize];
-        self.file.read_exact(&mut body)?;
+        self.read_exact(&mut body)?;
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&size_field);
         hasher.update(&body);
@@ -148,38 +156,62 @@ impl Volume {
         self.len
     }
 
-    /// Reads `len` bytes of a data area starting at `at` into `out`, in pieces, calling `sink` on each.
-    /// `len` bytes at `at`, appended to `out` with no buffer in between.
+    /// Moves to `at`, keeping what is already read when `at` lies within it.
+    fn seek(&mut self, at: u64) -> Result<()> {
+        if at != self.pos {
+            self.file.seek_relative(at as i64 - self.pos as i64)?;
+            self.pos = at;
+        }
+        Ok(())
+    }
+
+    fn read_exact(&mut self, out: &mut [u8]) -> Result<()> {
+        self.file.read_exact(out)?;
+        self.pos += out.len() as u64;
+        Ok(())
+    }
+
+    /// `len` bytes at `at`, appended to `out`.
     pub fn read_data_into(&mut self, at: u64, len: u64, out: &mut Vec<u8>) -> Result<()> {
         if at.checked_add(len).is_none_or(|end| end > self.len) {
             return Err(Error::Truncated);
         }
-        self.file.seek(SeekFrom::Start(at))?;
+        self.seek(at)?;
         let want = out.len() + len as usize;
-        // seeking emptied the buffer, so reading the file underneath keeps the reader's place and saves a copy
-        self.file.get_mut().take(len).read_to_end(out)?;
+        // what was read already, then the rest straight from the file with no buffer in between
+        let held = self.file.buffer();
+        let n = held.len().min(len as usize);
+        out.extend_from_slice(&held[..n]);
+        self.file.consume(n);
+        self.pos += n as u64;
+        if out.len() < want {
+            let rest = (want - out.len()) as u64;
+            let got = self.file.get_mut().take(rest).read_to_end(out)?;
+            self.pos += got as u64;
+        }
         if out.len() != want {
             return Err(Error::Truncated);
         }
         Ok(())
     }
 
-    pub fn read_data(
-        &mut self,
-        at: u64,
-        len: u64,
-        buf: &mut [u8],
-        mut sink: impl FnMut(&[u8]) -> Result<()>,
-    ) -> Result<()> {
+    /// Reads `len` bytes of a data area starting at `at`, in pieces, calling `sink` on each.
+    pub fn read_data(&mut self, at: u64, len: u64, mut sink: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
         if at.checked_add(len).is_none_or(|end| end > self.len) {
             return Err(Error::Truncated);
         }
-        self.file.seek(SeekFrom::Start(at))?;
+        self.seek(at)?;
         let mut left = len;
         while left > 0 {
-            let n = (buf.len() as u64).min(left) as usize;
-            self.file.read_exact(&mut buf[..n])?;
-            sink(&buf[..n])?;
+            let held = self.file.fill_buf()?;
+            if held.is_empty() {
+                return Err(Error::Truncated);
+            }
+            let n = (held.len() as u64).min(left) as usize;
+            let result = sink(&held[..n]);
+            self.file.consume(n);
+            self.pos += n as u64;
+            result?;
             left -= n as u64;
         }
         Ok(())
