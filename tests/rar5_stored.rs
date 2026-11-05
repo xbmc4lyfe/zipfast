@@ -30,7 +30,8 @@ fn extracts_stored_files_with_folders() {
     let big: Vec<u8> = (0..5_000_000u32).map(|i| (i * 7 + i / 13) as u8).collect();
     let files = [
         FileSpec::new("a.txt", b"hello"),
-        FileSpec { dir: true, ..FileSpec::new("sub", b"") },
+        // a folder needs its execute bit for the files inside it to be read back as a normal user
+        FileSpec { dir: true, unix_mode: Some(0o755), ..FileSpec::new("sub", b"") },
         FileSpec::new("sub/big.bin", &big),
         FileSpec::new("empty", b""),
     ];
