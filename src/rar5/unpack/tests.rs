@@ -405,6 +405,31 @@ fn quick_literals_round_trip_with_mixed_lengths() {
     u.feed(&block, &mut sink).unwrap();
     u.finish(&mut sink).unwrap();
     assert_eq!(u.tables.main.common, 8);
+
+    // literals spread over several lengths, about a hundred at the most common one: guessing would often miss,
+    // so it isn't tried
+    let mut x = 77u64;
+    let text: Vec<u8> = (0..60_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            ((x >> 8) as u8).min((x >> 40) as u8)
+        })
+        .collect();
+    let ops = lits(&text);
+    let mut u = Unpacker::new(1 << 20).unwrap();
+    u.set_threads(0, 0);
+    u.reset(Some(text.len() as u64));
+    let mut out = Vec::new();
+    let mut sink = |b: &[u8]| {
+        out.extend_from_slice(b);
+        Ok(())
+    };
+    u.feed(&tuned_block(&ops, true), &mut sink).unwrap();
+    u.finish(&mut sink).unwrap();
+    assert_eq!(u.tables.main.common, 0);
+    assert!(out == text);
 }
 
 #[test]
