@@ -25,6 +25,10 @@ pub(crate) const STORED_PARALLEL_MIN: u64 = 64 << 20;
 const PIECE: u64 = 1 << 20;
 /// Bytes of files read ahead of the workers.
 const BYTES_IN_FLIGHT: usize = 64 << 20;
+/// Small files go to a worker in groups of up to this many bytes (packed and unpacked)...
+const GROUP_BYTES: usize = 256 << 10;
+/// ...or this many files, so that handing them over, which wakes a thread, costs little next to the work.
+const GROUP_FILES: usize = 64;
 
 /// One file, read whole, to be decoded, checked and written.
 pub(crate) struct Job {
@@ -57,8 +61,11 @@ pub(crate) struct Done {
 }
 
 pub(crate) struct Batch {
-    tx: Option<Sender<(u64, Job)>>,
-    rx: Receiver<(u64, Done, usize)>,
+    tx: Option<Sender<Vec<(u64, Job)>>>,
+    /// files handed over but not yet sent, with their weight
+    group: Vec<(u64, Job)>,
+    group_bytes: usize,
+    rx: Receiver<Vec<(u64, Done, usize)>>,
     handles: Vec<JoinHandle<()>>,
     workers: usize,
     next: u64,
@@ -69,7 +76,7 @@ pub(crate) struct Batch {
 
 impl Batch {
     pub(crate) fn new(workers: usize) -> Batch {
-        let (tx, jobs) = mpsc::channel::<(u64, Job)>();
+        let (tx, jobs) = mpsc::channel::<Vec<(u64, Job)>>();
         let (done_tx, rx) = mpsc::channel();
         let jobs = Arc::new(Mutex::new(jobs));
         let handles = (0..workers)
@@ -82,10 +89,14 @@ impl Batch {
                         let mut unpacker: Option<Unpacker> = None;
                         loop {
                             let next = jobs.lock().map(|rx| rx.recv());
-                            let Ok(Ok((seq, job))) = next else { break };
-                            let weight = job.packed.len() + job.size as usize;
-                            let done = run(job, &mut unpacker);
-                            if done_tx.send((seq, done, weight)).is_err() {
+                            let Ok(Ok(group)) = next else { break };
+                            // results go back as a group too, so the main thread wakes once for it
+                            let mut dones = Vec::with_capacity(group.len());
+                            for (seq, job) in group {
+                                let weight = weight(&job);
+                                dones.push((seq, run(job, &mut unpacker), weight));
+                            }
+                            if done_tx.send(dones).is_err() {
                                 break;
                             }
                         }
@@ -94,7 +105,18 @@ impl Batch {
             })
             .collect::<Vec<_>>();
         let workers = handles.len();
-        Batch { tx: Some(tx), rx, handles, workers, next: 0, applied: 0, bytes: 0, ready: BTreeMap::new() }
+        Batch {
+            tx: Some(tx),
+            group: Vec::new(),
+            group_bytes: 0,
+            rx,
+            handles,
+            workers,
+            next: 0,
+            applied: 0,
+            bytes: 0,
+            ready: BTreeMap::new(),
+        }
     }
 
     /// Whether any worker started.
@@ -104,9 +126,10 @@ impl Batch {
 
     /// Hands `job` over, first taking back finished files while too much is waiting. Finished files go to `apply`
     /// in archive order.
+    /// Small files wait to be sent in a group; [`Self::send`] sends what is waiting.
     pub(crate) fn submit(&mut self, job: Job, apply: &mut dyn FnMut(Done) -> Result<()>) -> Result<()> {
-        let weight = job.packed.len() + job.size as usize;
-        while self.next - self.applied >= 4 * self.workers as u64
+        let weight = weight(&job);
+        while self.next - self.applied >= (4 * self.workers * GROUP_FILES) as u64
             || (self.next > self.applied && self.bytes + weight > BYTES_IN_FLIGHT)
         {
             if let Err(e) = self.take_one(apply) {
@@ -114,18 +137,33 @@ impl Batch {
                 return Err(e);
             }
         }
-        let seq = self.next;
-        let Some(tx) = self.tx.as_ref() else {
+        if self.tx.is_none() {
             discard(job);
-            return Err(Error::Io(std::io::Error::other("file workers stopped")));
-        };
-        if let Err(mpsc::SendError((_, job))) = tx.send((seq, job)) {
-            // every worker is gone; can't happen while one is alive
-            discard(job);
-            return Err(Error::Io(std::io::Error::other("file workers stopped")));
+            return Err(stopped());
         }
+        self.group.push((self.next, job));
+        self.group_bytes += weight;
         self.bytes += weight;
         self.next += 1;
+        if self.group_bytes >= GROUP_BYTES || self.group.len() >= GROUP_FILES {
+            self.send()?;
+        }
+        Ok(())
+    }
+
+    /// Sends the files waiting in a group to the workers.
+    pub(crate) fn send(&mut self) -> Result<()> {
+        if self.group.is_empty() {
+            return Ok(());
+        }
+        let group = std::mem::take(&mut self.group);
+        self.group_bytes = 0;
+        let Some(tx) = self.tx.as_ref() else { return Err(stopped()) };
+        if let Err(mpsc::SendError(group)) = tx.send(group) {
+            // every worker is gone; can't happen while one is alive
+            group.into_iter().for_each(|(_, job)| discard(job));
+            return Err(stopped());
+        }
         Ok(())
     }
 
@@ -138,11 +176,13 @@ impl Batch {
     }
 
     fn take_one(&mut self, apply: &mut dyn FnMut(Done) -> Result<()>) -> Result<()> {
+        // the file waited for may still be in the group
+        self.send()?;
         while !self.ready.contains_key(&self.applied) {
-            let Ok((seq, done, weight)) = self.rx.recv() else {
-                return Err(Error::Io(std::io::Error::other("file workers stopped")));
-            };
-            self.ready.insert(seq, (done, weight));
+            let Ok(dones) = self.rx.recv() else { return Err(stopped()) };
+            for (seq, done, weight) in dones {
+                self.ready.insert(seq, (done, weight));
+            }
         }
         let (done, weight) = self.ready.remove(&self.applied).unwrap();
         self.applied += 1;
@@ -163,6 +203,15 @@ impl Drop for Batch {
 /// Drops a job no worker will see. Its file was never created.
 fn discard(job: Job) {
     drop(job);
+}
+
+/// What a job counts for against [`BYTES_IN_FLIGHT`] and [`GROUP_BYTES`].
+fn weight(job: &Job) -> usize {
+    job.packed.len() + job.size as usize
+}
+
+fn stopped() -> Error {
+    Error::Io(std::io::Error::other("file workers stopped"))
 }
 
 fn run(job: Job, unpacker: &mut Option<Unpacker>) -> Done {
