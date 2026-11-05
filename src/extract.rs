@@ -1,7 +1,7 @@
 //! Lists, tests and extracts an archive. RAR 5.0 lives here: its volumes are followed in order and compressed files
 //! decoded. Other formats have modules of their own.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -110,16 +110,27 @@ pub(crate) fn open_target(opts: &Options, rel: &Path, size: Option<u64>) -> Resu
     })
 }
 
-/// The first half of [`open_target`]: makes the folders and checks the target, without creating it. Folders in
-/// `made` are known to be there already; the ones made are added.
-pub(crate) fn check_target(opts: &Options, rel: &Path, made: Option<&mut HashSet<PathBuf>>) -> Result<Checked> {
+/// The folders one run has made or checked, so each is looked at once.
+#[derive(Default)]
+pub(crate) struct Dirs {
+    /// each folder, and whether this run made it
+    known: HashMap<PathBuf, bool>,
+    /// every name this run has put in a folder it made, in lower case
+    taken: HashSet<String>,
+}
+
+/// The first half of [`open_target`]: makes the folders and checks the target, without creating it. With `dirs`,
+/// folders are made only once, and a file in a folder this run made is not looked for, since nothing can be there
+/// that the run did not put there.
+pub(crate) fn check_target(opts: &Options, rel: &Path, dirs: Option<&mut Dirs>) -> Result<Checked> {
     let target = opts.dest.join(rel);
     if let Some(parent) = rel.parent() {
-        match made {
-            Some(made) if made.contains(parent) => {}
-            Some(made) => {
-                make_dirs(&opts.dest, parent)?;
-                made.insert(parent.to_path_buf());
+        match dirs {
+            Some(dirs) => {
+                make_dirs_known(&opts.dest, parent, dirs)?;
+                if dirs.known.get(parent) == Some(&true) && dirs.claim(rel) {
+                    return Ok(Checked::Write(Place { path: target, replace: false }));
+                }
             }
             None => make_dirs(&opts.dest, parent)?,
         }
@@ -550,7 +561,7 @@ struct Run<'a, R: FnMut(&str)> {
     /// where the queued files are written, as `batch_paths`
     queued_paths: HashSet<String>,
     /// folders under the destination made (or found) so far
-    made_dirs: HashSet<PathBuf>,
+    dirs: Dirs,
 }
 
 /// A file finished on another thread, counted and reported as if done here.
@@ -589,7 +600,7 @@ fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Sum
         batch_paths: HashSet::new(),
         queued: VecDeque::new(),
         queued_paths: HashSet::new(),
-        made_dirs: HashSet::new(),
+        dirs: Dirs::default(),
     };
     let walked = walk(first, |vol, block| {
         let Block::File(h) = block else { return Ok(()) };
@@ -768,10 +779,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
         if h.is_dir() {
             if self.opts.mode == Mode::Extract && !self.opts.flatten {
                 // a folder made earlier for a file inside it still gets its own times and permissions
-                if !self.made_dirs.contains(&rel) {
-                    make_dirs(&self.opts.dest, &rel)?;
-                    self.made_dirs.insert(rel.clone());
-                }
+                make_dirs_known(&self.opts.dest, &rel, &mut self.dirs)?;
                 self.summary.dir_meta.push((self.opts.dest.join(&rel), Meta::from(h)));
             }
             self.summary.dirs += 1;
@@ -790,7 +798,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
         }
 
         let place = if self.opts.mode == Mode::Extract {
-            match check_target(self.opts, &rel, Some(&mut self.made_dirs))? {
+            match check_target(self.opts, &rel, Some(&mut self.dirs))? {
                 Checked::Write(place) => Some(place),
                 Checked::Exists => {
                     self.drain()?;
@@ -1228,6 +1236,50 @@ fn set_time(out: &File, h: &Meta) {
             let _ = out.set_modified(at);
         }
     }
+}
+
+impl Dirs {
+    /// Takes the name `rel` in a folder this run made. False when the name may already be in use there: taken
+    /// before, perhaps under other letter case, or not plain ASCII, where a file system may treat two different
+    /// spellings as one name. (Opening the file still refuses to replace anything, should such a name slip by.)
+    fn claim(&mut self, rel: &Path) -> bool {
+        let Some(name) = rel.to_str() else { return false };
+        name.is_ascii() && !name.contains('~') && self.taken.insert(name.to_ascii_lowercase())
+    }
+}
+
+/// [`make_dirs`] for a run that remembers the folders it has made or checked, in `dirs`. It starts below the
+/// deepest one already known, and tries to make each folder before looking at what is there, so a new folder costs
+/// one call.
+pub(crate) fn make_dirs_known(root: &Path, rel: &Path, dirs: &mut Dirs) -> Result<()> {
+    let known =
+        rel.ancestors().find(|a| a.as_os_str().is_empty() || dirs.known.contains_key(*a)).unwrap_or(Path::new(""));
+    let Ok(rest) = rel.strip_prefix(known) else { return make_dirs(root, rel) };
+    let mut at = root.join(known);
+    let mut sub = known.to_path_buf();
+    for part in rest.components() {
+        at.push(part);
+        sub.push(part);
+        let made = match fs::create_dir(&at) {
+            Ok(()) => true,
+            // something is there already: only a real folder will do, never a link to one
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match fs::symlink_metadata(&at) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    return Err(Error::UnsafePath(rel.display().to_string()));
+                }
+                Ok(meta) if meta.is_dir() => false,
+                Ok(_) => return Err(Error::UnsafePath(format!("{}: a file is in the way", rel.display()))),
+                Err(e) => return Err(e.into()),
+            },
+            Err(e) => return Err(e.into()),
+        };
+        // a folder put in a folder this run made takes its name there, so no file is later created over it
+        if sub.parent().is_some_and(|p| dirs.known.get(p) == Some(&true)) {
+            dirs.claim(&sub);
+        }
+        dirs.known.insert(sub.clone(), made);
+    }
+    Ok(())
 }
 
 /// Creates `rel` under `root` one folder at a time, refusing to pass through a link.
