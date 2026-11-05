@@ -1340,15 +1340,14 @@ fn copy(window: &mut [u8], mask: u64, sp: u64, len: u32, dist: u64, size_end: u6
     let src = ((sp - dist) & mask) as usize;
     let w = window.len();
     if n <= 32 && dist >= n as u64 && dst + 32 <= w && src + 32 <= w {
-        // a short copy that doesn't overlap: whole 16-byte words, keeping the destination's bytes past the match
-        let mut i = 0;
-        while i < n {
-            let k = (n - i).min(16);
-            let s = u128::from_le_bytes(window[src + i..src + i + 16].try_into().unwrap());
-            let d = u128::from_le_bytes(window[dst + i..dst + i + 16].try_into().unwrap());
-            let keep = if k == 16 { 0 } else { !0u128 << (8 * k) };
-            window[dst + i..dst + i + 16].copy_from_slice(&((s & !keep) | (d & keep)).to_le_bytes());
-            i += 16;
+        // a short copy whose source ends before it: whole 16-byte words, keeping the destination's bytes past the
+        // match, which a match from nearly a window back may still read
+        // SAFETY: the 32 bytes at `src` and at `dst` are inside the window, and 1 <= n <= 32
+        unsafe {
+            blend16(window, src, dst, n.min(16));
+            if n > 16 {
+                blend16(window, src + 16, dst + 16, n - 16);
+            }
         }
         return Ok(());
     }
@@ -1384,6 +1383,42 @@ fn copy(window: &mut [u8], mask: u64, sp: u64, len: u32, dist: u64, size_end: u6
         }
     }
     Ok(())
+}
+
+/// 16 bytes of 0xFF then 16 of zero: the 16 bytes from `16 - k` on select the first `k` of a word.
+static FIRST: [u8; 32] = {
+    let mut m = [0u8; 32];
+    let mut i = 0;
+    while i < 16 {
+        m[i] = 0xff;
+        i += 1;
+    }
+    m
+};
+
+/// The first `k` of the 16 bytes at `src` written over those at `dst`, the rest of `dst` kept.
+///
+/// # Safety
+///
+/// The 16 bytes at `src` and at `dst` must be inside `window`, and `k` must be 1 to 16.
+#[inline(always)]
+unsafe fn blend16(window: &mut [u8], src: usize, dst: usize, k: usize) {
+    debug_assert!(src + 16 <= window.len() && dst + 16 <= window.len() && (1..=16).contains(&k));
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: as the caller promises; the 16 bytes at `16 - k` are inside `FIRST`
+    unsafe {
+        use std::arch::aarch64::*;
+        let w = window.as_mut_ptr();
+        let pick = vld1q_u8(FIRST.as_ptr().add(16 - k));
+        vst1q_u8(w.add(dst), vbslq_u8(pick, vld1q_u8(w.add(src)), vld1q_u8(w.add(dst))));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let s = u128::from_le_bytes(window[src..src + 16].try_into().unwrap());
+        let d = u128::from_le_bytes(window[dst..dst + 16].try_into().unwrap());
+        let pick = u128::from_le_bytes(FIRST[16 - k..32 - k].try_into().unwrap());
+        window[dst..dst + 16].copy_from_slice(&((s & pick) | (d & !pick)).to_le_bytes());
+    }
 }
 
 /// What follows a main-table symbol of 256 or more, read right after a refill.

@@ -812,3 +812,36 @@ fn filters_in_place_match_the_byte_at_a_time_reading() {
         }
     }
 }
+
+#[test]
+fn match_copies_equal_a_byte_at_a_time_and_touch_nothing_else() {
+    let size = 4096usize;
+    let mask = size as u64 - 1;
+    let mut x = 9u64;
+    let mut next = move || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        x
+    };
+    let base: Vec<u8> = (0..size).map(|_| next() as u8).collect();
+    for len in (2..70).chain([100, 255, 300]) {
+        for _ in 0..400 {
+            // the second time round the window, so a match may reach a whole window back
+            let sp = size as u64 + next() % size as u64;
+            let dist = match next() % 6 {
+                0 => 1 + next() % 8,
+                1 => 1 + next() % u64::from(len),
+                2 => size as u64 - next() % 40,
+                _ => 1 + next() % size as u64,
+            };
+            let mut got = base.clone();
+            copy(&mut got, mask, sp, len, dist, sp + u64::from(len)).unwrap();
+            let mut want = base.clone();
+            for i in 0..u64::from(len) {
+                want[((sp + i) & mask) as usize] = want[((sp + i - dist) & mask) as usize];
+            }
+            assert!(got == want, "len {len} dist {dist} at {}", sp & mask);
+        }
+    }
+}
