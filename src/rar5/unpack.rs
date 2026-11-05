@@ -1460,9 +1460,19 @@ fn resolve(tok: Tok, hist: &mut [u64; 4], last: &mut u32) -> Option<(u32, u64)> 
     match tok {
         Tok::Last => (*last != 0).then(|| (*last, hist[0])),
         Tok::Rep { k, len } => {
-            let k = usize::from(k);
+            // the distance used moves to the front and the ones before it back one; spelled out, since shifting a
+            // run of variable length calls memmove
+            let k = usize::from(k) & 3;
             let d = hist[k];
-            hist.copy_within(0..k, 1);
+            if k >= 3 {
+                hist[3] = hist[2];
+            }
+            if k >= 2 {
+                hist[2] = hist[1];
+            }
+            if k >= 1 {
+                hist[1] = hist[0];
+            }
             hist[0] = d;
             *last = len;
             Some((len, d))
