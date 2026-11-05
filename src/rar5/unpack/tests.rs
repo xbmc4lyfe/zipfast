@@ -464,7 +464,15 @@ fn eight_bit_codes_of_other_symbols_end_a_quick_run() {
     assert_eq!(main.common, 8);
     let at = |v: usize| main.lut[v << (LUT_BITS - 8)];
     assert!((0..256).any(|v| at(v) & 15 == 8 && at(v) >> 4 >= 256), "no other symbol got an 8-bit code");
-    assert!((0..256).all(|v| (main.tab8[v] >= 0x100) == (at(v) & 0xF00F == 8)));
+    // the literal codes of length 8 are a range of 8-bit values, and `lit8` holds their literals in code order
+    for v in 0..256usize {
+        let i = (v as u8).wrapping_sub(main.first8);
+        let literal8 = at(v) & 0xF00F == 8;
+        assert_eq!(u16::from(i) < main.nlit8, literal8, "code {v}");
+        if literal8 {
+            assert_eq!(u16::from(main.lit8[usize::from(i)]), at(v) >> 4, "code {v}");
+        }
+    }
     // the same on workers, and fed in small pieces
     let stream = tuned_stream(&ops, 20_000);
     for threads in [0, 3] {
@@ -663,4 +671,56 @@ fn a_queued_files_trouble_is_its_own_and_stops_the_files_after_it() {
             assert!(q_out == s_out, "{what} {piece}");
         }
     }
+}
+
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn sixteen_literals_at_a_time_match_one_at_a_time() {
+    // a block whose literals nearly all have 8-bit codes, with codes of other lengths among them
+    let ops = mostly_noise(60_000, 21);
+    let data = model(&ops);
+    let block = tuned_block(&ops, true);
+    let mut u = Unpacker::new(1 << 20).unwrap();
+    u.set_threads(0, 0);
+    u.reset(Some(data.len() as u64));
+    let mut out = Vec::new();
+    let mut sink = |b: &[u8]| {
+        out.extend_from_slice(b);
+        Ok(())
+    };
+    u.feed(&block, &mut sink).unwrap();
+    u.finish(&mut sink).unwrap();
+    assert!(out == data);
+    let main = &u.tables.main;
+    assert_eq!(main.common, 8);
+    let (header_len, payload, flags) = block_header(&block).unwrap().unwrap();
+    let mut buf = block[header_len..header_len + payload].to_vec();
+    buf.resize(payload + PAD, 0);
+    let end_bits = (payload - 1) * 8 + usize::from(flags & 7) + 1;
+    // the code of 8 bits at any bit position
+    let code = |pos: usize| ((u16::from(buf[pos / 8]) << 8 | u16::from(buf[pos / 8 + 1])) >> (8 - pos % 8)) as u8;
+    let starts = (1000..1400).chain(end_bits - 600..end_bits);
+    let mut total = 0;
+    for start in starts {
+        for room in [0, 15, 16, 17, 40, 300, STAGE] {
+            // one code at a time: as many literals as come in a row, in whole rounds of 16 that fit
+            let rounds = if start + 136 <= end_bits { ((end_bits - start - 136) / 128 + 1).min(room / 16) } else { 0 };
+            let mut want = Vec::new();
+            while want.len() < 16 * rounds {
+                let i = code(start + 8 * want.len()).wrapping_sub(main.first8);
+                if u16::from(i) >= main.nlit8 {
+                    break;
+                }
+                want.push(main.lit8[usize::from(i)]);
+            }
+            let mut bits = Bits::at(&buf, start);
+            let mut got = [0u8; STAGE + 8];
+            let k = main.run8(&mut bits, end_bits, &mut got, room);
+            assert_eq!(&got[..k], &want[..], "start {start} room {room}");
+            assert_eq!(bits.pos(), start + 8 * k, "start {start} room {room}");
+            total += k;
+        }
+    }
+    // plenty of the starts are inside runs of literal codes
+    assert!(total > 20_000, "{total}");
 }
