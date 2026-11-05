@@ -138,9 +138,15 @@ impl Huff {
 
     #[allow(clippy::needless_range_loop)]
     fn build(&mut self, lengths: &[u8]) -> Result<()> {
-        let mut count = [0u32; 16];
-        for &l in lengths {
-            count[l as usize] += 1;
+        // (a length is at most 15) the literals are counted apart too, for the guess at their common length below
+        let lits = if lengths.len() >= 256 { &lengths[..256] } else { &[][..] };
+        let mut by_len = [0u32; 16];
+        for &l in lits {
+            by_len[usize::from(l & 15)] += 1;
+        }
+        let mut count = by_len;
+        for &l in &lengths[lits.len()..] {
+            count[usize::from(l & 15)] += 1;
         }
         count[0] = 0;
         let mut kraft = 0u32;
@@ -172,26 +178,37 @@ impl Huff {
         }
         self.empty = index == 0;
         // incompressible data comes out as literals nearly all of one length: worth guessing at
-        let mut by_len = [0u32; 16];
-        for &l in lengths.iter().take(256) {
-            by_len[l as usize] += 1;
-        }
         by_len[0] = 0;
         let (len, n) = by_len.iter().enumerate().max_by_key(|&(l, &n)| (n, std::cmp::Reverse(l))).unwrap();
-        self.common = if lengths.len() >= 256 && *n >= 160 && len <= LUT_BITS as usize { len as u32 } else { 0 };
+        self.common = if !lits.is_empty() && *n >= 160 && len <= LUT_BITS as usize { len as u32 } else { 0 };
         // canonical codes up to the table's width fill it from the start, in order; the rest belongs to longer codes
         // or to none, and is marked for the slow path
         let mut covered = 0;
         for l in 1..=LUT_BITS as usize {
-            let from = self.start[l] as usize;
-            let first = self.first[l] >> (16 - l);
-            let span = 1 << (LUT_BITS as usize - l);
-            for (rank, &sym) in self.sorted[from..from + count[l] as usize].iter().enumerate() {
-                let code = first + rank as u32;
-                let at = (code << (LUT_BITS as usize - l)) as usize;
-                self.lut[at..at + span].fill((sym << 4) | l as u16);
-                covered = at + span;
+            let n = count[l] as usize;
+            if n == 0 {
+                continue;
             }
+            let from = self.start[l] as usize;
+            let syms = &self.sorted[from..from + n];
+            let shift = LUT_BITS as usize - l;
+            let lut = &mut self.lut[covered..covered + (n << shift)];
+            let tag = l as u16;
+            // a code of length l covers 2^shift entries; the common spans get loops of their own
+            match shift {
+                0 => fill::<1>(lut, syms, tag),
+                1 => fill::<2>(lut, syms, tag),
+                2 => fill::<4>(lut, syms, tag),
+                3 => fill::<8>(lut, syms, tag),
+                4 => fill::<16>(lut, syms, tag),
+                5 => fill::<32>(lut, syms, tag),
+                _ => {
+                    for (d, &sym) in lut.chunks_exact_mut(1 << shift).zip(syms) {
+                        d.fill((sym << 4) | tag);
+                    }
+                }
+            }
+            covered += n << shift;
         }
         if covered < self.dirty {
             self.lut[covered..self.dirty].fill(0);
@@ -199,9 +216,13 @@ impl Huff {
         self.dirty = covered;
         // the codes of literals of length 8, by their 8-bit value
         if self.common == 8 {
-            for (v, slot) in self.tab8.iter_mut().enumerate() {
-                let e = self.lut[v << (LUT_BITS - 8)];
-                *slot = if e & 0xF00F == 8 { 0x100 | (e >> 4) } else { 0 };
+            self.tab8.fill(0);
+            let from = self.start[8] as usize;
+            let first = (self.first[8] >> 8) as usize;
+            for (rank, &sym) in self.sorted[from..from + count[8] as usize].iter().enumerate() {
+                if sym < 256 {
+                    self.tab8[first + rank] = 0x100 | sym;
+                }
             }
         }
         Ok(())
@@ -306,6 +327,14 @@ impl Huff {
             }
         }
         Err(corrupt(if self.empty { "symbol from an empty prefix code" } else { "bit pattern matches no code" }))
+    }
+}
+
+/// Each symbol's entry, `SPAN` times over, in order.
+#[inline(always)]
+fn fill<const SPAN: usize>(lut: &mut [u16], syms: &[u16], tag: u16) {
+    for (d, &sym) in lut.as_chunks_mut::<SPAN>().0.iter_mut().zip(syms) {
+        *d = [(sym << 4) | tag; SPAN];
     }
 }
 
