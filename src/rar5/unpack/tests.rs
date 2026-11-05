@@ -441,7 +441,7 @@ fn eight_bit_codes_of_other_symbols_end_a_quick_run() {
         x ^= x << 13;
         x ^= x >> 7;
         x ^= x << 17;
-        if i > 100 && (x >> 20) % 256 == 0 {
+        if i > 100 && (x >> 20).is_multiple_of(256) {
             ops.push(Op::Match(4, 64));
         } else {
             ops.push(Op::Lit((x >> 32) as u8));
