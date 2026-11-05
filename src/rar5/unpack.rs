@@ -21,6 +21,9 @@ const TABLES: usize = NC + DC + LDC + RC;
 const PAD: usize = 32;
 const MAX_FILTERS: usize = 8192;
 const MAX_FILTER_LEN: u64 = 0x40_0000;
+
+/// Output is emitted at least this often (see [`Unpacker::flush_at`]). It must not be less than [`MAX_FILTER_LEN`].
+const FLUSH_EVERY: u64 = MAX_FILTER_LEN;
 /// Quick literals gathered before they go to the window.
 const STAGE: usize = 256;
 /// Bits of a code looked up in one step; longer codes take the slow path.
@@ -548,6 +551,14 @@ impl Unpacker {
         self.next_file(size);
     }
 
+    /// How much unemitted output the window may hold before it is emitted. No more than half the window, so a
+    /// match never overwrites output not yet emitted, and no more than [`FLUSH_EVERY`], so the output is still in
+    /// cache when the sink reads it. Never less than a filter's longest range, which is emitted only once it is
+    /// whole, so decoding can always reach the end of one.
+    fn flush_at(&self) -> u64 {
+        (self.window_size() / 2).min(FLUSH_EVERY)
+    }
+
     fn op(&self) -> u64 {
         self.sp - self.file_base
     }
@@ -752,7 +763,7 @@ impl Unpacker {
 
     /// Some of a block's tokens, applied to the window with the same checks the decoding loop makes.
     fn apply(&mut self, toks: &[Tok], lits: &[u8], sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
-        let flush_at = self.window_size() / 2;
+        let flush_at = self.flush_at();
         let size_end = self.size.map_or(u64::MAX, |s| self.file_base.saturating_add(s));
         let mut li = 0usize;
         for &tok in toks {
@@ -916,7 +927,7 @@ impl Unpacker {
         tables: &Tables,
         sink: &mut dyn FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
-        let flush_at = self.window_size() / 2;
+        let flush_at = self.flush_at();
         while bits.pos() < end_bits {
             if self.sp - self.file_base - self.emitted > flush_at {
                 self.flush(sink)?;

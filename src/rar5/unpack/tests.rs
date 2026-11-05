@@ -189,6 +189,36 @@ fn a_filter_over_the_whole_file_fits_the_window_chosen_for_it() {
     assert_eq!(got.len(), 100_000);
 }
 
+/// Output is emitted every few MiB however big the window; filters of the longest range still come out whole,
+/// wherever they fall against those points.
+#[test]
+fn longest_filters_across_the_points_output_is_emitted_at() {
+    const MIB: usize = 1 << 20;
+    let len = MAX_FILTER_LEN as usize;
+    let data: Vec<u8> = (0..12 * MIB as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+    let mut ops = lits(&data[..3 * MIB + 5]);
+    ops.push(Op::Filter { start: 0, len: len as u64, kind: 0, channels: 1 });
+    ops.extend(lits(&data[3 * MIB + 5..7 * MIB + 9]));
+    ops.push(Op::Filter { start: 0, len: len as u64, kind: 0, channels: 1 });
+    ops.extend(lits(&data[7 * MIB + 9..]));
+    let mut stream = Vec::new();
+    let chunks: Vec<_> = ops.chunks(MIB / 2).collect();
+    for (i, chunk) in chunks.iter().enumerate() {
+        stream.extend(block(chunk, i == 0, i + 1 == chunks.len()));
+    }
+    let got = decode(&stream, data.len() as u64, 32 << 20, MIB).unwrap();
+    let mut want = data.clone();
+    for start in [3 * MIB + 5, 7 * MIB + 9] {
+        // delta over one channel: negated running sums
+        let mut acc = 0u8;
+        for j in start..start + len {
+            acc = acc.wrapping_sub(data[j]);
+            want[j] = acc;
+        }
+    }
+    assert!(got == want, "mismatch");
+}
+
 #[test]
 fn window_sizes_stay_sane_for_any_stated_size() {
     assert_eq!(window_for(1 << 17, Some(u64::MAX - 1), false).unwrap(), 1 << 17);
