@@ -362,3 +362,22 @@ fn a_big_file_is_written_whole() {
     assert_eq!(s.errors.len(), 1);
     assert!(!out2.join("big.bin").exists());
 }
+
+/// A read by position may move the volume (Windows does); the next header is still found where it is.
+#[test]
+fn headers_are_found_after_the_volume_was_moved_under_the_reader() {
+    use std::io::{Seek, SeekFrom};
+    use zipfast::rar5::reader::{Block, Volume};
+    let dir = tmp("moved");
+    let arc = dir.join("t.rar");
+    // past what one read holds, so the reader has to go to the file for the next header
+    let big = vec![7u8; 3 << 20];
+    fs::write(&arc, archive(&[FileSpec::new("a", &big), FileSpec::new("b", b"two")])).unwrap();
+    let mut vol = Volume::open(&arc).unwrap();
+    let Some(Block::File(a)) = vol.next_block().unwrap() else { panic!("first file") };
+    assert_eq!(a.name, "a");
+    let mut file = vol.file();
+    file.seek(SeekFrom::Start(1)).unwrap();
+    let Some(Block::File(b)) = vol.next_block().unwrap() else { panic!("second file") };
+    assert_eq!(b.name, "b");
+}

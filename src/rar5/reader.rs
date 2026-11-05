@@ -1,7 +1,7 @@
 //! Walks one RAR 5.0 volume block by block.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use super::*;
@@ -28,6 +28,8 @@ pub struct Volume {
     file: BufReader<File>,
     /// where `file` stands, so moving within what it holds needs no system call
     pos: u64,
+    /// the file was read by position since, which on some systems moves it, so `pos` can't be trusted
+    lost: bool,
     /// where the next block starts
     next: u64,
     len: u64,
@@ -58,7 +60,8 @@ impl Volume {
         let len = file.metadata()?.len();
         let mut file = BufReader::with_capacity(READ, file);
         let (next, pos) = find_signature(&mut file)?;
-        let mut vol = Volume { path: path.to_path_buf(), file, pos, next, len, main: MainHeader::default() };
+        let mut vol =
+            Volume { path: path.to_path_buf(), file, pos, next, len, lost: false, main: MainHeader::default() };
         match vol.next_block()? {
             Some(Block::Main(m)) => vol.main = m,
             Some(Block::Crypt) => return Err(Error::Encrypted),
@@ -145,9 +148,10 @@ impl Volume {
         }))
     }
 
-    /// The volume file's length.
-    /// The open volume, for reads by position that leave its own position alone.
-    pub fn file(&self) -> &File {
+    /// The open volume, for reads by position. Those may move it (Windows does), so the next read here finds its
+    /// place again from the start of the file.
+    pub fn file(&mut self) -> &File {
+        self.lost = true;
         self.file.get_ref()
     }
 
@@ -158,7 +162,12 @@ impl Volume {
 
     /// Moves to `at`, keeping what is already read when `at` lies within it.
     fn seek(&mut self, at: u64) -> Result<()> {
-        if at != self.pos {
+        if self.lost {
+            // drops what was read, and puts the file at `at` wherever it stands now
+            self.file.seek(SeekFrom::Start(at))?;
+            self.pos = at;
+            self.lost = false;
+        } else if at != self.pos {
             self.file.seek_relative(at as i64 - self.pos as i64)?;
             self.pos = at;
         }
