@@ -5,9 +5,9 @@
 //! - ZIP traditional PKWARE stream cipher (ZipCrypto) and WinZip AES (`0x9901`) PBKDF2-HMAC-SHA1 decryption
 
 /// AES-128 (10 rounds), AES-192 (12 rounds), or AES-256 (14 rounds) expanded round keys.
+#[derive(Clone, Copy)]
 pub struct AesKey {
     enc_rk: [[u8; 16]; 15],
-    dec_rk: [[u8; 16]; 15],
     rounds: usize,
 }
 
@@ -119,11 +119,7 @@ impl AesKey {
                 enc_rk[r][c * 4..c * 4 + 4].copy_from_slice(&w[r * 4 + c].to_be_bytes());
             }
         }
-        let mut dec_rk = enc_rk;
-        for rk in dec_rk.iter_mut().take(nr).skip(1) {
-            inv_mix_columns(rk);
-        }
-        Some(Self { enc_rk, dec_rk, rounds: nr })
+        Some(Self { enc_rk, rounds: nr })
     }
 
     pub fn encrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
@@ -160,7 +156,7 @@ impl AesKey {
 
     pub fn decrypt_block(&self, block: &[u8; 16]) -> [u8; 16] {
         let mut s = *block;
-        for (b, &k) in s.iter_mut().zip(&self.dec_rk[self.rounds]) {
+        for (b, &k) in s.iter_mut().zip(&self.enc_rk[self.rounds]) {
             *b ^= k;
         }
         for round in (1..self.rounds).rev() {
@@ -168,7 +164,7 @@ impl AesKey {
             for b in &mut s {
                 *b = INV_SBOX[usize::from(*b)];
             }
-            for (b, &k) in s.iter_mut().zip(&self.dec_rk[round]) {
+            for (b, &k) in s.iter_mut().zip(&self.enc_rk[round]) {
                 *b ^= k;
             }
             inv_mix_columns(&mut s);
@@ -177,7 +173,7 @@ impl AesKey {
         for b in &mut s {
             *b = INV_SBOX[usize::from(*b)];
         }
-        for (b, &k) in s.iter_mut().zip(&self.dec_rk[0]) {
+        for (b, &k) in s.iter_mut().zip(&self.enc_rk[0]) {
             *b ^= k;
         }
         s
@@ -1022,4 +1018,30 @@ pub fn aes_extra_info(extra: &[u8]) -> Option<(u8, u16, u16)> {
         p = p.checked_add(4 + size)?;
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fips_197_and_cbc_round_trip() {
+        let pt: [u8; 16] =
+            [0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let k256: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11,
+            0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let c256: [u8; 16] =
+            [0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49, 0x60, 0x89];
+        let aes = AesKey::new(&k256).unwrap();
+        let enc = aes.encrypt_block(&pt);
+        assert_eq!(enc, c256);
+        assert_eq!(aes.decrypt_block(&enc), pt);
+
+        let iv = [0x42u8; 16];
+        let msg = b"0123456789abcdeffedcba9876543210";
+        let ct = encrypt_cbc(&k256, &iv, msg).unwrap();
+        assert_eq!(decrypt_cbc(&k256, &iv, &ct).unwrap(), msg);
+    }
 }
