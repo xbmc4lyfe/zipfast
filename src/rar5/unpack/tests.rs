@@ -866,3 +866,28 @@ fn packed_tokens_come_back_as_they_went_in() {
         assert_eq!(format!("{t:?}"), format!("{:?}", p.get(&filters)));
     }
 }
+
+#[test]
+fn filter_records_count_against_a_workers_budget() {
+    // nothing but filter records, a few bytes each packed: their fields, kept beside the tokens, overrun a worker's
+    // budget for this many packed bytes
+    let ops: Vec<Op> = (0..300_000u64).map(|i| Op::Filter { start: 4 * i, len: 4, kind: 1, channels: 0 }).collect();
+    let stream = block(&ops, true, true);
+    // the calling thread finds too many pending, as it would have decoding them itself
+    let err = decode(&stream, 1 << 20, 1 << 20, usize::MAX).unwrap_err();
+    assert_eq!(err.to_string(), corrupt("too many filters").to_string());
+    // a worker reading the block stops at its budget
+    let (header_len, payload, flags) = block_header(&stream).unwrap().unwrap();
+    let mut buf = stream[header_len..header_len + payload].to_vec();
+    buf.resize(payload + PAD, 0);
+    let end_bits = (payload - 1) * 8 + usize::from(flags & 7) + 1;
+    let mut bits = Bits::new(&buf);
+    let lens = read_lengths(&mut Huff::new(), &mut bits, end_bits).unwrap();
+    let mut t = Tables::empty();
+    t.build(&lens).unwrap();
+    let (mut toks, mut filters, mut lits) = (Vec::new(), Vec::new(), Vec::new());
+    let budget = payload * parallel::BUDGET + (1 << 20);
+    let stop = parallel::tokenize(&buf, bits.pos(), end_bits, &t, (&mut toks, &mut filters, &mut lits), budget);
+    assert!(matches!(stop, Ok(Some(_))), "{:?} with {} filters read", stop.map(|_| ()), filters.len());
+    assert!(filters.len() < ops.len());
+}

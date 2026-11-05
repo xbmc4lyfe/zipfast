@@ -94,7 +94,7 @@ pub(super) struct Packed(u64);
 pub(super) type FilterFields = (u64, u64, FilterKind);
 
 /// Where [`tokenize`] puts what it reads: tokens, filter fields, literals.
-type Out<'a> = (&'a mut Vec<Packed>, &'a mut Vec<FilterFields>, &'a mut Vec<u8>);
+pub(super) type Out<'a> = (&'a mut Vec<Packed>, &'a mut Vec<FilterFields>, &'a mut Vec<u8>);
 
 impl Packed {
     pub fn lits(n: u32) -> Packed {
@@ -276,7 +276,7 @@ fn work(
 /// A block's symbols, from `start_bit` to `end_bits`, as tokens. Literals go to `lits`, each run of them counted
 /// by one `Lits` token. On an error, what was read before it is kept. Once the tokens and literals take more than
 /// `budget` bytes it stops between symbols and returns the bit to go on from.
-fn tokenize(
+pub(super) fn tokenize(
     buf: &[u8],
     start_bit: usize,
     end_bits: usize,
@@ -297,7 +297,8 @@ fn tokenize(
         };
     }
     let result = loop {
-        if lits.len() + toks.len() * std::mem::size_of::<Packed>() > budget {
+        let held = lits.len() + toks.len() * size_of::<Packed>() + filters.len() * size_of::<FilterFields>();
+        if held > budget {
             break Ok(Some(bits.pos()));
         }
         let sym;
