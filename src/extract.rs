@@ -16,9 +16,6 @@ use crate::rar5::unpack::{Unpacker, window_for};
 use crate::rar5::{FileHeader, Redirection};
 use crate::volume::next_volume;
 
-/// Bytes moved per read. Large enough that a stored file is copied at disk speed.
-const BUF: usize = 4 << 20;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     /// read every file and check it, write nothing
@@ -539,7 +536,6 @@ struct Run<'a, R: FnMut(&str)> {
     pending: Option<Pending>,
     /// the decoder, kept between files of a solid stream
     stream: Option<Unpacker>,
-    buf: Vec<u8>,
     report: R,
     /// threads for work spread over files; 1 for none
     threads: usize,
@@ -587,7 +583,6 @@ fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Sum
         summary: Summary::default(),
         pending: None,
         stream: None,
-        buf: vec![0u8; BUF],
         report,
         threads,
         batch: None,
@@ -942,18 +937,16 @@ impl<R: FnMut(&str)> Run<'_, R> {
             self.queued_paths.insert(key);
         }
         self.queued.push_back((p, Checks::from(h)));
-        let mut buf = std::mem::take(&mut self.buf);
         let mut stream = self.stream.take();
         let mut fed = false;
         let mut books = Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch };
         let queued = &mut self.queued;
-        let read = vol.read_data(h.data_at, h.packed_size, &mut buf, |chunk| {
+        let read = vol.read_data(h.data_at, h.packed_size, |chunk| {
             let Some(u) = stream.as_mut() else { return Err(Error::Corrupt("no decoder for a queued file")) };
             let r = u.feed(chunk, &mut route(queued, &mut books));
             fed = r.is_err();
             r
         });
-        self.buf = buf;
         match read {
             Ok(()) => {
                 self.stream = stream;
@@ -1073,9 +1066,8 @@ impl<R: FnMut(&str)> Run<'_, R> {
         {
             return self.stored_parallel(vol, h, p);
         }
-        let mut buf = std::mem::take(&mut self.buf);
         let mut stream = if p.compressed { self.stream.take() } else { None };
-        let read = vol.read_data(h.data_at, h.packed_size, &mut buf, |chunk| {
+        let read = vol.read_data(h.data_at, h.packed_size, |chunk| {
             if split_after {
                 part.update(chunk);
                 if let Some(b) = part_blake.as_mut() {
@@ -1087,7 +1079,6 @@ impl<R: FnMut(&str)> Run<'_, R> {
                 None => p.sink()(chunk),
             }
         });
-        self.buf = buf;
         // a decoder error is this file's problem; an archive read error ends the run
         let decoded = match read {
             Ok(()) if !split_after => match stream.as_mut() {
