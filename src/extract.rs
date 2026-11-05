@@ -185,11 +185,15 @@ pub struct Entry {
 }
 
 /// Every volume of the set in turn, starting from `first`, calling `on_block` for each block.
-fn walk(first: &Path, mut on_block: impl FnMut(&mut Volume, Block) -> Result<()>) -> Result<u64> {
+fn walk(
+    first: &Path,
+    password: Option<&str>,
+    mut on_block: impl FnMut(&mut Volume, Block) -> Result<()>,
+) -> Result<u64> {
     let mut path = first.to_path_buf();
     let mut volumes = 0;
     loop {
-        let mut vol = Volume::open(&path)?;
+        let mut vol = Volume::open_with_password(&path, password)?;
         volumes += 1;
         let mut more = vol.main.is_volume();
         let mut saw_end = false;
@@ -253,40 +257,60 @@ fn sniff(path: &Path) -> Result<Format> {
 
 /// The entries of an archive, whatever its format.
 pub fn list(first: &Path) -> Result<Vec<Entry>> {
+    list_with_password(first, None)
+}
+
+/// The entries of an archive, decrypting encrypted headers when `password` is given.
+pub fn list_with_password(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
     match sniff(first)? {
         Format::Zip => return crate::zip::list(first),
         Format::Tar => return crate::tar::list(first),
         Format::Other => {}
     }
-    match rar_list(first) {
+    match rar_list(first, password) {
         Err(Error::NotAnArchive) => crate::zip::list(first),
         other => other,
     }
 }
 
 /// Tests or extracts an archive, whatever its format.
-pub fn run(first: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<Summary> {
+pub fn run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Summary> {
+    run_with_password(first, opts, None, report)
+}
+
+/// Tests or extracts an archive, decrypting with `password` when encrypted.
+pub fn run_with_password(
+    first: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    mut report: impl FnMut(&str),
+) -> Result<Summary> {
     match sniff(first)? {
-        Format::Zip => return zip_run(first, opts, &mut report),
+        Format::Zip => return zip_run(first, opts, password, &mut report),
         Format::Tar => return crate::tar::run(first, opts, &mut report),
         Format::Other => {}
     }
-    match rar_run(first, opts, &mut report) {
-        Err(Error::NotAnArchive) => zip_run(first, opts, &mut report),
+    match rar_run(first, opts, password, &mut report) {
+        Err(Error::NotAnArchive) => zip_run(first, opts, password, &mut report),
         other => other,
     }
 }
 
-fn zip_run(path: &Path, opts: &Options, report: &mut impl FnMut(&str)) -> Result<Summary> {
+fn zip_run(
+    path: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    report: &mut impl FnMut(&str),
+) -> Result<Summary> {
     if opts.mode == Mode::Extract {
         fs::create_dir_all(&opts.dest)?;
     }
-    crate::zip::run(path, opts, report)
+    crate::zip::run_with_password(path, opts, password, report)
 }
 
-fn rar_list(first: &Path) -> Result<Vec<Entry>> {
+fn rar_list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
-    walk(first, |_, block| {
+    walk(first, password, |_, block| {
         let Block::File(h) = block else { return Ok(()) };
         if h.split_before() {
             if let Some(last) = out.last_mut().filter(|e| e.name == h.name) {
@@ -314,6 +338,14 @@ fn rar_list(first: &Path) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
+struct PendingCipher {
+    aes: crate::crypto::AesKey,
+    iv: [u8; 16],
+    rem: Vec<u8>,
+    hash_key: Option<[u8; 32]>,
+    cap: Option<u64>,
+}
+
 /// A file being read, whose data may run on into later volumes.
 struct Pending {
     name: String,
@@ -329,6 +361,9 @@ struct Pending {
     /// decoded only to keep a solid stream going: not counted, not written
     passive: bool,
     compressed: bool,
+    encrypted: bool,
+    /// AES-256-CBC state for an encrypted RAR5 file
+    cipher: Option<PendingCipher>,
     /// where it is written, folded as `batch_paths` is
     key: Option<String>,
     /// where it is to be written, until the file is created there
@@ -350,6 +385,8 @@ impl Pending {
             failed: false,
             passive: false,
             compressed: h.method != 0,
+            encrypted: h.encrypted,
+            cipher: None,
             key: None,
             place: None,
             mem: None,
@@ -382,7 +419,16 @@ impl Pending {
         move |chunk: &[u8]| self.take(chunk)
     }
 
-    fn take(&mut self, chunk: &[u8]) -> Result<()> {
+    fn take(&mut self, mut chunk: &[u8]) -> Result<()> {
+        if let Some(cap) = self.cipher.as_ref().and_then(|c| c.cap) {
+            let rem = cap.saturating_sub(self.bytes) as usize;
+            if chunk.len() > rem {
+                chunk = &chunk[..rem];
+            }
+            if chunk.is_empty() {
+                return Ok(());
+            }
+        }
         if let Some(mem) = self.mem.as_mut() {
             mem.extend_from_slice(chunk);
             self.bytes += chunk.len() as u64;
@@ -480,18 +526,26 @@ fn check_and_finish<R: FnMut(&str)>(books: &mut Books<'_, R>, c: &Checks, mut p:
         let (summary, report) = (&mut *books.summary, &mut *books.report);
         return batch.submit(job, &mut |done| apply_done(summary, report, done));
     }
-    let crc_bad = c.crc32.is_some_and(|want| p.hasher.clone().finalize() != want);
-    let blake_bad = match (c.blake2sp, p.blake.take()) {
-        (Some(want), Some(got)) => got.finish() != want,
-        // a hash that only the last part states can't be checked from here: say so rather than pass it
-        (Some(_), None) if c.crc32.is_none() => {
-            if !p.passive {
-                books.fail(&p.name, "its BLAKE2sp hash starts only in a later part, so it can't be checked")?;
+    let got_crc = match p.cipher.as_ref().and_then(|c| c.hash_key.as_ref()) {
+        Some(hk) => crate::crypto::rar5_tweak_crc32(p.hasher.clone().finalize(), hk),
+        None => p.hasher.clone().finalize(),
+    };
+    let crc_bad = c.crc32.is_some_and(|want| got_crc != want);
+    let blake_bad = if p.encrypted && p.cipher.as_ref().is_some_and(|c| c.hash_key.is_some()) {
+        false
+    } else {
+        match (c.blake2sp, p.blake.take()) {
+            (Some(want), Some(got)) => got.finish() != want,
+            // a hash that only the last part states can't be checked from here: say so rather than pass it
+            (Some(_), None) if c.crc32.is_none() => {
+                if !p.passive {
+                    books.fail(&p.name, "its BLAKE2sp hash starts only in a later part, so it can't be checked")?;
+                }
+                p.discard();
+                return Ok(());
             }
-            p.discard();
-            return Ok(());
+            _ => false,
         }
-        _ => false,
     };
     if p.passive {
         return Ok(());
@@ -547,6 +601,7 @@ fn decoding_error(e: &Error) -> bool {
 
 struct Run<'a, R: FnMut(&str)> {
     opts: &'a Options,
+    password: Option<&'a str>,
     summary: Summary,
     pending: Option<Pending>,
     /// the decoder, kept between files of a solid stream
@@ -586,7 +641,12 @@ fn apply_done(summary: &mut Summary, report: &mut impl FnMut(&str), done: Done) 
     }
 }
 
-fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Summary> {
+fn rar_run(
+    first: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    report: impl FnMut(&str),
+) -> Result<Summary> {
     if opts.mode == Mode::Extract {
         fs::create_dir_all(&opts.dest)?;
     }
@@ -595,6 +655,7 @@ fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Sum
     let threads = if opts.parallel_min.is_some() { 1 } else { threads };
     let mut r = Run {
         opts,
+        password: password.filter(|s| !s.is_empty()),
         summary: Summary::default(),
         pending: None,
         stream: None,
@@ -606,7 +667,7 @@ fn rar_run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Sum
         queued_paths: HashSet::new(),
         dirs: Dirs::default(),
     };
-    let walked = walk(first, |vol, block| {
+    let walked = walk(first, r.password, |vol, block| {
         let Block::File(h) = block else { return Ok(()) };
         r.file_block(vol, &h)
     });
@@ -669,6 +730,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
         self.threads > 1
             && !vol.main.is_solid()
             && !h.solid
+            && !h.encrypted
             && !h.split_before()
             && !h.split_after()
             && !h.size_unknown()
@@ -789,8 +851,8 @@ impl<R: FnMut(&str)> Run<'_, R> {
             self.summary.dirs += 1;
             return Ok(());
         }
-        let refuse = if h.encrypted {
-            Some("encrypted (passwords are not supported yet)".to_string())
+        let refuse = if h.encrypted && (self.password.is_none() || h.crypt.is_none()) {
+            Some("encrypted (password required)".to_string())
         } else if h.method != 0 && h.algorithm != 0 {
             Some("RAR 7 compression is not supported yet".to_string())
         } else {
@@ -800,6 +862,22 @@ impl<R: FnMut(&str)> Run<'_, R> {
             self.fail_in_order(&h.name, &why)?;
             return self.pass_over(vol, h);
         }
+        let cipher = if h.encrypted {
+            let pw = self.password.unwrap_or_default();
+            let cp = h.crypt.as_ref().unwrap();
+            let Some((key, hk)) = crate::crypto::derive_rar5_key_and_hash_key(pw, cp.kdf_count, &cp.salt, cp.check) else {
+                self.fail_in_order(&h.name, "wrong password")?;
+                return self.pass_over(vol, h);
+            };
+            let Some(aes) = crate::crypto::AesKey::new(&key) else {
+                self.fail_in_order(&h.name, "invalid encryption key")?;
+                return self.pass_over(vol, h);
+            };
+            let cap = (!h.size_unknown()).then_some(h.unpacked_size);
+            Some(PendingCipher { aes, iv: cp.iv, rem: Vec::new(), hash_key: cp.tweaked_crc.then_some(hk), cap })
+        } else {
+            None
+        };
 
         let place = if self.opts.mode == Mode::Extract {
             match check_target(self.opts, &rel, Some(&mut self.dirs))? {
@@ -825,6 +903,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
             return self.send_to_batch(vol, h, place);
         }
         let mut p = Pending::new(h, None, None);
+        p.cipher = cipher;
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
         p.place = place;
         self.begin_decoding(vol, h, p)
@@ -1056,7 +1135,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
             }
             return Ok(());
         }
-        if (h.method != 0) != p.compressed || h.encrypted {
+        if (h.method != 0) != p.compressed || h.encrypted != p.encrypted {
             if !p.passive {
                 self.fail(&p.name, "a later part is packed differently");
             }
@@ -1071,6 +1150,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
         let mut part = crc32fast::Hasher::new();
         let mut part_blake = h.blake2sp.filter(|_| split_after).map(|_| Blake2sp::new());
         if !p.compressed
+            && !p.encrypted
             && self.threads > 1
             && h.packed_size >= batch::STORED_PARALLEL_MIN
             && p.blake.is_none()
@@ -1086,9 +1166,31 @@ impl<R: FnMut(&str)> Run<'_, R> {
                     b.update(chunk);
                 }
             }
-            match stream.as_mut() {
-                Some(u) => u.feed(chunk, &mut p.sink()),
-                None => p.sink()(chunk),
+            if let Some(PendingCipher { aes, iv, rem, .. }) = p.cipher.as_mut() {
+                let mut dec_buf;
+                let to_feed: &[u8] = if !rem.is_empty() || !chunk.len().is_multiple_of(16) {
+                    rem.extend_from_slice(chunk);
+                    let aligned = rem.len() & !15;
+                    if aligned == 0 {
+                        return Ok(());
+                    }
+                    dec_buf = rem.drain(..aligned).collect::<Vec<u8>>();
+                    aes.decrypt_cbc_in_place(iv, &mut dec_buf);
+                    &dec_buf
+                } else {
+                    dec_buf = chunk.to_vec();
+                    aes.decrypt_cbc_in_place(iv, &mut dec_buf);
+                    &dec_buf
+                };
+                match stream.as_mut() {
+                    Some(u) => u.feed(to_feed, &mut p.sink()),
+                    None => p.sink()(to_feed),
+                }
+            } else {
+                match stream.as_mut() {
+                    Some(u) => u.feed(chunk, &mut p.sink()),
+                    None => p.sink()(chunk),
+                }
             }
         });
         // a decoder error is this file's problem; an archive read error ends the run

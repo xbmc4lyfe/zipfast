@@ -19,6 +19,7 @@ switches:
   -o- skip files that already exist (default)
   -y  same as -o+
   -q  quiet: report only errors
+  -p<pw>  decrypt encrypted archives with password
   -mt<n>  use up to n threads (default: one per core)
 ";
 
@@ -31,6 +32,7 @@ fn main() -> ExitCode {
     let mut overwrite = Overwrite::Skip;
     let mut quiet = false;
     let mut threads = None;
+    let mut password: Option<String> = None;
     let mut paths = Vec::new();
     for arg in &args[1..] {
         match arg.as_str() {
@@ -38,6 +40,7 @@ fn main() -> ExitCode {
             "-o-" => overwrite = Overwrite::Skip,
             "-q" | "-idq" => quiet = true,
             "--" => {}
+            s if s.starts_with("-p") && s.len() > 2 => password = Some(s[2..].to_string()),
             s if s.starts_with("-mt") => match s[3..].parse::<usize>() {
                 Ok(n) if n >= 1 => threads = Some(n),
                 _ => {
@@ -58,11 +61,11 @@ fn main() -> ExitCode {
     };
     let dest = paths.get(1).cloned().unwrap_or_else(|| PathBuf::from("."));
     match command.as_str() {
-        "l" | "v" => list(&archive),
+        "l" | "v" => list(&archive, password.as_deref()),
         "t" | "x" | "e" => {
             let mode = if command == "t" { Mode::Test } else { Mode::Extract };
             let opts = Options { mode, dest, overwrite, flatten: command == "e", threads, parallel_min: None };
-            run(&archive, &opts, quiet)
+            run(&archive, &opts, password.as_deref(), quiet)
         }
         other => {
             eprintln!("unknown command {other}\n{USAGE}");
@@ -71,8 +74,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn list(archive: &Path) -> ExitCode {
-    match extract::list(archive) {
+fn list(archive: &Path, password: Option<&str>) -> ExitCode {
+    match extract::list_with_password(archive, password) {
         Ok(entries) => {
             println!("{:>14} {:>14} {:>8} {:>6}  name", "size", "packed", "crc32", "method");
             for e in &entries {
@@ -90,9 +93,9 @@ fn list(archive: &Path) -> ExitCode {
     }
 }
 
-fn run(archive: &Path, opts: &Options, quiet: bool) -> ExitCode {
+fn run(archive: &Path, opts: &Options, password: Option<&str>, quiet: bool) -> ExitCode {
     let started = Instant::now();
-    let result = extract::run(archive, opts, |line| eprintln!("{line}"));
+    let result = extract::run_with_password(archive, opts, password, |line| eprintln!("{line}"));
     match result {
         Ok(s) => {
             if !quiet {

@@ -5,6 +5,7 @@
 
 mod batch;
 pub mod blake2sp;
+pub mod crypto;
 pub mod error;
 pub mod extract;
 mod output;

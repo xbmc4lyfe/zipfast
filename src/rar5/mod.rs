@@ -167,6 +167,7 @@ pub struct FileHeader {
     pub host_os: u64,
     pub name: String,
     pub encrypted: bool,
+    pub crypt: Option<crate::crypto::Rar5CryptParams>,
     pub redirection: Option<Redirection>,
     /// set on an older revision of a file kept alongside the current one
     pub version: Option<u64>,
@@ -243,7 +244,10 @@ fn parse_file_extra(f: &mut FileHeader, extra: &[u8]) -> Result<()> {
         let mut r = Cursor::new(record);
         let kind = r.vint()?;
         match kind {
-            FHEXTRA_CRYPT => f.encrypted = true,
+            FHEXTRA_CRYPT => {
+                f.encrypted = true;
+                f.crypt = crate::crypto::rar5_record_params(r.bytes(r.remaining())?);
+            }
             FHEXTRA_HASH => {
                 if r.vint()? == 0 {
                     f.blake2sp = Some(r.bytes(32)?.try_into().unwrap());

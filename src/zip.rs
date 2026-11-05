@@ -63,6 +63,7 @@ pub struct ZipEntry {
     pub external: u32,
     pub mtime: Option<i64>,
     pub nanos: u32,
+    pub aes_info: Option<(u8, u16, u16)>,
 }
 
 impl ZipEntry {
@@ -81,7 +82,15 @@ impl ZipEntry {
     }
 
     pub fn encrypted(&self) -> bool {
-        self.flags & FLAG_ENCRYPTED != 0 || self.method == 99
+        self.flags & FLAG_ENCRYPTED != 0 || self.method == 99 || self.aes_info.is_some()
+    }
+
+    pub fn effective_method(&self) -> u16 {
+        if self.method == 99 {
+            self.aes_info.map_or(self.method, |(_, _, m)| m)
+        } else {
+            self.method
+        }
     }
 
     fn meta(&self) -> Meta {
@@ -209,7 +218,13 @@ impl Archive {
     }
 
     /// Reads an entry's data, decompressed, into `sink`, and checks its size and CRC.
-    fn read_entry(&mut self, e: &ZipEntry, buf: &mut [u8], sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    fn read_entry(
+        &mut self,
+        e: &ZipEntry,
+        password: Option<&str>,
+        buf: &mut [u8],
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
         let at = self.data_at(e)?;
         self.file.seek(SeekFrom::Start(at))?;
         let mut crc = crc32fast::Hasher::new();
@@ -222,6 +237,80 @@ impl Archive {
             crc.update(chunk);
             sink(chunk)
         };
+        if e.encrypted() {
+            let pw = password.filter(|s| !s.is_empty()).ok_or_else(|| Error::Unsupported("encrypted (password required)".into()))?;
+            let packed_len = usize::try_from(e.packed).map_err(|_| Error::Corrupt("encrypted entry too large"))?;
+            let mut raw = vec![0u8; packed_len];
+            self.file.read_exact(&mut raw)?;
+            let mut skip_crc = false;
+            let decrypted = if e.method == 99 || e.aes_info.is_some() {
+                let (strength, vendor, _) = e.aes_info.ok_or(Error::Corrupt("missing WinZip AES extra field"))?;
+                if vendor == 2 {
+                    skip_crc = true;
+                }
+                crate::crypto::decrypt_winzip_aes(pw, strength, &raw, Some(e.packed))
+                    .ok_or(Error::Corrupt("wrong password or damaged AES stream"))?
+            } else {
+                let check = if e.flags & 0x0008 != 0 {
+                    let head = read_at(&mut self.file, e.local_at, 30)?;
+                    head[11]
+                } else {
+                    (e.crc32 >> 24) as u8
+                };
+                crate::crypto::decrypt_zipcrypto(pw, check, &raw).ok_or(Error::Corrupt("wrong password"))?
+            };
+            let method = e.effective_method();
+            match method {
+                METHOD_STORED => {
+                    if decrypted.len() as u64 != e.size {
+                        return Err(Error::Corrupt("stored entry's sizes differ"));
+                    }
+                    emit(&decrypted)?;
+                }
+                METHOD_DEFLATE => {
+                    let mut z = Decompress::new(false);
+                    let mut out = vec![0u8; BUF];
+                    let mut input = decrypted.as_slice();
+                    loop {
+                        let (before_in, before_out) = (z.total_in(), z.total_out());
+                        let status = z
+                            .decompress(input, &mut out, FlushDecompress::None)
+                            .map_err(|_| Error::Corrupt("deflate data"))?;
+                        let used = (z.total_in() - before_in) as usize;
+                        let made = (z.total_out() - before_out) as usize;
+                        input = &input[used..];
+                        emit(&out[..made])?;
+                        if status == Status::StreamEnd {
+                            break;
+                        }
+                        if made == out.len() {
+                            continue;
+                        }
+                        if input.is_empty() || (used == 0 && made == 0) {
+                            return Err(Error::Corrupt("deflate data"));
+                        }
+                    }
+                }
+                METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
+                    let mut dec = stream_decoder_slice(e, method, &decrypted)?;
+                    loop {
+                        let n = dec.read(buf).map_err(|_| Error::Corrupt("compressed data is damaged"))?;
+                        if n == 0 {
+                            break;
+                        }
+                        emit(&buf[..n])?;
+                    }
+                }
+                m => return Err(Error::Unsupported(format!("compression method {m}"))),
+            }
+            if size != e.size {
+                return Err(Error::Corrupt("less data than the directory says"));
+            }
+            if !skip_crc && crc.finalize() != e.crc32 {
+                return Err(Error::BadChecksum(e.name.clone()));
+            }
+            return Ok(());
+        }
         let mut left = e.packed;
         match e.method {
             METHOD_STORED => {
@@ -301,6 +390,36 @@ impl Archive {
     }
 }
 
+/// A reader of an entry's data from an in-memory decrypted slice.
+fn stream_decoder_slice<'a>(e: &ZipEntry, method: u16, data: &'a [u8]) -> Result<Box<dyn Read + 'a>> {
+    let packed = BufReader::new(Cursor::new(data));
+    Ok(match method {
+        METHOD_BZIP2 => Box::new(bzip2::bufread::MultiBzDecoder::new(packed)),
+        METHOD_ZSTD => Box::new(zstd::stream::read::Decoder::with_buffer(packed)?),
+        METHOD_XZ => {
+            let stream = liblzma::stream::Stream::new_stream_decoder(u64::MAX, liblzma::stream::CONCATENATED)
+                .map_err(|_| Error::Corrupt("xz data"))?;
+            Box::new(liblzma::bufread::XzDecoder::new_stream(packed, stream))
+        }
+        _ => {
+            let mut packed = packed;
+            let mut head = [0u8; 4];
+            packed.read_exact(&mut head)?;
+            let props_len = u16::from_le_bytes([head[2], head[3]]) as usize;
+            if props_len != 5 {
+                return Err(Error::Corrupt("LZMA properties"));
+            }
+            let mut alone = vec![0u8; 13];
+            packed.read_exact(&mut alone[..5])?;
+            let size = if e.flags & FLAG_LZMA_EOS != 0 { u64::MAX } else { e.size };
+            alone[5..].copy_from_slice(&size.to_le_bytes());
+            let stream =
+                liblzma::stream::Stream::new_lzma_decoder(u64::MAX).map_err(|_| Error::Corrupt("LZMA data"))?;
+            Box::new(liblzma::bufread::XzDecoder::new_stream(BufReader::new(Cursor::new(alone).chain(packed)), stream))
+        }
+    })
+}
+
 /// A reader of an entry's data for the methods that have a stream decoder.
 fn stream_decoder<'a>(e: &ZipEntry, packed: BufReader<std::io::Take<&'a mut File>>) -> Result<Box<dyn Read + 'a>> {
     Ok(match e.method {
@@ -359,6 +478,7 @@ fn parse_central(cd: &[u8], at: usize) -> Result<(ZipEntry, usize)> {
         external: le32(h, 38),
         mtime: dos_time(le16(h, 12), le16(h, 14)),
         nanos: 0,
+        aes_info: crate::crypto::aes_extra_info(extra),
     };
     let disk_start = le16(h, 34);
     e.name = decode_name(raw_name, flags & FLAG_UTF8 != 0);
@@ -469,11 +589,21 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
         .collect())
 }
 
-pub fn run(path: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<Summary> {
+pub fn run(path: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Summary> {
+    run_with_password(path, opts, None, report)
+}
+
+pub fn run_with_password(
+    path: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    mut report: impl FnMut(&str),
+) -> Result<Summary> {
     let mut archive = Archive::open(path)?;
     let mut summary = Summary { volumes: 1, ..Summary::default() };
     let mut buf = vec![0u8; BUF];
     let entries = std::mem::take(&mut archive.entries);
+    let password = password.filter(|s| !s.is_empty());
     fn fail(summary: &mut Summary, report: &mut impl FnMut(&str), name: &str, why: &str) {
         let line = format!("{name}: {why}");
         report(&line);
@@ -496,10 +626,11 @@ pub fn run(path: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<
             summary.dirs += 1;
             continue;
         }
-        let refuse = if e.encrypted() {
-            Some("encrypted (passwords are not supported yet)".to_string())
-        } else if !supported(e.method) {
-            Some(format!("compression method {} is not supported yet", e.method))
+        let eff_method = e.effective_method();
+        let refuse = if e.encrypted() && password.is_none() {
+            Some("encrypted (password required)".to_string())
+        } else if !supported(eff_method) {
+            Some(format!("compression method {} is not supported yet", eff_method))
         } else if e.is_link() {
             Some("links are not supported yet".to_string())
         } else {
@@ -525,8 +656,8 @@ pub fn run(path: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<
             }
         }
         let read = match target.as_mut() {
-            Some((out, _)) => archive.read_entry(e, &mut buf, &mut |chunk| Ok(out.write(chunk)?)),
-            None => archive.read_entry(e, &mut buf, &mut |_| Ok(())),
+            Some((out, _)) => archive.read_entry(e, password, &mut buf, &mut |chunk| Ok(out.write(chunk)?)),
+            None => archive.read_entry(e, password, &mut buf, &mut |_| Ok(())),
         };
         match read {
             Ok(()) => {

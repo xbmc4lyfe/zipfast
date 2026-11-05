@@ -161,6 +161,8 @@ pub struct Volume {
     next: u64,
     len: u64,
     pub main: MainHeader,
+    password: Option<String>,
+    header_key: Option<[u8; 32]>,
 }
 
 /// Finds the signature within the first [`MAX_SFX`] bytes. Returns the offset just past it.
@@ -181,11 +183,22 @@ fn find_signature(file: &File, len: u64) -> Result<u64> {
 
 impl Volume {
     pub fn open(path: &Path) -> Result<Volume> {
+        Self::open_with_password(path, None)
+    }
+
+    pub fn open_with_password(path: &Path, password: Option<&str>) -> Result<Volume> {
         let file = File::open(path)?;
         let len = file.metadata()?.len();
         let next = find_signature(&file, len)?;
-        let mut vol =
-            Volume { path: path.to_path_buf(), src: Source::new(file, len), next, len, main: MainHeader::default() };
+        let mut vol = Volume {
+            path: path.to_path_buf(),
+            src: Source::new(file, len),
+            next,
+            len,
+            main: MainHeader::default(),
+            password: password.filter(|s| !s.is_empty()).map(str::to_owned),
+            header_key: None,
+        };
         match vol.next_block()? {
             Some(Block::Main(m)) => vol.main = m,
             Some(Block::Crypt) => return Err(Error::Encrypted),
@@ -196,80 +209,165 @@ impl Volume {
 
     /// The next block, or None at the physical end of the volume.
     pub fn next_block(&mut self) -> Result<Option<Block>> {
-        if self.next >= self.len {
-            return Ok(None);
-        }
-        self.seek(self.next)?;
-        let start = self.next;
-        let mut crc_bytes = [0u8; 4];
-        self.read_exact(&mut crc_bytes)?;
-        let stored_crc = u32::from_le_bytes(crc_bytes);
-        // the size field is a vint of at most 3 bytes
-        let mut size_field = Vec::with_capacity(3);
-        let mut size = 0u64;
-        for i in 0..3 {
-            let mut b = [0u8; 1];
-            self.read_exact(&mut b)?;
-            size_field.push(b[0]);
-            size |= u64::from(b[0] & 0x7f) << (7 * i);
-            if b[0] & 0x80 == 0 {
-                break;
+        loop {
+            if self.next >= self.len {
+                return Ok(None);
             }
-            if i == 2 {
-                return Err(Error::Corrupt("header size field too long"));
-            }
-        }
-        if size == 0 || size > MAX_HEADER {
-            return Err(Error::Corrupt("header size"));
-        }
-        let header_end = start + 4 + size_field.len() as u64 + size;
-        if header_end > self.len {
-            return Err(Error::Truncated);
-        }
-        let mut body = vec![0u8; size as usize];
-        self.read_exact(&mut body)?;
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&size_field);
-        hasher.update(&body);
-        if hasher.finalize() != stored_crc {
-            return Err(Error::Corrupt("header checksum mismatch"));
-        }
+            self.seek(self.next)?;
+            let start = self.next;
+            let (body, header_end) = if let Some(key) = self.header_key {
+                if start.checked_add(32).is_none_or(|e| e > self.len) {
+                    return Err(Error::Truncated);
+                }
+                let mut iv = [0u8; 16];
+                let mut first_ct = [0u8; 16];
+                self.read_exact(&mut iv)?;
+                self.read_exact(&mut first_ct)?;
+                let first_dec =
+                    crate::crypto::decrypt_cbc(&key, &iv, &first_ct).ok_or(Error::Encrypted)?;
+                let mut size = 0u64;
+                let mut size_len = 0usize;
+                for i in 0..3 {
+                    let b = *first_dec.get(4 + i).ok_or(Error::Encrypted)?;
+                    size |= u64::from(b & 0x7f) << (7 * i);
+                    size_len = i + 1;
+                    if b & 0x80 == 0 {
+                        break;
+                    }
+                    if i == 2 {
+                        return Err(Error::Encrypted);
+                    }
+                }
+                if size == 0 || size > MAX_HEADER {
+                    return Err(Error::Encrypted);
+                }
+                let plain_need = 4 + size_len + size as usize;
+                let padded_len = plain_need
+                    .checked_next_multiple_of(16)
+                    .ok_or(Error::Encrypted)?;
+                let header_end = start
+                    .checked_add(16 + padded_len as u64)
+                    .ok_or(Error::Corrupt("header size"))?;
+                if header_end > self.len {
+                    return Err(Error::Truncated);
+                }
+                let mut ct = vec![0u8; padded_len];
+                ct[..16].copy_from_slice(&first_ct);
+                if padded_len > 16 {
+                    self.read_exact(&mut ct[16..])?;
+                }
+                let dec = crate::crypto::decrypt_cbc(&key, &iv, &ct).ok_or(Error::Encrypted)?;
+                let stored_crc = u32::from_le_bytes(dec[..4].try_into().unwrap());
+                if crc32fast::hash(&dec[4..plain_need]) != stored_crc {
+                    return Err(Error::Encrypted);
+                }
+                (dec[4 + size_len..plain_need].to_vec(), header_end)
+            } else {
+                let mut crc_bytes = [0u8; 4];
+                self.read_exact(&mut crc_bytes)?;
+                let stored_crc = u32::from_le_bytes(crc_bytes);
+                // the size field is a vint of at most 3 bytes
+                let mut size_field = Vec::with_capacity(3);
+                let mut size = 0u64;
+                for i in 0..3 {
+                    let mut b = [0u8; 1];
+                    self.read_exact(&mut b)?;
+                    size_field.push(b[0]);
+                    size |= u64::from(b[0] & 0x7f) << (7 * i);
+                    if b[0] & 0x80 == 0 {
+                        break;
+                    }
+                    if i == 2 {
+                        return Err(Error::Corrupt("header size field too long"));
+                    }
+                }
+                if size == 0 || size > MAX_HEADER {
+                    return Err(Error::Corrupt("header size"));
+                }
+                let header_end = start + 4 + size_field.len() as u64 + size;
+                if header_end > self.len {
+                    return Err(Error::Truncated);
+                }
+                let mut body = vec![0u8; size as usize];
+                self.read_exact(&mut body)?;
+                let mut hasher = crc32fast::Hasher::new();
+                hasher.update(&size_field);
+                hasher.update(&body);
+                if hasher.finalize() != stored_crc {
+                    return Err(Error::Corrupt("header checksum mismatch"));
+                }
+                (body, header_end)
+            };
 
-        let mut c = Cursor::new(&body);
-        let kind = c.vint()?;
-        let flags = c.vint()?;
-        let extra_size = if flags & HFL_EXTRA != 0 { c.vsize()? } else { 0 };
-        let data_size = if flags & HFL_DATA != 0 { c.vint()? } else { 0 };
-        let fields_end = body.len().checked_sub(extra_size).filter(|&e| e >= c.pos());
-        let Some(fields_end) = fields_end else { return Err(Error::Corrupt("extra area size")) };
-        let fields = &body[c.pos()..fields_end];
-        let extra = &body[fields_end..];
-        let data_end = header_end.checked_add(data_size).ok_or(Error::Corrupt("data size"))?;
-        // checked here, not only when the data is read, since skipped blocks are never read
-        if data_end > self.len {
-            return Err(Error::Truncated);
-        }
-        self.next = data_end;
-        let head = BlockHead { kind, flags, data_size, data_at: header_end };
+            let mut c = Cursor::new(&body);
+            let kind = c.vint()?;
+            let flags = c.vint()?;
+            let extra_size = if flags & HFL_EXTRA != 0 { c.vsize()? } else { 0 };
+            let data_size = if flags & HFL_DATA != 0 { c.vint()? } else { 0 };
+            let fields_end = body.len().checked_sub(extra_size).filter(|&e| e >= c.pos());
+            let Some(fields_end) = fields_end else {
+                return Err(Error::Corrupt("extra area size"));
+            };
+            let fields = &body[c.pos()..fields_end];
+            let extra = &body[fields_end..];
+            let data_end = header_end
+                .checked_add(data_size)
+                .ok_or(Error::Corrupt("data size"))?;
+            // checked here, not only when the data is read, since skipped blocks are never read
+            if data_end > self.len {
+                return Err(Error::Truncated);
+            }
+            self.next = data_end;
+            let head = BlockHead {
+                kind,
+                flags,
+                data_size,
+                data_at: header_end,
+            };
 
-        Ok(Some(match kind {
-            HEAD_MAIN => {
-                let mut f = Cursor::new(fields);
-                let flags = f.vint()?;
-                let volume_number = if flags & MHFL_VOLNUMBER != 0 { f.vint()? } else { 0 };
-                Block::Main(MainHeader { flags, volume_number })
+            match kind {
+                HEAD_MAIN => {
+                    let mut f = Cursor::new(fields);
+                    let flags = f.vint()?;
+                    let volume_number = if flags & MHFL_VOLNUMBER != 0 {
+                        f.vint()?
+                    } else {
+                        0
+                    };
+                    return Ok(Some(Block::Main(MainHeader {
+                        flags,
+                        volume_number,
+                    })));
+                }
+                HEAD_FILE => return Ok(Some(Block::File(parse_file(&head, fields, extra)?))),
+                HEAD_SERVICE => return Ok(Some(Block::Service(parse_file(&head, fields, extra)?))),
+                HEAD_CRYPT => {
+                    if let Some(pw) = self.password.as_deref() {
+                        let params =
+                            crate::crypto::rar5_record_params(fields).ok_or(Error::Encrypted)?;
+                        let key = crate::crypto::derive_rar5_key(
+                            pw,
+                            params.kdf_count,
+                            &params.salt,
+                            params.check,
+                        )
+                        .ok_or(Error::Encrypted)?;
+                        self.header_key = Some(key);
+                        continue;
+                    }
+                    return Ok(Some(Block::Crypt));
+                }
+                HEAD_END => {
+                    let mut f = Cursor::new(fields);
+                    let flags = f.vint().unwrap_or(0);
+                    self.next = self.len;
+                    return Ok(Some(Block::End {
+                        more_volumes: flags & EOAFL_MORE_VOLUMES != 0,
+                    }));
+                }
+                _ => return Ok(Some(Block::Unknown)),
             }
-            HEAD_FILE => Block::File(parse_file(&head, fields, extra)?),
-            HEAD_SERVICE => Block::Service(parse_file(&head, fields, extra)?),
-            HEAD_CRYPT => Block::Crypt,
-            HEAD_END => {
-                let mut f = Cursor::new(fields);
-                let flags = f.vint().unwrap_or(0);
-                self.next = self.len;
-                Block::End { more_volumes: flags & EOAFL_MORE_VOLUMES != 0 }
-            }
-            _ => Block::Unknown,
-        }))
+        }
     }
 
     /// The open volume, for reads by position.
