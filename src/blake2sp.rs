@@ -135,7 +135,7 @@ impl Blake2sp {
     pub fn update(&mut self, mut data: &[u8]) {
         while !data.is_empty() {
             if self.round.len() == LANES * BLOCK {
-                for (leaf, block) in self.leaves.iter_mut().zip(self.round.chunks_exact(BLOCK)) {
+                for (leaf, block) in self.leaves.iter_mut().zip(self.round.as_chunks::<BLOCK>().0) {
                     leaf.update(block);
                 }
                 self.round.clear();
