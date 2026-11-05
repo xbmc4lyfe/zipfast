@@ -346,6 +346,17 @@ pub fn tuned_block(ops: &[Op], last: bool) -> Vec<u8> {
     write_block(ops, &Codes::tuned(ops), true, last)
 }
 
+/// Blocks sharing one set of code lengths fitted to all their ops: the first carries the tables, the others go without.
+pub fn tuned_blocks(runs: &[&[Op]], last: bool) -> Vec<u8> {
+    let all: Vec<Op> = runs.iter().flat_map(|r| r.iter().cloned()).collect();
+    let codes = Codes::tuned(&all);
+    let mut out = Vec::new();
+    for (i, r) in runs.iter().enumerate() {
+        out.extend(write_block(r, &codes, i == 0, last && i == runs.len() - 1));
+    }
+    out
+}
+
 fn write_block(ops: &[Op], codes: &Codes, tables: bool, last: bool) -> Vec<u8> {
     let mut w = BitWriter::new();
     if tables {

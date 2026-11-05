@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 mod parallel;
-use parallel::{Boundary, Done, Job, Part, Pool, Slot};
+use parallel::{Boundary, Done, Job, Packed, Part, Pool, Slot};
 
 pub(crate) const NC: usize = 306;
 pub(crate) const DC: usize = 64;
@@ -867,7 +867,7 @@ impl Unpacker {
             if let Some(b) = p.boundary {
                 self.end_file(b, sink)?;
             }
-            self.apply(&job.toks[from.0..to.0], &job.lits[from.1..to.1], sink)?;
+            self.apply(&job.toks[from.0..to.0], &job.filters, &job.lits[from.1..to.1], sink)?;
             from = to;
         }
         Ok(())
@@ -902,11 +902,18 @@ impl Unpacker {
     }
 
     /// Some of a block's tokens, applied to the window with the same checks the decoding loop makes.
-    fn apply(&mut self, toks: &[Tok], lits: &[u8], sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+    fn apply(
+        &mut self,
+        toks: &[Packed],
+        filters: &[parallel::FilterFields],
+        lits: &[u8],
+        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
         let flush_at = self.flush_at();
         let size_end = self.size.map_or(u64::MAX, |s| self.file_base.saturating_add(s));
         let mut li = 0usize;
-        for &tok in toks {
+        for &packed in toks {
+            let tok = packed.get(filters);
             if self.sp - self.file_base - self.emitted > flush_at {
                 self.flush(sink)?;
             }

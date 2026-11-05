@@ -295,7 +295,7 @@ fn an_earlier_blocks_error_comes_before_a_later_damaged_header() {
 
 #[test]
 fn a_block_of_tiny_codes_is_finished_on_the_calling_thread() {
-    // nine-bit codes that each stand for a 24-byte token: far past a worker's budget for this many packed bytes
+    // nine-bit codes that each stand for an 8-byte token: far past a worker's budget for this many packed bytes
     let mut ops = vec![Op::Lit(b'a'), Op::Lit(b'b'), Op::Match(2, 2)];
     ops.extend(std::iter::repeat_n(Op::Last, 400_000));
     let want = model(&ops);
@@ -320,12 +320,12 @@ fn a_worker_stopped_mid_run_still_hands_on_the_lengths_after_it() {
     // one run of blocks: tiny codes past the budget, then blocks without and with tables, then enough noise that
     // more runs follow and wait on the lengths the first run carries
     let mut ops = vec![Op::Lit(b'a'), Op::Lit(b'b'), Op::Match(2, 2)];
-    ops.extend(std::iter::repeat_n(Op::Last, 150_000));
-    let mut stream = block(&ops, true, false);
+    ops.extend(std::iter::repeat_n(Op::Last, 300_000));
+    let tail = lits(b"no tables here");
+    // codes fitted to both, so the repeats take a bit each and the block after reads with the same tables
+    let mut stream = tuned_blocks(&[&ops, &tail], false);
     assert!(stream.len() < JOB_BYTES);
     let mut all = ops;
-    let tail = lits(b"no tables here");
-    stream.extend(block(&tail, false, false));
     all.extend(tail);
     let mut x = 7u64;
     for i in 0..40 {
@@ -584,7 +584,7 @@ fn solid_files() -> Vec<(Vec<u8>, Vec<u8>)> {
             4 => Vec::new(),
             5 if i == 12 => {
                 let mut v = vec![Op::Lit(b'a'), Op::Lit(b'b'), Op::Match(2, 2)];
-                v.extend(std::iter::repeat_n(Op::Last, 150_000));
+                v.extend(std::iter::repeat_n(Op::Last, 450_000));
                 v
             }
             _ => noise_ops(500, i as u64),
@@ -843,5 +843,26 @@ fn match_copies_equal_a_byte_at_a_time_and_touch_nothing_else() {
             }
             assert!(got == want, "len {len} dist {dist} at {}", sp & mask);
         }
+    }
+}
+
+#[test]
+fn packed_tokens_come_back_as_they_went_in() {
+    let toks = [
+        Tok::Lits(0),
+        Tok::Lits(u32::MAX),
+        Tok::Last,
+        Tok::Rep { k: 0, len: 2 },
+        Tok::Rep { k: 3, len: 4097 },
+        Tok::Match { len: 2, dist: 1 },
+        Tok::Match { len: 4100, dist: (1 << 33) - 1 },
+        Tok::Filter { offset: 0, len: 4, kind: FilterKind::E8 },
+        Tok::Filter { offset: u64::MAX, len: MAX_FILTER_LEN, kind: FilterKind::Delta(32) },
+        Tok::Filter { offset: 7, len: 9, kind: FilterKind::Arm },
+    ];
+    let mut filters = Vec::new();
+    let packed: Vec<Packed> = toks.iter().map(|&t| Packed::new(t, &mut filters)).collect();
+    for (t, p) in toks.iter().zip(&packed) {
+        assert_eq!(format!("{t:?}"), format!("{:?}", p.get(&filters)));
     }
 }
