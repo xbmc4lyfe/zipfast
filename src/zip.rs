@@ -86,11 +86,7 @@ impl ZipEntry {
     }
 
     pub fn effective_method(&self) -> u16 {
-        if self.method == 99 {
-            self.aes_info.map_or(self.method, |(_, _, m)| m)
-        } else {
-            self.method
-        }
+        if self.method == 99 { self.aes_info.map_or(self.method, |(_, _, m)| m) } else { self.method }
     }
 
     fn meta(&self) -> Meta {
@@ -238,7 +234,9 @@ impl Archive {
             sink(chunk)
         };
         if e.encrypted() {
-            let pw = password.filter(|s| !s.is_empty()).ok_or_else(|| Error::Unsupported("encrypted (password required)".into()))?;
+            let pw = password
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| Error::Unsupported("encrypted (password required)".into()))?;
             let packed_len = usize::try_from(e.packed).map_err(|_| Error::Corrupt("encrypted entry too large"))?;
             let mut raw = vec![0u8; packed_len];
             self.file.read_exact(&mut raw)?;

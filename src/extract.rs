@@ -296,12 +296,7 @@ pub fn run_with_password(
     }
 }
 
-fn zip_run(
-    path: &Path,
-    opts: &Options,
-    password: Option<&str>,
-    report: &mut impl FnMut(&str),
-) -> Result<Summary> {
+fn zip_run(path: &Path, opts: &Options, password: Option<&str>, report: &mut impl FnMut(&str)) -> Result<Summary> {
     if opts.mode == Mode::Extract {
         fs::create_dir_all(&opts.dest)?;
     }
@@ -641,12 +636,7 @@ fn apply_done(summary: &mut Summary, report: &mut impl FnMut(&str), done: Done) 
     }
 }
 
-fn rar_run(
-    first: &Path,
-    opts: &Options,
-    password: Option<&str>,
-    report: impl FnMut(&str),
-) -> Result<Summary> {
+fn rar_run(first: &Path, opts: &Options, password: Option<&str>, report: impl FnMut(&str)) -> Result<Summary> {
     if opts.mode == Mode::Extract {
         fs::create_dir_all(&opts.dest)?;
     }
@@ -865,7 +855,8 @@ impl<R: FnMut(&str)> Run<'_, R> {
         let cipher = if h.encrypted {
             let pw = self.password.unwrap_or_default();
             let cp = h.crypt.as_ref().unwrap();
-            let Some((key, hk)) = crate::crypto::derive_rar5_key_and_hash_key(pw, cp.kdf_count, &cp.salt, cp.check) else {
+            let Some((key, hk)) = crate::crypto::derive_rar5_key_and_hash_key(pw, cp.kdf_count, &cp.salt, cp.check)
+            else {
                 self.fail_in_order(&h.name, "wrong password")?;
                 return self.pass_over(vol, h);
             };
