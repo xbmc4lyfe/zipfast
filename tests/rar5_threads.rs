@@ -223,3 +223,34 @@ fn a_big_stored_file_named_like_its_own_archive_is_read_from_the_open_archive() 
     assert!(fs::read(&arc).unwrap() == data);
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn files_handed_over_in_groups_keep_their_order_past_the_held_limit() {
+    let dir = tmp("groups");
+    // more files than the workers may hold at once (four groups each), a few of them bad, ending mid-group
+    let datas: Vec<Vec<u8>> = (0..1_337).map(|i| noise(40 + i % 97, i as u64)).collect();
+    let names: Vec<String> = (0..datas.len()).map(|i| format!("g/f{i:04}.bin")).collect();
+    let files: Vec<(FileSpec, u32)> = datas
+        .iter()
+        .enumerate()
+        .map(|(i, d)| (FileSpec::new(&names[i], d), if i % 250 == 7 { 1 } else { crc32fast::hash(d) }))
+        .collect();
+    let arc = dir.join("t.rar");
+    fs::write(&arc, archive_with(&files, false)).unwrap();
+    let bad: Vec<String> =
+        (0..datas.len()).filter(|i| i % 250 == 7).map(|i| format!("{}: checksum error", names[i])).collect();
+    for mode in [Mode::Test, Mode::Extract] {
+        let out = dir.join(format!("out-{mode:?}"));
+        let mut lines = Vec::new();
+        let s = extract::run(&arc, &Options { mode, ..opts(&out, 4) }, |l| lines.push(l.to_string())).unwrap();
+        assert_eq!(s.files as usize, datas.len() - bad.len());
+        assert_eq!(s.errors, bad);
+        assert_eq!(lines, bad);
+        if mode == Mode::Extract {
+            for (i, d) in datas.iter().enumerate().filter(|(i, _)| i % 250 != 7).step_by(50) {
+                assert_eq!(&fs::read(out.join(&names[i])).unwrap(), d, "{}", names[i]);
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
