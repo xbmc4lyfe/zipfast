@@ -297,7 +297,7 @@ pub(crate) fn stored(
     Ok(total)
 }
 
-fn read_at(file: &File, buf: &mut [u8], mut at: u64) -> Result<()> {
+pub(crate) fn read_at(file: &File, buf: &mut [u8], mut at: u64) -> Result<()> {
     let mut done = 0;
     while done < buf.len() {
         #[cfg(unix)]
