@@ -3,7 +3,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::batch::{self, Batch, Done, Job, Outcome};
@@ -1244,22 +1244,36 @@ fn set_time(out: &File, h: &Meta) {
 
 impl Dirs {
     /// Records the path `rel` as used by this run. True when nothing this run wrote can be at `rel` under any
-    /// spelling: it is plain ASCII, was not used before in any letter case, and no name seen so far could be
-    /// another spelling of it. A name that a file system may fold into a different one (not plain ASCII, so subject
-    /// to Unicode normalization, or with a `~` short-name marker, or ending in a dot or space) makes every later
-    /// answer false. (Opening the file still refuses to replace anything, should a name slip by.)
+    /// spelling: every part of it is a plain name, it was not used before in any letter case, and no name seen so
+    /// far could be another spelling of it. A plain name has only ASCII letters, digits and common punctuation, and
+    /// doesn't end in a dot or space. Anything else may be folded by some file system into a different name
+    /// (Unicode normalization, `~` short names, `\` or `:` on Windows, trailing dots and spaces), so it makes every
+    /// later answer false. (Opening the file still refuses to replace anything, should a name slip by.)
     fn note(&mut self, rel: &Path) -> bool {
-        let plain = rel.to_str().filter(|name| {
-            name.is_ascii()
-                && !name.contains('~')
-                && rel.components().all(|c| !c.as_os_str().to_str().is_some_and(|c| c.ends_with(['.', ' '])))
-        });
-        let Some(name) = plain else {
-            self.unsure = true;
-            return false;
-        };
-        self.taken.insert(name.to_ascii_lowercase()) && !self.unsure
+        let mut key = String::new();
+        for part in rel.components() {
+            let plain = match part {
+                Component::Normal(name) => name.to_str().filter(|n| plain_name(n)),
+                _ => None,
+            };
+            let Some(name) = plain else {
+                self.unsure = true;
+                return false;
+            };
+            if !key.is_empty() {
+                key.push('/');
+            }
+            key.extend(name.chars().map(|c| c.to_ascii_lowercase()));
+        }
+        self.taken.insert(key) && !self.unsure
     }
+}
+
+/// A name every file system keeps as it is, apart from letter case.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.ends_with(['.', ' '])
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b" -_.,+=()[]{}@#&!'$%^;".contains(&b))
 }
 
 /// [`make_dirs`] for a run that remembers the folders it has made or checked, in `dirs`. It starts below the
@@ -1334,7 +1348,7 @@ mod tests {
 
     #[test]
     fn after_a_name_that_may_fold_into_another_nothing_is_new() {
-        for odd in ["d/\u{212A}", "d/e\u{301}", "d/LONGNA~1.TXT", "d/f.", "d/f ", "d./f"] {
+        for odd in ["d/\u{212A}", "d/e\u{301}", "d/LONGNA~1.TXT", "d/f.", "d/f ", "d./f", "d\\\\f", "d/f:s", "d/f*"] {
             let mut dirs = Dirs::default();
             assert!(dirs.note(Path::new("d/a")));
             assert!(!dirs.note(Path::new(odd)), "{odd:?}");
