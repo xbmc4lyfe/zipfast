@@ -25,7 +25,7 @@ const MAX_FILTER_LEN: u64 = 0x40_0000;
 /// Output is emitted at least this often (see [`Unpacker::flush_at`]). It must not be less than [`MAX_FILTER_LEN`].
 const FLUSH_EVERY: u64 = MAX_FILTER_LEN;
 /// Quick literals gathered before they go to the window.
-const STAGE: usize = 256;
+const STAGE: usize = 1024;
 /// Bits of a code looked up in one step; longer codes take the slow path.
 const LUT_BITS: u32 = 11;
 
@@ -116,9 +116,11 @@ struct Huff {
     common: u32,
     /// entries of `lut` past this are zero already
     dirty: usize,
-    /// when the common length is 8: for each 8-bit value, 0x100 | the literal when it is the code of a literal of
-    /// length 8, below 0x100 otherwise
-    tab8: Box<[u16; 256]>,
+    /// when the common length is 8: the literals of length 8 in code order, from code `first8` on. Canonical codes
+    /// of one length go in symbol order, so they are the first `nlit8` codes of that length.
+    lit8: Box<[u8; 256]>,
+    first8: u8,
+    nlit8: u16,
 }
 
 impl Huff {
@@ -132,7 +134,9 @@ impl Huff {
             empty: true,
             common: 0,
             dirty: 1 << LUT_BITS,
-            tab8: Box::new([0; 256]),
+            lit8: Box::new([0; 256]),
+            first8: 0,
+            nlit8: 0,
         }
     }
 
@@ -214,16 +218,15 @@ impl Huff {
             self.lut[covered..self.dirty].fill(0);
         }
         self.dirty = covered;
-        // the codes of literals of length 8, by their 8-bit value
+        // the literals of length 8, by their codes
         if self.common == 8 {
-            self.tab8.fill(0);
             let from = self.start[8] as usize;
-            let first = (self.first[8] >> 8) as usize;
-            for (rank, &sym) in self.sorted[from..from + count[8] as usize].iter().enumerate() {
-                if sym < 256 {
-                    self.tab8[first + rank] = 0x100 | sym;
-                }
+            let n = by_len[8] as usize;
+            for (slot, &sym) in self.lit8.iter_mut().zip(&self.sorted[from..from + n]) {
+                *slot = sym as u8;
             }
+            self.first8 = (self.first[8] >> 8) as u8;
+            self.nlit8 = n as u16;
         }
         Ok(())
     }
@@ -269,23 +272,81 @@ impl Huff {
     }
 
     /// [`Huff::quick`] when the common length is 8, as it is for incompressible data: the next codes are the
-    /// accumulator's top bytes, so each is looked up whole in a 256-entry table that says whether it is a literal of
-    /// length 8 and which. Up to seven.
+    /// accumulator's top bytes, and a byte is the code of a literal of length 8 when it falls in their range. Up to
+    /// seven.
     #[inline(always)]
     fn quick8(&self, bits: &mut Bits<'_>) -> ([u8; 8], usize) {
         let c = bits.acc.to_be_bytes();
         let mut lits = [0u8; 8];
         let mut n = 0;
         while n < 7 {
-            let e = self.tab8[c[n] as usize];
-            if e < 0x100 {
+            let i = c[n].wrapping_sub(self.first8);
+            if u16::from(i) >= self.nlit8 {
                 break;
             }
-            lits[n] = e as u8;
+            lits[n] = self.lit8[usize::from(i)];
             n += 1;
         }
         bits.skip(n as u32 * 8);
         (lits, n)
+    }
+
+    /// Literals of length 8, sixteen at a time. Within a run of such codes the bit offset in each byte stays the
+    /// same, so the next sixteen codes are the payload's bytes shifted by it; each is checked against the range of
+    /// literal codes and looked up in [`Huff::lit8`] in one go. Stops before the first code that isn't one, or when
+    /// the bits come within 136 of `end_bits` or fewer than sixteen of `room` are left. Returns how many.
+    #[cfg(target_arch = "aarch64")]
+    #[inline(always)]
+    fn run8(&self, bits: &mut Bits<'_>, end_bits: usize, out: &mut [u8], room: usize) -> usize {
+        use std::arch::aarch64::*;
+        let room = room.min(out.len());
+        let start = bits.pos();
+        let mut pos = start;
+        let mut k = 0;
+        if self.common != 8 || pos + 136 > end_bits || room < 16 {
+            return 0;
+        }
+        // SAFETY: round r reads 17 bytes from byte `pos / 8 + 16 r`, all before byte `end_bits / 8`, which the
+        // buffer holds, and writes 16 bytes at `16 r`, inside `room`, which `out` holds
+        unsafe {
+            let t = self.lit8.as_ptr();
+            let tables = [vld1q_u8_x4(t), vld1q_u8_x4(t.add(64)), vld1q_u8_x4(t.add(128)), vld1q_u8_x4(t.add(192))];
+            let first = vdupq_n_u8(self.first8);
+            let last = vdupq_n_u8((self.nlit8 - 1) as u8);
+            let shift = (pos & 7) as i8;
+            let (left, right) = (vdupq_n_s8(shift), vdupq_n_s8(shift - 8));
+            let quarter = vdupq_n_u8(64);
+            let from = bits.buf.as_ptr().add(pos / 8);
+            // rounds go at fixed places, as if every code so far was a literal: nothing a round needs waits on the
+            // round before, and the first that finds another code ends the run
+            let rounds = ((end_bits - pos - 136) / 128 + 1).min(room / 16);
+            for r in 0..rounds {
+                let at = from.add(16 * r);
+                let codes = vorrq_u8(vshlq_u8(vld1q_u8(at), left), vshlq_u8(vld1q_u8(at.add(1)), right));
+                let i = vsubq_u8(codes, first);
+                // a table of 64 entries leaves an index past it alone, so each quarter fills in only its own
+                let mut lits = vqtbl4q_u8(tables[0], i);
+                let i1 = vsubq_u8(i, quarter);
+                lits = vqtbx4q_u8(lits, tables[1], i1);
+                let i2 = vsubq_u8(i1, quarter);
+                lits = vqtbx4q_u8(lits, tables[2], i2);
+                lits = vqtbx4q_u8(lits, tables[3], vsubq_u8(i2, quarter));
+                vst1q_u8(out.as_mut_ptr().add(16 * r), lits);
+                // four bits per code, set while it is a literal's
+                let ok = vcleq_u8(i, last);
+                let mask = vget_lane_u64(vreinterpret_u64_u8(vshrn_n_u16(vreinterpretq_u16_u8(ok), 4)), 0);
+                if mask != u64::MAX {
+                    k = 16 * r + ((!mask).trailing_zeros() / 4) as usize;
+                    break;
+                }
+                k = 16 * (r + 1);
+            }
+            pos += 8 * k;
+        }
+        if pos != start {
+            *bits = Bits::at(bits.buf, pos);
+        }
+        k
     }
 
     /// Quick literals for as long as they keep coming, into `stage`, while the bits stay at least 128 short of
@@ -298,6 +359,13 @@ impl Huff {
             return 0;
         }
         while k < room && bits.pos() + 128 <= end_bits {
+            #[cfg(target_arch = "aarch64")]
+            {
+                k += self.run8(bits, end_bits, &mut stage[k..], room - k);
+                if k >= room || bits.pos() + 128 > end_bits {
+                    break;
+                }
+            }
             bits.refill();
             let (lits, n) = self.quick(bits);
             stage[k..k + 8].copy_from_slice(&lits);
