@@ -115,8 +115,11 @@ pub(crate) fn open_target(opts: &Options, rel: &Path, size: Option<u64>) -> Resu
 pub(crate) struct Dirs {
     /// each folder, and whether this run made it
     known: HashMap<PathBuf, bool>,
-    /// every name this run has put in a folder it made, in lower case
+    /// every path this run has written or made, in lower case
     taken: HashSet<String>,
+    /// a name was seen that a file system may take as another spelling of a different one, so from then on every
+    /// target is looked for
+    unsure: bool,
 }
 
 /// The first half of [`open_target`]: makes the folders and checks the target, without creating it. With `dirs`,
@@ -128,7 +131,8 @@ pub(crate) fn check_target(opts: &Options, rel: &Path, dirs: Option<&mut Dirs>) 
         match dirs {
             Some(dirs) => {
                 make_dirs_known(&opts.dest, parent, dirs)?;
-                if dirs.known.get(parent) == Some(&true) && dirs.claim(rel) {
+                let first = dirs.note(rel);
+                if first && dirs.known.get(parent) == Some(&true) {
                     return Ok(Checked::Write(Place { path: target, replace: false }));
                 }
             }
@@ -1239,12 +1243,22 @@ fn set_time(out: &File, h: &Meta) {
 }
 
 impl Dirs {
-    /// Takes the name `rel` in a folder this run made. False when the name may already be in use there: taken
-    /// before, perhaps under other letter case, or not plain ASCII, where a file system may treat two different
-    /// spellings as one name. (Opening the file still refuses to replace anything, should such a name slip by.)
-    fn claim(&mut self, rel: &Path) -> bool {
-        let Some(name) = rel.to_str() else { return false };
-        name.is_ascii() && !name.contains('~') && self.taken.insert(name.to_ascii_lowercase())
+    /// Records the path `rel` as used by this run. True when nothing this run wrote can be at `rel` under any
+    /// spelling: it is plain ASCII, was not used before in any letter case, and no name seen so far could be
+    /// another spelling of it. A name that a file system may fold into a different one (not plain ASCII, so subject
+    /// to Unicode normalization, or with a `~` short-name marker, or ending in a dot or space) makes every later
+    /// answer false. (Opening the file still refuses to replace anything, should a name slip by.)
+    fn note(&mut self, rel: &Path) -> bool {
+        let plain = rel.to_str().filter(|name| {
+            name.is_ascii()
+                && !name.contains('~')
+                && rel.components().all(|c| !c.as_os_str().to_str().is_some_and(|c| c.ends_with(['.', ' '])))
+        });
+        let Some(name) = plain else {
+            self.unsure = true;
+            return false;
+        };
+        self.taken.insert(name.to_ascii_lowercase()) && !self.unsure
     }
 }
 
@@ -1273,10 +1287,8 @@ pub(crate) fn make_dirs_known(root: &Path, rel: &Path, dirs: &mut Dirs) -> Resul
             },
             Err(e) => return Err(e.into()),
         };
-        // a folder put in a folder this run made takes its name there, so no file is later created over it
-        if sub.parent().is_some_and(|p| dirs.known.get(p) == Some(&true)) {
-            dirs.claim(&sub);
-        }
+        // a folder takes its name, so no file is later created over it
+        dirs.note(&sub);
         dirs.known.insert(sub.clone(), made);
     }
     Ok(())
@@ -1301,4 +1313,34 @@ pub(crate) fn make_dirs(root: &Path, rel: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_path_used_under_other_letter_case_is_not_new() {
+        let mut dirs = Dirs::default();
+        assert!(dirs.note(Path::new("d")));
+        assert!(dirs.note(Path::new("d/one")));
+        // `D` may be `d` itself, and what goes in it lands in `d`
+        assert!(!dirs.note(Path::new("D")));
+        assert!(dirs.note(Path::new("D/two")));
+        assert!(!dirs.note(Path::new("d/two")));
+        assert!(!dirs.note(Path::new("d/ONE")));
+        assert!(dirs.note(Path::new("d/three")));
+    }
+
+    #[test]
+    fn after_a_name_that_may_fold_into_another_nothing_is_new() {
+        for odd in ["d/\u{212A}", "d/e\u{301}", "d/LONGNA~1.TXT", "d/f.", "d/f ", "d./f"] {
+            let mut dirs = Dirs::default();
+            assert!(dirs.note(Path::new("d/a")));
+            assert!(!dirs.note(Path::new(odd)), "{odd:?}");
+            // the Kelvin sign is `K` to a file system that normalizes names
+            assert!(!dirs.note(Path::new("d/K")), "after {odd:?}");
+            assert!(!dirs.note(Path::new("x/y")), "after {odd:?}");
+        }
+    }
 }
