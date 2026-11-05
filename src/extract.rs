@@ -757,7 +757,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
         // a file done here reports as it goes, so the ones before it with the workers come in first (a solid
         // stream's queued files, and the ones the workers write for it, wait for the next file that can't join
         // them)
-        if !self.goes_to_batch(vol, h) && !self.queueable(vol, h) {
+        if !self.goes_to_batch(vol, h) && !self.queueable(vol, h) && !self.beside_batch(vol, h) {
             self.drain_batch()?;
         }
         if h.split_before() {
@@ -932,8 +932,10 @@ impl<R: FnMut(&str)> Run<'_, R> {
             u.queue_file(size);
             return self.decode_queued(vol, h, p);
         }
-        // anything else is done in order, after the queued files and what the workers hold
-        if let Err(e) = self.drain() {
+        // anything else is done in order, after the queued files and what the workers hold; a whole file too big
+        // for the workers is decoded here while they finish the ones before it, and reports in order when it fails
+        let drained = if self.beside_batch(vol, h) { self.drain_solid() } else { self.drain() };
+        if let Err(e) = drained {
             p.discard();
             return Err(e);
         }
@@ -968,11 +970,11 @@ impl<R: FnMut(&str)> Run<'_, R> {
                 }
             };
             if let Err(why) = ready {
-                if !p.passive {
-                    self.fail(&h.name, &why);
-                }
                 p.discard();
                 self.stream = None;
+                if !p.passive {
+                    self.fail_in_order(&h.name, &why)?;
+                }
             } else if queues
                 && let Some(u) = self.stream.as_mut()
                 && u.threads() > 0
@@ -986,6 +988,21 @@ impl<R: FnMut(&str)> Run<'_, R> {
             return Err(e);
         }
         self.continue_file(vol, h, p)
+    }
+
+    /// Whether `h` is a whole compressed file, standing alone, that is decoded on this thread while the workers
+    /// finish the files handed to them before it: one too big to hand them. Its reports wait for theirs.
+    fn beside_batch(&self, vol: &Volume, h: &FileHeader) -> bool {
+        self.threads > 1
+            && !vol.main.is_solid()
+            && !h.solid
+            && h.method != 0
+            && h.algorithm == 0
+            && !h.encrypted
+            && !h.split_before()
+            && !h.split_after()
+            && h.version.is_none()
+            && h.redirection.is_none()
     }
 
     /// Whether `h` can be decoded behind the files before it in a solid stream: compressed, whole in this volume, of
@@ -1198,10 +1215,10 @@ impl<R: FnMut(&str)> Run<'_, R> {
             }
         };
         if let Err(e) = decoded {
-            if !p.passive {
-                self.fail(&p.name, &e.to_string());
-            }
             p.discard();
+            if !p.passive {
+                self.fail_in_order(&p.name, &e.to_string())?;
+            }
             // the stream's state is lost with it
             if split_after {
                 self.pending = Some(p);
