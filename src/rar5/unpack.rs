@@ -68,6 +68,10 @@ fn corrupt(what: &'static str) -> Error {
 
 /// MSB-first bits over one block's payload, followed by [`PAD`] zero bytes. Bits are taken from a 64-bit
 /// accumulator that [`Bits::refill`] tops up to at least 56 bits; every read must fit in what a refill guarantees.
+///
+/// The decoding loops keep one in a local that nothing takes the address of, so that it lives in registers: what isn't
+/// inlined takes and gives back a copy (see [`read_filter`], [`Huff::decode_slow`]).
+#[derive(Clone, Copy)]
 struct Bits<'a> {
     buf: &'a [u8],
     /// the next byte not yet in `acc`
@@ -272,7 +276,9 @@ impl Huff {
             bits.skip(u32::from(entry & 15));
             return Ok(entry >> 4);
         }
-        self.decode_slow(peek, bits)
+        let (sym, len) = self.decode_slow(peek)?;
+        bits.skip(len);
+        Ok(sym)
     }
 
     /// Up to six literals of the common length from one refill (seven when it is 8). All the lookups are made at once, as if every
@@ -418,13 +424,14 @@ impl Huff {
         k
     }
 
+    /// A code longer than the table, from the next 16 bits: its symbol and length.
     #[cold]
-    fn decode_slow(&self, peek: u32, bits: &mut Bits<'_>) -> Result<u16> {
+    fn decode_slow(&self, peek: u32) -> Result<(u16, u32)> {
         for l in LUT_BITS as usize + 1..16 {
             if peek < self.limit[l] && peek >= self.first[l] {
                 let idx = self.start[l] as u32 + ((peek - self.first[l]) >> (16 - l));
-                bits.skip(l as u32);
-                return self.sorted.get(idx as usize).copied().ok_or(corrupt("prefix code"));
+                let sym = self.sorted.get(idx as usize).copied().ok_or(corrupt("prefix code"))?;
+                return Ok((sym, l as u32));
             }
         }
         Err(corrupt(if self.empty { "symbol from an empty prefix code" } else { "bit pattern matches no code" }))
@@ -1138,7 +1145,10 @@ impl Unpacker {
 
     /// The decoding loop: symbols until the block's bits run out or the stream position reaches `stop`. The state
     /// it touches on every symbol lives in locals, so the window writes can't make the compiler reload it.
-    fn run(&mut self, bits: &mut Bits<'_>, end_bits: usize, stop: u64, t: &Tables) -> Result<()> {
+    fn run(&mut self, bits_at: &mut Bits<'_>, end_bits: usize, stop: u64, t: &Tables) -> Result<()> {
+        // a copy, so that it can live in registers
+        let mut local = *bits_at;
+        let bits = &mut local;
         let Unpacker { window, mask, sp: sp_ref, file_base, size, history, last_len, filters, .. } = self;
         let mask = *mask;
         let file_base = *file_base;
@@ -1235,6 +1245,7 @@ impl Unpacker {
         *sp_ref = sp;
         *history = hist;
         *last_len = last;
+        *bits_at = local;
         result
     }
 
@@ -1573,7 +1584,11 @@ unsafe fn blend16_words(w: *mut u8, src: usize, dst: usize, k: usize) {
 #[inline(always)]
 fn read_op(sym: u16, bits: &mut Bits<'_>, t: &Tables) -> Result<Tok> {
     Ok(match sym {
-        256 => read_filter(bits)?,
+        256 => {
+            let (after, tok) = read_filter(*bits);
+            *bits = after;
+            tok?
+        }
         257 => Tok::Last,
         258..=261 => {
             let slot = t.rep.decode(bits)?;
@@ -1634,8 +1649,13 @@ fn resolve(tok: Tok, hist: &mut [u64; 4], last: &mut u32) -> Option<(u32, u64)> 
     }
 }
 
-/// A filter record's fields.
-fn read_filter(bits: &mut Bits<'_>) -> Result<Tok> {
+/// A filter record's fields, with the bits after it.
+fn read_filter(mut bits: Bits<'_>) -> (Bits<'_>, Result<Tok>) {
+    let tok = read_filter_fields(&mut bits);
+    (bits, tok)
+}
+
+fn read_filter_fields(bits: &mut Bits<'_>) -> Result<Tok> {
     let number = |bits: &mut Bits<'_>| -> u64 {
         bits.refill();
         let n = bits.get(2) + 1;
