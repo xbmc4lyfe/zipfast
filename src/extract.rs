@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::output::Output;
 use crate::path::sanitize;
 use crate::rar5::reader::{Block, Volume};
-use crate::rar5::unpack::{Unpacker, window_for};
+use crate::rar5::unpack::{Sink, Unpacker, window_for};
 use crate::rar5::{FileHeader, Redirection};
 use crate::volume::next_volume;
 
@@ -347,6 +347,10 @@ struct Pending {
     out: Option<Output>,
     path: Option<PathBuf>,
     hasher: crc32fast::Hasher,
+    /// the decoder works out the CRC32 instead, and hands it over as `crc`: it does so for every compressed file
+    /// whose bytes aren't gathered for a worker
+    decoder_crc: bool,
+    crc: Option<u32>,
     /// kept only when the archive stores a BLAKE2sp hash for this file
     blake: Option<Blake2sp>,
     /// unpacked bytes so far
@@ -375,6 +379,8 @@ impl Pending {
             out: out.map(|f| Output::new(f, size)),
             path,
             hasher: crc32fast::Hasher::new(),
+            decoder_crc: h.method != 0 && !h.encrypted,
+            crc: None,
             blake: h.blake2sp.map(|_| Blake2sp::new()),
             bytes: 0,
             failed: false,
@@ -409,11 +415,7 @@ impl Pending {
         }
     }
 
-    /// Where decoded bytes go: the checksums and the output file.
-    fn sink(&mut self) -> impl FnMut(&[u8]) -> Result<()> + '_ {
-        move |chunk: &[u8]| self.take(chunk)
-    }
-
+    /// Decoded bytes, to the checksums and the output file.
     fn take(&mut self, mut chunk: &[u8]) -> Result<()> {
         if let Some(cap) = self.cipher.as_ref().and_then(|c| c.cap) {
             let rem = cap.saturating_sub(self.bytes) as usize;
@@ -429,7 +431,9 @@ impl Pending {
             self.bytes += chunk.len() as u64;
             return Ok(());
         }
-        self.hasher.update(chunk);
+        if !self.decoder_crc {
+            self.hasher.update(chunk);
+        }
         if let Some(b) = self.blake.as_mut() {
             b.update(chunk);
         }
@@ -438,6 +442,20 @@ impl Pending {
         }
         self.bytes += chunk.len() as u64;
         Ok(())
+    }
+}
+
+impl Sink for Pending {
+    fn put(&mut self, bytes: &[u8]) -> Result<()> {
+        self.take(bytes)
+    }
+
+    fn wants_crc(&self) -> bool {
+        self.decoder_crc
+    }
+
+    fn crc(&mut self, crc: u32) {
+        self.crc = Some(crc);
     }
 }
 
@@ -521,11 +539,13 @@ fn check_and_finish<R: FnMut(&str)>(books: &mut Books<'_, R>, c: &Checks, mut p:
         let (summary, report) = (&mut *books.summary, &mut *books.report);
         return batch.submit(job, &mut |done| apply_done(summary, report, done));
     }
+    // a CRC the decoder never handed over can't match
+    let raw_crc = if p.decoder_crc { p.crc } else { Some(p.hasher.clone().finalize()) };
     let got_crc = match p.cipher.as_ref().and_then(|c| c.hash_key.as_ref()) {
-        Some(hk) => crate::crypto::rar5_tweak_crc32(p.hasher.clone().finalize(), hk),
-        None => p.hasher.clone().finalize(),
+        Some(hk) => raw_crc.map(|crc| crate::crypto::rar5_tweak_crc32(crc, hk)),
+        None => raw_crc,
     };
-    let crc_bad = c.crc32.is_some_and(|want| got_crc != want);
+    let crc_bad = c.crc32.is_some_and(|want| got_crc != Some(want));
     let blake_bad = if p.encrypted && p.cipher.as_ref().is_some_and(|c| c.hash_key.is_some()) {
         false
     } else {
@@ -576,15 +596,36 @@ fn check_and_finish<R: FnMut(&str)>(books: &mut Books<'_, R>, c: &Checks, mut p:
 fn route<'a, 'b: 'a, R: FnMut(&str)>(
     queued: &'a mut VecDeque<Queued>,
     books: &'a mut Books<'b, R>,
-) -> impl FnMut(&[u8]) -> Result<()> + 'a {
-    move |chunk: &[u8]| {
+) -> Route<'a, 'b, R> {
+    Route { queued, books }
+}
+
+struct Route<'a, 'b, R: FnMut(&str)> {
+    queued: &'a mut VecDeque<Queued>,
+    books: &'a mut Books<'b, R>,
+}
+
+impl<R: FnMut(&str)> Sink for Route<'_, '_, R> {
+    fn put(&mut self, chunk: &[u8]) -> Result<()> {
         if chunk.is_empty() {
-            let Some((p, c)) = queued.pop_front() else { return Err(Error::Corrupt("more files than were queued")) };
-            return check_and_finish(books, &c, p);
+            let Some((p, c)) = self.queued.pop_front() else {
+                return Err(Error::Corrupt("more files than were queued"));
+            };
+            return check_and_finish(self.books, &c, p);
         }
-        match queued.front_mut() {
+        match self.queued.front_mut() {
             Some((p, _)) => p.take(chunk),
             None => Err(Error::Corrupt("more files than were queued")),
+        }
+    }
+
+    fn wants_crc(&self) -> bool {
+        self.queued.front().is_some_and(|(p, _)| p.wants_crc())
+    }
+
+    fn crc(&mut self, crc: u32) {
+        if let Some((p, _)) = self.queued.front_mut() {
+            p.crc = Some(crc);
         }
     }
 }
@@ -1027,6 +1068,8 @@ impl<R: FnMut(&str)> Run<'_, R> {
             && self.batch.get_or_insert_with(|| Batch::new(self.threads)).usable()
         {
             p.mem = Some(Vec::with_capacity(size as usize));
+            // checked on the worker
+            p.decoder_crc = false;
         } else if let Err(e) = p.open(Some(size)) {
             p.discard();
             return Err(e);
@@ -1191,20 +1234,20 @@ impl<R: FnMut(&str)> Run<'_, R> {
                     &dec_buf
                 };
                 match stream.as_mut() {
-                    Some(u) => u.feed(to_feed, &mut p.sink()),
-                    None => p.sink()(to_feed),
+                    Some(u) => u.feed(to_feed, &mut p),
+                    None => p.take(to_feed),
                 }
             } else {
                 match stream.as_mut() {
-                    Some(u) => u.feed(chunk, &mut p.sink()),
-                    None => p.sink()(chunk),
+                    Some(u) => u.feed(chunk, &mut p),
+                    None => p.take(chunk),
                 }
             }
         });
         // a decoder error is this file's problem; an archive read error ends the run
         let decoded = match read {
             Ok(()) if !split_after => match stream.as_mut() {
-                Some(u) => u.finish(&mut p.sink()),
+                Some(u) => u.finish(&mut p),
                 None => Ok(()),
             },
             Ok(()) => Ok(()),
