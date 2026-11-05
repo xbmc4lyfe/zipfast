@@ -433,6 +433,48 @@ fn quick_literals_round_trip_with_mixed_lengths() {
 }
 
 #[test]
+fn eight_bit_codes_of_other_symbols_end_a_quick_run() {
+    // noise with one short match about as often as each byte value, so the match gets an 8-bit code too
+    let mut x = 11u64;
+    let mut ops = Vec::new();
+    for i in 0..200_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        if i > 100 && (x >> 20).is_multiple_of(256) {
+            ops.push(Op::Match(4, 64));
+        } else {
+            ops.push(Op::Lit((x >> 32) as u8));
+        }
+    }
+    let data = model(&ops);
+    let block = tuned_block(&ops, true);
+    let mut u = Unpacker::new(1 << 20).unwrap();
+    u.set_threads(0, 0);
+    u.reset(Some(data.len() as u64));
+    let mut out = Vec::new();
+    let mut sink = |b: &[u8]| {
+        out.extend_from_slice(b);
+        Ok(())
+    };
+    u.feed(&block, &mut sink).unwrap();
+    u.finish(&mut sink).unwrap();
+    assert!(out == data);
+    let main = &u.tables.main;
+    assert_eq!(main.common, 8);
+    let at = |v: usize| main.lut[v << (LUT_BITS - 8)];
+    assert!((0..256).any(|v| at(v) & 15 == 8 && at(v) >> 4 >= 256), "no other symbol got an 8-bit code");
+    assert!((0..256).all(|v| (main.tab8[v] >= 0x100) == (at(v) & 0xF00F == 8)));
+    // the same on workers, and fed in small pieces
+    let stream = tuned_stream(&ops, 20_000);
+    for threads in [0, 3] {
+        for piece in [usize::MAX, 4_096] {
+            assert!(decode_with(&stream, data.len() as u64, 1 << 20, piece, threads).unwrap() == data);
+        }
+    }
+}
+
+#[test]
 fn quick_literals_agree_with_workers_on_damage() {
     let ops = mostly_noise(120_000, 5);
     let data = model(&ops);

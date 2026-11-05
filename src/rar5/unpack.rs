@@ -116,6 +116,9 @@ struct Huff {
     common: u32,
     /// entries of `lut` past this are zero already
     dirty: usize,
+    /// when the common length is 8: for each 8-bit value, 0x100 | the literal when it is the code of a literal of
+    /// length 8, below 0x100 otherwise
+    tab8: Box<[u16; 256]>,
 }
 
 impl Huff {
@@ -129,6 +132,7 @@ impl Huff {
             empty: true,
             common: 0,
             dirty: 1 << LUT_BITS,
+            tab8: Box::new([0; 256]),
         }
     }
 
@@ -193,6 +197,13 @@ impl Huff {
             self.lut[covered..self.dirty].fill(0);
         }
         self.dirty = covered;
+        // the codes of literals of length 8, by their 8-bit value
+        if self.common == 8 {
+            for (v, slot) in self.tab8.iter_mut().enumerate() {
+                let e = self.lut[v << (LUT_BITS - 8)];
+                *slot = if e & 0xF00F == 8 { 0x100 | (e >> 4) } else { 0 };
+            }
+        }
         Ok(())
     }
 
@@ -207,18 +218,21 @@ impl Huff {
         self.decode_slow(peek, bits)
     }
 
-    /// Up to six literals of the common length from one refill. All the lookups are made at once, as if every
+    /// Up to six literals of the common length from one refill (seven when it is 8). All the lookups are made at once, as if every
     /// code had that length, and kept for as long as that holds. Returns them with how many there are (none when
     /// the first code isn't such a literal). Needs 56 bits in the accumulator.
     #[inline(always)]
-    fn quick(&self, bits: &mut Bits<'_>) -> ([u8; 6], usize) {
+    fn quick(&self, bits: &mut Bits<'_>) -> ([u8; 8], usize) {
         let g = self.common;
+        if g == 8 {
+            return self.quick8(bits);
+        }
         let a = bits.acc;
         let sh = 64 - LUT_BITS;
         let at = |k: u32| self.lut[((a << (k * g)) >> sh) as usize];
         // a literal (symbol below 256, so the top four bits clear) of length g
         let hit = |e: u16| u32::from(e & 0xF00F) == g;
-        let e = [at(0), at(1), at(2), at(3), at(4), at(5)];
+        let e = [at(0), at(1), at(2), at(3), at(4), at(5), 0, 0];
         let lits = e.map(|e| (e >> 4) as u8);
         if g == 0 || !hit(e[0]) {
             return (lits, 0);
@@ -233,10 +247,30 @@ impl Huff {
         (lits, n)
     }
 
+    /// [`Huff::quick`] when the common length is 8, as it is for incompressible data: the next codes are the
+    /// accumulator's top bytes, so each is looked up whole in a 256-entry table that says whether it is a literal of
+    /// length 8 and which. Up to seven.
+    #[inline(always)]
+    fn quick8(&self, bits: &mut Bits<'_>) -> ([u8; 8], usize) {
+        let c = bits.acc.to_be_bytes();
+        let mut lits = [0u8; 8];
+        let mut n = 0;
+        while n < 7 {
+            let e = self.tab8[c[n] as usize];
+            if e < 0x100 {
+                break;
+            }
+            lits[n] = e as u8;
+            n += 1;
+        }
+        bits.skip(n as u32 * 8);
+        (lits, n)
+    }
+
     /// Quick literals for as long as they keep coming, into `stage`, while the bits stay at least 128 short of
     /// `end_bits` and fewer than `room` are out. Returns how many.
     #[inline(always)]
-    fn quick_run(&self, bits: &mut Bits<'_>, end_bits: usize, stage: &mut [u8; STAGE + 6], room: usize) -> usize {
+    fn quick_run(&self, bits: &mut Bits<'_>, end_bits: usize, stage: &mut [u8; STAGE + 8], room: usize) -> usize {
         let room = room.min(STAGE);
         let mut k = 0;
         if self.common == 0 {
@@ -245,7 +279,7 @@ impl Huff {
         while k < room && bits.pos() + 128 <= end_bits {
             bits.refill();
             let (lits, n) = self.quick(bits);
-            stage[k..k + 6].copy_from_slice(&lits);
+            stage[k..k + 8].copy_from_slice(&lits);
             k += n;
             if n < 5 {
                 // a code of some other kind stopped them, with at least the table's width of bits still in the
@@ -978,12 +1012,12 @@ impl Unpacker {
         }
         // a run of quick literals is gathered here, where whole groups can be written past the ones kept, and then
         // copied to the window in one go
-        let mut stage = [0u8; STAGE + 6];
+        let mut stage = [0u8; STAGE + 8];
         let result = loop {
             let sym;
-            if bits.pos() + 128 <= end_bits && sp + 6 <= limit {
-                // room for every literal the stage can take, each run of quick ones ending at most six past it
-                let room = usize::try_from(limit - sp - 5).unwrap_or(usize::MAX);
+            if bits.pos() + 128 <= end_bits && sp + 7 <= limit {
+                // room for every literal the stage can take, each run of quick ones ending at most seven past it
+                let room = usize::try_from(limit - sp - 6).unwrap_or(usize::MAX);
                 let k = main.quick_run(bits, end_bits, &mut stage, room);
                 if k > 0 {
                     let at = (sp & mask) as usize;

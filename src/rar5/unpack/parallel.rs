@@ -232,7 +232,7 @@ fn tokenize(
     let mut bits = Bits::at(buf, start_bit);
     lits.reserve((end_bits - start_bit) / 8);
     let mut run = 0u32;
-    let mut stage = [0u8; STAGE + 6];
+    let mut stage = [0u8; STAGE + 8];
     macro_rules! decode {
         ($table:expr) => {
             match $table.decode(&mut bits) {
