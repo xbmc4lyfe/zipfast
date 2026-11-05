@@ -254,3 +254,37 @@ fn files_handed_over_in_groups_keep_their_order_past_the_held_limit() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn a_file_too_big_for_the_workers_reports_after_the_ones_they_hold() {
+    let dir = tmp("beside");
+    let a = noise(3000, 7);
+    let b = noise(3000, 8);
+    // 17 MiB from a few bytes: too big to hand the workers, so it is decoded here while they finish `a.bin`
+    let mut ops: Vec<Op> = (0..255u32).map(|i| Op::Lit(i as u8)).collect();
+    ops.extend((0..70_000).map(|_| Op::Match(255, 255)));
+    let (stream, plain) = packed("big", &ops);
+    assert!(plain.len() > 16 << 20);
+    let big = |data| FileSpec { method: 3, size: Some(plain.len() as u64), ..FileSpec::new("big.bin", data) };
+    // a broken block header, for a decoding error rather than a checksum error
+    let mut broken = stream.clone();
+    broken[1] ^= 0xff;
+    for (big_spec, crc, why) in
+        [(big(&stream), 1, "big.bin: checksum error"), (big(&broken), crc32fast::hash(&plain), "big.bin: ")]
+    {
+        let entries = vec![(FileSpec::new("a.bin", &a), 1), (big_spec, crc), (FileSpec::new("b.bin", &b), 2)];
+        let arc = dir.join("t.rar");
+        fs::write(&arc, archive_with(&entries, false)).unwrap();
+        for mode in [Mode::Test, Mode::Extract] {
+            let mut lines = Vec::new();
+            let o = Options { mode, ..opts(&dir.join("out"), 4) };
+            let s = extract::run(&arc, &o, |l| lines.push(l.to_string())).unwrap();
+            assert_eq!(s.errors.len(), 3, "{:?}", s.errors);
+            assert!(s.errors[0].starts_with("a.bin: checksum error"), "{:?}", s.errors);
+            assert!(s.errors[1].starts_with(why), "{:?}", s.errors);
+            assert!(s.errors[2].starts_with("b.bin: checksum error"), "{:?}", s.errors);
+            assert_eq!(lines, s.errors);
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
