@@ -6,7 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -306,6 +306,7 @@ pub(crate) fn stored(
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let first_error: Mutex<Option<Error>> = Mutex::new(None);
+    let flusher = out.filter(|f| defers_to_close(f)).map(Flusher::new);
     thread::scope(|s| {
         for _ in 0..threads.min(pieces).max(1) {
             s.spawn(|| {
@@ -326,6 +327,9 @@ pub(crate) fn stored(
                         h.update(&buf[..n]);
                         if let Some(out) = out {
                             write_at(out, &buf[..n], out_at + off)?;
+                            if let Some(f) = &flusher {
+                                f.wrote(n as u64);
+                            }
                         }
                         *crcs[i].lock().unwrap() = Some(h);
                     }
@@ -346,6 +350,67 @@ pub(crate) fn stored(
     }
     Ok(total)
 }
+
+/// A big stored file's copy pushes what it has written to the disk every this many bytes. Its pieces land out of
+/// order, and APFS then holds them all in memory until the file is closed, where the close spends as long writing
+/// them as the copy spent reading the archive. Pushed out on the way, they are written while the reading goes on.
+const FLUSH_EVERY: u64 = 64 << 20;
+
+/// Pushes a file's data to the disk as the copy into it goes on (see [`FLUSH_EVERY`]). One copying thread at a time
+/// does it, and waits for it, while the others go on copying.
+struct Flusher<'a> {
+    file: &'a File,
+    written: AtomicU64,
+    due: AtomicU64,
+    busy: AtomicBool,
+}
+
+impl<'a> Flusher<'a> {
+    fn new(file: &'a File) -> Self {
+        Flusher { file, written: AtomicU64::new(0), due: AtomicU64::new(FLUSH_EVERY), busy: AtomicBool::new(false) }
+    }
+
+    /// `n` more bytes were written.
+    fn wrote(&self, n: u64) {
+        let written = self.written.fetch_add(n, Ordering::Relaxed) + n;
+        if written < self.due.load(Ordering::Relaxed) || self.busy.swap(true, Ordering::Acquire) {
+            return;
+        }
+        self.due.store(written + FLUSH_EVERY, Ordering::Relaxed);
+        flush_data(self.file);
+        self.busy.store(false, Ordering::Release);
+    }
+}
+
+/// Whether `file` is on a file system that keeps data written out of order until the file is closed: APFS.
+#[cfg(target_os = "macos")]
+fn defers_to_close(file: &File) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: statfs is plain data, which fstatfs fills in for an open descriptor
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(file.as_raw_fd(), &mut fs) } != 0 {
+        return false;
+    }
+    let name = fs.f_fstypename.map(|c| c as u8);
+    name.starts_with(b"apfs\0")
+}
+
+#[cfg(not(target_os = "macos"))]
+fn defers_to_close(_file: &File) -> bool {
+    false
+}
+
+/// Writes `file`'s data out now, waiting until it is on the disk; best effort.
+#[cfg(target_os = "macos")]
+fn flush_data(file: &File) {
+    use std::os::fd::AsRawFd;
+    const F_FLUSH_DATA: libc::c_int = 40;
+    // SAFETY: fcntl on an open descriptor, with no argument to point at anything
+    unsafe { libc::fcntl(file.as_raw_fd(), F_FLUSH_DATA) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn flush_data(_file: &File) {}
 
 pub(crate) fn read_at(file: &File, buf: &mut [u8], mut at: u64) -> Result<()> {
     let mut done = 0;
@@ -376,4 +441,23 @@ fn write_at(file: &File, mut buf: &[u8], mut at: u64) -> Result<()> {
         at += n as u64;
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_file_on_apfs_is_pushed_to_the_disk_as_it_is_copied() {
+        // the temporary folder is on APFS on any macOS this builds for, so a big stored copy there flushes on the way
+        let path = std::env::temp_dir().join(format!("zipfast-flush-{}", std::process::id()));
+        let file = File::create(&path).unwrap();
+        assert!(defers_to_close(&file));
+        let f = Flusher::new(&file);
+        f.wrote(FLUSH_EVERY + 1);
+        assert_eq!(f.due.load(Ordering::Relaxed), 2 * FLUSH_EVERY + 1);
+        assert!(!f.busy.load(Ordering::Relaxed));
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+    }
 }
