@@ -27,8 +27,13 @@ pub enum Block {
 /// run of small files takes one read for several of them.
 const READ: usize = 1 << 20;
 
-/// Pieces read ahead of the one in use, once the volume is read straight through.
+/// Pieces read ahead of the one in use, once the volume is read straight through, by each reading thread.
 const AHEAD: usize = 2;
+
+/// Threads reading ahead for stored data ([`Volume::read_fast`]), which is only checked (and copied) as it comes:
+/// that takes it faster than one thread copies it out of the page cache, so two take turns. Compressed data comes no
+/// faster than it is decoded, so one thread keeps up there, and a second would only take time from the decoding.
+const FAST_READERS: usize = 2;
 
 /// A move forward by up to this much past what is read reads on through; a longer one starts again at the place.
 const SKIP_MAX: u64 = 2 * READ as u64;
@@ -78,48 +83,80 @@ struct Source {
     piece: Arc<Piece>,
     at: u64,
     off: usize,
-    /// set while pieces are read in order, so the next one can come from the thread
+    /// set while pieces are read in order, so the next one can come from the threads
     sequential: bool,
     ahead: Option<Ahead>,
+    /// how many threads read ahead, from when they next start
+    readers: usize,
 }
 
-/// The thread reading ahead, and where the next piece it sends starts.
+/// The threads reading ahead, the one the next piece comes from, and where that piece starts.
 struct Ahead {
-    pieces: Receiver<Result<Vec<u8>>>,
+    pieces: Vec<Receiver<Result<Vec<u8>>>>,
+    turn: usize,
     spare: Sender<Vec<u8>>,
     next: u64,
 }
 
 impl Ahead {
-    fn start(file: &File, from: u64, len: u64) -> Result<Ahead> {
-        let file = file.try_clone()?;
-        let (send, pieces) = sync_channel::<Result<Vec<u8>>>(AHEAD);
+    fn start(file: &File, from: u64, len: u64, readers: usize) -> Result<Ahead> {
         let (spare, spares) = channel::<Vec<u8>>();
-        std::thread::Builder::new()
-            .name("rar5-read".into())
-            .spawn(move || read_ahead(&file, from, len, &send, &spares))?;
-        Ok(Ahead { pieces, spare, next: from })
+        let spares = Arc::new(std::sync::Mutex::new(spares));
+        let mut pieces = Vec::with_capacity(readers);
+        for k in 0..readers {
+            let file = file.try_clone()?;
+            let (send, recv) = sync_channel::<Result<Vec<u8>>>(AHEAD);
+            let spares = Arc::clone(&spares);
+            std::thread::Builder::new()
+                .name("rar5-read".into())
+                .spawn(move || read_ahead(&file, from + (k * READ) as u64, readers, len, &send, &spares))?;
+            pieces.push(recv);
+        }
+        Ok(Ahead { pieces, turn: 0, spare, next: from })
+    }
+
+    /// The next piece, in order.
+    fn recv(&mut self) -> Result<Vec<u8>> {
+        let piece = self.pieces[self.turn].recv().map_err(|_| Error::Truncated)?;
+        self.turn = (self.turn + 1) % self.pieces.len();
+        piece
     }
 }
 
-/// Reads pieces from `at` to `len` in order and sends them, until the receiver goes away.
-fn read_ahead(file: &File, mut at: u64, len: u64, send: &SyncSender<Result<Vec<u8>>>, spares: &Receiver<Vec<u8>>) {
+/// Reads every `readers`th piece from `at` to `len` in order and sends them, until the receiver goes away.
+fn read_ahead(
+    file: &File,
+    mut at: u64,
+    readers: usize,
+    len: u64,
+    send: &SyncSender<Result<Vec<u8>>>,
+    spares: &std::sync::Mutex<Receiver<Vec<u8>>>,
+) {
     while at < len {
         let n = (len - at).min(READ as u64) as usize;
-        let mut buf = spares.try_recv().unwrap_or_default();
+        let mut buf = spares.lock().ok().and_then(|s| s.try_recv().ok()).unwrap_or_default();
         buf.resize(n, 0);
         let read = read_at(file, &mut buf, at).map(|()| buf);
         let failed = read.is_err();
         if send.send(read).is_err() || failed {
             return;
         }
-        at += n as u64;
+        at += (readers * READ) as u64;
     }
 }
 
 impl Source {
     fn new(file: File, len: u64) -> Source {
-        Source { file, len, piece: Piece::new(Vec::new(), None), at: 0, off: 0, sequential: false, ahead: None }
+        Source {
+            file,
+            len,
+            piece: Piece::new(Vec::new(), None),
+            at: 0,
+            off: 0,
+            sequential: false,
+            ahead: None,
+            readers: 1,
+        }
     }
 
     /// What is left of the piece in use.
@@ -178,7 +215,7 @@ impl Source {
                 self.ahead = None;
             }
             if self.ahead.is_none() && self.sequential {
-                self.ahead = Some(Ahead::start(&self.file, from, self.len)?);
+                self.ahead = Some(Ahead::start(&self.file, from, self.len, self.readers)?);
             }
             self.piece = match self.ahead.as_mut() {
                 Some(a) => {
@@ -186,7 +223,7 @@ impl Source {
                         // the thread fills it again rather than making a new one
                         let _ = a.spare.send(used);
                     }
-                    let bytes = a.pieces.recv().map_err(|_| Error::Truncated)??;
+                    let bytes = a.recv()?;
                     a.next += bytes.len() as u64;
                     // back to the thread once nothing holds it
                     Piece::new(bytes, Some(a.spare.clone()))
@@ -401,6 +438,13 @@ impl Volume {
         &self.src.file
     }
 
+    /// Whether the data read next is taken as fast as it can come (stored data, only checked and copied), so that
+    /// two threads read ahead, or is decoded, for which one keeps up. It counts from when the reading ahead next
+    /// starts (the first piece after the volume opens or after a move), so files that alternate don't restart it.
+    pub fn read_fast(&mut self, fast: bool) {
+        self.src.readers = if fast { FAST_READERS } else { 1 };
+    }
+
     #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> u64 {
         self.len
@@ -466,5 +510,44 @@ impl Volume {
             left -= n as u64;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pieces_read_ahead_on_several_threads_come_in_order() {
+        let dir = std::env::temp_dir().join(format!("zipfast-reader-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data");
+        let data: Vec<u8> =
+            (0..(7 * READ + 12_345) as u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        for readers in [1, 2, 3] {
+            // from the start, from just past it (read on through), and from a far place (started again there)
+            for start in [0, 13, 5 * READ + 77] {
+                let mut src = Source::new(File::open(&path).unwrap(), data.len() as u64);
+                src.readers = readers;
+                src.seek(start as u64);
+                let mut got = Vec::new();
+                let mut moved = false;
+                while src.fill().unwrap() {
+                    let n = src.held().len().min(300_007);
+                    got.extend_from_slice(&src.held()[..n]);
+                    src.consume(n);
+                    // a move back, from well into the reading ahead, starts it again
+                    if start == 0 && !moved && got.len() > 3 * READ {
+                        moved = true;
+                        src.seek(0);
+                        got.clear();
+                    }
+                }
+                assert!(start != 0 || moved);
+                assert!(got == data[start..], "{readers} readers from {start}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
