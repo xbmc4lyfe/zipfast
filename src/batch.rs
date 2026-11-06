@@ -289,7 +289,7 @@ fn decode(
             unpacker.insert(u)
         }
     };
-    u.reset(Some(size));
+    u.restart(window, Some(size));
     u.feed(packed, sink)?;
     u.finish(sink)
 }

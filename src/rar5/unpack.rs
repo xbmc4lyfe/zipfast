@@ -53,6 +53,10 @@ const FLUSH_EVERY: u64 = MAX_FILTER_LEN;
 /// How far past [`Unpacker::flush_at`] unemitted bytes the window may be written before output is emitted again:
 /// the longest match, with the 32 bytes a short copy rewrites, and room to spare.
 const WRITE_SLACK: u64 = 64 << 10;
+/// How far past its end a short write may spill (see [`Win::spills`]).
+const SPILL: u64 = 32;
+/// Dictionaries up to this size get a window twice as big, so that short writes may spill (see [`window_for`]).
+const ROOMY_MAX: u64 = 32 << 20;
 /// Output is hashed on a helper thread straight from windows of this size up, where a stretch emitted stays in
 /// place for a while: other windows are reused too soon after.
 const HAND_OVER_WINDOW: usize = 4 * FLUSH_EVERY as usize;
@@ -627,6 +631,8 @@ const PARALLEL_MIN: u64 = 4 << 20;
 pub struct Unpacker {
     window: Vec<u8>,
     mask: u64,
+    /// the farthest back a match may reach
+    reach: u64,
     /// bytes decoded in the whole stream
     sp: u64,
     /// `sp` when the current file started
@@ -694,24 +700,50 @@ impl Drop for Unpacker {
     }
 }
 
-/// The window a file needs: its declared dictionary, but no more than twice the file when nothing before or after it
-/// can refer back into it. Twice, because a filter may cover up to half the window and a filter may cover the whole
-/// file.
-pub fn window_for(dictionary: u64, unpacked: Option<u64>, solid_stream: bool) -> Result<u64> {
+/// A stream's window: its size (a power of two), and how far back into it a match may reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Window {
+    pub size: u64,
+    pub reach: u64,
+}
+
+impl Window {
+    /// A window of `size` bytes that matches may reach all the way back into.
+    pub fn full(size: u64) -> Self {
+        Window { size, reach: size }
+    }
+}
+
+/// The window a file needs. Matches reach back as far as its declared dictionary, or no further than the file when
+/// nothing before or after it can refer back into it. Short writes may spill (`Win::spills`) where the window is
+/// longer than that reach by `SPILL` (32) or more: a file on its own gets twice its size anyway, because a filter may
+/// cover up to half the window and a filter may cover the whole file, and one of up to the dictionary gets that
+/// much. Longer streams get twice the dictionary, where that costs no more than `ROOMY_MAX` (32 MiB) extra.
+pub fn window_for(dictionary: u64, unpacked: Option<u64>, solid_stream: bool) -> Result<Window> {
     if dictionary == 0 || !dictionary.is_power_of_two() {
         return Err(Error::Unsupported(format!("dictionary size {dictionary}")));
     }
-    let need = match unpacked {
+    if let Some(size) = unpacked
+        && !solid_stream
+    {
         // bounded by the dictionary first, so an absurd stated size can't overflow the rounding
-        Some(size) if !solid_stream => (size.min(dictionary).max(1) * 2).next_power_of_two().max(128 * 1024),
-        _ => dictionary,
-    };
-    Ok(need.min(dictionary))
+        let need = (size.min(dictionary).max(1) * 2).next_power_of_two().max(128 * 1024);
+        if need <= dictionary {
+            return Ok(Window { size: need, reach: need / 2 });
+        }
+        if size <= dictionary - SPILL {
+            return Ok(Window { size: dictionary, reach: size });
+        }
+    }
+    let size = if dictionary <= ROOMY_MAX { dictionary * 2 } else { dictionary };
+    Ok(Window { size, reach: dictionary })
 }
 
 impl Unpacker {
-    /// A fresh stream with a window of `window` bytes (a power of two).
-    pub fn new(window: u64) -> Result<Self> {
+    /// A fresh stream with the window `window`.
+    pub fn new(window: Window) -> Result<Self> {
+        let Window { size: window, reach } = window;
+        assert!(window.is_power_of_two() && reach <= window, "window {window}, reach {reach}");
         let size = usize::try_from(window).map_err(|_| Error::Unsupported("dictionary too large".into()))?;
         // asked first so an absurd size is an error, not an abort; the window itself comes zeroed from the system,
         // so its pages cost nothing until they are written
@@ -721,6 +753,7 @@ impl Unpacker {
         Ok(Unpacker {
             window: vec![0; size],
             mask: window - 1,
+            reach,
             sp: 0,
             file_base: 0,
             emitted: 0,
@@ -789,11 +822,17 @@ impl Unpacker {
         self.mask + 1
     }
 
-    /// Whether this decoder can take a stream that needs a `window` byte window: its own is big enough, and not so
-    /// much bigger that keeping it wastes memory. Reusing one saves allocating a window for every file.
-    pub fn fits(&self, window: u64) -> bool {
+    /// The farthest back a match may reach.
+    pub fn reach(&self) -> u64 {
+        self.reach
+    }
+
+    /// Whether this decoder can take a stream that needs the window `window` (see [`Self::restart`]): its own is big
+    /// enough, and not so much bigger that keeping it wastes memory. Reusing one saves allocating a window for every
+    /// file.
+    pub fn fits(&self, window: Window) -> bool {
         let have = self.window_size();
-        have >= window && have <= window.saturating_mul(4).max(4 << 20)
+        have >= window.size && have <= window.size.saturating_mul(4).max(4 << 20)
     }
 
     /// Decodes the current file's blocks on the workers whatever its size, when there are any: for a file that
@@ -845,6 +884,13 @@ impl Unpacker {
         self.filters.clear();
         self.input.clear();
         self.parallel = self.wants_parallel();
+    }
+
+    /// [`Self::reset`] for a stream that needs the window `window`, which this decoder [`fits`](Self::fits).
+    pub fn restart(&mut self, window: Window, size: Option<u64>) {
+        assert!(self.fits(window), "{window:?} in a window of {}", self.window_size());
+        self.reset(size);
+        self.reach = window.reach;
     }
 
     /// Starts a file that stands alone in a stream this decoder already decoded into: everything resets.
@@ -1087,8 +1133,29 @@ impl Unpacker {
         ended
     }
 
+    /// Whether short writes may spill (see [`Win::spills`]).
+    fn spills(&self) -> bool {
+        self.window_size() - self.reach >= SPILL
+    }
+
     /// Some of a block's tokens, applied to the window with the same checks the decoding loop makes.
     fn apply(
+        &mut self,
+        toks: &[Packed],
+        filters: &[parallel::FilterFields],
+        lits: &[u8],
+        sink: &mut dyn Sink,
+    ) -> Result<()> {
+        // the loop is built for each, so it doesn't ask on every write
+        if self.spills() {
+            self.apply_with::<true>(toks, filters, lits, sink)
+        } else {
+            self.apply_with::<false>(toks, filters, lits, sink)
+        }
+    }
+
+    /// [`Self::apply`], with short writes spilling if `SPILLS`.
+    fn apply_with<const SPILLS: bool>(
         &mut self,
         toks: &[Packed],
         filters: &[parallel::FilterFields],
@@ -1103,7 +1170,7 @@ impl Unpacker {
         let (mut sp, mut history, mut last_len) = (self.sp, self.history, self.last_len);
         // SAFETY: the window is neither resized nor freed while this runs, and the pointer is taken again after
         // every flush, which reads the window through `self`
-        let mut win = unsafe { Win::detached(&mut self.window) };
+        let mut win = unsafe { Win::detached(&mut self.window) }.reaching(self.reach);
         // output past this is emitted before more is decoded
         let mut stop = self.file_base + self.emitted + flush_at;
         let mut li = 0usize;
@@ -1117,12 +1184,12 @@ impl Unpacker {
                     }
                     stop = self.file_base + self.emitted + flush_at;
                     // SAFETY: as above
-                    win = unsafe { Win::detached(&mut self.window) };
+                    win = unsafe { Win::detached(&mut self.window) }.reaching(self.reach);
                 }
                 match tok {
                     Tok::Lits(n) if sp + u64::from(n) <= (stop + 1).min(size_end) => {
                         // the common case: the run fits before the next flush and the file's end
-                        put_from(win, sp, lits, li, n as usize);
+                        put_from::<SPILLS>(win, sp, lits, li, n as usize);
                         sp += u64::from(n);
                         li += n as usize;
                     }
@@ -1136,7 +1203,7 @@ impl Unpacker {
                                 }
                                 stop = self.file_base + self.emitted + flush_at;
                                 // SAFETY: as above
-                                win = unsafe { Win::detached(&mut self.window) };
+                                win = unsafe { Win::detached(&mut self.window) }.reaching(self.reach);
                             }
                             if sp >= size_end {
                                 break 'apply Err(corrupt("more data than the header says"));
@@ -1146,7 +1213,7 @@ impl Unpacker {
                             if take == 0 {
                                 break 'apply Err(corrupt("the window can't hold the pending output"));
                             }
-                            put_from(win, sp, lits, li, take);
+                            put_from::<SPILLS>(win, sp, lits, li, take);
                             sp += take as u64;
                             li += take;
                             n -= take;
@@ -1160,7 +1227,7 @@ impl Unpacker {
                     }
                     _ => {
                         if let Some((len, d)) = resolve(tok, &mut history, &mut last_len) {
-                            if let Err(e) = copy(win, sp, len, d, size_end) {
+                            if let Err(e) = copy::<SPILLS>(win, sp, len, d, size_end) {
                                 break 'apply Err(e);
                             }
                             sp += u64::from(len);
@@ -1332,10 +1399,26 @@ impl Unpacker {
     /// The decoding loop: symbols until the block's bits run out or the stream position reaches `stop`. The state
     /// it touches on every symbol lives in locals, so the window writes can't make the compiler reload it.
     fn run(&mut self, bits_at: &mut Bits<'_>, end_bits: usize, stop: u64, t: &Tables) -> Result<()> {
+        // built for each, as `apply` is
+        if self.spills() {
+            self.run_with::<true>(bits_at, end_bits, stop, t)
+        } else {
+            self.run_with::<false>(bits_at, end_bits, stop, t)
+        }
+    }
+
+    /// [`Self::run`], with short writes spilling if `SPILLS`.
+    fn run_with<const SPILLS: bool>(
+        &mut self,
+        bits_at: &mut Bits<'_>,
+        end_bits: usize,
+        stop: u64,
+        t: &Tables,
+    ) -> Result<()> {
         // a copy, so that it can live in registers
         let mut local = *bits_at;
         let bits = &mut local;
-        let Unpacker { window, mask, sp: sp_ref, file_base, size, history, last_len, filters, .. } = self;
+        let Unpacker { window, mask, reach, sp: sp_ref, file_base, size, history, last_len, filters, .. } = self;
         let mask = *mask;
         let file_base = *file_base;
         let size_end = size.map_or(u64::MAX, |s| file_base.saturating_add(s));
@@ -1343,7 +1426,7 @@ impl Unpacker {
         let mut sp = *sp_ref;
         let mut hist = *history;
         let mut last = *last_len;
-        let window = Win::of(window);
+        let window = Win::of(window).reaching(*reach);
         let main = &t.main;
         macro_rules! decode {
             ($table:expr) => {
@@ -1426,7 +1509,7 @@ impl Unpacker {
                 continue;
             }
             let Some((len, d)) = resolve(tok, &mut hist, &mut last) else { continue };
-            if let Err(e) = copy(window, sp, len, d, size_end) {
+            if let Err(e) = copy::<SPILLS>(window, sp, len, d, size_end) {
                 break Err(e);
             }
             sp += u64::from(len);
@@ -1496,8 +1579,8 @@ impl Unpacker {
         if self.crc.out() {
             let window = self.window_size();
             let reach = self.file_base + self.emitted + self.flush_at() + WRITE_SLACK;
-            // a short copy may have rewritten 32 bytes past the stream position
-            self.crc.clear_before(reach.saturating_sub(window), (self.sp + 32).saturating_sub(window));
+            // a short copy may have rewritten (or spilled over) the bytes just past the stream position
+            self.crc.clear_before(reach.saturating_sub(window), (self.sp + SPILL).saturating_sub(window));
         }
     }
 
@@ -1618,6 +1701,8 @@ fn block_header(b: &[u8]) -> Result<Option<(usize, usize, u8)>> {
 struct Win<'a> {
     ptr: *mut u8,
     mask: usize,
+    /// the farthest back a match may reach
+    reach: u64,
     _window: PhantomData<&'a mut Vec<u8>>,
 }
 
@@ -1626,7 +1711,8 @@ impl<'a> Win<'a> {
     #[inline(always)]
     fn of(window: &'a mut Vec<u8>) -> Self {
         debug_assert!(window.len().is_power_of_two());
-        Win { ptr: window.as_mut_ptr(), mask: window.len() - 1, _window: PhantomData }
+        let len = window.len();
+        Win { ptr: window.as_mut_ptr(), mask: len - 1, reach: len as u64, _window: PhantomData }
     }
 
     /// A `Win` over `window` that doesn't keep it borrowed.
@@ -1637,7 +1723,24 @@ impl<'a> Win<'a> {
     #[inline(always)]
     unsafe fn detached(window: &mut Vec<u8>) -> Win<'a> {
         debug_assert!(window.len().is_power_of_two());
-        Win { ptr: window.as_mut_ptr(), mask: window.len() - 1, _window: PhantomData }
+        let len = window.len();
+        Win { ptr: window.as_mut_ptr(), mask: len - 1, reach: len as u64, _window: PhantomData }
+    }
+
+    /// This window with matches reaching no farther back than `reach`.
+    #[inline(always)]
+    fn reaching(self, reach: u64) -> Self {
+        debug_assert!(reach <= self.len() as u64);
+        Win { reach, ..self }
+    }
+
+    /// Whether short writes may spill: write up to [`SPILL`] bytes past their end, which hold nothing yet, rather
+    /// than keep those bytes as they are. That holds when no match reaches back within [`SPILL`] of the window's
+    /// size, so the bytes past the stream position are never ones a match may still read: they are written again
+    /// before anything reads them.
+    #[inline(always)]
+    fn spills(self) -> bool {
+        self.len() as u64 - self.reach >= SPILL
     }
 
     #[inline(always)]
@@ -1667,18 +1770,25 @@ impl<'a> Win<'a> {
     }
 }
 
-/// `lits[at..at + n]` into the window at stream position `sp`. A short run whose word fits on both sides is blended
-/// in, without a call to copy it.
+/// `lits[at..at + n]` into the window at stream position `sp`. A short run whose word fits on both sides goes in
+/// as two 16-byte words, without a call to copy it: blended in, or with `SPILLS` (which `window` must allow, see
+/// [`Win::spills`]) spilling the literals after it.
 #[inline(always)]
-fn put_from(window: Win<'_>, sp: u64, lits: &[u8], at: usize, n: usize) {
+fn put_from<const SPILLS: bool>(window: Win<'_>, sp: u64, lits: &[u8], at: usize, n: usize) {
+    debug_assert!(!SPILLS || window.spills());
     let dst = sp as usize & window.mask;
     if n <= 32 && at + 32 <= lits.len() && dst + 32 <= window.len() {
         // SAFETY: the 32 bytes at `at` in `lits` and at `dst` in the window are there, and n <= 32; `lits` is a shared
-        // slice, so it isn't the window. Both words are always blended, as in `copy`.
+        // slice, so it isn't the window. Both words are always written, as in `copy`.
         unsafe {
             let (s, d) = (lits.as_ptr().add(at), window.ptr.add(dst));
-            blend16p(s, d, n.min(16));
-            blend16p(s.add(16), d.add(16), n.saturating_sub(16));
+            if SPILLS {
+                word16(s, d);
+                word16(s.add(16), d.add(16));
+            } else {
+                blend16p(s, d, n.min(16));
+                blend16p(s.add(16), d.add(16), n.saturating_sub(16));
+            }
         }
     } else {
         window.write(sp, &lits[at..at + n]);
@@ -1686,11 +1796,12 @@ fn put_from(window: Win<'_>, sp: u64, lits: &[u8], at: usize, n: usize) {
 }
 
 /// Copies a match inside the window. `sp` is the stream position the copy starts at; nothing may land at or past
-/// `size_end`.
+/// `size_end`. With `SPILLS` (which `window` must allow, see [`Win::spills`]) a short copy spills.
 #[inline(always)]
-fn copy(window: Win<'_>, sp: u64, len: u32, dist: u64, size_end: u64) -> Result<()> {
+fn copy<const SPILLS: bool>(window: Win<'_>, sp: u64, len: u32, dist: u64, size_end: u64) -> Result<()> {
+    debug_assert!(!SPILLS || window.spills());
     let mask = window.mask as u64;
-    if dist == 0 || dist > sp || dist > mask + 1 {
+    if dist == 0 || dist > sp || dist > window.reach {
         return Err(corrupt("match reaches before the start of the data"));
     }
     if u64::from(len) > size_end - sp {
@@ -1702,13 +1813,19 @@ fn copy(window: Win<'_>, sp: u64, len: u32, dist: u64, size_end: u64) -> Result<
     let w = window.len();
     let p = window.ptr;
     if n <= 32 && dist >= n as u64 && dst + 32 <= w && src + 32 <= w {
-        // a short copy whose source ends before it: whole 16-byte words, keeping the destination's bytes past the
-        // match, which a match from nearly a window back may still read
+        // a short copy whose source ends before it: whole 16-byte words, which spill where they may and otherwise
+        // keep the destination's bytes past the match, which a match from nearly a window back may still read.
+        // Spilling saves reading back bytes the copy before has only just written, which stalls.
         // SAFETY: the 32 bytes at `src` and at `dst` are inside the window, and 1 <= n <= 32. Both words are always
-        // blended, the second keeping all its bytes for a match of 16 or less, so no branch hangs on the length.
+        // written, the second keeping all its bytes for a match of 16 or less, so no branch hangs on the length.
         unsafe {
-            blend16(p, src, dst, n.min(16));
-            blend16(p, src + 16, dst + 16, n.saturating_sub(16));
+            if SPILLS {
+                word16(p.add(src), p.add(dst));
+                word16(p.add(src + 16), p.add(dst + 16));
+            } else {
+                blend16(p, src, dst, n.min(16));
+                blend16(p, src + 16, dst + 16, n.saturating_sub(16));
+            }
         }
         return Ok(());
     }
@@ -1723,7 +1840,11 @@ fn copy(window: Win<'_>, sp: u64, len: u32, dist: u64, size_end: u64) -> Result<
                 i += 16;
             }
             if i < n {
-                blend16(p, src + i, dst + i, n - i);
+                if SPILLS {
+                    word16(p.add(src + i), p.add(dst + i));
+                } else {
+                    blend16(p, src + i, dst + i, n - i);
+                }
             }
         }
         return Ok(());
