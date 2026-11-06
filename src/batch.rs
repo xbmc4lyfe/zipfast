@@ -448,13 +448,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_file_on_apfs_is_pushed_to_the_disk_as_it_is_copied() {
-        // the temporary folder is on APFS on any macOS this builds for, so a big stored copy there flushes on the way
+    fn only_apfs_is_taken_to_hold_writes_until_close() {
+        // the system volume is APFS on any macOS this builds for; /dev is never
+        assert!(defers_to_close(&File::open("/").unwrap()));
+        assert!(!defers_to_close(&File::open("/dev").unwrap()));
+    }
+
+    #[test]
+    fn a_copy_is_pushed_to_the_disk_every_so_often() {
         let path = std::env::temp_dir().join(format!("zipfast-flush-{}", std::process::id()));
         let file = File::create(&path).unwrap();
-        assert!(defers_to_close(&file));
         let f = Flusher::new(&file);
-        f.wrote(FLUSH_EVERY + 1);
+        f.wrote(FLUSH_EVERY - 1);
+        assert_eq!(f.due.load(Ordering::Relaxed), FLUSH_EVERY);
+        f.wrote(2);
         assert_eq!(f.due.load(Ordering::Relaxed), 2 * FLUSH_EVERY + 1);
         assert!(!f.busy.load(Ordering::Relaxed));
         drop(file);
