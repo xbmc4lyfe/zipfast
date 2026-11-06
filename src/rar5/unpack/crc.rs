@@ -23,7 +23,7 @@ enum Bytes {
 unsafe impl Send for Bytes {}
 
 impl Bytes {
-    fn hash(&self, h: &mut crc32fast::Hasher) {
+    fn hash(&self, h: &mut crate::crc32::Hasher) {
         match self {
             // SAFETY: the bytes are in the window and stay as they are until the stretch is hashed
             Bytes::Window(p, n) => h.update(unsafe { std::slice::from_raw_parts(*p, *n) }),
@@ -41,7 +41,7 @@ struct Stretch {
 #[derive(Default)]
 struct Chain {
     /// the file's hasher, unless a thread is hashing a stretch into it
-    hasher: Option<crc32fast::Hasher>,
+    hasher: Option<crate::crc32::Hasher>,
     /// stretches not yet hashed, oldest first
     waiting: VecDeque<Stretch>,
     /// where the stretch being hashed starts, while one is
@@ -126,7 +126,7 @@ pub(super) enum Helper {
 /// The current file's CRC32, from its output as it leaves the window.
 pub(super) struct FileCrc {
     /// the file's hasher, while none of its stretches are with the helper
-    here: Option<crc32fast::Hasher>,
+    here: Option<crate::crc32::Hasher>,
     /// what this shares with the helper, once there is one
     shared: Option<Arc<Shared>>,
     pub helper: Helper,
@@ -138,7 +138,7 @@ impl FileCrc {
     /// With a helper thread if `threaded`, otherwise hashing everything as it is given.
     pub fn with_helper(threaded: bool) -> Self {
         let helper = if threaded { Helper::Thread } else { Helper::Off };
-        FileCrc { here: Some(crc32fast::Hasher::new()), shared: None, helper, handed_over: 0 }
+        FileCrc { here: Some(crate::crc32::Hasher::new()), shared: None, helper, handed_over: 0 }
     }
 
     /// Whether stretches of the file are with the helper.
@@ -224,7 +224,7 @@ impl FileCrc {
     /// The CRC32 of all the file's bytes given since it began; the next file starts afresh.
     pub fn finish(&mut self) -> u32 {
         self.clear_before(u64::MAX, 0);
-        self.here.replace(crc32fast::Hasher::new()).expect("everything hashed").finalize()
+        self.here.replace(crate::crc32::Hasher::new()).expect("everything hashed").finalize()
     }
 
     /// Forgets the file's bytes once the helper is done with any of them: the window may then be written anywhere.
@@ -243,7 +243,7 @@ impl FileCrc {
             }
             chain.hasher = None;
         }
-        self.here = Some(crc32fast::Hasher::new());
+        self.here = Some(crate::crc32::Hasher::new());
     }
 
     /// Starts the helper, unless there is one or it can't be started. [`Helper::Held`] starts no thread: stretches
