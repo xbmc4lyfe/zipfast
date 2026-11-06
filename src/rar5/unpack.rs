@@ -1696,19 +1696,31 @@ unsafe fn blend16(w: *mut u8, src: usize, dst: usize, k: usize) {
         let pick = vld1q_u8(FIRST.as_ptr().add(16 - k));
         vst1q_u8(w.add(dst), vbslq_u8(pick, vld1q_u8(w.add(src)), vld1q_u8(w.add(dst))));
     }
-    #[cfg(not(target_arch = "aarch64"))]
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: as the caller promises; the 16 bytes at `16 - k` are inside `FIRST`. SSE2 is part of x86-64.
+    unsafe {
+        use std::arch::x86_64::*;
+        let pick = _mm_loadu_si128(FIRST.as_ptr().add(16 - k).cast());
+        let (s, d) = (_mm_loadu_si128(w.add(src).cast()), _mm_loadu_si128(w.add(dst).cast()));
+        #[cfg(target_feature = "sse4.1")]
+        let out = _mm_blendv_epi8(d, s, pick);
+        #[cfg(not(target_feature = "sse4.1"))]
+        let out = _mm_or_si128(_mm_and_si128(pick, s), _mm_andnot_si128(pick, d));
+        _mm_storeu_si128(w.add(dst).cast(), out);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     // SAFETY: as the caller promises
     unsafe {
         blend16_words(w, src, dst, k)
     }
 }
 
-/// [`blend16`] with plain 128-bit words, where there is no NEON.
+/// [`blend16`] with plain 128-bit words, where there is neither NEON nor SSE.
 ///
 /// # Safety
 ///
 /// As for [`blend16`].
-#[cfg(any(test, not(target_arch = "aarch64")))]
+#[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "x86_64"))))]
 #[inline(always)]
 unsafe fn blend16_words(w: *mut u8, src: usize, dst: usize, k: usize) {
     // SAFETY: as the caller promises
