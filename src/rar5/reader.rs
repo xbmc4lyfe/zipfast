@@ -1,7 +1,9 @@
 //! Walks one RAR 5.0 volume block by block.
 
 use std::fs::File;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 
 use crate::batch::read_at;
@@ -31,6 +33,41 @@ const AHEAD: usize = 2;
 /// A move forward by up to this much past what is read reads on through; a longer one starts again at the place.
 const SKIP_MAX: u64 = 2 * READ as u64;
 
+/// A piece of a volume as it was read, shared with whatever keeps its bytes without copying them (the decoder's
+/// workers). Once the last reference goes, the buffer goes back to the thread reading ahead, if it came from one, to
+/// be filled again.
+pub struct Piece {
+    bytes: Vec<u8>,
+    home: Option<Sender<Vec<u8>>>,
+}
+
+impl Piece {
+    fn new(bytes: Vec<u8>, home: Option<Sender<Vec<u8>>>) -> Arc<Piece> {
+        Arc::new(Piece { bytes, home })
+    }
+
+    /// `bytes` as a piece of their own.
+    #[cfg(test)]
+    pub fn of(bytes: Vec<u8>) -> Arc<Piece> {
+        Piece::new(bytes, None)
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for Piece {
+    fn drop(&mut self) {
+        if let Some(home) = self.home.take()
+            && self.bytes.capacity() > 0
+        {
+            // the thread may have stopped; the buffer is freed then
+            let _ = home.send(std::mem::take(&mut self.bytes));
+        }
+    }
+}
+
 /// A volume read in pieces of [`READ`] bytes. Read straight through, the pieces come from a thread of its own
 /// that keeps [`AHEAD`] of them ready, so the reading is off the caller's thread. All reads are by position, so
 /// nothing depends on where the file stands.
@@ -38,7 +75,7 @@ struct Source {
     file: File,
     len: u64,
     /// the piece in use, which starts at `at` in the file; `off` of it is used up
-    piece: Vec<u8>,
+    piece: Arc<Piece>,
     at: u64,
     off: usize,
     /// set while pieces are read in order, so the next one can come from the thread
@@ -82,12 +119,27 @@ fn read_ahead(file: &File, mut at: u64, len: u64, send: &SyncSender<Result<Vec<u
 
 impl Source {
     fn new(file: File, len: u64) -> Source {
-        Source { file, len, piece: Vec::new(), at: 0, off: 0, sequential: false, ahead: None }
+        Source { file, len, piece: Piece::new(Vec::new(), None), at: 0, off: 0, sequential: false, ahead: None }
     }
 
     /// What is left of the piece in use.
     fn held(&self) -> &[u8] {
-        &self.piece[self.off..]
+        &self.piece.bytes[self.off..]
+    }
+
+    /// The piece in use, and where what is left of it starts.
+    fn held_shared(&self) -> (&Arc<Piece>, usize) {
+        (&self.piece, self.off)
+    }
+
+    /// Lets go of the piece in use: its buffer goes back to the thread, or is kept to read into next when nothing
+    /// else holds it.
+    fn release(&mut self) -> Vec<u8> {
+        let used = std::mem::replace(&mut self.piece, Piece::new(Vec::new(), None));
+        match Arc::try_unwrap(used) {
+            Ok(mut piece) if piece.home.is_none() => std::mem::take(&mut piece.bytes),
+            _ => Vec::new(),
+        }
     }
 
     fn consume(&mut self, n: usize) {
@@ -96,32 +148,32 @@ impl Source {
 
     /// Moves to `at`.
     fn seek(&mut self, at: u64) {
-        let end = self.at + self.piece.len() as u64;
+        let end = self.at + self.piece.bytes.len() as u64;
         if (self.at..=end).contains(&at) {
             self.off = (at - self.at) as usize;
         } else if at > end && at - end <= SKIP_MAX {
             // close ahead: read on to it, so a run of small blocks keeps its pieces coming
             self.at = end;
-            self.piece.clear();
+            let _ = self.release();
             self.off = (at - end) as usize;
         } else {
             self.ahead = None;
             self.sequential = false;
             self.at = at;
-            self.piece.clear();
+            let _ = self.release();
             self.off = 0;
         }
     }
 
     /// Makes sure the piece in use has bytes left, unless the file ends. False at the end of the file.
     fn fill(&mut self) -> Result<bool> {
-        while self.off >= self.piece.len() {
-            let skip = self.off - self.piece.len();
-            let from = self.at + self.piece.len() as u64;
+        while self.off >= self.piece.bytes.len() {
+            let skip = self.off - self.piece.bytes.len();
+            let from = self.at + self.piece.bytes.len() as u64;
             if from >= self.len {
                 return Ok(false);
             }
-            let used = std::mem::take(&mut self.piece);
+            let used = self.release();
             if self.ahead.as_ref().is_some_and(|a| a.next != from) {
                 self.ahead = None;
             }
@@ -134,9 +186,10 @@ impl Source {
                         // the thread fills it again rather than making a new one
                         let _ = a.spare.send(used);
                     }
-                    let piece = a.pieces.recv().map_err(|_| Error::Truncated)??;
-                    a.next += piece.len() as u64;
-                    piece
+                    let bytes = a.pieces.recv().map_err(|_| Error::Truncated)??;
+                    a.next += bytes.len() as u64;
+                    // back to the thread once nothing holds it
+                    Piece::new(bytes, Some(a.spare.clone()))
                 }
                 None => {
                     // the first piece after a move is read here; read on past it, and the thread takes over
@@ -144,7 +197,7 @@ impl Source {
                     buf.resize((self.len - from).min(READ as u64) as usize, 0);
                     read_at(&self.file, &mut buf, from)?;
                     self.sequential = true;
-                    buf
+                    Piece::new(buf, None)
                 }
             };
             self.at = from;
@@ -386,6 +439,16 @@ impl Volume {
 
     /// Reads `len` bytes of a data area starting at `at`, in pieces, calling `sink` on each.
     pub fn read_data(&mut self, at: u64, len: u64, mut sink: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        self.read_data_shared(at, len, |piece, range| sink(&piece.bytes()[range]))
+    }
+
+    /// [`Self::read_data`], handing `sink` each stretch as a range of the piece it lies in, which it may keep.
+    pub fn read_data_shared(
+        &mut self,
+        at: u64,
+        len: u64,
+        mut sink: impl FnMut(&Arc<Piece>, Range<usize>) -> Result<()>,
+    ) -> Result<()> {
         if at.checked_add(len).is_none_or(|end| end > self.len) {
             return Err(Error::Truncated);
         }
@@ -395,9 +458,9 @@ impl Volume {
             if !self.src.fill()? {
                 return Err(Error::Truncated);
             }
-            let held = self.src.held();
-            let n = (held.len() as u64).min(left) as usize;
-            let result = sink(&held[..n]);
+            let (piece, off) = self.src.held_shared();
+            let n = ((piece.bytes.len() - off) as u64).min(left) as usize;
+            let result = sink(piece, off..off + n);
             self.src.consume(n);
             result?;
             left -= n as u64;
