@@ -23,6 +23,9 @@ pub(crate) const JOB_MAX: u64 = 16 << 20;
 pub(crate) const STORED_PARALLEL_MIN: u64 = 64 << 20;
 /// The piece of stored data one thread checks and copies at a time.
 const PIECE: u64 = 1 << 20;
+/// Threads stored data is copied on at most. The copy waits on memory, not on the processor: past this many threads
+/// it goes no faster, and the extra ones only spend time in the kernel contending for the same pages.
+const STORED_THREADS: usize = 6;
 /// Bytes of files read ahead of the workers. Enough that the main thread gets well ahead of them: a file too big to
 /// hand them, which it decodes itself, then overlaps with theirs instead of being left to the end.
 const BYTES_IN_FLIGHT: usize = 256 << 20;
@@ -292,7 +295,7 @@ fn decode(
 }
 
 /// Checks (and, given `out`, copies to `out` from `out_at` on) `len` stored bytes at `at` in the open `volume`, on
-/// `threads` threads. Returns the CRC32 of the bytes.
+/// `threads` threads (no more than [`STORED_THREADS`]). Returns the CRC32 of the bytes.
 pub(crate) fn stored(
     volume: &File,
     at: u64,
@@ -308,7 +311,7 @@ pub(crate) fn stored(
     let first_error: Mutex<Option<Error>> = Mutex::new(None);
     let flusher = out.filter(|f| defers_to_close(f)).map(Flusher::new);
     thread::scope(|s| {
-        for _ in 0..threads.min(pieces).max(1) {
+        for _ in 0..threads.min(STORED_THREADS).min(pieces).max(1) {
             s.spawn(|| {
                 let result = (|| -> Result<()> {
                     let mut buf = vec![0u8; PIECE as usize];
