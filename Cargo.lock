@@ -155,6 +155,7 @@ dependencies = [
  "bzip2",
  "crc32fast",
  "flate2",
+ "libc",
  "liblzma",
  "zstd",
 ]
