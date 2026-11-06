@@ -62,6 +62,14 @@ const HAND_OVER_MIN: usize = 64 << 10;
 const STAGE: usize = 1024;
 /// Bits of a code looked up in one step; longer codes take the slow path.
 const LUT_BITS: u32 = 11;
+/// Codes [`Huff::run8`] reads in one round, and the bits from where a round starts to the end of the last byte it
+/// reads: a round's codes and one more byte.
+#[cfg(target_arch = "aarch64")]
+const RUN8_ROUND: usize = 16;
+#[cfg(target_arch = "x86_64")]
+const RUN8_ROUND: usize = 32;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const RUN8_REACH: usize = 8 * RUN8_ROUND + 8;
 
 fn corrupt(what: &'static str) -> Error {
     Error::Corrupt(what)
@@ -331,10 +339,10 @@ impl Huff {
         (lits, n)
     }
 
-    /// Literals of length 8, sixteen at a time. Within a run of such codes the bit offset in each byte stays the
-    /// same, so the next sixteen codes are the payload's bytes shifted by it; each is checked against the range of
-    /// literal codes and looked up in [`Huff::lit8`] in one go. Stops before the first code that isn't one, or when
-    /// the bits come within 136 of `end_bits` or fewer than sixteen of `room` are left. Returns how many.
+    /// Literals of length 8, [`RUN8_ROUND`] at a time. Within a run of such codes the bit offset in each byte stays
+    /// the same, so the next codes are the payload's bytes shifted by it; each is checked against the range of literal
+    /// codes and looked up in [`Huff::lit8`] in one go. Stops before the first code that isn't one, or when the bits
+    /// come within [`RUN8_REACH`] of `end_bits` or fewer than a round of `room` is left. Returns how many.
     #[cfg(target_arch = "aarch64")]
     #[inline(always)]
     fn run8(&self, bits: &mut Bits<'_>, end_bits: usize, out: &mut [u8], room: usize) -> usize {
@@ -343,7 +351,7 @@ impl Huff {
         let start = bits.pos();
         let mut pos = start;
         let mut k = 0;
-        if self.common != 8 || pos + 136 > end_bits || room < 16 {
+        if self.common != 8 || pos + RUN8_REACH > end_bits || room < RUN8_ROUND {
             return 0;
         }
         // SAFETY: round r reads 17 bytes from byte `pos / 8 + 16 r`, all before byte `end_bits / 8`, which the
@@ -359,7 +367,7 @@ impl Huff {
             let from = bits.buf.as_ptr().add(pos / 8);
             // rounds go at fixed places, as if every code so far was a literal: nothing a round needs waits on the
             // round before, and the first that finds another code ends the run
-            let rounds = ((end_bits - pos - 136) / 128 + 1).min(room / 16);
+            let rounds = ((end_bits - pos - RUN8_REACH) / (8 * RUN8_ROUND) + 1).min(room / RUN8_ROUND);
             for r in 0..rounds {
                 let at = from.add(16 * r);
                 let codes = vorrq_u8(vshlq_u8(vld1q_u8(at), left), vshlq_u8(vld1q_u8(at.add(1)), right));
@@ -389,6 +397,85 @@ impl Huff {
         k
     }
 
+    /// [`Huff::run8`] on x86-64: with AVX2, when the processor has it, 32 codes a round; without, none.
+    #[cfg(target_arch = "x86_64")]
+    #[inline(always)]
+    fn run8(&self, bits: &mut Bits<'_>, end_bits: usize, out: &mut [u8], room: usize) -> usize {
+        if !std::arch::is_x86_feature_detected!("avx2") {
+            return 0;
+        }
+        // SAFETY: the processor has AVX2
+        unsafe { self.run8_avx2(bits, end_bits, out, room) }
+    }
+
+    /// The rounds of [`Huff::run8`] with AVX2. There are no shifts of single bytes, so the codes come from 16-bit
+    /// shifts with the bits from the neighbouring byte masked off; and no lookup in 256 bytes, so the table goes in
+    /// sixteen pieces of sixteen, and each code takes its literal from the piece its high four bits name.
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    fn run8_avx2(&self, bits: &mut Bits<'_>, end_bits: usize, out: &mut [u8], room: usize) -> usize {
+        use std::arch::x86_64::*;
+        let room = room.min(out.len());
+        let start = bits.pos();
+        let mut pos = start;
+        let mut k = 0;
+        if self.common != 8 || pos + RUN8_REACH > end_bits || room < RUN8_ROUND {
+            return 0;
+        }
+        // SAFETY: round r reads 33 bytes from byte `pos / 8 + 32 r`, all before byte `end_bits / 8`, which the
+        // buffer holds, and writes 32 bytes at `32 r`, inside `room`, which `out` holds; the pieces of the table are
+        // inside its 256 bytes
+        unsafe {
+            let mut pieces = [_mm256_setzero_si256(); 16];
+            for (j, piece) in pieces.iter_mut().enumerate() {
+                // in both halves, since a byte shuffle stays within its half
+                *piece = _mm256_broadcastsi128_si256(_mm_loadu_si128(self.lit8.as_ptr().add(16 * j).cast()));
+            }
+            let first = _mm256_set1_epi8(self.first8 as i8);
+            let last = _mm256_set1_epi8((self.nlit8 - 1) as u8 as i8);
+            let shift = (pos & 7) as u32;
+            let (left, right) = (_mm_cvtsi32_si128(shift as i32), _mm_cvtsi32_si128(8 - shift as i32));
+            // each byte shifted left keeps its own high bits; the next byte, shifted right, gives the low ones
+            let own = _mm256_set1_epi8(((0xffu32 << shift) & 0xff) as u8 as i8);
+            let next = _mm256_set1_epi8((0xffu32 >> (8 - shift)) as u8 as i8);
+            let nibble = _mm256_set1_epi8(0x0f);
+            let from = bits.buf.as_ptr().add(pos / 8);
+            // rounds go at fixed places, as if every code so far was a literal: nothing a round needs waits on the
+            // round before, and the first that finds another code ends the run
+            let rounds = ((end_bits - pos - RUN8_REACH) / (8 * RUN8_ROUND) + 1).min(room / RUN8_ROUND);
+            for r in 0..rounds {
+                let at = from.add(RUN8_ROUND * r);
+                let a = _mm256_loadu_si256(at.cast());
+                let b = _mm256_loadu_si256(at.add(1).cast());
+                let codes = _mm256_or_si256(
+                    _mm256_and_si256(_mm256_sll_epi16(a, left), own),
+                    _mm256_and_si256(_mm256_srl_epi16(b, right), next),
+                );
+                let i = _mm256_sub_epi8(codes, first);
+                let low = _mm256_and_si256(i, nibble);
+                let high = _mm256_and_si256(_mm256_srli_epi16(i, 4), nibble);
+                let mut lits = _mm256_setzero_si256();
+                for (j, piece) in pieces.iter().enumerate() {
+                    let mine = _mm256_cmpeq_epi8(high, _mm256_set1_epi8(j as i8));
+                    lits = _mm256_or_si256(lits, _mm256_and_si256(_mm256_shuffle_epi8(*piece, low), mine));
+                }
+                _mm256_storeu_si256(out.as_mut_ptr().add(RUN8_ROUND * r).cast(), lits);
+                // a bit per code, set while it is a literal's: i no more than the last, unsigned
+                let ok = _mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_min_epu8(i, last), i)) as u32;
+                if ok != u32::MAX {
+                    k = RUN8_ROUND * r + (!ok).trailing_zeros() as usize;
+                    break;
+                }
+                k = RUN8_ROUND * (r + 1);
+            }
+            pos += 8 * k;
+        }
+        if pos != start {
+            *bits = Bits::at(bits.buf, pos);
+        }
+        k
+    }
+
     /// Quick literals for as long as they keep coming, into `stage`, while the bits stay at least 128 short of
     /// `end_bits` and fewer than `room` are out. Returns how many.
     #[inline(always)]
@@ -399,7 +486,7 @@ impl Huff {
             return 0;
         }
         while k < room && bits.pos() + 128 <= end_bits {
-            #[cfg(target_arch = "aarch64")]
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
             {
                 k += self.run8(bits, end_bits, &mut stage[k..], room - k);
                 if k >= room || bits.pos() + 128 > end_bits {
