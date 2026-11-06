@@ -1083,9 +1083,9 @@ impl<R: FnMut(&str)> Run<'_, R> {
         let mut fed = false;
         let mut books = Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch };
         let queued = &mut self.queued;
-        let read = vol.read_data(h.data_at, h.packed_size, |chunk| {
+        let read = vol.read_data_shared(h.data_at, h.packed_size, |piece, range| {
             let Some(u) = stream.as_mut() else { return Err(Error::Corrupt("no decoder for a queued file")) };
-            let r = u.feed(chunk, &mut route(queued, &mut books));
+            let r = u.feed_shared(piece, range, &mut route(queued, &mut books));
             fed = r.is_err();
             r
         });
@@ -1210,7 +1210,8 @@ impl<R: FnMut(&str)> Run<'_, R> {
             return self.stored_parallel(vol, h, p);
         }
         let mut stream = if p.compressed { self.stream.take() } else { None };
-        let read = vol.read_data(h.data_at, h.packed_size, |chunk| {
+        let read = vol.read_data_shared(h.data_at, h.packed_size, |piece, range| {
+            let chunk = &piece.bytes()[range.clone()];
             if split_after {
                 part.update(chunk);
                 if let Some(b) = part_blake.as_mut() {
@@ -1239,7 +1240,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
                 }
             } else {
                 match stream.as_mut() {
-                    Some(u) => u.feed(chunk, &mut p),
+                    Some(u) => u.feed_shared(piece, range, &mut p),
                     None => p.take(chunk),
                 }
             }

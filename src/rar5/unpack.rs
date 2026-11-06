@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 mod crc;
 mod parallel;
-use parallel::{Boundary, Done, Job, Packed, Part, Pool, Slot};
+use super::reader::Piece;
+use parallel::{Boundary, Done, Job, OWN, Packed, Part, Pool, Slot, block_bytes};
 
 /// Where decoded output goes.
 pub trait Sink {
@@ -709,6 +710,7 @@ impl Unpacker {
         let at = self.batch.buf.len();
         self.batch.parts.push(Part {
             at,
+            src: OWN,
             end_bits: 0,
             read_tables: false,
             slot: Arc::clone(&self.slot),
@@ -766,7 +768,14 @@ impl Unpacker {
     /// Hands a block to the workers. A worker reads its code lengths, builds the tables and reads its symbols; the
     /// tokens are applied to the window in order by [`Self::settle`]. Later blocks without tables of their own wait
     /// for the lengths, on the worker that has them.
-    fn submit(&mut self, buf: &[u8], payload: usize, flags: u8, sink: &mut dyn Sink) -> Result<()> {
+    fn submit(
+        &mut self,
+        buf: &[u8],
+        shared: Option<(&Arc<Piece>, usize)>,
+        payload: usize,
+        flags: u8,
+        sink: &mut dyn Sink,
+    ) -> Result<()> {
         let valid_bits = usize::from(flags & 7) + 1;
         let end_bits = if payload == 0 { 0 } else { (payload - 1) * 8 + valid_bits };
         let read_tables = flags & 0x80 != 0;
@@ -784,10 +793,18 @@ impl Unpacker {
             self.slot = Slot::pending();
             self.tables_ready = true;
         }
-        let at = self.batch.buf.len();
-        self.batch.buf.extend_from_slice(&buf[..payload + PAD]);
-        self.batch.parts.push(Part { at, end_bits, read_tables, slot: Arc::clone(&self.slot), boundary: None });
-        if self.batch.buf.len() >= JOB_BYTES {
+        // a block in a shared piece stays there; any other is copied in
+        let (src, at) = match shared {
+            Some((piece, at)) => (self.batch.share(piece), at),
+            None => {
+                let at = self.batch.buf.len();
+                self.batch.buf.extend_from_slice(&buf[..payload + PAD]);
+                (OWN, at)
+            }
+        };
+        self.batch.packed += payload + PAD;
+        self.batch.parts.push(Part { at, src, end_bits, read_tables, slot: Arc::clone(&self.slot), boundary: None });
+        if self.batch.packed >= JOB_BYTES {
             self.send_batch();
             self.settle(4 * self.threads as u64, sink)?;
         }
@@ -801,10 +818,9 @@ impl Unpacker {
         }
         let pool = self.pool.get_or_insert_with(|| Pool::new(self.threads));
         let mut job = std::mem::replace(&mut self.batch, self.spare.pop().unwrap_or_default());
-        self.batch.buf.clear();
-        self.batch.parts.clear();
+        self.batch.clear();
         job.seq = self.submitted;
-        self.queued += job.buf.len();
+        self.queued += job.packed;
         pool.submit(job);
         self.submitted += 1;
     }
@@ -821,8 +837,8 @@ impl Unpacker {
         loop {
             while let Some(done) = self.ready.remove(&self.applied) {
                 self.applied += 1;
-                let Done { job, result, tables } = done;
-                self.queued -= job.buf.len();
+                let Done { mut job, result, tables } = done;
+                self.queued -= job.packed;
                 if failed.is_none() {
                     let mut applied = self.apply_job(&job, sink).and(result);
                     // the worker stopped at its memory budget: the rest of the job is decoded here
@@ -835,6 +851,8 @@ impl Unpacker {
                         max = 0;
                     }
                 }
+                // the pieces it shares go back to be read into again
+                job.clear();
                 self.spare.push(job);
             }
             let in_flight = self.submitted - self.applied;
@@ -871,7 +889,7 @@ impl Unpacker {
                 self.end_file(b, sink)?;
                 continue;
             }
-            let buf = &job.buf[p.at..];
+            let buf = block_bytes(&job.buf, &job.shared, p);
             let mut bits = if i == part { Bits::at(buf, bit) } else { Bits::new(buf) };
             if i > part && p.read_tables {
                 let lens = read_lengths(&mut self.pre, &mut bits, p.end_bits)?;
@@ -903,8 +921,9 @@ impl Unpacker {
                 self.ready.insert(done.job.seq, done);
                 continue;
             }
-            if let Some(Done { job, .. }) = self.ready.remove(&self.applied) {
-                self.queued -= job.buf.len();
+            if let Some(Done { mut job, .. }) = self.ready.remove(&self.applied) {
+                self.queued -= job.packed;
+                job.clear();
                 self.spare.push(job);
             }
             self.applied += 1;
@@ -1025,7 +1044,29 @@ impl Unpacker {
 
     /// More of the file's packed bytes. Every block that is now complete is decoded and its output emitted. Blocks
     /// that arrive whole are decoded where they lie; only a block split across calls is gathered first.
-    pub fn feed(&mut self, mut data: &[u8], sink: &mut dyn Sink) -> Result<()> {
+    pub fn feed(&mut self, data: &[u8], sink: &mut dyn Sink) -> Result<()> {
+        self.feed_from(data, None, sink)
+    }
+
+    /// [`Self::feed`] with the bytes in `range` of `piece`. Blocks that lie whole in it, with their padding, go to the
+    /// workers as they lie, without being copied.
+    pub fn feed_shared(
+        &mut self,
+        piece: &Arc<Piece>,
+        range: std::ops::Range<usize>,
+        sink: &mut dyn Sink,
+    ) -> Result<()> {
+        let from = range.start;
+        self.feed_from(&piece.bytes()[range], Some((piece, from)), sink)
+    }
+
+    /// `data` is at `base` in `piece`, given one.
+    fn feed_from(
+        &mut self,
+        mut data: &[u8],
+        mut piece: Option<(&Arc<Piece>, usize)>,
+        sink: &mut dyn Sink,
+    ) -> Result<()> {
         // finish the block an earlier call left incomplete
         while !self.input.is_empty() {
             let flags = self.input[0];
@@ -1038,6 +1079,9 @@ impl Unpacker {
             let take = need.saturating_sub(self.input.len()).min(data.len());
             self.input.extend_from_slice(&data[..take]);
             data = &data[take..];
+            if let Some((_, base)) = piece.as_mut() {
+                *base += take;
+            }
             if self.input.len() < need {
                 return Ok(());
             }
@@ -1047,7 +1091,7 @@ impl Unpacker {
             {
                 let mut block = std::mem::take(&mut self.input);
                 block.resize(header_len + payload + PAD, 0);
-                let result = self.block(&block[header_len..], payload, flags, sink);
+                let result = self.block(&block[header_len..], None, payload, flags, sink);
                 block.clear();
                 self.input = block;
                 result?;
@@ -1065,13 +1109,14 @@ impl Unpacker {
             let end = start + payload;
             if data.len() >= end + PAD {
                 // the bytes after the block serve as its padding
-                self.block(&data[start..end + PAD], payload, flags, sink)?;
+                let shared = piece.map(|(piece, base)| (piece, base + start));
+                self.block(&data[start..end + PAD], shared, payload, flags, sink)?;
             } else {
                 let mut padded = std::mem::take(&mut self.padded);
                 padded.clear();
                 padded.extend_from_slice(&data[start..end]);
                 padded.resize(payload + PAD, 0);
-                let result = self.block(&padded, payload, flags, sink);
+                let result = self.block(&padded, None, payload, flags, sink);
                 self.padded = padded;
                 result?;
             }
@@ -1095,9 +1140,18 @@ impl Unpacker {
         self.check_end(sink)
     }
 
-    fn block(&mut self, buf: &[u8], payload: usize, flags: u8, sink: &mut dyn Sink) -> Result<()> {
+    /// A whole block, `buf` being its payload and padding; `shared` says where it lies in a piece the workers may
+    /// keep instead of a copy.
+    fn block(
+        &mut self,
+        buf: &[u8],
+        shared: Option<(&Arc<Piece>, usize)>,
+        payload: usize,
+        flags: u8,
+        sink: &mut dyn Sink,
+    ) -> Result<()> {
         if self.parallel {
-            return self.submit(buf, payload, flags, sink);
+            return self.submit(buf, shared, payload, flags, sink);
         }
         let valid_bits = usize::from(flags & 7) + 1;
         let end_bits = if payload == 0 { 0 } else { (payload - 1) * 8 + valid_bits };

@@ -3,17 +3,21 @@
 use super::*;
 use crate::rar5::testenc::*;
 
-/// Decodes on the calling thread and on workers, with and without the decoder working out the CRC32, and checks
-/// all give the same output or the same error.
+/// Decodes on the calling thread and on workers, with and without the decoder working out the CRC32, and fed as
+/// shared pieces, and checks all give the same output or the same error.
 fn decode(stream: &[u8], size: u64, window: u64, piece: usize) -> Result<Vec<u8>> {
-    let serial = decode_with(stream, size, window, piece, 0, Hash::Off);
-    for (threads, hash) in [(3, Hash::Off), (0, Hash::Here), (3, Hash::Helper)] {
-        let other = decode_with(stream, size, window, piece, threads, hash);
+    let serial = decode_with(stream, size, window, piece, 0, Hash::Off, false);
+    for (threads, hash, shared) in
+        [(3, Hash::Off, false), (0, Hash::Here, false), (3, Hash::Helper, false), (3, Hash::Off, true)]
+    {
+        let other = decode_with(stream, size, window, piece, threads, hash, shared);
         match (&serial, &other) {
-            (Ok(a), Ok(b)) => assert!(a == b, "{threads} workers, {hash:?}: different bytes"),
-            (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{threads} workers, {hash:?}: another error"),
+            (Ok(a), Ok(b)) => assert!(a == b, "{threads} workers, {hash:?}, shared {shared}: different bytes"),
+            (Err(a), Err(b)) => {
+                assert_eq!(a.to_string(), b.to_string(), "{threads} workers, {hash:?}, shared {shared}: another error")
+            }
             _ => panic!(
-                "serial {:?} vs {threads} workers, {hash:?}: {:?}",
+                "serial {:?} vs {threads} workers, {hash:?}, shared {shared}: {:?}",
                 serial.as_ref().map(|v| v.len()),
                 other.as_ref().map(|v| v.len())
             ),
@@ -86,14 +90,31 @@ impl Sink for Hashed {
     }
 }
 
-fn decode_with(stream: &[u8], size: u64, window: u64, piece: usize, threads: usize, hash: Hash) -> Result<Vec<u8>> {
+/// With `shared`, each piece is fed as a range of a [`Piece`] that has other bytes before and after it, as a
+/// volume's pieces have.
+fn decode_with(
+    stream: &[u8],
+    size: u64,
+    window: u64,
+    piece: usize,
+    threads: usize,
+    hash: Hash,
+    shared: bool,
+) -> Result<Vec<u8>> {
     let mut u = Unpacker::new(window)?;
     u.set_threads(threads, 0);
     hashing(&mut u, hash);
     u.reset(Some(size));
     let mut sink = Hashed::new(hash);
     for chunk in stream.chunks(piece.max(1)) {
-        u.feed(chunk, &mut sink)?;
+        if shared {
+            let mut bytes = vec![0xa5; 5];
+            bytes.extend_from_slice(chunk);
+            bytes.extend_from_slice(&[0x5a; 40]);
+            u.feed_shared(&Piece::of(bytes), 5..5 + chunk.len(), &mut sink)?;
+        } else {
+            u.feed(chunk, &mut sink)?;
+        }
     }
     u.finish(&mut sink)?;
     sink.put(&[])?;
@@ -616,7 +637,9 @@ fn eight_bit_codes_of_other_symbols_end_a_quick_run() {
     let stream = tuned_stream(&ops, 20_000);
     for threads in [0, 3] {
         for piece in [usize::MAX, 4_096] {
-            assert!(decode_with(&stream, data.len() as u64, 1 << 20, piece, threads, Hash::Off).unwrap() == data);
+            assert!(
+                decode_with(&stream, data.len() as u64, 1 << 20, piece, threads, Hash::Off, false).unwrap() == data
+            );
         }
     }
 }

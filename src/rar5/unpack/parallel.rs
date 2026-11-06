@@ -40,16 +40,22 @@ impl Slot {
     }
 }
 
-/// One block in a job: where it starts in the job's bytes, where its bits end, whether it starts with tables, and
-/// the slot for the lengths it is read with, which it fills itself when it has tables. A part with a boundary holds
-/// no block: it marks where one file of a solid stream ends and the next begins.
+/// One block in a job: where it starts in the job's own bytes or in a piece of the volume it shares, where its bits
+/// end, whether it starts with tables, and the slot for the lengths it is read with, which it fills itself when it
+/// has tables. A part with a boundary holds no block: it marks where one file of a solid stream ends and the next
+/// begins.
 pub(super) struct Part {
     pub at: usize,
+    /// [`OWN`], or which of the job's shared pieces the block lies in
+    pub src: u32,
     pub end_bits: usize,
     pub read_tables: bool,
     pub slot: Arc<Slot>,
     pub boundary: Option<Boundary>,
 }
+
+/// A part whose block is in the job's own bytes.
+pub(super) const OWN: u32 = u32::MAX;
 
 /// The end of one file of a solid stream and the start of the next.
 #[derive(Clone, Copy)]
@@ -65,7 +71,12 @@ pub(super) struct Boundary {
 #[derive(Default)]
 pub(super) struct Job {
     pub seq: u64,
+    /// blocks copied in, each with its padding
     pub buf: Vec<u8>,
+    /// pieces of the volume that blocks lie in whole, with their padding after them, kept rather than copied
+    pub shared: Vec<Arc<Piece>>,
+    /// packed bytes of all its blocks, padding included, wherever they lie
+    pub packed: usize,
     pub parts: Vec<Part>,
     pub toks: Vec<Packed>,
     /// the fields of the filter records among the tokens, which don't fit in one
@@ -73,6 +84,29 @@ pub(super) struct Job {
     pub lits: Vec<u8>,
     /// for each part the worker got to, where its tokens and literals end
     pub ends: Vec<(usize, usize)>,
+}
+
+impl Job {
+    /// Empty for reuse, letting go of the pieces it shares.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+        self.shared.clear();
+        self.packed = 0;
+        self.parts.clear();
+    }
+
+    /// Where the blocks after the gathered ones will be: `piece`, if they lie in it.
+    pub fn share(&mut self, piece: &Arc<Piece>) -> u32 {
+        if !self.shared.last().is_some_and(|p| Arc::ptr_eq(p, piece)) {
+            self.shared.push(Arc::clone(piece));
+        }
+        (self.shared.len() - 1) as u32
+    }
+}
+
+/// A part's block, from its start to the end of what holds it.
+pub(super) fn block_bytes<'a>(buf: &'a [u8], shared: &'a [Arc<Piece>], p: &Part) -> &'a [u8] {
+    if p.src == OWN { &buf[p.at..] } else { &shared[p.src as usize].bytes()[p.at..] }
 }
 
 /// A worker's output for a job: every token read before the end of its blocks, the first error, or the memory
@@ -217,7 +251,7 @@ fn work(
     job.filters.clear();
     job.lits.clear();
     job.ends.clear();
-    let budget = job.buf.len() * BUDGET + SLACK;
+    let budget = job.packed * BUDGET + SLACK;
     let mut result = Ok(None);
     let mut last = None;
     for (i, p) in job.parts.iter().enumerate() {
@@ -227,7 +261,7 @@ fn work(
             }
             continue;
         }
-        let mut bits = Bits::new(&job.buf[p.at..]);
+        let mut bits = Bits::new(block_bytes(&job.buf, &job.shared, p));
         if !matches!(result, Ok(None)) {
             if p.read_tables {
                 // after the budget stopped it the lengths are still good; after an error they no longer matter
@@ -265,8 +299,8 @@ fn work(
         };
         let start = bits.pos();
         let out = (&mut job.toks, &mut job.filters, &mut job.lits);
-        result =
-            tokenize(&job.buf[p.at..], start, p.end_bits, &tables, out, budget).map(|stop| stop.map(|bit| (i, bit)));
+        result = tokenize(block_bytes(&job.buf, &job.shared, p), start, p.end_bits, &tables, out, budget)
+            .map(|stop| stop.map(|bit| (i, bit)));
         job.ends.push((job.toks.len(), job.lits.len()));
         last = Some(tables);
     }
