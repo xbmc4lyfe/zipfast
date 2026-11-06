@@ -840,9 +840,14 @@ fn a_queued_files_trouble_is_its_own_and_stops_the_files_after_it() {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 #[test]
-fn sixteen_literals_at_a_time_match_one_at_a_time() {
+fn rounds_of_8_bit_literals_match_one_at_a_time() {
+    #[cfg(target_arch = "x86_64")]
+    if !std::arch::is_x86_feature_detected!("avx2") {
+        // no rounds without it
+        return;
+    }
     // a block whose literals nearly all have 8-bit codes, with codes of other lengths among them
     let ops = mostly_noise(60_000, 21);
     let data = model(&ops);
@@ -869,11 +874,15 @@ fn sixteen_literals_at_a_time_match_one_at_a_time() {
     let starts = (1000..1400).chain(end_bits - 600..end_bits);
     let mut total = 0;
     for start in starts {
-        for room in [0, 15, 16, 17, 40, 300, STAGE] {
-            // one code at a time: as many literals as come in a row, in whole rounds of 16 that fit
-            let rounds = if start + 136 <= end_bits { ((end_bits - start - 136) / 128 + 1).min(room / 16) } else { 0 };
+        for room in [0, 15, 16, 17, 31, 32, 33, 40, 300, STAGE] {
+            // one code at a time: as many literals as come in a row, in whole rounds that fit
+            let rounds = if start + RUN8_REACH <= end_bits {
+                ((end_bits - start - RUN8_REACH) / (8 * RUN8_ROUND) + 1).min(room / RUN8_ROUND)
+            } else {
+                0
+            };
             let mut want = Vec::new();
-            while want.len() < 16 * rounds {
+            while want.len() < RUN8_ROUND * rounds {
                 let i = code(start + 8 * want.len()).wrapping_sub(main.first8);
                 if u16::from(i) >= main.nlit8 {
                     break;
