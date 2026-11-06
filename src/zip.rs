@@ -223,7 +223,7 @@ impl Archive {
     ) -> Result<()> {
         let at = self.data_at(e)?;
         self.file.seek(SeekFrom::Start(at))?;
-        let mut crc = crc32fast::Hasher::new();
+        let mut crc = crate::crc32::Hasher::new();
         let mut size = 0u64;
         let mut emit = |chunk: &[u8]| -> Result<()> {
             size += chunk.len() as u64;
@@ -521,7 +521,7 @@ fn parse_central(cd: &[u8], at: usize) -> Result<(ZipEntry, usize)> {
                 e.nanos = 0;
             }
             // Info-ZIP Unicode path: used when it was made from the very name stored here
-            0x7075 if body.len() >= 5 && body[0] == 1 && le32(body, 1) == crc32fast::hash(raw_name) => {
+            0x7075 if body.len() >= 5 && body[0] == 1 && le32(body, 1) == crate::crc32::hash(raw_name) => {
                 e.name = String::from_utf8_lossy(&body[5..]).into_owned();
             }
             _ => {}

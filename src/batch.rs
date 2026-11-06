@@ -217,7 +217,7 @@ fn stopped() -> Error {
 
 fn run(job: Job, unpacker: &mut Option<Unpacker>) -> Done {
     let Job { name, packed, method, dictionary, size, crc32, blake2sp, out, meta } = job;
-    let mut hasher = crc32fast::Hasher::new();
+    let mut hasher = crate::crc32::Hasher::new();
     let mut blake = blake2sp.map(|_| Blake2sp::new());
     let (mut out, path) = match out {
         Some(place) => match create_target(&place, Some(size)) {
@@ -300,9 +300,9 @@ pub(crate) fn stored(
     out: Option<&File>,
     out_at: u64,
     threads: usize,
-) -> Result<crc32fast::Hasher> {
+) -> Result<crate::crc32::Hasher> {
     let pieces = len.div_ceil(PIECE) as usize;
-    let crcs: Vec<Mutex<Option<crc32fast::Hasher>>> = (0..pieces).map(|_| Mutex::new(None)).collect();
+    let crcs: Vec<Mutex<Option<crate::crc32::Hasher>>> = (0..pieces).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let first_error: Mutex<Option<Error>> = Mutex::new(None);
@@ -323,7 +323,7 @@ pub(crate) fn stored(
                         let off = i as u64 * PIECE;
                         let n = PIECE.min(len - off) as usize;
                         read_at(volume, &mut buf[..n], at + off)?;
-                        let mut h = crc32fast::Hasher::new();
+                        let mut h = crate::crc32::Hasher::new();
                         h.update(&buf[..n]);
                         if let Some(out) = out {
                             write_at(out, &buf[..n], out_at + off)?;
@@ -344,7 +344,7 @@ pub(crate) fn stored(
     if let Some(e) = first_error.into_inner().unwrap() {
         return Err(e);
     }
-    let mut total = crc32fast::Hasher::new();
+    let mut total = crate::crc32::Hasher::new();
     for c in crcs {
         total.combine(&c.into_inner().unwrap().expect("every piece was done"));
     }

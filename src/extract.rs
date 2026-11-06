@@ -346,7 +346,7 @@ struct Pending {
     name: String,
     out: Option<Output>,
     path: Option<PathBuf>,
-    hasher: crc32fast::Hasher,
+    hasher: crate::crc32::Hasher,
     /// the decoder works out the CRC32 instead, and hands it over as `crc`: it does so for every compressed file
     /// whose bytes aren't gathered for a worker
     decoder_crc: bool,
@@ -378,7 +378,7 @@ impl Pending {
             name: h.name.clone(),
             out: out.map(|f| Output::new(f, size)),
             path,
-            hasher: crc32fast::Hasher::new(),
+            hasher: crate::crc32::Hasher::new(),
             decoder_crc: h.method != 0 && !h.encrypted,
             crc: None,
             blake: h.blake2sp.map(|_| Blake2sp::new()),
@@ -1198,7 +1198,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
             return Ok(());
         }
         // a part's checksums cover only its own packed bytes
-        let mut part = crc32fast::Hasher::new();
+        let mut part = crate::crc32::Hasher::new();
         let mut part_blake = h.blake2sp.filter(|_| split_after).map(|_| Blake2sp::new());
         if !p.compressed
             && !p.encrypted

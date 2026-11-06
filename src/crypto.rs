@@ -674,7 +674,7 @@ pub fn decrypt_rar5_header(data: &[u8], pos: usize, key: &[u8; 32]) -> Option<(V
     let dec = decrypt_cbc(key, &iv, ct)?;
     let stored_crc = u32::from_le_bytes(dec.get(..4)?.try_into().ok()?);
     let crc_slice = dec.get(4..plain_need)?;
-    if crc32fast::hash(crc_slice) != stored_crc {
+    if crate::crc32::hash(crc_slice) != stored_crc {
         return None;
     }
     Some((dec, ct_end))
@@ -829,7 +829,7 @@ pub fn decrypt_rar4_header(data: &[u8], pos: usize, key: &[u8; 16], iv: &[u8; 16
     let ct = data.get(pos..ct_end)?;
     let dec = decrypt_cbc(key, iv, ct)?;
     let stored_crc = u16::from_le_bytes(dec.get(0..2)?.try_into().ok()?);
-    let calc_crc = (crc32fast::hash(dec.get(2..head_size)?) & 0xffff) as u16;
+    let calc_crc = (crate::crc32::hash(dec.get(2..head_size)?) & 0xffff) as u16;
     if stored_crc != calc_crc {
         return None;
     }
@@ -867,7 +867,7 @@ impl Rar4HeaderCheck {
         }
         if head_size <= 16 {
             let stored_crc = u16::from_le_bytes([dec[0], dec[1]]);
-            let calc_crc = (crc32fast::hash(&dec[2..head_size]) & 0xffff) as u16;
+            let calc_crc = (crate::crc32::hash(&dec[2..head_size]) & 0xffff) as u16;
             return stored_crc == calc_crc;
         }
         true

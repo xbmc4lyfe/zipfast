@@ -306,7 +306,7 @@ impl Volume {
                 }
                 let dec = crate::crypto::decrypt_cbc(&key, &iv, &ct).ok_or(Error::Encrypted)?;
                 let stored_crc = u32::from_le_bytes(dec[..4].try_into().unwrap());
-                if crc32fast::hash(&dec[4..plain_need]) != stored_crc {
+                if crate::crc32::hash(&dec[4..plain_need]) != stored_crc {
                     return Err(Error::Encrypted);
                 }
                 (dec[4 + size_len..plain_need].to_vec(), header_end)
@@ -338,7 +338,7 @@ impl Volume {
                 }
                 let mut body = vec![0u8; size as usize];
                 self.read_exact(&mut body)?;
-                let mut hasher = crc32fast::Hasher::new();
+                let mut hasher = crate::crc32::Hasher::new();
                 hasher.update(&size_field);
                 hasher.update(&body);
                 if hasher.finalize() != stored_crc {
