@@ -32,6 +32,22 @@ threads (default: one per core).
 
 Exit status: 0 all good, 1 some files failed, 2 the archive couldn't be read.
 
+## Builds tuned for a processor
+
+A plain `cargo build --release` runs on any x86-64 or Apple silicon processor, and picks AVX2 at run time where
+that pays. `scripts/build-tuned.sh` builds variants tuned for newer processors into `dist/`:
+
+| Build | For |
+|---|---|
+| `zipfast-x86_64-v3` | x86-64-v3: AVX2, BMI2, FMA (Intel Haswell, AMD Zen 1 and later) |
+| `zipfast-x86_64-v4` | x86-64-v4: AVX-512 (Intel Skylake-X and Ice Lake, AMD Zen 4 and later) |
+| `zipfast-apple-m4` | Apple M4 and later |
+| `zipfast-apple-m5` | Apple M5 and later |
+
+The x86 builds are made on an x86-64 machine and the Apple ones on an Apple silicon Mac; `scripts/build-tuned.sh v3`
+makes just one. A tuned build uses its processor's instructions everywhere, the Rust runtime included, so on a
+processor that lacks them it stops on an illegal instruction.
+
 ## Sources
 
 ZIP follows PKWARE's published APPNOTE. tar follows the POSIX ustar and pax interchange formats and GNU tar's
