@@ -338,7 +338,8 @@ pub(super) fn tokenize(
         let sym;
         if bits.pos() + 128 <= end_bits {
             // three codes of at most 15 bits fit in one refill
-            bits.refill();
+            // SAFETY: 128 bits before the block's end, and a block's bytes go on for PAD past it
+            unsafe { bits.refill_inside() };
             let k = if t.main.common == 0 { 0 } else { t.main.quick_run(&mut bits, end_bits, &mut stage, STAGE) };
             if k > 0 {
                 lits.extend_from_slice(&stage[..k]);
@@ -367,6 +368,8 @@ pub(super) fn tokenize(
                     }
                 }
             }
+            // SAFETY: as above: at most 45 bits have gone since the check, well inside PAD's 256
+            unsafe { bits.refill_inside() };
         } else {
             if bits.pos() >= end_bits {
                 break Ok(None);
@@ -379,12 +382,12 @@ pub(super) fn tokenize(
                 continue;
             }
             sym = s;
+            bits.refill();
         }
         if run > 0 {
             toks.push(Packed::lits(run));
             run = 0;
         }
-        bits.refill();
         match read_op(sym, &mut bits, t) {
             Ok(tok) => toks.push(Packed::new(tok, filters)),
             Err(e) => break Err(e),

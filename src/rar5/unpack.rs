@@ -115,6 +115,21 @@ impl<'a> Bits<'a> {
         self.cnt |= 56;
     }
 
+    /// [`Self::refill`] without the bounds check, for a caller that knows at least eight bytes follow `next`.
+    ///
+    /// # Safety
+    ///
+    /// `next + 8` must not pass the end of `buf`.
+    #[inline(always)]
+    unsafe fn refill_inside(&mut self) {
+        debug_assert!(self.next + 8 <= self.buf.len());
+        // SAFETY: as the caller promises
+        let bytes = unsafe { self.buf.as_ptr().add(self.next).cast::<[u8; 8]>().read_unaligned() };
+        self.acc |= u64::from_be_bytes(bytes) >> self.cnt;
+        self.next += ((63 - self.cnt) >> 3) as usize;
+        self.cnt |= 56;
+    }
+
     /// Bits read so far.
     #[inline(always)]
     fn pos(&self) -> usize {
@@ -493,7 +508,9 @@ impl Huff {
                     break;
                 }
             }
-            bits.refill();
+            // SAFETY: 128 bits before the block's end (checked by the loop, and again after the rounds), and a
+            // block's bytes go on for PAD past it
+            unsafe { bits.refill_inside() };
             let (lits, n) = self.quick(bits);
             stage[k..k + 8].copy_from_slice(&lits);
             k += n;
@@ -1357,7 +1374,8 @@ impl Unpacker {
                     sp += k as u64;
                     continue;
                 }
-                bits.refill();
+                // SAFETY: 128 bits before the block's end, and a block's bytes go on for PAD past it
+                unsafe { bits.refill_inside() };
                 // well inside the block and the output limits: a refill holds at least 56 bits and a code is at
                 // most 15, so up to three literals go without another refill or any limit check
                 let s1 = decode!(main);
@@ -1379,6 +1397,8 @@ impl Unpacker {
                         }
                     }
                 }
+                // SAFETY: as above: at most 45 bits have gone since the check, well inside PAD's 256
+                unsafe { bits.refill_inside() };
             } else {
                 if bits.pos() >= end_bits || sp >= stop {
                     break Ok(());
@@ -1393,8 +1413,8 @@ impl Unpacker {
                     continue;
                 }
                 sym = s;
+                bits.refill();
             }
-            bits.refill();
             let tok = match read_op(sym, bits, t) {
                 Ok(tok) => tok,
                 Err(e) => break Err(e),
