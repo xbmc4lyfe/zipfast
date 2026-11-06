@@ -5,7 +5,7 @@
 
 use std::time::Instant;
 use zipfast::rar5::testenc::{lz, tuned_stream};
-use zipfast::rar5::unpack::Unpacker;
+use zipfast::rar5::unpack::{Unpacker, Window};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -28,7 +28,7 @@ fn main() {
     };
     let mut best = f64::MAX;
     for _ in 0..runs {
-        let mut u = Unpacker::new(1 << wlog).unwrap();
+        let mut u = Unpacker::new(Window::full(1 << wlog)).unwrap();
         u.set_threads(threads, 0);
         u.reset(Some(data.len() as u64));
         let mut crc = crc32fast::Hasher::new();

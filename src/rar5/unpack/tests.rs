@@ -3,24 +3,36 @@
 use super::*;
 use crate::rar5::testenc::*;
 
+impl From<u64> for Window {
+    fn from(size: u64) -> Self {
+        Window::full(size)
+    }
+}
+
 /// Decodes on the calling thread and on workers, with and without the decoder working out the CRC32, and fed as
-/// shared pieces, and checks all give the same output or the same error.
-fn decode(stream: &[u8], size: u64, window: u64, piece: usize) -> Result<Vec<u8>> {
+/// shared pieces, in `window` and in one twice its size reaching as far, where short writes spill, and checks all
+/// give the same output or the same error.
+fn decode(stream: &[u8], size: u64, window: impl Into<Window>, piece: usize) -> Result<Vec<u8>> {
+    let window = window.into();
     let serial = decode_with(stream, size, window, piece, 0, Hash::Off, false);
-    for (threads, hash, shared) in
-        [(3, Hash::Off, false), (0, Hash::Here, false), (3, Hash::Helper, false), (3, Hash::Off, true)]
-    {
-        let other = decode_with(stream, size, window, piece, threads, hash, shared);
+    let roomy = Window { size: window.size * 2, reach: window.reach };
+    for (w, threads, hash, shared) in [
+        (window, 3, Hash::Off, false),
+        (window, 0, Hash::Here, false),
+        (window, 3, Hash::Helper, false),
+        (window, 3, Hash::Off, true),
+        (roomy, 0, Hash::Off, false),
+        (roomy, 3, Hash::Helper, false),
+        (roomy, 3, Hash::Off, true),
+    ] {
+        let other = decode_with(stream, size, w, piece, threads, hash, shared);
+        let how = format!("{w:?}, {threads} workers, {hash:?}, shared {shared}");
         match (&serial, &other) {
-            (Ok(a), Ok(b)) => assert!(a == b, "{threads} workers, {hash:?}, shared {shared}: different bytes"),
-            (Err(a), Err(b)) => {
-                assert_eq!(a.to_string(), b.to_string(), "{threads} workers, {hash:?}, shared {shared}: another error")
+            (Ok(a), Ok(b)) => assert!(a == b, "{how}: different bytes"),
+            (Err(a), Err(b)) => assert_eq!(a.to_string(), b.to_string(), "{how}: another error"),
+            _ => {
+                panic!("serial {:?} vs {how}: {:?}", serial.as_ref().map(|v| v.len()), other.as_ref().map(|v| v.len()))
             }
-            _ => panic!(
-                "serial {:?} vs {threads} workers, {hash:?}, shared {shared}: {:?}",
-                serial.as_ref().map(|v| v.len()),
-                other.as_ref().map(|v| v.len())
-            ),
         }
     }
     serial
@@ -95,13 +107,13 @@ impl Sink for Hashed {
 fn decode_with(
     stream: &[u8],
     size: u64,
-    window: u64,
+    window: impl Into<Window>,
     piece: usize,
     threads: usize,
     hash: Hash,
     shared: bool,
 ) -> Result<Vec<u8>> {
-    let mut u = Unpacker::new(window)?;
+    let mut u = Unpacker::new(window.into())?;
     u.set_threads(threads, 0);
     hashing(&mut u, hash);
     u.reset(Some(size));
@@ -229,7 +241,7 @@ fn output_hashed_straight_from_the_window_matches_what_was_put() {
     let plain = decode(&stream, made, window, 70_000).unwrap();
     assert_eq!(plain.len() as u64, made);
     for (threads, hash) in [(0, Hash::Here), (3, Hash::Helper)] {
-        let mut u = Unpacker::new(window).unwrap();
+        let mut u = Unpacker::new(Window::full(window)).unwrap();
         u.set_threads(threads, 0);
         hashing(&mut u, hash);
         u.reset(Some(made));
@@ -252,7 +264,7 @@ fn the_crc_helper_runs_only_beside_decoding_workers() {
         stream.extend(block(chunk, i == 0, i + 1 == chunks.len()));
     }
     for threads in [0, 3] {
-        let mut u = Unpacker::new(16 << 20).unwrap();
+        let mut u = Unpacker::new(Window::full(16 << 20)).unwrap();
         u.set_threads(threads, 0);
         u.reset(Some(data.len() as u64));
         let mut sink = Hashed { hash: true, files: vec![(Vec::new(), None)] };
@@ -381,11 +393,78 @@ fn longest_filters_across_the_points_output_is_emitted_at() {
 
 #[test]
 fn window_sizes_stay_sane_for_any_stated_size() {
-    assert_eq!(window_for(1 << 17, Some(u64::MAX - 1), false).unwrap(), 1 << 17);
-    assert_eq!(window_for(1 << 22, Some(u64::MAX), false).unwrap(), 1 << 22);
-    assert_eq!(window_for(1 << 22, Some(100_000), false).unwrap(), 1 << 18);
-    assert_eq!(window_for(1 << 22, Some(10), false).unwrap(), 1 << 17);
-    assert_eq!(window_for(1 << 22, Some(10), true).unwrap(), 1 << 22);
+    let w = |size: u64, reach: u64| Window { size, reach };
+    assert_eq!(window_for(1 << 17, Some(u64::MAX - 1), false).unwrap(), w(1 << 18, 1 << 17));
+    assert_eq!(window_for(1 << 22, Some(u64::MAX), false).unwrap(), w(1 << 23, 1 << 22));
+    assert_eq!(window_for(1 << 22, Some(100_000), false).unwrap(), w(1 << 18, 1 << 17));
+    assert_eq!(window_for(1 << 22, Some(10), false).unwrap(), w(1 << 17, 1 << 16));
+    assert_eq!(window_for(1 << 22, Some(10), true).unwrap(), w(1 << 23, 1 << 22));
+    assert_eq!(window_for(1 << 22, None, false).unwrap(), w(1 << 23, 1 << 22));
+    // a file of more than half the dictionary reaches only as far as its own size, which leaves room to spill
+    // unless it is about the dictionary's size or more
+    assert_eq!(window_for(1 << 22, Some(3 << 20), false).unwrap(), w(1 << 22, 3 << 20));
+    assert_eq!(window_for(1 << 22, Some((1 << 22) - SPILL), false).unwrap(), w(1 << 22, (1 << 22) - SPILL));
+    assert_eq!(window_for(1 << 22, Some((1 << 22) - SPILL + 1), false).unwrap(), w(1 << 23, 1 << 22));
+    // past ROOMY_MAX the window is only as big as the dictionary
+    assert_eq!(window_for(ROOMY_MAX, None, true).unwrap(), w(2 * ROOMY_MAX, ROOMY_MAX));
+    assert_eq!(window_for(2 * ROOMY_MAX, None, true).unwrap(), w(2 * ROOMY_MAX, 2 * ROOMY_MAX));
+    assert_eq!(window_for(1 << 30, Some(1 << 29), false).unwrap(), w(1 << 30, 1 << 29));
+    assert_eq!(window_for(1 << 30, Some(1 << 20), false).unwrap(), w(1 << 21, 1 << 20));
+}
+
+/// About 1 MiB of short matches and literal runs through a 128 KiB window, with matches from up to `reach` back:
+/// many from right at it, others from close by.
+fn reaching_ops(reach: u64) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let mut seed = 3u32;
+    let mut made = 0u64;
+    while made < 1 << 20 {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+        let r = seed >> 16;
+        if made < reach || r.is_multiple_of(4) {
+            for _ in 0..1 + r % 3 {
+                ops.push(Op::Lit((seed >> 8) as u8));
+                made += 1;
+            }
+            continue;
+        }
+        let dist = match r % 7 {
+            0 => reach,
+            1 | 2 => reach - u64::from(r >> 3) % 40,
+            3 => 1 + u64::from(r >> 3) % 40,
+            _ => 1 + u64::from(r >> 3) % reach,
+        };
+        // (a match from more than 256 bytes back is one longer than its length code says, from 8 KiB two)
+        let len = if dist > 0x100 { 4 } else { 2 } + (r >> 5) % 40;
+        ops.push(Op::Match(len, dist));
+        made += u64::from(len);
+    }
+    ops
+}
+
+#[test]
+fn spilling_writes_never_touch_what_matches_from_as_far_back_as_they_may_reach_read() {
+    let window = 1u64 << 17;
+    // a window matches may reach all the way back into, where short writes must not spill, and one they may reach
+    // all but SPILL bytes back into, where they do
+    for reach in [window, window - SPILL] {
+        let ops = reaching_ops(reach);
+        let want = model(&ops);
+        let mut stream = Vec::new();
+        let chunks: Vec<_> = ops.chunks(3000).collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            stream.extend(block(chunk, i == 0, i + 1 == chunks.len()));
+        }
+        let got = decode(&stream, want.len() as u64, Window { size: window, reach }, 50_000).unwrap();
+        assert!(got == want, "reach {reach}: mismatch");
+        // and a match from farther back than that is turned down
+        if reach < window {
+            let mut far = lits(&want[..window as usize]);
+            far.push(Op::Match(4, reach + 1));
+            let stream = block(&far, true, true);
+            assert!(decode(&stream, window + 4, Window { size: window, reach }, 50_000).is_err());
+        }
+    }
 }
 
 #[test]
@@ -461,7 +540,7 @@ fn a_block_of_tiny_codes_is_finished_on_the_calling_thread() {
     let want = model(&ops);
     let stream = block(&ops, true, true);
     assert_eq!(decode(&stream, want.len() as u64, 1 << 21, usize::MAX).unwrap(), want);
-    let mut u = Unpacker::new(1 << 21).unwrap();
+    let mut u = Unpacker::new(Window::full(1 << 21)).unwrap();
     u.set_threads(2, 0);
     u.reset(Some(want.len() as u64));
     let mut out = Vec::new();
@@ -505,7 +584,7 @@ fn a_worker_stopped_mid_run_still_hands_on_the_lengths_after_it() {
     for piece in [usize::MAX, 70_000] {
         assert_eq!(decode(&stream, want.len() as u64, 1 << 22, piece).unwrap(), want, "{piece}");
     }
-    let mut u = Unpacker::new(1 << 22).unwrap();
+    let mut u = Unpacker::new(Window::full(1 << 22)).unwrap();
     u.set_threads(2, 0);
     u.reset(Some(want.len() as u64));
     let mut n = 0;
@@ -558,7 +637,7 @@ fn quick_literals_round_trip_with_mixed_lengths() {
     // the tables these blocks get do have a common literal length to guess with
     let ops = mostly_noise(50_000, 9);
     let block = tuned_block(&ops, true);
-    let mut u = Unpacker::new(1 << 20).unwrap();
+    let mut u = Unpacker::new(Window::full(1 << 20)).unwrap();
     u.set_threads(0, 0);
     u.reset(Some(model(&ops).len() as u64));
     let mut sink = |_: &[u8]| Ok(());
@@ -578,7 +657,7 @@ fn quick_literals_round_trip_with_mixed_lengths() {
         })
         .collect();
     let ops = lits(&text);
-    let mut u = Unpacker::new(1 << 20).unwrap();
+    let mut u = Unpacker::new(Window::full(1 << 20)).unwrap();
     u.set_threads(0, 0);
     u.reset(Some(text.len() as u64));
     let mut out = Vec::new();
@@ -609,7 +688,7 @@ fn eight_bit_codes_of_other_symbols_end_a_quick_run() {
     }
     let data = model(&ops);
     let block = tuned_block(&ops, true);
-    let mut u = Unpacker::new(1 << 20).unwrap();
+    let mut u = Unpacker::new(Window::full(1 << 20)).unwrap();
     u.set_threads(0, 0);
     u.reset(Some(data.len() as u64));
     let mut out = Vec::new();
@@ -670,7 +749,7 @@ fn solid_run(
     piece: usize,
     hash: Hash,
 ) -> (Vec<Vec<u8>>, Option<(usize, String)>, u64) {
-    let mut u = Unpacker::new(1 << 22).unwrap();
+    let mut u = Unpacker::new(Window::full(1 << 22)).unwrap();
     u.set_threads(threads, u64::MAX);
     hashing(&mut u, hash);
     let mut sink = Hashed::new(hash);
@@ -852,7 +931,7 @@ fn rounds_of_8_bit_literals_match_one_at_a_time() {
     let ops = mostly_noise(60_000, 21);
     let data = model(&ops);
     let block = tuned_block(&ops, true);
-    let mut u = Unpacker::new(1 << 20).unwrap();
+    let mut u = Unpacker::new(Window::full(1 << 20)).unwrap();
     u.set_threads(0, 0);
     u.reset(Some(data.len() as u64));
     let mut out = Vec::new();
@@ -1012,12 +1091,26 @@ fn match_copies_equal_a_byte_at_a_time_and_touch_nothing_else() {
                 _ => 1 + next() % size as u64,
             };
             let mut got = base.clone();
-            copy(Win::of(&mut got), sp, len, dist, sp + u64::from(len)).unwrap();
+            copy::<false>(Win::of(&mut got), sp, len, dist, sp + u64::from(len)).unwrap();
             let mut want = base.clone();
             for i in 0..u64::from(len) {
                 want[((sp + i) & mask) as usize] = want[((sp + i - dist) & mask) as usize];
             }
             assert!(got == want, "len {len} dist {dist} at {}", sp & mask);
+            // where writes may spill, the match's bytes are the same and only the SPILL after it may differ
+            let reach = size as u64 - SPILL;
+            if dist > reach {
+                continue;
+            }
+            let mut spilt = base.clone();
+            copy::<true>(Win::of(&mut spilt).reaching(reach), sp, len, dist, sp + u64::from(len)).unwrap();
+            for (i, (&a, &b)) in spilt.iter().zip(&want).enumerate() {
+                let past = (i as u64).wrapping_sub(sp) & mask;
+                assert!(
+                    a == b || (u64::from(len)..u64::from(len) + SPILL).contains(&past),
+                    "spilt: len {len} dist {dist} at {i}"
+                );
+            }
         }
     }
 }

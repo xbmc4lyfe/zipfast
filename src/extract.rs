@@ -951,7 +951,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
             && h.solid
             && !self.queued.is_empty()
             && let Some(u) = self.stream.as_mut()
-            && h.dictionary <= u.window_size()
+            && h.dictionary <= u.reach()
         {
             // every queued file holds its output open
             let most = if self.opts.mode == Mode::Extract { MAX_OPEN_QUEUED } else { MAX_TESTED_QUEUED };
@@ -986,7 +986,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
             let solid_archive = vol.main.is_solid();
             let ready = if h.solid {
                 match self.stream.as_mut() {
-                    Some(u) if h.dictionary <= u.window_size() => {
+                    Some(u) if h.dictionary <= u.reach() => {
                         u.next_file(size);
                         Ok(())
                     }
@@ -996,7 +996,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
                 match window_for(h.dictionary, size, solid_archive) {
                     Ok(window) => match self.stream.as_mut().filter(|u| u.fits(window)) {
                         Some(u) => {
-                            u.reset(size);
+                            u.restart(window, size);
                             Ok(())
                         }
                         None => Unpacker::new(window).map(|mut u| {
