@@ -773,6 +773,8 @@ impl<R: FnMut(&str)> Run<'_, R> {
     /// Reads `h`'s data and hands it to the workers.
     fn send_to_batch(&mut self, vol: &mut Volume, h: &FileHeader, out: Option<Place>) -> Result<()> {
         let mut packed = Vec::with_capacity(h.packed_size as usize);
+        // stored data is only checked (and written) by the worker; compressed data keeps it busy decoding
+        vol.read_fast(h.method == 0);
         vol.read_data_into(h.data_at, h.packed_size, &mut packed)?;
         let job = Job {
             name: h.name.clone(),
@@ -1083,6 +1085,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
         let mut fed = false;
         let mut books = Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch };
         let queued = &mut self.queued;
+        vol.read_fast(false);
         let read = vol.read_data_shared(h.data_at, h.packed_size, |piece, range| {
             let Some(u) = stream.as_mut() else { return Err(Error::Corrupt("no decoder for a queued file")) };
             let r = u.feed_shared(piece, range, &mut route(queued, &mut books));
@@ -1210,6 +1213,8 @@ impl<R: FnMut(&str)> Run<'_, R> {
             return self.stored_parallel(vol, h, p);
         }
         let mut stream = if p.compressed { self.stream.take() } else { None };
+        // stored data is only checked (and copied) as it comes; compressed data goes to the decoder
+        vol.read_fast(self.threads > 1 && !p.compressed && p.cipher.is_none());
         let read = vol.read_data_shared(h.data_at, h.packed_size, |piece, range| {
             let chunk = &piece.bytes()[range.clone()];
             if split_after {
