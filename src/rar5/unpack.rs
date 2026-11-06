@@ -1080,53 +1080,81 @@ impl Unpacker {
     ) -> Result<()> {
         let flush_at = self.flush_at();
         let size_end = self.size.map_or(u64::MAX, |s| self.file_base.saturating_add(s));
+        // The stream position, the distance history and the window are kept in locals: any write into the window
+        // might be to a field of `self` as far as the compiler knows, so read through `self` they would be loaded
+        // again after every write. They go back before a flush, which reads them, and at the end.
+        let (mut sp, mut history, mut last_len) = (self.sp, self.history, self.last_len);
+        // SAFETY: the window is neither resized nor freed while this runs, and the pointer is taken again after
+        // every flush, which reads the window through `self`
+        let mut win = unsafe { Win::detached(&mut self.window) };
+        // output past this is emitted before more is decoded
+        let mut stop = self.file_base + self.emitted + flush_at;
         let mut li = 0usize;
-        for &packed in toks {
-            let tok = packed.get(filters);
-            if self.sp - self.file_base - self.emitted > flush_at {
-                self.flush(sink)?;
-            }
-            match tok {
-                Tok::Lits(n) => {
-                    let mut n = n as usize;
-                    while n > 0 {
-                        if self.sp - self.file_base - self.emitted > flush_at {
-                            self.flush(sink)?;
+        let ended = 'apply: {
+            for &packed in toks {
+                let tok = packed.get(filters);
+                if sp > stop {
+                    self.sp = sp;
+                    if let Err(e) = self.flush(sink) {
+                        break 'apply Err(e);
+                    }
+                    stop = self.file_base + self.emitted + flush_at;
+                    // SAFETY: as above
+                    win = unsafe { Win::detached(&mut self.window) };
+                }
+                match tok {
+                    Tok::Lits(n) if sp + u64::from(n) <= (stop + 1).min(size_end) => {
+                        // the common case: the run fits before the next flush and the file's end
+                        put_from(win, sp, lits, li, n as usize);
+                        sp += u64::from(n);
+                        li += n as usize;
+                    }
+                    Tok::Lits(n) => {
+                        let mut n = n as usize;
+                        while n > 0 {
+                            if sp > stop {
+                                self.sp = sp;
+                                if let Err(e) = self.flush(sink) {
+                                    break 'apply Err(e);
+                                }
+                                stop = self.file_base + self.emitted + flush_at;
+                                // SAFETY: as above
+                                win = unsafe { Win::detached(&mut self.window) };
+                            }
+                            if sp >= size_end {
+                                break 'apply Err(corrupt("more data than the header says"));
+                            }
+                            let room = (stop + 1).min(size_end).saturating_sub(sp);
+                            let take = n.min(usize::try_from(room).unwrap_or(usize::MAX));
+                            if take == 0 {
+                                break 'apply Err(corrupt("the window can't hold the pending output"));
+                            }
+                            put_from(win, sp, lits, li, take);
+                            sp += take as u64;
+                            li += take;
+                            n -= take;
                         }
-                        if self.sp >= size_end {
-                            return Err(corrupt("more data than the header says"));
+                    }
+                    Tok::Filter { offset, len, kind } => {
+                        let window = self.window_size();
+                        if let Err(e) = add_filter(&mut self.filters, sp - self.file_base, offset, len, kind, window) {
+                            break 'apply Err(e);
                         }
-                        let stop = self.file_base + self.emitted + flush_at + 1;
-                        let room = stop.min(size_end).saturating_sub(self.sp);
-                        let take = n.min(usize::try_from(room).unwrap_or(usize::MAX));
-                        if take == 0 {
-                            return Err(corrupt("the window can't hold the pending output"));
+                    }
+                    _ => {
+                        if let Some((len, d)) = resolve(tok, &mut history, &mut last_len) {
+                            if let Err(e) = copy(win, sp, len, d, size_end) {
+                                break 'apply Err(e);
+                            }
+                            sp += u64::from(len);
                         }
-                        self.put(&lits[li..li + take]);
-                        li += take;
-                        n -= take;
                     }
                 }
-                Tok::Filter { offset, len, kind } => {
-                    let op = self.op();
-                    let window = self.window_size();
-                    add_filter(&mut self.filters, op, offset, len, kind, window)?;
-                }
-                _ => {
-                    if let Some((len, d)) = resolve(tok, &mut self.history, &mut self.last_len) {
-                        copy(Win::of(&mut self.window), self.sp, len, d, size_end)?;
-                        self.sp += u64::from(len);
-                    }
-                }
             }
-        }
-        Ok(())
-    }
-
-    /// Literal bytes into the window at the stream position.
-    fn put(&mut self, bytes: &[u8]) {
-        Win::of(&mut self.window).write(self.sp, bytes);
-        self.sp += bytes.len() as u64;
+            Ok(())
+        };
+        (self.sp, self.history, self.last_len) = (sp, history, last_len);
+        ended
     }
 
     /// More of the file's packed bytes. Every block that is now complete is decoded and its output emitted. Blocks
@@ -1581,6 +1609,17 @@ impl<'a> Win<'a> {
         Win { ptr: window.as_mut_ptr(), mask: window.len() - 1, _window: PhantomData }
     }
 
+    /// A `Win` over `window` that doesn't keep it borrowed.
+    ///
+    /// # Safety
+    ///
+    /// While the `Win` is used, `window` must not be resized or freed, and no reference to its bytes may be live.
+    #[inline(always)]
+    unsafe fn detached(window: &mut Vec<u8>) -> Win<'a> {
+        debug_assert!(window.len().is_power_of_two());
+        Win { ptr: window.as_mut_ptr(), mask: window.len() - 1, _window: PhantomData }
+    }
+
     #[inline(always)]
     fn len(self) -> usize {
         self.mask + 1
@@ -1608,6 +1647,24 @@ impl<'a> Win<'a> {
     }
 }
 
+/// `lits[at..at + n]` into the window at stream position `sp`. A short run whose word fits on both sides is blended
+/// in, without a call to copy it.
+#[inline(always)]
+fn put_from(window: Win<'_>, sp: u64, lits: &[u8], at: usize, n: usize) {
+    let dst = sp as usize & window.mask;
+    if n <= 32 && at + 32 <= lits.len() && dst + 32 <= window.len() {
+        // SAFETY: the 32 bytes at `at` in `lits` and at `dst` in the window are there, and n <= 32; `lits` is a shared
+        // slice, so it isn't the window. Both words are always blended, as in `copy`.
+        unsafe {
+            let (s, d) = (lits.as_ptr().add(at), window.ptr.add(dst));
+            blend16p(s, d, n.min(16));
+            blend16p(s.add(16), d.add(16), n.saturating_sub(16));
+        }
+    } else {
+        window.write(sp, &lits[at..at + n]);
+    }
+}
+
 /// Copies a match inside the window. `sp` is the stream position the copy starts at; nothing may land at or past
 /// `size_end`.
 #[inline(always)]
@@ -1627,11 +1684,26 @@ fn copy(window: Win<'_>, sp: u64, len: u32, dist: u64, size_end: u64) -> Result<
     if n <= 32 && dist >= n as u64 && dst + 32 <= w && src + 32 <= w {
         // a short copy whose source ends before it: whole 16-byte words, keeping the destination's bytes past the
         // match, which a match from nearly a window back may still read
-        // SAFETY: the 32 bytes at `src` and at `dst` are inside the window, and 1 <= n <= 32
+        // SAFETY: the 32 bytes at `src` and at `dst` are inside the window, and 1 <= n <= 32. Both words are always
+        // blended, the second keeping all its bytes for a match of 16 or less, so no branch hangs on the length.
         unsafe {
             blend16(p, src, dst, n.min(16));
-            if n > 16 {
-                blend16(p, src + 16, dst + 16, n - 16);
+            blend16(p, src + 16, dst + 16, n.saturating_sub(16));
+        }
+        return Ok(());
+    }
+    if dist >= 16 && (n <= LONG_COPY || dist < n as u64) && dst + n + 16 <= w && src + n + 16 <= w {
+        // 16 bytes at a time and the last few blended. With the source at least 16 behind, each word reads only
+        // finished bytes; with it ahead (a match from nearly a window back), only bytes not yet written over.
+        // SAFETY: the `n + 16` bytes at `src` and at `dst` are inside the window
+        unsafe {
+            let mut i = 0;
+            while i + 16 <= n {
+                word16(p.add(src + i), p.add(dst + i));
+                i += 16;
+            }
+            if i < n {
+                blend16(p, src + i, dst + i, n - i);
             }
         }
         return Ok(());
@@ -1681,55 +1753,80 @@ static FIRST: [u8; 32] = {
     m
 };
 
+/// Matches longer than this whose source ends before them are copied with a call, not 16 bytes at a time.
+const LONG_COPY: usize = 256;
+
+/// The 16 bytes at `s` written at `d`, read before any is written, so the two may overlap.
+///
+/// # Safety
+///
+/// The 16 bytes at `s` must be valid to read and those at `d` to write.
+#[inline(always)]
+unsafe fn word16(s: *const u8, d: *mut u8) {
+    // SAFETY: as the caller promises
+    unsafe { d.cast::<[u8; 16]>().write_unaligned(s.cast::<[u8; 16]>().read_unaligned()) };
+}
+
 /// The first `k` of the 16 bytes at `w + src` written over those at `w + dst`, the rest of `dst` kept.
 ///
 /// # Safety
 ///
-/// The 16 bytes at `w + src` and at `w + dst` must be valid to read and write, and `k` must be 1 to 16.
+/// The 16 bytes at `w + src` and at `w + dst` must be valid to read and write, and `k` must be 0 to 16.
 #[inline(always)]
 unsafe fn blend16(w: *mut u8, src: usize, dst: usize, k: usize) {
-    debug_assert!((1..=16).contains(&k));
+    // SAFETY: as the caller promises
+    unsafe { blend16p(w.add(src), w.add(dst), k) }
+}
+
+/// The first `k` of the 16 bytes at `s` written over those at `d`, the rest of `d` kept (all of it for `k` 0).
+///
+/// # Safety
+///
+/// The 16 bytes at `s` must be valid to read and those at `d` to read and write, and `k` must be 0 to 16.
+#[inline(always)]
+unsafe fn blend16p(s: *const u8, d: *mut u8, k: usize) {
+    debug_assert!(k <= 16);
     #[cfg(target_arch = "aarch64")]
     // SAFETY: as the caller promises; the 16 bytes at `16 - k` are inside `FIRST`
     unsafe {
         use std::arch::aarch64::*;
         let pick = vld1q_u8(FIRST.as_ptr().add(16 - k));
-        vst1q_u8(w.add(dst), vbslq_u8(pick, vld1q_u8(w.add(src)), vld1q_u8(w.add(dst))));
+        vst1q_u8(d, vbslq_u8(pick, vld1q_u8(s), vld1q_u8(d)));
     }
     #[cfg(target_arch = "x86_64")]
     // SAFETY: as the caller promises; the 16 bytes at `16 - k` are inside `FIRST`. SSE2 is part of x86-64.
     unsafe {
         use std::arch::x86_64::*;
         let pick = _mm_loadu_si128(FIRST.as_ptr().add(16 - k).cast());
-        let (s, d) = (_mm_loadu_si128(w.add(src).cast()), _mm_loadu_si128(w.add(dst).cast()));
+        let (from, to) = (_mm_loadu_si128(s.cast()), _mm_loadu_si128(d.cast()));
         #[cfg(target_feature = "sse4.1")]
-        let out = _mm_blendv_epi8(d, s, pick);
+        let out = _mm_blendv_epi8(to, from, pick);
         #[cfg(not(target_feature = "sse4.1"))]
-        let out = _mm_or_si128(_mm_and_si128(pick, s), _mm_andnot_si128(pick, d));
-        _mm_storeu_si128(w.add(dst).cast(), out);
+        let out = _mm_or_si128(_mm_and_si128(pick, from), _mm_andnot_si128(pick, to));
+        _mm_storeu_si128(d.cast(), out);
     }
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
     // SAFETY: as the caller promises
     unsafe {
-        blend16_words(w, src, dst, k)
+        blend16_words(s, d, k)
     }
 }
 
-/// [`blend16`] with plain 128-bit words, where there is neither NEON nor SSE.
+/// [`blend16p`] with plain 128-bit words, where there is neither NEON nor SSE.
 ///
 /// # Safety
 ///
-/// As for [`blend16`].
+/// As for [`blend16p`].
 #[cfg(any(test, not(any(target_arch = "aarch64", target_arch = "x86_64"))))]
 #[inline(always)]
-unsafe fn blend16_words(w: *mut u8, src: usize, dst: usize, k: usize) {
+unsafe fn blend16_words(s: *const u8, d: *mut u8, k: usize) {
     // SAFETY: as the caller promises
     unsafe {
-        let s = w.add(src).cast::<u128>().read_unaligned();
-        let d = w.add(dst).cast::<u128>().read_unaligned();
+        let from = s.cast::<u128>().read_unaligned();
+        let to = d.cast::<u128>().read_unaligned();
         // in the reads' own byte order, so each mask byte lines up with the window byte it picks
         let pick = u128::from_ne_bytes(FIRST[16 - k..32 - k].try_into().unwrap());
-        w.add(dst).cast::<u128>().write_unaligned((s & pick) | (d & !pick));
+        d.cast::<u128>().write_unaligned((from & pick) | (to & !pick));
     }
 }
 
@@ -1778,7 +1875,13 @@ fn resolve(tok: Tok, hist: &mut [u64; 4], last: &mut u32) -> Option<(u32, u64)> 
             // the distance used moves to the front and the ones before it back one; spelled out, since shifting a
             // run of variable length calls memmove
             let k = usize::from(k) & 3;
-            let d = hist[k];
+            // picked by cases, not by index, so the history can stay in registers
+            let d = match k {
+                0 => hist[0],
+                1 => hist[1],
+                2 => hist[2],
+                _ => hist[3],
+            };
             if k >= 3 {
                 hist[3] = hist[2];
             }
