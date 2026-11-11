@@ -19,8 +19,9 @@ Prybar's manifests still use the vendored sibling paths
 `crates/zipfast` and `crates/zipview`. The compatibility branch keeps both
 snapshots from Prybar's original vendor commit, `7ddfeaa`. The zipview
 vendor matches the committed standalone tree except for its Cargo manifest.
-The vendor declares GPL-3.0. The zipfast vendor manifest adds `subtle = "2.6"`
-and `tempfile = "3.27"` and leaves release profiles to its workspace root.
+The vendored zipview manifest declares `license = "GPL-3.0"`. The vendored
+zipfast manifest has no `license` field. It adds `subtle = "2.6"` and
+`tempfile = "3.27"` and leaves release profiles to its workspace root.
 
 The [compatibility plan](superpowers/plans/2026-11-11-zipview-merge-and-compatibility.md)
 leaves the Prybar pin and release licensing decision open. It calls for
@@ -28,6 +29,18 @@ reviewing the dependency terms and combined distribution before changing the
 engine pins or shipping a release with them. The existing GPL-covered
 snapshots and dependencies retain their applicable terms. The previous
 engine snapshots remain the rollback point.
+
+RPL 1.5 section 1.2 excludes internal research and personal use from its
+definition of deployment. Section 6 requires covered extension source
+within one month of deployment and for at least 12 months after deployment
+ceases. It also requires documenting modifications, preserving notices,
+providing the license text or access instructions, notifying the community
+within one month of initial deployment, and preserving Exhibit B attribution
+in applicable displays and documentation. The FSF lists RPL in its nonfree
+category without specifying a version. The FSF classifies licenses in that
+category as GPL-incompatible. The combined Prybar release remains unresolved.
+[OSI RPL 1.5 text](https://opensource.org/license/RPL-1.5) ·
+[FSF license list](https://www.gnu.org/licenses/license-list.html#RPL)
 
 ## Engine callers
 
@@ -37,7 +50,7 @@ revision.
 | Caller | Engine APIs and behavior |
 | --- | --- |
 | Prybar `crates/pry/src/archive.rs` | Uses `extract::list_with_password` for listing and `extract::run_with_password` with `Options` for bulk extraction and testing. It uses `volume::next_volume` to collect input paths for overwrite protection. Selected extraction calls `SelectedEntry::open_cancelable` and reads by zero-based index with an 8 GiB cap. The caller stages the file and checks its guard before publication. |
-| Prybar `crates/pry/src/archive.rs` and `browse.rs` | Opens `zipview::ZipIndex` with a seek/read callback and a 129 MiB metadata budget. The caller checks the count, order, names, sizes, CRCs, and directory flags against the engine listing. It uses `by_index` and reads the `ZipEntry` compression name, effective method, flags, local-header offset, creator version and host, Unix mode, and AES strength. |
+| Prybar `crates/pry/src/archive.rs` and `browse.rs` | Calls `zipview::ZipIndex::open()` with a seek/read callback and a 129 MiB metadata budget. The caller compares `ZipIndex::len()` with the engine entry count and walks `ZipIndex::entries()` in listing order. It compares `ZipEntry::name()`, `size()` for decoded size, `compressed_size()` for packed size, `crc32()` wrapped in `Some`, and `is_dir()` with the corresponding engine fields. Inspection and browse use `ZipIndex::by_index()` for member details and display `ZipEntry::compression_name()`, `effective_compression()`, `flags()`, `local_header_offset()`, `version_made_by()`, `unix_mode()`, and `aes_info()`. Archive inspection displays `ZipIndex::comment()` when it is nonempty. |
 | Prybar `crates/pry/src/browse.rs` | Calls `extract::list_with_password` for navigation and `SelectedEntry::open_cancelable` for a preview with a 64 MiB decode cap. The terminal event loop, cancellation controls, and metadata display live in Prybar. |
 | Prybar `crates/pry/src/archive_compat.rs` | Uses `rar5::reader::Volume::open_with_password`, `extract::list_with_password`, `SelectedEntry::open` with an 8 GiB cap, and `zip::run` for ZIP tests. The argument and status adapters live in Prybar, along with `gzip_compat.rs` and `parity.rs`. |
 | Zipfast `src/main.rs` | Routes `l` and `v` to `extract::list_with_password`. Routes `t`, `x`, and `e` to `extract::run_with_password`, with flattened paths for `e`. The Prybar vendor's copy of this binary supplies an empty protection set. |
@@ -95,9 +108,11 @@ Prybar's Ubuntu workflow builds tools with
 `scripts/build-compatibility-references.sh`, builds the CLI with
 `cargo build -p prybar --locked`, and runs
 `scripts/check-compatibility.py target/debug/pry "$RUNNER_TEMP/prybar-references/bin"`.
-The Prybar build script also pins par2cmdline and par2cmdline-turbo. The
-separate Debian arm64 smoke build adds Info-ZIP UnZip. Its local build and
-smoke commands, logs, and binary checksums are in
+The Prybar build script also pins par2cmdline at
+`3f247813023c9721fae3543309e977b1272c840e` and par2cmdline-turbo at
+`3e60f6fcfed52bf257e79c46deae616cb6135d59`. The separate Debian arm64
+smoke covers the five tools in the table, including Info-ZIP UnZip. The local
+build and smoke commands, logs, and binary checksums are in
 `/tmp/zipfast-reference.SZkt27` while that scratch directory is available.
 Prybar's `scripts/check-encryption.py` uses pyzipper 0.3.6 and pinned rarfile
 fixtures for independent interoperability checks.
