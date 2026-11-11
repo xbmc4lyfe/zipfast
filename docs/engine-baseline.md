@@ -36,11 +36,13 @@ within one month of deployment and for at least 12 months after deployment
 ceases. It also requires documenting modifications, preserving notices,
 providing the license text or access instructions, notifying the community
 within one month of initial deployment, and preserving Exhibit B attribution
-in applicable displays and documentation. The FSF lists RPL in its nonfree
-category without specifying a version. The FSF classifies licenses in that
-category as GPL-incompatible. The combined Prybar release remains unresolved.
+in applicable displays and documentation. The FSF's nonfree license list
+links to the FSF RPL 1.3 record. Its classification applies to the linked
+record. Compatibility review for an RPL 1.5 engine in a combined Prybar
+release remains open.
 [OSI RPL 1.5 text](https://opensource.org/license/RPL-1.5) ·
-[FSF license list](https://www.gnu.org/licenses/license-list.html#RPL)
+[FSF license list](https://www.gnu.org/licenses/license-list.html#RPL) ·
+[FSF RPL 1.3 record](https://directory.fsf.org/wiki/License:ReciprocalPLv1.3)
 
 ## Engine callers
 
