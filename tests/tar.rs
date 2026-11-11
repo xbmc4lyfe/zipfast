@@ -182,6 +182,47 @@ fn data(n: usize, seed: u32) -> Vec<u8> {
 }
 
 #[test]
+fn rejects_a_zstandard_window_above_the_decoder_limit() {
+    use std::io::{BufReader, Read};
+    use zipfast::stream::Codec;
+
+    let dir = tmp("zstd-window-limit");
+    let path = dir.join("large-window.zst");
+    // A short Zstandard frame declaring a 512 MiB window and no stored content size.
+    let encoded = [
+        0x28, 0xb5, 0x2f, 0xfd, 0x04, 0x98, 0xc1, 0, 0, 0x64, 0x69, 0x63, 0x74, 0x69, 0x6f, 0x6e, 0x61, 0x72, 0x79,
+        0x20, 0x6c, 0x69, 0x6d, 0x69, 0x74, 0x20, 0x66, 0x69, 0x78, 0x74, 0x75, 0x72, 0x65, 0x5f, 0x47, 0x32, 0x8e,
+    ];
+    fs::write(&path, encoded).unwrap();
+    let mut decoder = Codec::Zstd.open(BufReader::new(fs::File::open(&path).unwrap()), 1).unwrap();
+    let error = decoder.read(&mut [0; 64]).unwrap_err();
+    assert!(error.to_string().contains("too much memory"), "{error}");
+}
+
+#[test]
+fn rejects_an_xz_dictionary_above_the_decoder_limit() {
+    use std::io::{BufReader, Read};
+    use zipfast::stream::Codec;
+
+    let dir = tmp("xz-dictionary-limit");
+    let path = dir.join("large-dictionary.xz");
+    let mut encoded = xz(b"small XZ stream");
+    let block_start = 12;
+    let crc_start = block_start + (usize::from(encoded[block_start]) + 1) * 4 - 4;
+    // This block has one LZMA2 filter. Replace its dictionary property and update the block-header CRC.
+    assert_eq!(&encoded[13..16], &[0, 0x21, 1]);
+    encoded[16] = 36; // 256 MiB, excluding decoder overhead
+    let crc = crc32fast::hash(&encoded[block_start..crc_start]);
+    encoded[crc_start..crc_start + 4].copy_from_slice(&crc.to_le_bytes());
+    fs::write(&path, encoded).unwrap();
+    for threads in [1, 4] {
+        let mut decoder = Codec::Xz.open(BufReader::new(fs::File::open(&path).unwrap()), threads).unwrap();
+        let error = decoder.read(&mut [0; 64]).unwrap_err();
+        assert_eq!(error.to_string(), "memory limit reached");
+    }
+}
+
+#[test]
 fn plain_and_compressed_tar_extract_the_same_tree() {
     let big = data(5 << 20, 1);
     let long = format!("deep/{}/name.bin", "a".repeat(120));

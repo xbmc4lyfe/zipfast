@@ -17,7 +17,7 @@
 //! ZIP archives built by a small writer here, read back through the same entry points as RAR.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use flate2::Compression;
@@ -174,6 +174,76 @@ fn opts(dest: &Path) -> Options {
 
 fn test_opts(dest: &Path) -> Options {
     Options { mode: Mode::Test, ..opts(dest) }
+}
+
+#[test]
+fn refuses_an_oversized_zip_directory_before_loading_it() {
+    let dir = tmp("large-directory");
+    let path = dir.join("large.zip");
+    let mut file = fs::File::create(&path).unwrap();
+    let directory_size: u32 = (128 << 20) + 1;
+    file.seek(SeekFrom::Start(u64::from(directory_size))).unwrap();
+    let mut end = zip(&[]);
+    end[12..16].copy_from_slice(&directory_size.to_le_bytes());
+    file.write_all(&end).unwrap();
+    drop(file);
+    let result = zipfast::zip::Archive::open(&path).map(|archive| archive.entries.len());
+    assert!(
+        matches!(&result, Err(zipfast::Error::Unsupported(message)) if message.contains("directory")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn refuses_a_zip64_directory_declaring_over_a_million_entries() {
+    let dir = tmp("many-entries");
+    let path = dir.join("many.zip");
+    let mut end = zip_with(&[], true, b"");
+    end[24..32].copy_from_slice(&1_000_001u64.to_le_bytes());
+    end[32..40].copy_from_slice(&1_000_001u64.to_le_bytes());
+    fs::write(&path, end).unwrap();
+    let result = zipfast::zip::Archive::open(&path).map(|archive| archive.entries.len());
+    assert!(
+        matches!(&result, Err(zipfast::Error::Unsupported(message)) if message.contains("directory")),
+        "{result:?}"
+    );
+}
+
+#[test]
+fn central_directory_entry_count_must_match_the_records() {
+    let dir = tmp("entry-count");
+    let path = dir.join("wrong-count.zip");
+    for count in [0u16, 2] {
+        // For count 0, the extra record's invalid offset must not be examined.
+        let mut bytes = zip(&[Z { offset64: (count == 0).then_some(u64::MAX), ..Z::new("f", b"x") }]);
+        let end = bytes.len() - 22;
+        bytes[end + 8..end + 10].copy_from_slice(&count.to_le_bytes());
+        bytes[end + 10..end + 12].copy_from_slice(&count.to_le_bytes());
+        fs::write(&path, bytes).unwrap();
+        let result = zipfast::zip::Archive::open(&path).map(|archive| archive.entries.len());
+        assert!(matches!(result, Err(zipfast::Error::Corrupt("central directory entry count"))), "{result:?}");
+    }
+}
+
+#[test]
+fn refuses_an_oversized_encrypted_zip_entry() {
+    let dir = tmp("encrypted-packed-limit");
+    let path = dir.join("large.zip");
+    let packed: u32 = (128 << 20) + 1;
+    let mut bytes = zip(&[Z { flags: 0x0801, crc: Some(u32::MAX), ..Z::new("f", b"") }]);
+    let cd = 31; // local header and the one-byte name, before the sparse packed data
+    let end = bytes.len() - 22;
+    bytes[18..22].copy_from_slice(&packed.to_le_bytes());
+    bytes[cd + 20..cd + 24].copy_from_slice(&packed.to_le_bytes());
+    bytes[end + 16..end + 20].copy_from_slice(&(cd as u32 + packed).to_le_bytes());
+    let mut file = fs::File::create(&path).unwrap();
+    file.write_all(&bytes[..cd]).unwrap();
+    file.seek(SeekFrom::Current(i64::from(packed))).unwrap();
+    file.write_all(&bytes[cd..]).unwrap();
+    drop(file);
+    let result = extract::run_with_password(&path, &test_opts(&dir), Some("password"), |_| {}).unwrap();
+    assert_eq!((result.files, result.errors.len()), (0, 1));
+    assert!(result.errors[0].contains("128 MiB packed limit"), "{:?}", result.errors);
 }
 
 #[test]
@@ -416,6 +486,47 @@ fn bzip2_lzma_xz_and_zstd_entries_extract() {
         assert_eq!(fs::read(out.join(name)).unwrap(), data, "{name}");
     }
     assert_eq!(fs::read(out.join("empty")).unwrap(), b"");
+}
+
+#[test]
+fn rejects_a_zip_lzma_dictionary_above_the_decoder_limit() {
+    let dir = tmp("lzma-limit");
+    let path = dir.join("large-dictionary.zip");
+    let data = b"small LZMA entry";
+    let mut packed = lzma_packed(data);
+    // Increasing the declared dictionary does not change the distances in the compressed data.
+    packed[5..9].copy_from_slice(&(256u32 << 20).to_le_bytes());
+    fs::write(&path, zip(&[Z { method: Some(14), flags: 0x0802, raw: Some(packed), ..Z::new("f", data) }])).unwrap();
+    let result = extract::run(&path, &test_opts(&dir), |_| {}).unwrap();
+    assert_eq!((result.files, result.errors.len()), (0, 1), "{:?}", result.errors);
+}
+
+#[test]
+fn rejects_a_zip_xz_dictionary_above_the_decoder_limit() {
+    let dir = tmp("xz-limit");
+    let path = dir.join("large-dictionary.zip");
+    let data = b"small XZ entry";
+    let mut packed = xz_packed(data);
+    let block_start = 12;
+    let crc_start = block_start + (usize::from(packed[block_start]) + 1) * 4 - 4;
+    assert_eq!(&packed[13..16], &[0, 0x21, 1]);
+    packed[16] = 36; // LZMA2 dictionary of 256 MiB, excluding decoder overhead
+    let crc = crc32fast::hash(&packed[block_start..crc_start]);
+    packed[crc_start..crc_start + 4].copy_from_slice(&crc.to_le_bytes());
+    fs::write(&path, zip(&[Z { method: Some(95), raw: Some(packed), ..Z::new("f", data) }])).unwrap();
+    let result = extract::run(&path, &test_opts(&dir), |_| {}).unwrap();
+    assert_eq!((result.files, result.errors.len()), (0, 1), "{:?}", result.errors);
+}
+
+#[test]
+fn rejects_a_zip_zstandard_window_above_the_decoder_limit() {
+    let dir = tmp("zstd-limit");
+    let path = dir.join("large-window.zip");
+    // Frame header with a 256 MiB window, then one final raw block containing "x".
+    let packed = vec![0x28, 0xb5, 0x2f, 0xfd, 0, 0x90, 0x09, 0, 0, b'x'];
+    fs::write(&path, zip(&[Z { method: Some(93), raw: Some(packed), ..Z::new("f", b"x") }])).unwrap();
+    let result = extract::run(&path, &test_opts(&dir), |_| {}).unwrap();
+    assert_eq!((result.files, result.errors.len()), (0, 1), "{:?}", result.errors);
 }
 
 #[test]

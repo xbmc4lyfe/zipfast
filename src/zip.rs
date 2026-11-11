@@ -19,7 +19,7 @@
 //! LZMA, xz or zstd.
 
 use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use flate2::{Decompress, FlushDecompress, Status};
@@ -29,6 +29,7 @@ use crate::extract::{Entry, Meta, Mode, Options, Summary, Target, finish_dirs, f
 use crate::output::Output;
 use crate::path::sanitize;
 use crate::rar5::Redirection;
+use crate::stream::{LZMA_MEMORY_LIMIT, zstd_decoder};
 
 const SIG_LOCAL: u32 = 0x0403_4b50;
 const SIG_CENTRAL: u32 = 0x0201_4b50;
@@ -59,6 +60,10 @@ const S_IFDIR: u32 = 0o040000;
 const S_IFLNK: u32 = 0o120000;
 
 const BUF: usize = 1 << 20;
+const ENCRYPTED_PACKED_LIMIT: u64 = 128 << 20;
+const DIRECTORY_BYTE_LIMIT: u64 = 128 << 20;
+const DIRECTORY_ENTRY_LIMIT: u64 = 1_000_000;
+const CENTRAL_HEADER_LEN: usize = 46;
 
 /// Whether the file starts the way a ZIP archive does.
 pub fn sniff(head: &[u8]) -> bool {
@@ -196,11 +201,17 @@ impl Archive {
         if cd_start.checked_add(cd_size).is_none_or(|e| e > len) {
             return Err(Error::Corrupt("central directory size or offset"));
         }
+        if cd_size > DIRECTORY_BYTE_LIMIT || count > DIRECTORY_ENTRY_LIMIT {
+            return Err(Error::Unsupported("ZIP directory exceeds the listing limit".into()));
+        }
         let cd_len = usize::try_from(cd_size).map_err(|_| Error::Corrupt("central directory size"))?;
         let cd = read_at(&mut file, cd_start, cd_len)?;
-        let mut entries = Vec::with_capacity(count.min(1 << 20) as usize);
+        let mut entries = Vec::with_capacity((count as usize).min(cd_len / CENTRAL_HEADER_LEN));
         let mut at = 0usize;
-        while at + 46 <= cd.len() && le32(&cd, at) == SIG_CENTRAL {
+        while at + CENTRAL_HEADER_LEN <= cd.len() && le32(&cd, at) == SIG_CENTRAL {
+            if entries.len() as u64 >= count {
+                return Err(Error::Corrupt("central directory entry count"));
+            }
             let (entry, next) = parse_central(&cd, at)?;
             let local_at = entry.local_at.checked_add(shift).filter(|&a| a < len);
             let local_at = local_at.ok_or(Error::Corrupt("local header offset"))?;
@@ -250,6 +261,9 @@ impl Archive {
             sink(chunk)
         };
         if e.encrypted() {
+            if e.packed > ENCRYPTED_PACKED_LIMIT {
+                return Err(Error::Unsupported("encrypted ZIP entry exceeds the 128 MiB packed limit".into()));
+            }
             let pw = password
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| Error::Unsupported("encrypted (password required)".into()))?;
@@ -306,7 +320,7 @@ impl Archive {
                     }
                 }
                 METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
-                    let mut dec = stream_decoder_slice(e, method, &decrypted)?;
+                    let mut dec = stream_decoder(e, method, BufReader::new(Cursor::new(&decrypted)))?;
                     loop {
                         let n = dec.read(buf).map_err(|_| Error::Corrupt("compressed data is damaged"))?;
                         if n == 0 {
@@ -378,7 +392,7 @@ impl Archive {
             }
             METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
                 let packed = BufReader::with_capacity(1 << 20, (&mut self.file).take(e.packed));
-                let mut dec = stream_decoder(e, packed)?;
+                let mut dec = stream_decoder(e, e.method, packed)?;
                 loop {
                     let n = match dec.read(buf) {
                         Ok(n) => n,
@@ -404,43 +418,13 @@ impl Archive {
     }
 }
 
-/// A reader of an entry's data from an in-memory decrypted slice.
-fn stream_decoder_slice<'a>(e: &ZipEntry, method: u16, data: &'a [u8]) -> Result<Box<dyn Read + 'a>> {
-    let packed = BufReader::new(Cursor::new(data));
+/// A reader of an entry's data for the methods that have a stream decoder.
+fn stream_decoder<'a>(e: &ZipEntry, method: u16, packed: impl BufRead + 'a) -> Result<Box<dyn Read + 'a>> {
     Ok(match method {
         METHOD_BZIP2 => Box::new(bzip2::bufread::MultiBzDecoder::new(packed)),
-        METHOD_ZSTD => Box::new(zstd::stream::read::Decoder::with_buffer(packed)?),
+        METHOD_ZSTD => Box::new(zstd_decoder(packed)?),
         METHOD_XZ => {
-            let stream = liblzma::stream::Stream::new_stream_decoder(u64::MAX, liblzma::stream::CONCATENATED)
-                .map_err(|_| Error::Corrupt("xz data"))?;
-            Box::new(liblzma::bufread::XzDecoder::new_stream(packed, stream))
-        }
-        _ => {
-            let mut packed = packed;
-            let mut head = [0u8; 4];
-            packed.read_exact(&mut head)?;
-            let props_len = u16::from_le_bytes([head[2], head[3]]) as usize;
-            if props_len != 5 {
-                return Err(Error::Corrupt("LZMA properties"));
-            }
-            let mut alone = vec![0u8; 13];
-            packed.read_exact(&mut alone[..5])?;
-            let size = if e.flags & FLAG_LZMA_EOS != 0 { u64::MAX } else { e.size };
-            alone[5..].copy_from_slice(&size.to_le_bytes());
-            let stream =
-                liblzma::stream::Stream::new_lzma_decoder(u64::MAX).map_err(|_| Error::Corrupt("LZMA data"))?;
-            Box::new(liblzma::bufread::XzDecoder::new_stream(BufReader::new(Cursor::new(alone).chain(packed)), stream))
-        }
-    })
-}
-
-/// A reader of an entry's data for the methods that have a stream decoder.
-fn stream_decoder<'a>(e: &ZipEntry, packed: BufReader<std::io::Take<&'a mut File>>) -> Result<Box<dyn Read + 'a>> {
-    Ok(match e.method {
-        METHOD_BZIP2 => Box::new(bzip2::bufread::MultiBzDecoder::new(packed)),
-        METHOD_ZSTD => Box::new(zstd::stream::read::Decoder::with_buffer(packed)?),
-        METHOD_XZ => {
-            let stream = liblzma::stream::Stream::new_stream_decoder(u64::MAX, liblzma::stream::CONCATENATED)
+            let stream = liblzma::stream::Stream::new_stream_decoder(LZMA_MEMORY_LIMIT, liblzma::stream::CONCATENATED)
                 .map_err(|_| Error::Corrupt("xz data"))?;
             Box::new(liblzma::bufread::XzDecoder::new_stream(packed, stream))
         }
@@ -458,8 +442,8 @@ fn stream_decoder<'a>(e: &ZipEntry, packed: BufReader<std::io::Take<&'a mut File
             packed.read_exact(&mut alone[..5])?;
             let size = if e.flags & FLAG_LZMA_EOS != 0 { u64::MAX } else { e.size };
             alone[5..].copy_from_slice(&size.to_le_bytes());
-            let stream =
-                liblzma::stream::Stream::new_lzma_decoder(u64::MAX).map_err(|_| Error::Corrupt("LZMA data"))?;
+            let stream = liblzma::stream::Stream::new_lzma_decoder(LZMA_MEMORY_LIMIT)
+                .map_err(|_| Error::Corrupt("LZMA data"))?;
             Box::new(liblzma::bufread::XzDecoder::new_stream(BufReader::new(Cursor::new(alone).chain(packed)), stream))
         }
     })
@@ -467,17 +451,17 @@ fn stream_decoder<'a>(e: &ZipEntry, packed: BufReader<std::io::Take<&'a mut File
 
 /// One central directory record at `at`: the entry and where the next record starts.
 fn parse_central(cd: &[u8], at: usize) -> Result<(ZipEntry, usize)> {
-    let h = &cd[at..at + 46];
+    let h = &cd[at..at + CENTRAL_HEADER_LEN];
     let name_len = le16(h, 28) as usize;
     let extra_len = le16(h, 30) as usize;
     let comment_len = le16(h, 32) as usize;
-    let name_end = at + 46 + name_len;
+    let name_end = at + CENTRAL_HEADER_LEN + name_len;
     let extra_end = name_end + extra_len;
     let next = extra_end + comment_len;
     if next > cd.len() {
         return Err(Error::Corrupt("central directory record"));
     }
-    let raw_name = &cd[at + 46..name_end];
+    let raw_name = &cd[at + CENTRAL_HEADER_LEN..name_end];
     let extra = &cd[name_end..extra_end];
     let flags = le16(h, 8);
     let mut e = ZipEntry {

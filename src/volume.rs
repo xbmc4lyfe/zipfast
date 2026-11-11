@@ -24,10 +24,12 @@ pub fn next_volume(path: &Path) -> Option<PathBuf> {
     let name = path.file_name()?.to_str()?;
     let lower = name.to_ascii_lowercase();
     let next = if let Some(stem) = lower.strip_suffix(".rar") {
-        match part_number(stem) {
-            Some((digits_at, width, n)) => {
-                let digits = format!("{:0width$}", n + 1, width = width);
-                format!("{}{}{}", &name[..digits_at], digits, &name[digits_at + width..])
+        match part_digits_at(stem) {
+            Some(digits_at) => {
+                let suffix = &stem[digits_at..];
+                let n: u64 = suffix.parse().ok()?;
+                let digits = format!("{:0width$}", n.checked_add(1)?, width = suffix.len());
+                format!("{}{}{}", &name[..digits_at], digits, &name[stem.len()..])
             }
             // keep the extension's case: set.RAR goes on in set.R00
             None => {
@@ -41,33 +43,33 @@ pub fn next_volume(path: &Path) -> Option<PathBuf> {
         let mut chars = ext.chars();
         let letter = chars.next()?;
         let digits = chars.as_str();
-        if digits.len() < 2 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        if !letter.is_ascii_alphabetic() || digits.len() < 2 || !digits.chars().all(|c| c.is_ascii_digit()) {
             return None;
         }
         let n: u32 = digits.parse().ok()?;
-        let limit = 10u32.pow(digits.len() as u32);
-        if n + 1 < limit {
-            format!("{base}.{letter}{:0w$}", n + 1, w = digits.len())
+        let limit = 10u32.checked_pow(digits.len().try_into().ok()?)?;
+        let next_number = n.checked_add(1)?;
+        if next_number < limit {
+            format!("{base}.{letter}{next_number:0w$}", w = digits.len())
         } else {
             let next_letter = (letter as u8 + 1) as char;
+            if !next_letter.is_ascii_alphabetic() {
+                return None;
+            }
             format!("{base}.{next_letter}{:0w$}", 0, w = digits.len())
         }
     };
     Some(path.with_file_name(next))
 }
 
-/// In `name.partNN`, where the digits start, how many there are, and their value.
-fn part_number(stem: &str) -> Option<(usize, usize, u64)> {
+/// In `name.partNN`, where the digits start.
+fn part_digits_at(stem: &str) -> Option<usize> {
     let digits_len = stem.bytes().rev().take_while(u8::is_ascii_digit).count();
     if digits_len == 0 {
         return None;
     }
     let digits_at = stem.len() - digits_len;
-    if !stem[..digits_at].ends_with(".part") {
-        return None;
-    }
-    let n = stem[digits_at..].parse().ok()?;
-    Some((digits_at, digits_len, n))
+    stem[..digits_at].ends_with(".part").then_some(digits_at)
 }
 
 #[cfg(test)]
@@ -76,6 +78,25 @@ mod tests {
 
     fn next(s: &str) -> String {
         next_volume(Path::new(s)).unwrap().to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn rejects_an_overflowing_part_number() {
+        assert_eq!(next_volume(Path::new("a.part18446744073709551615.rar")), None);
+        assert_eq!(next_volume(Path::new("a.part18446744073709551616.rar")), None);
+    }
+
+    #[test]
+    fn rejects_an_overflowing_old_style_suffix() {
+        assert_eq!(next_volume(Path::new("a.r0000000001")), None);
+        assert_eq!(next_volume(Path::new("a.r4294967295")), None);
+    }
+
+    #[test]
+    fn rejects_suffixes_without_an_ascii_letter_successor() {
+        for name in ["a.é00", "a.100", "a.z99", "a.Z99"] {
+            assert_eq!(next_volume(Path::new(name)), None, "{name}");
+        }
     }
 
     #[test]

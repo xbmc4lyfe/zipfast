@@ -23,6 +23,9 @@ use std::path::Path;
 
 use flate2::bufread::MultiGzDecoder;
 
+pub(crate) const LZMA_MEMORY_LIMIT: u64 = 256 << 20;
+const ZSTD_WINDOW_LOG_LIMIT: u32 = 27;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Codec {
     Gzip,
@@ -66,18 +69,24 @@ impl Codec {
         Ok(match self {
             Codec::Gzip => Box::new(MultiGzDecoder::new(r)),
             Codec::Xz => Box::new(XzStreams { inner: Some(xz_decoder(r, threads)?), threads }),
-            Codec::Zstd => Box::new(zstd::stream::read::Decoder::with_buffer(r)?),
+            Codec::Zstd => Box::new(zstd_decoder(r)?),
             Codec::Bzip2 => Box::new(bzip2::bufread::MultiBzDecoder::new(r)),
         })
     }
+}
+
+pub(crate) fn zstd_decoder<R: BufRead>(reader: R) -> io::Result<zstd::stream::read::Decoder<'static, R>> {
+    let mut decoder = zstd::stream::read::Decoder::with_buffer(reader)?;
+    decoder.window_log_max(ZSTD_WINDOW_LOG_LIMIT)?;
+    Ok(decoder)
 }
 
 fn xz_decoder(r: BufReader<File>, threads: usize) -> io::Result<liblzma::bufread::XzDecoder<BufReader<File>>> {
     let stream = liblzma::stream::MtStreamBuilder::new()
         .threads(threads.clamp(1, 64) as u32)
         // past this much memory liblzma falls back to one thread rather than failing
-        .memlimit_threading(1 << 30)
-        .memlimit_stop(u64::MAX)
+        .memlimit_threading(LZMA_MEMORY_LIMIT)
+        .memlimit_stop(LZMA_MEMORY_LIMIT)
         .decoder()
         .map_err(io::Error::other)?;
     Ok(liblzma::bufread::XzDecoder::new_stream(r, stream))
