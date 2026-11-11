@@ -14,7 +14,7 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-//! A tiny RAR 5.0 writer for tests: stored files only, written from the published archive layout.
+//! A tiny RAR 5.0 writer for tests, written from the published archive layout.
 #![allow(dead_code)]
 
 pub fn vint(mut v: u64, out: &mut Vec<u8>) {
@@ -71,6 +71,7 @@ pub struct FileSpec<'a> {
     /// the unpacked size when `data` is packed
     pub size: Option<u64>,
     pub solid: bool,
+    pub size_unknown: bool,
 }
 
 impl<'a> FileSpec<'a> {
@@ -86,6 +87,7 @@ impl<'a> FileSpec<'a> {
             method: 0,
             size: None,
             solid: false,
+            size_unknown: false,
         }
     }
 }
@@ -99,6 +101,9 @@ pub fn file_block(spec: &FileSpec<'_>, part: &[u8], crc: u32, split_before: bool
     }
     if spec.mtime.is_some() {
         file_flags |= 2;
+    }
+    if spec.size_unknown {
+        file_flags |= 8;
     }
     vint(file_flags, &mut fields);
     vint(spec.size.unwrap_or(spec.data.len() as u64), &mut fields);

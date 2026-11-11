@@ -597,7 +597,7 @@ pub fn rar5_record_params(record: &[u8]) -> Option<Rar5CryptParams> {
     Some(Rar5CryptParams { kdf_count, salt, iv, check, tweaked_crc: flags & 0x0002 != 0 })
 }
 
-/// Derives the RAR5 32-byte AES-256 key and 32-byte `HashKey` (for tweaked CRC32) from `password`, `kdf_count`, and `salt`.
+/// Derives the RAR5 32-byte AES-256 key and 32-byte `HashKey` (for keyed checksums) from `password`, `kdf_count`, and `salt`.
 /// If `check` is `Some((chk, csum))` and `sha256(&chk)[..4] == csum`, verifies the password against `chk`.
 pub fn derive_rar5_key_and_hash_key(
     password: &str,
@@ -669,6 +669,11 @@ pub fn rar5_tweak_crc32(crc: u32, hash_key: &[u8; 32]) -> u32 {
         out ^= u32::from(b) << ((i & 3) * 8);
     }
     out
+}
+
+/// Computes the RAR5 authentication code for a BLAKE2sp digest.
+pub(crate) fn rar5_tweak_blake2sp(digest: &[u8; 32], hash_key: &[u8; 32]) -> [u8; 32] {
+    HmacSha256Key::new(hash_key).mac_slice(digest)
 }
 
 /// Decrypts an encrypted RAR5 block header at `pos` (starts with 16-byte IV followed by AES-256-CBC blocks).
