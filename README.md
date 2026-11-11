@@ -52,3 +52,12 @@ processor that lacks them it stops on an illegal instruction.
 
 ZIP follows PKWARE's published APPNOTE. tar follows the POSIX ustar and pax interchange formats and GNU tar's
 manual for its extensions. The RAR 5.0 block layout follows RARLAB's published "RAR 5.0 archive format" technical note.
+
+## License
+
+zipfast by xbmc4lyfe.
+
+The project source uses the [Reciprocal Public License 1.5](LICENSE).
+See section 6 for source availability, notices, and attribution for
+deployed extensions. Dependencies retain their own licenses.
+See [Contributing](CONTRIBUTING.md) for sending changes upstream.
