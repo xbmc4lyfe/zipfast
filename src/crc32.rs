@@ -120,17 +120,15 @@ mod fold {
     #[target_feature(enable = "aes")]
     #[inline]
     unsafe fn carry(acc: uint8x16_t, k: (u64, u64), next: uint8x16_t) -> uint8x16_t {
-        // SAFETY: as the caller promises
-        unsafe {
-            let halves = vreinterpretq_u64_u8(acc);
-            let a = vreinterpretq_u8_p128(vmull_p64(vgetq_lane_u64(halves, 0), k.0));
-            let b = vreinterpretq_u8_p128(vmull_p64(vgetq_lane_u64(halves, 1), k.1));
-            #[cfg(target_feature = "sha3")]
-            let sum = veor3q_u8(a, b, next);
-            #[cfg(not(target_feature = "sha3"))]
-            let sum = veorq_u8(veorq_u8(a, b), next);
-            sum
-        }
+        let halves = vreinterpretq_u64_u8(acc);
+        let a = vreinterpretq_u8_p128(vmull_p64(vgetq_lane_u64(halves, 0), k.0));
+        let b = vreinterpretq_u8_p128(vmull_p64(vgetq_lane_u64(halves, 1), k.1));
+        #[cfg(target_feature = "sha3")]
+        // SAFETY: This build requires SHA3 support.
+        let sum = unsafe { veor3q_u8(a, b, next) };
+        #[cfg(not(target_feature = "sha3"))]
+        let sum = veorq_u8(veorq_u8(a, b), next);
+        sum
     }
 
     /// Chained CRC instructions over `bytes`, from the raw (inverted) register `c`.
