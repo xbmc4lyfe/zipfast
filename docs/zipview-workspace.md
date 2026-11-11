@@ -68,7 +68,9 @@ Set `IMPORT_REV` to the full import revision to install the binary.
 
 ```sh
 cargo install --git https://github.com/xbmc4lyfe/zipfast --rev "$IMPORT_REV" --locked --bin zipfast zipfast
-``` Record the full remote revision and resolved
+```
+
+Record the full remote revision and resolved
 `Cargo.lock` when updating a downstream consumer. Validate the new pin
 against its caller tests before retiring the standalone source. Preserve
 the previous pin for rollback.
@@ -140,7 +142,10 @@ local bare mirror. On each platform, two independent consumer projects ran
 The zipview consumer used `ZipReader`, `ZipIndex`, and `ZipIndexOpener`.
 The zipfast consumer used `zipfast::extract::list`. The command installed
 with `cargo install --git "$GIT_URL" --rev "$IMPORT_REV" --locked --bin zipfast --root "$INSTALL_DIR" zipfast`
-and passed `zipfast t` on the same seed on each platform.
+and passed `zipfast t` on the same seed on each platform. The Linux
+install emitted the unused-unsafe warning from the initial import
+revision. The workspace Clippy and CRC parity results above cover the
+subsequent CRC adjustment in `ea51228e932066e6958852a60cdfdf92977f0f1d`.
 
 Archived standalone and workspace builds of zipview ran
 `cargo run --release --locked --example seedcheck` from their respective
