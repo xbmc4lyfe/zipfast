@@ -2,6 +2,12 @@
 
 A fast, universal archive extractor written in Rust. Work in progress.
 
+## Workspace
+
+The root package builds the `zipfast` library and command.
+[`zipview`](crates/zipview/README.md) is a read-only ZIP library for in-memory and range-based access.
+See [workspace integration](docs/zipview-workspace.md) for Git dependencies, build commands, and import provenance.
+
 ## What works
 
 - RAR 5.0 archives: listing, testing and extracting stored and compressed files (every method, solid archives,
@@ -57,7 +63,10 @@ manual for its extensions. The RAR 5.0 block layout follows RARLAB's published "
 
 zipfast by xbmc4lyfe.
 
+zipview by xbmc4lyfe.
+
 The project source uses the [Reciprocal Public License 1.5](LICENSE).
+Zipview's [license and Exhibit B](crates/zipview/LICENSE) accompany its source.
 See section 6 for source availability, notices, and attribution for
 deployed extensions. Dependencies retain their own licenses.
 See [Contributing](CONTRIBUTING.md) for sending changes upstream.

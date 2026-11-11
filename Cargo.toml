@@ -14,6 +14,12 @@
 # ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 # rights and limitations under the RPL.
 
+[workspace]
+members = ["crates/zipview"]
+default-members = ["."]
+exclude = ["crates/zipview/fuzz"]
+resolver = "3"
+
 [package]
 name = "zipfast"
 version = "0.1.0"

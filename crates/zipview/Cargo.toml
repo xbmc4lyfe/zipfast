@@ -1,0 +1,42 @@
+# Copyright (C) 2026 xbmc4lyfe
+# SPDX-License-Identifier: RPL-1.5
+#
+# Unless explicitly acquired and licensed from Licensor under another license,
+# the contents of this file are subject to the Reciprocal Public License
+# ("RPL") Version 1.5, or subsequent versions as allowed by the RPL, and You
+# may not copy or use this file in either source code or executable form,
+# except in compliance with the terms and conditions of the RPL.
+#
+# All software distributed under the RPL is provided strictly on an "AS IS"
+# basis, WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR
+# HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
+# WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
+# ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
+# rights and limitations under the RPL.
+
+[package]
+name = "zipview"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+authors = ["zipview contributors"]
+license = "RPL-1.5"
+description = "Read-only, allocation-bounded ZIP container reader. No extraction, no writing, no filesystem access."
+repository = "https://github.com/xbmc4lyfe/zipfast"
+keywords = ["zip", "archive", "read-only", "metadata", "parser"]
+categories = ["parser-implementations", "compression"]
+
+[dependencies]
+# The only dependency. ZIP's Deflate payloads are raw deflate streams, and
+# reimplementing inflate would be a genuinely bad trade: it is the one part of
+# this crate where a subtle bug is both likely and hard to find.
+#
+# Inflation runs on zlib-rs, a Rust port of zlib, rather than flate2's default
+# miniz_oxide: 2.3-2.6x faster on Apple M4/M5 cores. Unlike miniz_oxide it uses
+# `unsafe` internally, for its SIMD paths. `runtime_detection` lets it pick
+# those paths (AVX2 and the like on x86-64) on the machine it runs on.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
+
+[dev-dependencies]
+# None. Test fixtures are built by tests/writer.rs, which writes archives byte
+# by byte -- see README, "Why no dev-dependencies".
