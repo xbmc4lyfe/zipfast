@@ -76,6 +76,15 @@ fn assert_extracts(archive: &Path, out: &Path, expected: &[u8]) {
     let extracted = extract::run_with_password(archive, &options(out, Mode::Extract), Some(PASSWORD), |_| {}).unwrap();
     assert_eq!((extracted.files, extracted.errors.len()), (1, 0), "{:?}", extracted.errors);
     assert_eq!(fs::read(out.join("f")).unwrap(), expected);
+    let mut selected = Vec::new();
+    extract::SelectedEntry::open(archive, 0, Some(PASSWORD), 1 << 20)
+        .unwrap()
+        .read(Some(PASSWORD), |bytes| {
+            selected.extend_from_slice(bytes);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(selected, expected);
 }
 
 fn assert_rejected(archive: &Path, out: &Path, reason: &str) {
@@ -91,6 +100,11 @@ fn assert_rejected(archive: &Path, out: &Path, reason: &str) {
     assert_eq!(fs::read(&target).unwrap(), b"old destination");
     assert_eq!(fs::metadata(&target).unwrap().modified().unwrap(), original_modified);
     assert_eq!(fs::read_dir(out).unwrap().count(), 1);
+    let error = extract::SelectedEntry::open(archive, 0, Some(PASSWORD), 1 << 20)
+        .unwrap()
+        .read(Some(PASSWORD), |_| Ok(()))
+        .unwrap_err();
+    assert!(error.to_string().contains(reason), "{error}");
 }
 
 fn split_archive(dir: &Path, first: &FileSpec<'_>, last: &FileSpec<'_>, cut: usize, final_crc: u32) {
@@ -268,6 +282,14 @@ fn encrypted_split_uses_the_final_volume_crc_mode() {
     let last = FileSpec { size: first.size, extra: encryption_record(true), ..FileSpec::new("f", &encrypted) };
     split_archive(dir.path(), &first, &last, 7, encrypted_crc(plain));
     assert_extracts(&archive, &out, plain);
+    let limit = encrypted.len() as u64;
+    extract::SelectedEntry::open(&archive, 0, Some(PASSWORD), limit).unwrap().read(Some(PASSWORD), |_| Ok(())).unwrap();
+    let error = extract::SelectedEntry::open(&archive, 0, Some(PASSWORD), limit - 1)
+        .unwrap()
+        .read(Some(PASSWORD), |_| panic!("decoded a split member beyond the packed budget"))
+        .unwrap_err();
+    assert!(matches!(error, zipfast::Error::Unsupported(message) if message.contains("packed byte limit")));
+
     split_archive(dir.path(), &first, &last, 7, crc32fast::hash(plain));
     assert_rejected(&archive, &out, "checksum error");
 }
@@ -294,4 +316,26 @@ fn encrypted_split_uses_the_final_volume_blake_mode() {
             assert_rejected(&archive, &out, "checksum error");
         }
     }
+}
+
+#[test]
+fn selected_encrypted_rar_rejects_a_modified_ciphertext() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("modified.rar");
+    let plain = b"0123456789abcdef";
+    let mut cipher = encrypted_data(plain, 0);
+    cipher[0] ^= 1;
+    let spec = FileSpec { extra: encryption_record(true), ..FileSpec::new("f", &cipher) };
+    fs::write(&path, archive_with(&[(spec, encrypted_crc(plain))], false)).unwrap();
+    let entry = extract::SelectedEntry::open(&path, 0, Some(PASSWORD), 16).unwrap();
+    let mut provisional = Vec::new();
+    let error = entry
+        .read(Some(PASSWORD), |bytes| {
+            provisional.extend_from_slice(bytes);
+            Ok(())
+        })
+        .unwrap_err();
+    assert_eq!(provisional.len(), 16);
+    assert_ne!(provisional, plain);
+    assert!(error.to_string().contains("checksum error"), "{error}");
 }

@@ -25,7 +25,9 @@ use std::path::{Path, PathBuf};
 use flate2::{Decompress, FlushDecompress, Status};
 
 use crate::error::{Error, Result};
-use crate::extract::{Entry, Meta, Mode, Options, Summary, Target, finish_dirs, finish_file, make_dirs, open_target};
+use crate::extract::{
+    Cancellation, Entry, Meta, Mode, Options, Summary, Target, finish_dirs, finish_file, make_dirs, open_target,
+};
 use crate::path::sanitize;
 use crate::rar5::Redirection;
 use crate::stream::{LZMA_MEMORY_LIMIT, zstd_decoder};
@@ -142,6 +144,10 @@ pub struct Archive {
 
 impl Archive {
     pub fn open(path: &Path) -> Result<Archive> {
+        Self::open_cancelable(path, None)
+    }
+
+    pub(crate) fn open_cancelable(path: &Path, cancel: Option<&Cancellation>) -> Result<Archive> {
         let mut file = File::open(path)?;
         let len = file.metadata()?.len();
         // the end record is 22 bytes plus a comment of at most 65535
@@ -204,10 +210,23 @@ impl Archive {
             return Err(Error::Unsupported("ZIP directory exceeds the listing limit".into()));
         }
         let cd_len = usize::try_from(cd_size).map_err(|_| Error::Corrupt("central directory size"))?;
-        let cd = read_at(&mut file, cd_start, cd_len)?;
+        let cd = if let Some(cancel) = cancel {
+            file.seek(SeekFrom::Start(cd_start))?;
+            let mut cd = vec![0; cd_len];
+            for chunk in cd.chunks_mut(BUF) {
+                cancel.check_io()?;
+                file.read_exact(chunk)?;
+            }
+            cd
+        } else {
+            read_at(&mut file, cd_start, cd_len)?
+        };
         let mut entries = Vec::with_capacity((count as usize).min(cd_len / CENTRAL_HEADER_LEN));
         let mut at = 0usize;
         while at + CENTRAL_HEADER_LEN <= cd.len() && le32(&cd, at) == SIG_CENTRAL {
+            if let Some(cancel) = cancel {
+                cancel.check_io()?;
+            }
             if entries.len() as u64 >= count {
                 return Err(Error::Corrupt("central directory entry count"));
             }
@@ -239,6 +258,44 @@ impl Archive {
         Ok(at)
     }
 
+    /// Decodes the entry at a zero-based index and checks its integrity.
+    ///
+    /// Both its packed and unpacked sizes must be at most `max_bytes`.
+    /// The sink receives provisional data. Only publish it after success.
+    pub fn read_at(
+        &mut self,
+        index: usize,
+        password: Option<&str>,
+        max_bytes: u64,
+        sink: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        self.read_at_cancelable(index, password, max_bytes, None, sink)
+    }
+
+    pub(crate) fn selected_entry(&self, index: usize, limit: u64) -> Result<&ZipEntry> {
+        let entry = self.entries.get(index).ok_or_else(|| Error::Unsupported("entry index is out of range".into()))?;
+        if entry.is_dir() || entry.is_link() {
+            return Err(Error::Unsupported("the selected ZIP entry is not a regular file".into()));
+        }
+        if entry.packed > limit || entry.size > limit {
+            return Err(Error::Unsupported("the selected ZIP entry exceeds the byte limit".into()));
+        }
+        Ok(entry)
+    }
+
+    pub(crate) fn read_at_cancelable(
+        &mut self,
+        index: usize,
+        password: Option<&str>,
+        limit: u64,
+        cancel: Option<&Cancellation>,
+        mut sink: impl FnMut(&[u8]) -> Result<()>,
+    ) -> Result<()> {
+        let entry = self.selected_entry(index, limit)?.clone();
+        let mut buffer = vec![0; BUF];
+        self.read_entry(&entry, password, &mut buffer, &mut sink, cancel)
+    }
+
     /// Reads an entry's data, decompressed, into `sink`, and checks its size and CRC.
     fn read_entry(
         &mut self,
@@ -246,7 +303,10 @@ impl Archive {
         password: Option<&str>,
         buf: &mut [u8],
         sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+        cancel: Option<&Cancellation>,
     ) -> Result<()> {
+        let check = || cancel.map_or(Ok(()), Cancellation::check_io);
+        check()?;
         let at = self.data_at(e)?;
         self.file.seek(SeekFrom::Start(at))?;
         let mut crc = crate::crc32::Hasher::new();
@@ -268,7 +328,15 @@ impl Archive {
                 .ok_or_else(|| Error::Unsupported("encrypted (password required)".into()))?;
             let packed_len = usize::try_from(e.packed).map_err(|_| Error::Corrupt("encrypted entry too large"))?;
             let mut raw = vec![0u8; packed_len];
-            self.file.read_exact(&mut raw)?;
+            if cancel.is_some() {
+                for chunk in raw.chunks_mut(buf.len()) {
+                    check()?;
+                    self.file.read_exact(chunk)?;
+                }
+                check()?;
+            } else {
+                self.file.read_exact(&mut raw)?;
+            }
             let mut skip_crc = false;
             let decrypted = if e.method == 99 || e.aes_info.is_some() {
                 let (strength, vendor, _) = e.aes_info.ok_or(Error::Corrupt("missing WinZip AES extra field"))?;
@@ -292,13 +360,21 @@ impl Archive {
                     if decrypted.len() as u64 != e.size {
                         return Err(Error::Corrupt("stored entry's sizes differ"));
                     }
-                    emit(&decrypted)?;
+                    if cancel.is_some() {
+                        for chunk in decrypted.chunks(buf.len()) {
+                            check()?;
+                            emit(chunk)?;
+                        }
+                    } else {
+                        emit(&decrypted)?;
+                    }
                 }
                 METHOD_DEFLATE => {
                     let mut z = Decompress::new(false);
                     let mut out = vec![0u8; BUF];
                     let mut input = decrypted.as_slice();
                     loop {
+                        check()?;
                         let (before_in, before_out) = (z.total_in(), z.total_out());
                         let status = z
                             .decompress(input, &mut out, FlushDecompress::None)
@@ -321,6 +397,7 @@ impl Archive {
                 METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
                     let mut dec = stream_decoder(e, method, BufReader::new(Cursor::new(&decrypted)))?;
                     loop {
+                        check()?;
                         let n = dec.read(buf).map_err(|_| Error::Corrupt("compressed data is damaged"))?;
                         if n == 0 {
                             break;
@@ -345,6 +422,7 @@ impl Archive {
                     return Err(Error::Corrupt("stored entry's sizes differ"));
                 }
                 while left > 0 {
+                    check()?;
                     let n = (left.min(buf.len() as u64)) as usize;
                     self.file.read_exact(&mut buf[..n])?;
                     emit(&buf[..n])?;
@@ -361,6 +439,7 @@ impl Archive {
                     left -= n as u64;
                     let mut input = &buf[..n];
                     loop {
+                        check()?;
                         let (before_in, before_out) = (z.total_in(), z.total_out());
                         let status = z
                             .decompress(input, &mut out, FlushDecompress::None)
@@ -393,6 +472,7 @@ impl Archive {
                 let packed = BufReader::with_capacity(1 << 20, (&mut self.file).take(e.packed));
                 let mut dec = stream_decoder(e, e.method, packed)?;
                 loop {
+                    check()?;
                     let n = match dec.read(buf) {
                         Ok(n) => n,
                         Err(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => return Err(Error::Truncated),
@@ -654,8 +734,8 @@ pub fn run_with_password(
             }
         }
         let read = match target.as_mut() {
-            Some(out) => archive.read_entry(e, password, &mut buf, &mut |chunk| Ok(out.write(chunk)?)),
-            None => archive.read_entry(e, password, &mut buf, &mut |_| Ok(())),
+            Some(out) => archive.read_entry(e, password, &mut buf, &mut |chunk| Ok(out.write(chunk)?), None),
+            None => archive.read_entry(e, password, &mut buf, &mut |_| Ok(()), None),
         };
         match read {
             Ok(()) => {

@@ -66,6 +66,10 @@ impl Codec {
     /// A reader of the decompressed data. Concatenated streams or members read as one. `threads` is how many
     /// threads xz may decode with, for files that were compressed in independent blocks.
     pub fn open(self, r: BufReader<File>, threads: usize) -> io::Result<Box<dyn Read>> {
+        self.open_reader(r, threads)
+    }
+
+    pub(crate) fn open_reader(self, r: impl BufRead + 'static, threads: usize) -> io::Result<Box<dyn Read>> {
         Ok(match self {
             Codec::Gzip => Box::new(MultiGzDecoder::new(r)),
             Codec::Xz => Box::new(XzStreams { inner: Some(xz_decoder(r, threads)?), threads }),
@@ -81,7 +85,7 @@ pub(crate) fn zstd_decoder<R: BufRead>(reader: R) -> io::Result<zstd::stream::re
     Ok(decoder)
 }
 
-fn xz_decoder(r: BufReader<File>, threads: usize) -> io::Result<liblzma::bufread::XzDecoder<BufReader<File>>> {
+fn xz_decoder<R: BufRead>(r: R, threads: usize) -> io::Result<liblzma::bufread::XzDecoder<R>> {
     let stream = liblzma::stream::MtStreamBuilder::new()
         .threads(threads.clamp(1, 64) as u32)
         // past this much memory liblzma falls back to one thread rather than failing
@@ -94,12 +98,12 @@ fn xz_decoder(r: BufReader<File>, threads: usize) -> io::Result<liblzma::bufread
 
 /// xz streams back to back, as `xz` itself reads them: the decoder stops at the end of each stream, so a new one
 /// takes over after any stream padding, which is zero bytes in fours.
-struct XzStreams {
-    inner: Option<liblzma::bufread::XzDecoder<BufReader<File>>>,
+struct XzStreams<R: BufRead> {
+    inner: Option<liblzma::bufread::XzDecoder<R>>,
     threads: usize,
 }
 
-impl Read for XzStreams {
+impl<R: BufRead> Read for XzStreams<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let Some(dec) = self.inner.as_mut() else { return Ok(0) };

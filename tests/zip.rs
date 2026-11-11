@@ -677,3 +677,82 @@ fn caller_protected_paths_are_merged_with_automatic_input_protection() {
     assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn reads_only_the_selected_zip_entry_and_enforces_the_budget() {
+    let dir = tmp("select");
+    let path = dir.join("selected.zip");
+    let mut first = Z::new("duplicate.txt", b"first");
+    first.crc = Some(0);
+    fs::write(&path, zip(&[first, Z::new("duplicate.txt", b"second")])).unwrap();
+    let mut archive = zipfast::zip::Archive::open(&path).unwrap();
+    let mut bytes = Vec::new();
+    archive
+        .read_at(1, None, 6, |chunk| {
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(bytes, b"second");
+    assert!(archive.read_at(1, None, 5, |_| panic!("Decoded over budget")).is_err());
+    assert!(archive.read_at(0, None, 6, |_| Ok(())).is_err());
+    assert!(archive.read_at(2, None, 6, |_| panic!("Decoded a missing entry")).is_err());
+}
+
+#[test]
+fn selected_zip_reports_metadata_and_checks_packed_and_decoded_limits() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("limits.zip");
+    let large = vec![b'a'; 1024];
+    fs::write(
+        &path,
+        zip(&[
+            Z { deflate: true, ..Z::new("decoded", &large) },
+            Z { deflate: true, mtime: Some(981_173_106), mode: Some(0o100640), ..Z::new("sub/packed", b"x") },
+        ]),
+    )
+    .unwrap();
+    assert!(matches!(extract::SelectedEntry::open(&path, 0, None, 1023), Err(zipfast::Error::Unsupported(_))));
+    extract::SelectedEntry::open(&path, 0, None, 1024).unwrap().read(None, |_| Ok(())).unwrap();
+
+    // A raw deflate stream for the one-byte payload occupies three bytes.
+    assert!(matches!(extract::SelectedEntry::open(&path, 1, None, 2), Err(zipfast::Error::Unsupported(_))));
+    let entry = extract::SelectedEntry::open(&path, 1, None, 3).unwrap();
+    assert_eq!(entry.name(), "sub/packed");
+    assert_eq!(entry.relative_path().unwrap(), Path::new("sub/packed"));
+    assert_eq!(entry.unix_mode().unwrap() & 0o777, 0o640);
+    assert_eq!(entry.modified(), Some((981_173_106, 0)));
+    let mut decoded = Vec::new();
+    entry
+        .read(None, |bytes| {
+            decoded.extend_from_slice(bytes);
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(decoded, b"x");
+}
+
+#[test]
+fn selected_zip_cancellation_before_open_and_during_decode() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cancellation.zip");
+    let plain = vec![b'x'; 3 << 20];
+    fs::write(&path, zip(&[Z { deflate: true, ..Z::new("f", &plain) }])).unwrap();
+    let canceled = extract::Cancellation::default();
+    canceled.cancel();
+    let result = extract::SelectedEntry::open_cancelable(&path, 0, None, plain.len() as u64, canceled);
+    assert!(matches!(result, Err(zipfast::Error::Io(error)) if error.kind() == std::io::ErrorKind::ConnectionAborted));
+
+    let cancel = extract::Cancellation::default();
+    let entry = extract::SelectedEntry::open_cancelable(&path, 0, None, plain.len() as u64, cancel.clone()).unwrap();
+    let mut received = 0;
+    let error = entry
+        .read(None, |bytes| {
+            received += bytes.len();
+            cancel.cancel();
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(matches!(error, zipfast::Error::Io(error) if error.kind() == std::io::ErrorKind::ConnectionAborted));
+    assert!((1..plain.len()).contains(&received));
+}
