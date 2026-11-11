@@ -29,6 +29,7 @@ fn opts(dest: &Path) -> Options {
         overwrite: Overwrite::Skip,
         flatten: false,
         threads: None,
+        protected_paths: Default::default(),
         parallel_min: None,
     }
 }
@@ -448,4 +449,90 @@ fn headers_are_found_after_the_volume_was_moved_under_the_reader() {
     file.seek(SeekFrom::Start(1)).unwrap();
     let Some(Block::File(b)) = vol.next_block().unwrap() else { panic!("second file") };
     assert_eq!(b.name, "b");
+}
+
+#[test]
+fn rar_extraction_preserves_its_input() {
+    let dir = tmp("archive-collision");
+    let arc = dir.join("self.rar");
+    let bytes = archive(&[FileSpec::new("self.rar", b"replacement")]);
+    fs::write(&arc, &bytes).unwrap();
+    let check = |dest| {
+        let options = Options { overwrite: Overwrite::Always, ..opts(dest) };
+        let result = extract::run(&arc, &options, |_| {}).unwrap();
+        assert_eq!(fs::read(&arc).unwrap(), bytes);
+        assert_eq!((result.files, result.errors.len()), (0, 1));
+    };
+    check(&dir);
+    #[cfg(unix)]
+    {
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&dir, &alias).unwrap();
+        check(&alias);
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn early_rar_outputs_cannot_replace_a_later_volume() {
+    let dir = tmp("volume-collision");
+    let first = dir.join("set.part1.rar");
+    let second = dir.join("set.part2.rar");
+    let first_data = b"replacement";
+    let later_data = b"later member";
+    let mut volume = SIG.to_vec();
+    volume.extend(main_block(true, Some(1)));
+    volume.extend(file_block(
+        &FileSpec::new("later", later_data),
+        later_data,
+        crc32fast::hash(later_data),
+        false,
+        false,
+    ));
+    volume.extend(end_block(false));
+    let second_bytes = volume;
+    let options = Options { overwrite: Overwrite::Always, ..opts(&dir) };
+    for volume_flag in [true, false] {
+        let mut volume = SIG.to_vec();
+        volume.extend(main_block(volume_flag, None));
+        volume.extend(file_block(
+            &FileSpec::new("set.part2.rar", first_data),
+            first_data,
+            crc32fast::hash(first_data),
+            false,
+            false,
+        ));
+        volume.extend(end_block(true));
+        fs::write(&first, &volume).unwrap();
+        fs::write(&second, &second_bytes).unwrap();
+        let result = extract::run(&first, &options, |_| {});
+        assert_eq!(fs::read(&first).unwrap(), volume);
+        assert_eq!(fs::read(&second).unwrap(), second_bytes, "volume flag {volume_flag}");
+        let result = result.unwrap();
+        assert_eq!((result.volumes, result.files, result.errors.len()), (2, 1, 1));
+        assert_eq!(fs::read(dir.join("later")).unwrap(), later_data);
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_failed_batched_blake_check_preserves_existing_output() {
+    let dir = tmp("blake-overwrite");
+    let arc = dir.join("bad.rar");
+    let out = dir.join("out");
+    fs::create_dir(&out).unwrap();
+    let keep = out.join("keep");
+    fs::write(&keep, b"original").unwrap();
+    let before = fs::metadata(&keep).unwrap();
+    let spec = FileSpec { no_crc: true, extra: blake_record(blake(b"other")), ..FileSpec::new("keep", b"replacement") };
+    fs::write(&arc, archive(&[spec])).unwrap();
+    let options = Options { overwrite: Overwrite::Always, threads: Some(2), ..opts(&out) };
+    let result = extract::run(&arc, &options, |_| {}).unwrap();
+    assert_eq!(result.errors, ["keep: checksum error"]);
+    assert_eq!(fs::read(&keep).expect("original output still exists"), b"original");
+    let after = fs::metadata(&keep).unwrap();
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    assert_eq!(after.permissions(), before.permissions());
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
+    fs::remove_dir_all(&dir).unwrap();
 }

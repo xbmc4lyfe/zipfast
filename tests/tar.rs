@@ -165,6 +165,7 @@ fn opts(mode: Mode, dest: &Path) -> Options {
         overwrite: Overwrite::Skip,
         flatten: false,
         threads: None,
+        protected_paths: Default::default(),
         parallel_min: None,
     }
 }
@@ -549,4 +550,111 @@ fn a_refused_gnu_sparse_member_with_map_extensions_does_not_hide_what_follows() 
     assert!(s.errors[0].contains("sparse"), "{:?}", s.errors);
     assert_eq!(fs::read(out.join("after.txt")).unwrap(), b"after");
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn compressed_tar_preserves_order_for_conflicting_file_paths() {
+    let dir = tmp("conflicting-paths");
+    let tar = Tar::default().file("a", b"First").file("a/b", b"Second").end();
+    let archive = dir.join("archive.tar.gz");
+    fs::write(&archive, gzip(&tar)).unwrap();
+    let out = dir.join("out");
+    assert!(extract::run(&archive, &opts(Mode::Extract, &out), |_| {}).is_err());
+    assert_eq!(fs::read(out.join("a")).unwrap(), b"First");
+    assert_eq!(fs::read_dir(out).unwrap().count(), 1);
+}
+
+#[test]
+fn failed_compressed_tar_verification_preserves_existing_files() {
+    let dir = tmp("compressed-overwrite");
+    let out = dir.join("out");
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("keep.txt"), b"Original").unwrap();
+    let keep = fs::metadata(out.join("keep.txt")).unwrap();
+    let folder = out.join("folder");
+    fs::create_dir(&folder).unwrap();
+    let folder_meta = fs::metadata(&folder).unwrap();
+    let tar = Tar::default().file("keep.txt", b"Replacement").dir("folder", 0o700).file("new/child.txt", b"New").end();
+    let mut broken = gzip(&tar);
+    let trailer = broken.len() - 8;
+    broken[trailer] ^= 1;
+    let archive = dir.join("broken.tar.gz");
+    fs::write(&archive, broken).unwrap();
+    let options = Options { overwrite: Overwrite::Always, ..opts(Mode::Extract, &out) };
+    let summary = extract::run(&archive, &options, |_| {}).unwrap();
+    assert_eq!(summary.errors.len(), 1);
+    assert_eq!(summary.files, 0);
+    assert_eq!(fs::read(out.join("keep.txt")).unwrap(), b"Original");
+    let keep_after = fs::metadata(out.join("keep.txt")).unwrap();
+    let folder_after = fs::metadata(&folder).unwrap();
+    assert_eq!(keep_after.modified().unwrap(), keep.modified().unwrap());
+    assert_eq!(keep_after.permissions(), keep.permissions());
+    assert_eq!(folder_after.modified().unwrap(), folder_meta.modified().unwrap());
+    assert_eq!(folder_after.permissions(), folder_meta.permissions());
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 2);
+    assert_eq!(fs::read_dir(&folder).unwrap().count(), 0);
+
+    fs::write(&archive, gzip(&tar)).unwrap();
+    let summary = extract::run(&archive, &options, |_| {}).unwrap();
+    assert!(summary.errors.is_empty());
+    assert_eq!(summary.files, 2);
+    assert_eq!(fs::read(out.join("keep.txt")).unwrap(), b"Replacement");
+    assert_eq!(fs::read(out.join("new/child.txt")).unwrap(), b"New");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(fs::metadata(&folder).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(fs::metadata(out.join("keep.txt")).unwrap().permissions().mode() & 0o777, 0o640);
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn tar_extraction_preserves_its_input() {
+    let dir = tmp("archive-collision");
+    #[cfg(unix)]
+    let alias = {
+        let alias = dir.join("alias");
+        std::os::unix::fs::symlink(&dir, &alias).unwrap();
+        alias
+    };
+    for name in ["self.tar", "self.tar.gz"] {
+        let arc = dir.join(name);
+        let tar = Tar::default().file(name, b"replacement").end();
+        let bytes = if name.ends_with(".gz") { gzip(&tar) } else { tar };
+        for direct in [false, true] {
+            #[cfg(unix)]
+            let dest = if direct { &alias } else { &dir };
+            #[cfg(not(unix))]
+            let dest = &dir;
+            let options = Options { overwrite: Overwrite::Always, ..opts(Mode::Extract, dest) };
+            fs::write(&arc, &bytes).unwrap();
+            let result = if direct {
+                zipfast::tar::run(&arc, &options, |_| {}).unwrap()
+            } else {
+                extract::run(&arc, &options, |_| {}).unwrap()
+            };
+            assert_eq!(fs::read(&arc).unwrap(), bytes, "{name}");
+            assert_eq!((result.files, result.errors.len()), (0, 1), "{name}");
+        }
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_prepublication_filesystem_error_leaves_compressed_tar_outputs_untouched() {
+    let dir = tmp("staging-filesystem-error");
+    let out = dir.join("out");
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("keep"), b"original").unwrap();
+    fs::write(out.join("blocked"), b"obstruction").unwrap();
+    let tar = Tar::default().file("keep", b"replacement").file("blocked/child", b"new").end();
+    let archive = dir.join("archive.tar.gz");
+    fs::write(&archive, gzip(&tar)).unwrap();
+    let options = Options { overwrite: Overwrite::Always, ..opts(Mode::Extract, &out) };
+    assert!(extract::run(&archive, &options, |_| {}).is_err());
+    assert_eq!(fs::read(out.join("keep")).unwrap(), b"original");
+    assert_eq!(fs::read(out.join("blocked")).unwrap(), b"obstruction");
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 2);
+    fs::remove_dir_all(&dir).unwrap();
 }

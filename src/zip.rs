@@ -26,7 +26,6 @@ use flate2::{Decompress, FlushDecompress, Status};
 
 use crate::error::{Error, Result};
 use crate::extract::{Entry, Meta, Mode, Options, Summary, Target, finish_dirs, finish_file, make_dirs, open_target};
-use crate::output::Output;
 use crate::path::sanitize;
 use crate::rar5::Redirection;
 use crate::stream::{LZMA_MEMORY_LIMIT, zstd_decoder};
@@ -598,6 +597,7 @@ pub fn run_with_password(
     mut report: impl FnMut(&str),
 ) -> Result<Summary> {
     let mut archive = Archive::open(path)?;
+    let opts = &*opts.protecting(path)?;
     let mut summary = Summary { volumes: 1, ..Summary::default() };
     let mut buf = vec![0u8; BUF];
     let entries = std::mem::take(&mut archive.entries);
@@ -641,7 +641,7 @@ pub fn run_with_password(
         let mut target = None;
         if opts.mode == Mode::Extract {
             match open_target(opts, &rel, Some(e.size))? {
-                Target::Write(file, path) => target = Some((Output::new(file, Some(e.size)), path)),
+                Target::Write(out) => target = Some(out),
                 Target::Exists => {
                     report(&format!("{}: exists, skipped", e.name));
                     summary.skipped += 1;
@@ -654,31 +654,22 @@ pub fn run_with_password(
             }
         }
         let read = match target.as_mut() {
-            Some((out, _)) => archive.read_entry(e, password, &mut buf, &mut |chunk| Ok(out.write(chunk)?)),
+            Some(out) => archive.read_entry(e, password, &mut buf, &mut |chunk| Ok(out.write(chunk)?)),
             None => archive.read_entry(e, password, &mut buf, &mut |_| Ok(())),
         };
         match read {
             Ok(()) => {
-                if let Some((out, path)) = target.take() {
-                    // the last of a big entry may still be on its way to the disk
-                    match out.finish() {
-                        Ok(file) => finish_file(&file, &e.meta()),
-                        Err(io) => {
-                            let _ = std::fs::remove_file(path);
-                            finish_dirs(&mut summary);
-                            return Err(Error::Io(io));
-                        }
-                    }
+                if let Some(out) = target
+                    && let Err(io) = out.finish(|file| finish_file(file, &e.meta()))
+                {
+                    finish_dirs(&mut summary);
+                    return Err(Error::Io(io));
                 }
                 summary.files += 1;
                 summary.bytes += e.size;
             }
             Err(err) => {
-                if let Some((out, path)) = target.take() {
-                    // waits for anything still being written, so the removal is the last word
-                    drop(out);
-                    let _ = std::fs::remove_file(path);
-                }
+                drop(target);
                 match err {
                     // a failure writing out stops the run; anything about this entry's data fails only the entry
                     Error::Io(io) if io.kind() != std::io::ErrorKind::UnexpectedEof => {

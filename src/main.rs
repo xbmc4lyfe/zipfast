@@ -80,7 +80,15 @@ fn main() -> ExitCode {
         "l" | "v" => list(&archive, password.as_deref()),
         "t" | "x" | "e" => {
             let mode = if command == "t" { Mode::Test } else { Mode::Extract };
-            let opts = Options { mode, dest, overwrite, flatten: command == "e", threads, parallel_min: None };
+            let opts = Options {
+                mode,
+                dest,
+                overwrite,
+                flatten: command == "e",
+                threads,
+                protected_paths: Default::default(),
+                parallel_min: None,
+            };
             run(&archive, &opts, password.as_deref(), quiet)
         }
         other => {

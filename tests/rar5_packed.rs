@@ -30,6 +30,7 @@ fn opts(dest: &Path) -> Options {
         overwrite: Overwrite::Skip,
         flatten: false,
         threads: None,
+        protected_paths: Default::default(),
         parallel_min: None,
     }
 }

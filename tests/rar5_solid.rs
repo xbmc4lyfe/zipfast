@@ -32,6 +32,7 @@ fn opts(dest: &Path, threads: usize) -> Options {
         overwrite: Overwrite::Skip,
         flatten: false,
         threads: Some(threads),
+        protected_paths: Default::default(),
         parallel_min: None,
     }
 }

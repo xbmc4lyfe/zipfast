@@ -31,6 +31,7 @@ fn opts(dest: &Path, threads: usize) -> Options {
         overwrite: Overwrite::Skip,
         flatten: false,
         threads: Some(threads),
+        protected_paths: Default::default(),
         parallel_min: None,
     }
 }
@@ -226,17 +227,16 @@ fn a_file_under_one_the_workers_still_hold_waits_for_it() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[cfg(unix)]
 #[test]
-fn a_big_stored_file_named_like_its_own_archive_is_read_from_the_open_archive() {
+fn a_big_stored_file_cannot_replace_its_own_archive() {
     let dir = tmp("selfname");
     let data = noise((66 << 20) + 5, 10);
     let arc = dir.join("same.bin");
-    fs::write(&arc, archive(&[FileSpec::new("same.bin", &data)])).unwrap();
-    // extracting next to the archive replaces its name with the output while the archive is still open
+    let bytes = archive(&[FileSpec::new("same.bin", &data)]);
+    fs::write(&arc, &bytes).unwrap();
     let s = extract::run(&arc, &Options { overwrite: Overwrite::Always, ..opts(&dir, 4) }, |_| {}).unwrap();
-    assert!(s.errors.is_empty(), "{:?}", s.errors);
-    assert!(fs::read(&arc).unwrap() == data);
+    assert_eq!((s.files, s.errors.len()), (0, 1));
+    assert!(fs::read(&arc).unwrap() == bytes);
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -303,4 +303,62 @@ fn a_file_too_big_for_the_workers_reports_after_the_ones_they_hold() {
         }
     }
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn parallel_stored_overwrite_preserves_original_after_a_bad_checksum() {
+    let dir = tmp("overwrite-checksum");
+    let data = vec![b'x'; 64 << 20];
+    let archive = dir.join("bad.rar");
+    fs::write(&archive, archive_with(&[(FileSpec::new("keep", &data), 0)], false)).unwrap();
+    let out = dir.join("out");
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("keep"), b"Keep this file.").unwrap();
+    let before = fs::metadata(out.join("keep")).unwrap();
+    let options = Options { overwrite: Overwrite::Always, ..opts(&out, 2) };
+    let summary = extract::run(&archive, &options, |_| {}).unwrap();
+    assert_eq!(summary.errors.len(), 1);
+    let after = fs::metadata(out.join("keep")).expect("original output still exists");
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    assert_eq!(after.permissions(), before.permissions());
+    assert_eq!(fs::read(out.join("keep")).unwrap(), b"Keep this file.");
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
+
+    let tail = b"tail";
+    let spec = FileSpec { size: Some((data.len() + tail.len()) as u64), ..FileSpec::new("keep", &data) };
+    let first = dir.join("split.part1.rar");
+    let mut volume = SIG.to_vec();
+    volume.extend(main_block(true, None));
+    volume.extend(file_block(&spec, &data, crc32fast::hash(&data), false, true));
+    volume.extend(end_block(true));
+    fs::write(&first, volume).unwrap();
+    let second = dir.join("split.part2.rar");
+    let write_second = |crc| {
+        let mut volume = SIG.to_vec();
+        volume.extend(main_block(true, Some(1)));
+        volume.extend(file_block(&spec, tail, crc, true, false));
+        volume.extend(end_block(false));
+        fs::write(&second, volume).unwrap();
+    };
+    write_second(0);
+
+    let summary = extract::run(&first, &options, |_| {}).unwrap();
+    assert_eq!(summary.errors.len(), 1);
+    let after = fs::metadata(out.join("keep")).expect("original output still exists");
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    assert_eq!(after.permissions(), before.permissions());
+    assert_eq!(fs::read(out.join("keep")).unwrap(), b"Keep this file.");
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
+
+    let mut crc = crc32fast::Hasher::new();
+    crc.update(&data);
+    crc.update(tail);
+    write_second(crc.finalize());
+    let summary = extract::run(&first, &options, |_| {}).unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!((summary.files, summary.volumes), (1, 2));
+    let written = fs::read(out.join("keep")).unwrap();
+    assert!(written.strip_suffix(tail).is_some_and(|body| body == data));
+    assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
+    fs::remove_dir_all(&dir).unwrap();
 }

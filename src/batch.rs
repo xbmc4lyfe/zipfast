@@ -30,7 +30,6 @@ use std::thread::{self, JoinHandle};
 use crate::blake2sp::Blake2sp;
 use crate::error::{Error, Result};
 use crate::extract::{Meta, Place, create_target, finish_file};
-use crate::output::Output;
 use crate::rar5::unpack::{Sink, Unpacker, window_for};
 
 /// Files up to this size, packed and unpacked, go to the workers whole.
@@ -238,12 +237,9 @@ fn run(job: Job, unpacker: &mut Option<Unpacker>) -> Done {
     let Job { name, packed, method, dictionary, size, crc32, blake2sp, out, meta } = job;
     let mut hasher = crate::crc32::Hasher::new();
     let mut blake = blake2sp.map(|_| Blake2sp::new());
-    let (mut out, path) = match out {
-        Some(place) => match create_target(&place, Some(size)) {
-            Ok(file) => (Some(Output::new(file, Some(size))), Some(place.path)),
-            Err(e) => return Done { name, outcome: Outcome::Fatal(e) },
-        },
-        None => (None, None),
+    let mut out = match out.map(|place| create_target(place, Some(size))).transpose() {
+        Ok(out) => out,
+        Err(e) => return Done { name, outcome: Outcome::Fatal(e) },
     };
     let mut bytes = 0u64;
     let mut sink = |chunk: &[u8]| -> Result<()> {
@@ -258,32 +254,25 @@ fn run(job: Job, unpacker: &mut Option<Unpacker>) -> Done {
         Ok(())
     };
     let decoded = if method == 0 { sink(&packed) } else { decode(&packed, dictionary, size, unpacker, &mut sink) };
-    let fail = |out: Option<Output>, why: Outcome| {
-        drop(out);
-        if let Some(p) = &path {
-            let _ = std::fs::remove_file(p);
-        }
-        Done { name: name.clone(), outcome: why }
-    };
+    let fail = |outcome| Done { name: name.clone(), outcome };
     match decoded {
         // only writing out gives an OS error; the decoder's own are about the data
-        Err(Error::Io(e)) => return fail(out, Outcome::Fatal(Error::Io(e))),
-        Err(e) => return fail(out, Outcome::Failed(e.to_string())),
+        Err(Error::Io(e)) => return fail(Outcome::Fatal(Error::Io(e))),
+        Err(e) => return fail(Outcome::Failed(e.to_string())),
         Ok(()) => {}
     }
     let crc_bad = crc32.is_some_and(|want| hasher.finalize() != want);
     let blake_bad = blake2sp.zip(blake).is_some_and(|(want, got)| got.finish() != want);
     if crc_bad || blake_bad {
-        return fail(out, Outcome::Failed("checksum error".into()));
+        return fail(Outcome::Failed("checksum error".into()));
     }
     if bytes != size {
-        return fail(out, Outcome::Failed(format!("{bytes} bytes where the header says {size}")));
+        return fail(Outcome::Failed(format!("{bytes} bytes where the header says {size}")));
     }
-    if let Some(o) = out.take() {
-        match o.finish() {
-            Ok(file) => finish_file(&file, &meta),
-            Err(e) => return fail(None, Outcome::Fatal(Error::Io(e))),
-        }
+    if let Some(o) = out
+        && let Err(e) = o.finish(|file| finish_file(file, &meta))
+    {
+        return fail(Outcome::Fatal(Error::Io(e)));
     }
     Done { name, outcome: Outcome::Done(bytes) }
 }
