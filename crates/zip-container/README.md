@@ -23,3 +23,28 @@ extraction and its tests were developed with AI assistance.
 
 Licensed under the Reciprocal Public License 1.5. Both project attribution
 notices appear in [LICENSE](LICENSE).
+
+`parse_slice` and `DirectoryParser` continue discovery into a single streaming
+central-directory walk. Complete records borrow the incoming window. A split
+record retains only its incomplete fixed fields or body, bounded by the ZIP
+record lengths. The parser reuses the discovered tail and first fixed header.
+The result owns raw central names and comments, known-extra summaries, the
+raw archive comment, and absolute source ranges for the original records.
+`usage` includes discovery, and `buffer_usage` reports parser scratch separately
+from owned records and the caller's read buffer.
+
+The Zipfast profile requires the declared count and rejects another central
+signature immediately after the counted records. It permits noncentral
+directory trailers and requires complete record bodies. The Zipview profile
+can stop at a noncentral signature, traverse an undersold directory, or retain
+a clipped comment within configured limits. It preserves raw extra ranges and
+skips the Unicode Path projection used by Zipfast. Zipfast computes IEEE
+CRC-32 once per eligible raw name and accepts an optional function pointer
+for callers with an existing implementation.
+
+Range supplies must start at the first byte of the current request and may
+cover any contiguous prefix. Polling an unchanged request consumes no work.
+A bad caller supply leaves progress intact. Drop the parser between requests
+to cancel. The directory walk does not read local headers or payloads. Its
+physical local-header offset accessor checks start addresses. A later reader
+must validate the header and payload extents before access.

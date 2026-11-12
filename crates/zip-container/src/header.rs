@@ -81,24 +81,29 @@ impl CentralHeader {
         if le32(bytes, 0) != CENTRAL_HEADER_SIG {
             return Err(ParseError::BadSignature { offset: start });
         }
-        Ok(Self {
-            version_made_by: le16(bytes, 4),
-            version_needed: le16(bytes, 6),
-            flags: le16(bytes, 8),
-            method: le16(bytes, 10),
-            mod_time: le16(bytes, 12),
-            mod_date: le16(bytes, 14),
-            crc32: le32(bytes, 16),
-            packed_size: le32(bytes, 20),
-            unpacked_size: le32(bytes, 24),
-            name_len: le16(bytes, 28),
-            extra_len: le16(bytes, 30),
-            comment_len: le16(bytes, 32),
-            disk_start: le16(bytes, 34),
-            internal_attributes: le16(bytes, 36),
-            external_attributes: le32(bytes, 38),
-            local_header_offset: le32(bytes, 42),
-        })
+        Ok(Self::decode_fields(&bytes[4..]))
+    }
+
+    // The walker already checked the signature and fixed field extent.
+    pub(crate) fn decode_fields(bytes: &[u8]) -> Self {
+        Self {
+            version_made_by: le16(bytes, 0),
+            version_needed: le16(bytes, 2),
+            flags: le16(bytes, 4),
+            method: le16(bytes, 6),
+            mod_time: le16(bytes, 8),
+            mod_date: le16(bytes, 10),
+            crc32: le32(bytes, 12),
+            packed_size: le32(bytes, 16),
+            unpacked_size: le32(bytes, 20),
+            name_len: le16(bytes, 24),
+            extra_len: le16(bytes, 26),
+            comment_len: le16(bytes, 28),
+            disk_start: le16(bytes, 30),
+            internal_attributes: le16(bytes, 32),
+            external_attributes: le32(bytes, 34),
+            local_header_offset: le32(bytes, 38),
+        }
     }
 }
 
@@ -287,10 +292,14 @@ impl<'a> CentralView<'a> {
         let header = CentralHeader::parse_at(bytes, physical_start)?;
         let location = central_layout(header, physical_start, available_end)?;
 
-        let (name, tail) = bytes[CENTRAL_HEADER_LEN..].split_at(usize::from(header.name_len));
+        Ok(Self::from_layout(header, location, &bytes[CENTRAL_HEADER_LEN..]))
+    }
+
+    pub(crate) fn from_layout(header: CentralHeader, location: CentralLocation, body: &'a [u8]) -> Self {
+        let (name, tail) = body.split_at(usize::from(header.name_len));
         let (extra, tail) = tail.split_at(usize::from(header.extra_len));
         let comment = &tail[..usize::from(location.available_comment_len)];
-        Ok(Self { header, location, name, extra, comment })
+        Self { header, location, name, extra, comment }
     }
 
     /// Scalar fields as written in the central header.

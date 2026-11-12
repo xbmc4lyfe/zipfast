@@ -244,6 +244,7 @@ dependencies = [
  "liblzma",
  "subtle",
  "tempfile",
+ "zip-container",
  "zipview",
  "zstd",
 ]

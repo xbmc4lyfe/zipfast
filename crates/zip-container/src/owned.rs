@@ -132,7 +132,13 @@ impl OwnershipBudget {
         self.used
     }
 
-    fn check(&self, charge: OwnershipUsage) -> Result<OwnershipUsage, OwnershipError> {
+    pub(crate) fn resume(limits: OwnershipUsage, used: OwnershipUsage) -> Result<Self, OwnershipError> {
+        let mut budget = Self::new(limits);
+        budget.used = budget.check(used)?;
+        Ok(budget)
+    }
+
+    pub(crate) fn check(&self, charge: OwnershipUsage) -> Result<OwnershipUsage, OwnershipError> {
         let used = self.used;
         let limits = self.limits;
         Ok(OwnershipUsage {

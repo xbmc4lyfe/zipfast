@@ -694,3 +694,41 @@ fn deterministic_mutations_match_between_slice_and_fragmented_sources() {
         }
     }
 }
+
+#[test]
+fn zero_count_keeps_checked_noncentral_directory_trailer() {
+    let mut bytes = b"prefixtrailer".to_vec();
+    bytes.extend(end(0, 7, 0, 0));
+    for profile in PROFILES {
+        let location = discover_slice(&bytes, profile, Limits::default()).unwrap();
+        assert_eq!(location.directory_range(), 6..13);
+        assert_eq!(location.prefix_shift(), 6);
+        assert_eq!(location.first_header(), None);
+    }
+}
+
+#[test]
+fn walk_rejects_logical_comment_end_overflow_at_a_sparse_u64_source_end() {
+    use crate::{DirectoryParser, ParseError};
+
+    let len = u64::MAX;
+    let central_at = len - 144;
+    let zip64_at = len - 98;
+    let mut record = central();
+    set16(&mut record, 32, u16::MAX);
+    let suffix =
+        [record.as_slice(), &zip64(44, 1, 46, central_at), &locator(zip64_at), &end(u16::MAX, u32::MAX, u32::MAX, 0)]
+            .concat();
+    for profile in PROFILES {
+        let mut parser = DirectoryParser::new(len, profile, Limits::default()).unwrap();
+        let read = parser.next_read().unwrap().unwrap();
+        assert_eq!(read, len - TAIL..len);
+        let mut tail = vec![0; TAIL as usize];
+        tail[TAIL as usize - suffix.len()..].copy_from_slice(&suffix);
+        parser.supply(read.start, &tail).unwrap();
+        let error = Err(DirectoryError::Parse(ParseError::OffsetOverflow));
+        assert_eq!(parser.next_read(), error);
+        assert_eq!(parser.next_read(), error);
+        assert_eq!(parser.usage().owned.entries, 0);
+    }
+}
