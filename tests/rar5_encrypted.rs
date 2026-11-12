@@ -339,3 +339,335 @@ fn selected_encrypted_rar_rejects_a_modified_ciphertext() {
     assert_ne!(provisional, plain);
     assert!(error.to_string().contains("checksum error"), "{error}");
 }
+
+#[test]
+fn truncated_declared_password_check_never_publishes_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("test.rar");
+    let out = dir.path().join("out");
+    let plain = b"authenticated framing";
+    let encrypted = encrypted_data(plain, 0);
+    let mut extra = encryption_record(false);
+    extra[3] = 1; // a verifier is declared, but its bytes are absent
+    let spec = FileSpec { size: Some(plain.len() as u64), extra, ..FileSpec::new("f", &encrypted) };
+    fs::write(&archive, archive_with(&[(spec, crc32fast::hash(plain))], false)).unwrap();
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("f"), b"original").unwrap();
+    let summary = extract::run_with_password(&archive, &options(&out, Mode::Extract), Some(PASSWORD), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (0, 1));
+    assert_eq!(fs::read(out.join("f")).unwrap(), b"original");
+}
+
+#[test]
+fn truncated_member_iv_never_publishes_an_empty_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("test.rar");
+    let out = dir.path().join("out");
+    let mut extra = encryption_record(false);
+    extra[0] -= 1;
+    extra.pop();
+    let spec = FileSpec { extra, ..FileSpec::new("f", b"") };
+    fs::write(&archive, archive_with(&[(spec, 0)], false)).unwrap();
+    let summary = extract::run_with_password(&archive, &options(&out, Mode::Extract), Some(PASSWORD), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (0, 1));
+    assert!(!out.join("f").exists());
+}
+
+const CHECK: [u8; 12] = [0x17, 0x41, 0x9a, 0xfa, 0xa6, 0x98, 0xfd, 0x50, 0xa8, 0x4b, 0x9b, 0x32];
+
+fn checked_record(check: [u8; 12]) -> Vec<u8> {
+    let mut extra = encryption_record(false);
+    extra[0] += 12;
+    extra[3] = 1;
+    extra.extend(check);
+    extra
+}
+
+#[test]
+fn typed_password_evidence_belongs_to_the_member_that_was_checked() {
+    use zipfast::error::{RarFailure, RarIntegrityReason, RarPasswordEvidence, RarScope, RarVerifierUnavailable};
+    use zipfast::extract::{RarOutcome, run_rar_with_outcomes};
+
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("test.rar");
+    let out = dir.path().join("out");
+    let plain = b"password evidence";
+    let encrypted = encrypted_data(plain, 0);
+    let mut damaged_check = CHECK;
+    damaged_check[11] ^= 1;
+    let specs = [
+        (
+            FileSpec {
+                size: Some(plain.len() as u64),
+                extra: checked_record(CHECK),
+                ..FileSpec::new("trusted", &encrypted)
+            },
+            crc32fast::hash(plain),
+        ),
+        (
+            FileSpec {
+                size: Some(plain.len() as u64),
+                extra: encryption_record(false),
+                ..FileSpec::new("absent", &encrypted)
+            },
+            crc32fast::hash(plain),
+        ),
+        (
+            FileSpec {
+                size: Some(plain.len() as u64),
+                extra: checked_record(damaged_check),
+                ..FileSpec::new("damaged-check", &encrypted)
+            },
+            crc32fast::hash(plain),
+        ),
+        (
+            FileSpec {
+                size: Some(plain.len() as u64),
+                extra: checked_record(CHECK),
+                ..FileSpec::new("damaged-data", &encrypted)
+            },
+            crc32fast::hash(plain) ^ 1,
+        ),
+        (FileSpec::new("plain", plain), crc32fast::hash(plain)),
+    ];
+    fs::write(&archive, archive_with(&specs, false)).unwrap();
+    for threads in [1, 4] {
+        for password in [Some(PASSWORD), Some("wrong-password"), None, Some("")] {
+            let opts = Options { threads: Some(threads), ..options(&out, Mode::Test) };
+            let mut count = 0;
+            let summary = run_rar_with_outcomes(&archive, &opts, password, |event| {
+                let i = event.entry.index.unwrap();
+                assert_eq!(i, count);
+                count += 1;
+                match &event.outcome {
+                    RarOutcome::Verified { checks, .. } => {
+                        assert!(i == 4 || password == Some(PASSWORD));
+                        assert_eq!(
+                            checks.password,
+                            match i {
+                                0 => RarPasswordEvidence::VerifierMatched,
+                                1 => RarPasswordEvidence::VerifierUnavailable(RarVerifierUnavailable::Absent),
+                                2 => RarPasswordEvidence::VerifierUnavailable(
+                                    RarVerifierUnavailable::CheckChecksumMismatch
+                                ),
+                                4 => RarPasswordEvidence::NotEncrypted,
+                                _ => panic!("damaged member verified"),
+                            }
+                        );
+                    }
+                    RarOutcome::Failed(cause) => match (password, i, cause.as_ref()) {
+                        (
+                            None | Some(""),
+                            0..=3,
+                            RarFailure::PasswordRequired { scope: RarScope::Member { index, .. }, .. },
+                        )
+                        | (
+                            Some("wrong-password"),
+                            0 | 3,
+                            RarFailure::WrongPassword { scope: RarScope::Member { index, .. }, .. },
+                        ) => {
+                            assert_eq!(*index, Some(i));
+                        }
+                        (
+                            Some("wrong-password"),
+                            1 | 2,
+                            RarFailure::EncryptedIntegrity {
+                                reason: RarIntegrityReason::FinalChecks { crc32: true, .. },
+                                verifier,
+                                ..
+                            },
+                        ) => {
+                            assert_eq!(
+                                *verifier,
+                                if i == 1 {
+                                    RarVerifierUnavailable::Absent
+                                } else {
+                                    RarVerifierUnavailable::CheckChecksumMismatch
+                                }
+                            );
+                        }
+                        (
+                            Some(PASSWORD),
+                            3,
+                            RarFailure::Integrity {
+                                reason: RarIntegrityReason::FinalChecks { crc32: true, .. },
+                                password: RarPasswordEvidence::VerifierMatched,
+                                ..
+                            },
+                        ) => {}
+                        _ => panic!("unexpected password outcome {event:?}"),
+                    },
+                    _ => panic!("unexpected outcome {event:?}"),
+                }
+            })
+            .unwrap();
+            assert_eq!(count, 5);
+            assert_eq!((summary.files, summary.failed), if password == Some(PASSWORD) { (4, 1) } else { (1, 4) });
+        }
+    }
+}
+
+#[test]
+fn encrypted_header_failures_identify_scope_and_verifier_evidence() {
+    use zipfast::error::{RarFailure, RarIntegrityReason, RarPasswordEvidence, RarResource, RarScope, RarUnsupported};
+    use zipfast::extract::run_rar_with_outcomes;
+
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("encrypted.rar");
+    let opts = options(dir.path(), Mode::Test);
+    let key = derive_rar5_key_and_hash_key(PASSWORD, KDF_COUNT, &SALT, None).unwrap().0;
+    let mut params = vec![0, 1, KDF_COUNT];
+    params.extend(SALT);
+    params.extend(CHECK);
+
+    let write_archive = |params: &[u8], corrupt: bool| {
+        let mut bytes = SIG.to_vec();
+        bytes.extend(block(4, 0, params, &[], &[], false));
+        let mut main = main_block(false, None);
+        if corrupt {
+            main[0] ^= 1; // corruption is in the decrypted header CRC, with valid plaintext framing
+        }
+        for mut header in [main, end_block(false)] {
+            header.resize(header.len().next_multiple_of(16), 0);
+            bytes.extend(IV);
+            bytes.extend(encrypt_cbc(&key, &IV, &header).unwrap());
+        }
+        fs::write(&archive, bytes).unwrap();
+    };
+
+    write_archive(&params, false);
+    for (password, wrong) in [(None, false), (Some(""), false), (Some("wrong"), true)] {
+        let err = run_rar_with_outcomes(&archive, &opts, password, |_| panic!("no member exists")).unwrap_err();
+        let scope = match (wrong, err.failure.as_ref()) {
+            (false, RarFailure::PasswordRequired { scope }) | (true, RarFailure::WrongPassword { scope }) => scope,
+            _ => panic!("unexpected header error {err:?}"),
+        };
+        assert!(matches!(scope, RarScope::Header { volume, .. } if volume == &archive));
+        assert!(err.entry.is_none());
+        assert_eq!(err.partial.volumes, 0);
+    }
+    let result = run_rar_with_outcomes(&archive, &opts, Some(PASSWORD), |_| panic!("no member exists")).unwrap();
+    assert_eq!((result.volumes, result.files), (1, 0));
+
+    write_archive(&params, true);
+    let err = run_rar_with_outcomes(&archive, &opts, Some(PASSWORD), |_| panic!("no member exists")).unwrap_err();
+    assert!(matches!(
+        err.failure.as_ref(),
+        RarFailure::Integrity {
+            reason: RarIntegrityReason::HeaderCrc,
+            password: RarPasswordEvidence::VerifierMatched,
+            ..
+        }
+    ));
+
+    write_archive(&params[..params.len() - 1], false);
+    let err = run_rar_with_outcomes(&archive, &opts, None, |_| panic!("no member exists")).unwrap_err();
+    assert!(matches!(
+        err.failure.as_ref(),
+        RarFailure::Integrity { reason: RarIntegrityReason::MalformedEncryptionRecord, .. }
+    ));
+
+    params[2] = 25;
+    write_archive(&params, false);
+    let err = run_rar_with_outcomes(&archive, &opts, None, |_| panic!("no member exists")).unwrap_err();
+    assert!(matches!(
+        err.failure.as_ref(),
+        RarFailure::Limit { resource: RarResource::KdfExponent, requested: Some(25), allowed: Some(24), .. }
+    ));
+
+    params[0] = 2;
+    write_archive(&params, false);
+    let err = run_rar_with_outcomes(&archive, &opts, None, |_| panic!("no member exists")).unwrap_err();
+    assert!(matches!(err.failure.as_ref(), RarFailure::Unsupported(RarUnsupported::EncryptionVersion(2))));
+}
+
+#[test]
+fn packed_piece_integrity_identifies_when_password_can_affect_the_check() {
+    use zipfast::error::{RarFailure, RarIntegrityReason, RarVerifierUnavailable};
+    use zipfast::extract::{RarOutcome, run_rar_with_outcomes};
+
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("test.part1.rar");
+    let plain = b"checks before split";
+    let encrypted = encrypted_data(plain, 0);
+    for keyed in [false, true] {
+        let spec = FileSpec {
+            size: Some(plain.len() as u64),
+            extra: encryption_record(keyed),
+            ..FileSpec::new("f", &encrypted)
+        };
+        let (first, last) = encrypted.split_at(16);
+        let checksum = if keyed { encrypted_crc(first) } else { crc32fast::hash(first) };
+        for (i, data, crc) in [(0, first, checksum ^ 1), (1, last, crc32fast::hash(plain))] {
+            let mut volume = SIG.to_vec();
+            volume.extend(main_block(true, (i != 0).then_some(i)));
+            volume.extend(file_block(&spec, data, crc, i != 0, i == 0));
+            volume.extend(end_block(i == 0));
+            fs::write(dir.path().join(format!("test.part{}.rar", i + 1)), volume).unwrap();
+        }
+        let out = dir.path().join("out");
+        let mut seen = 0;
+        let summary = run_rar_with_outcomes(&archive, &options(&out, Mode::Extract), Some(PASSWORD), |event| {
+            seen += 1;
+            assert_eq!(event.entry.index, Some(0));
+            let RarOutcome::Failed(failure) = &event.outcome else { panic!("damaged piece verified") };
+            match (keyed, failure.as_ref()) {
+                (
+                    false,
+                    RarFailure::Integrity {
+                        reason: RarIntegrityReason::PackedPiece { crc32: true, keyed: false, .. },
+                        ..
+                    },
+                )
+                | (
+                    true,
+                    RarFailure::EncryptedIntegrity {
+                        reason: RarIntegrityReason::PackedPiece { crc32: true, keyed: true, .. },
+                        verifier: RarVerifierUnavailable::Absent,
+                        ..
+                    },
+                ) => {}
+                _ => panic!("unexpected piece failure {event:?}"),
+            }
+        })
+        .unwrap();
+        assert_eq!((seen, summary.failed, summary.volumes), (1, 1, 2));
+        assert!(!out.join("f").exists());
+    }
+}
+
+#[test]
+fn truncated_verifier_in_continuation_preserves_destination() {
+    use zipfast::error::{RarFailure, RarIntegrityReason};
+    use zipfast::extract::{RarOutcome, run_rar_with_outcomes};
+
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("test.part1.rar");
+    let out = dir.path().join("out");
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("f"), b"original").unwrap();
+    let plain = b"two encrypted pieces";
+    let encrypted = encrypted_data(plain, 0);
+    let first =
+        FileSpec { size: Some(plain.len() as u64), extra: encryption_record(false), ..FileSpec::new("f", &encrypted) };
+    let mut extra = encryption_record(false);
+    extra[3] = 1; // The continuation declares a check without providing it.
+    let last = FileSpec { extra, size: first.size, ..FileSpec::new("f", &encrypted) };
+    split_archive(dir.path(), &first, &last, 16, crc32fast::hash(plain));
+
+    let opts = options(&out, Mode::Extract);
+    let legacy = extract::run_with_password(&archive, &opts, Some(PASSWORD), |_| {}).unwrap();
+    assert_eq!(legacy.errors, ["f: encrypted (password required)"]);
+    let mut seen = 0;
+    let summary = run_rar_with_outcomes(&archive, &opts, Some(PASSWORD), |event| {
+        seen += 1;
+        assert_eq!(event.entry.index, Some(0));
+        assert!(matches!(&event.outcome, RarOutcome::Failed(failure) if matches!(failure.as_ref(),
+            RarFailure::Integrity { reason: RarIntegrityReason::MalformedEncryptionRecord, .. }
+        )));
+    })
+    .unwrap();
+    assert_eq!((seen, summary.failed, summary.files), (1, 1, 0));
+    assert_eq!(fs::read(out.join("f")).unwrap(), b"original");
+    assert_eq!(fs::read_dir(out).unwrap().count(), 1);
+}

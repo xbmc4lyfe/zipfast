@@ -280,3 +280,99 @@ fn a_stored_file_among_queued_ones_reports_after_them() {
     }
     assert_eq!(seen[0], seen[1]);
 }
+
+#[test]
+fn refused_solid_predecessor_cannot_leave_stale_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let arc = dir.path().join("solid.rar");
+    let start = testenc::block(&[Op::Lit(b'A'), Op::Lit(b'A'), Op::Lit(b'A')], true, true);
+    let dependent = testenc::block(&[Op::Match(3, 3)], true, true);
+    use std::sync::Arc;
+    use zipfast::error::RarFailure;
+    use zipfast::extract::{RarOutcome, run_rar_with_outcomes};
+
+    let unverified = [36, 1, 0, 0, 4].into_iter().chain([0x53; 16]).chain([0x49; 16]).collect::<Vec<_>>();
+    let mut trusted = unverified.clone();
+    trusted[0] += 12;
+    trusted[3] = 1;
+    trusted.extend([0x17, 0x41, 0x9a, 0xfa, 0xa6, 0x98, 0xfd, 0x50, 0xa8, 0x4b, 0x9b, 0x32]);
+    for (case, algorithm, extra, password, reason) in [
+        ("unsupported", 1, vec![], None, "RAR 7 compression is not supported yet"),
+        ("required", 0, unverified, None, "encrypted (password required)"),
+        ("wrong", 0, trusted, Some("incorrect"), "wrong password"),
+    ] {
+        let specs = [
+            (FileSpec { method: 6, size: Some(3), ..FileSpec::new("start", &start) }, crc32fast::hash(b"AAA")),
+            (FileSpec { method: 3, extra, size: Some(3), solid: true, ..FileSpec::new("refused", &start) }, 0),
+            (
+                FileSpec { method: 3, size: Some(3), solid: true, ..FileSpec::new("dependent", &dependent) },
+                crc32fast::hash(b"AAA"),
+            ),
+            (FileSpec { method: 7, size: Some(3), ..FileSpec::new("restart", &start) }, crc32fast::hash(b"AAA")),
+        ];
+        let mut archive = SIG.to_vec();
+        archive.extend(main_block_flags(false, None, true));
+        for (spec, crc) in &specs {
+            if algorithm == 1 && spec.name == "refused" {
+                let mut fields = vec![4, 3, 0x20];
+                fields.extend(crc.to_le_bytes());
+                vint((3 << 7) | 0x40 | 1, &mut fields);
+                fields.extend([0, 7]);
+                fields.extend(b"refused");
+                archive.extend(block(2, 0, &fields, &[], spec.data, true));
+            } else {
+                archive.extend(file_block(spec, spec.data, *crc, false, false));
+            }
+        }
+        archive.extend(end_block(false));
+        fs::write(&arc, archive).unwrap();
+        for threads in [1, 4] {
+            let out = dir.path().join(format!("out-{case}-{threads}"));
+            let mut lines = Vec::new();
+            let summary =
+                extract::run_with_password(&arc, &opts(&out, threads), password, |line| lines.push(line.to_owned()))
+                    .unwrap();
+            assert_eq!(
+                lines,
+                [
+                    format!("refused: {reason}"),
+                    "dependent: needs the files before it in this solid archive, which weren't decoded".to_owned(),
+                ]
+            );
+            assert_eq!(summary.files, 2);
+            assert!(!out.join("dependent").exists());
+            assert_eq!(fs::read(out.join("restart")).unwrap(), b"AAA");
+            let typed_out = dir.path().join(format!("typed-{case}-{threads}"));
+            let mut first_failure = None;
+            let mut seen = 0;
+            let summary = run_rar_with_outcomes(&arc, &opts(&typed_out, threads), password, |event| {
+                assert_eq!(event.entry.index, Some(seen));
+                match (seen, &event.outcome) {
+                    (0 | 3, RarOutcome::Verified { bytes: 3, .. }) => {
+                        assert_eq!(event.method, if seen == 0 { 6 } else { 7 });
+                    }
+                    (1, RarOutcome::Failed(failure)) => {
+                        assert!(match case {
+                            "unsupported" => matches!(failure.as_ref(), RarFailure::Unsupported(_)),
+                            "required" => matches!(failure.as_ref(), RarFailure::PasswordRequired { .. }),
+                            _ => matches!(failure.as_ref(), RarFailure::WrongPassword { .. }),
+                        });
+                        first_failure = Some(Arc::clone(failure));
+                    }
+                    (2, RarOutcome::Failed(failure)) => {
+                        assert!(matches!(failure.as_ref(), RarFailure::SolidHistoryUnavailable {
+                            predecessor: Some(1), cause: Some(cause), ..
+                        } if Arc::ptr_eq(first_failure.as_ref().unwrap(), cause)));
+                    }
+                    _ => panic!("unexpected solid outcome {event:?}"),
+                }
+                seen += 1;
+            })
+            .unwrap();
+            assert_eq!(seen, 4);
+            assert_eq!((summary.files, summary.failed), (2, 2));
+            assert!(!typed_out.join("dependent").exists());
+            assert_eq!(fs::read(typed_out.join("restart")).unwrap(), b"AAA");
+        }
+    }
+}

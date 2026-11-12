@@ -25,6 +25,8 @@ use std::thread::{self, JoinHandle};
 
 use tempfile::{NamedTempFile, TempPath};
 
+use crate::error::{Error, IoOperation, RarFailure, RarFault, RarInternal, RarPolicyReason};
+
 /// Files from this size up (or of unknown size) get a writer thread.
 const BACKGROUND_MIN: u64 = 4 << 20;
 /// Bytes gathered before they go to the writer. With the queue below, a file being written holds at most about
@@ -36,6 +38,73 @@ const DEPTH: usize = 4;
 pub(crate) struct Output {
     inner: Inner,
     pending: Option<PendingPath>,
+}
+
+#[derive(Debug)]
+pub(crate) enum OutputError {
+    Io { operation: IoOperation, path: Option<PathBuf>, source: io::Error },
+    Worker(WriterFailure),
+    Symlink(PathBuf),
+}
+
+impl OutputError {
+    fn into_legacy(self) -> io::Error {
+        match self {
+            Self::Io { source, .. } => source,
+            Self::Worker(failure) => failure.into_legacy(),
+            Self::Symlink(_) => io::Error::new(io::ErrorKind::AlreadyExists, "a symlink is in the way"),
+        }
+    }
+
+    pub(crate) fn detailed(self, preserve_eof: bool) -> RarFault {
+        match self {
+            Self::Io { operation, path, source } => RarFault::output(operation, path, None, source, preserve_eof),
+            Self::Worker(failure) => {
+                let reason = match failure {
+                    WriterFailure::Panicked => RarInternal::WorkerPanic,
+                    WriterFailure::MissingFile => RarInternal::Invariant("no file"),
+                    _ => RarInternal::WorkerStopped,
+                };
+                RarFault::new(RarFailure::Internal(reason), Error::Io(failure.into_legacy()))
+            }
+            Self::Symlink(path) => RarFault::new(
+                RarFailure::Policy { reason: RarPolicyReason::Symlink, path },
+                Error::Io(io::Error::new(io::ErrorKind::AlreadyExists, "a symlink is in the way")),
+            ),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum WriterFailure {
+    Io(io::Error),
+    MissingFile,
+    Stopped,
+    Panicked,
+    AlreadyStopped,
+}
+
+impl WriterFailure {
+    fn into_legacy(self) -> io::Error {
+        match self {
+            Self::Io(e) => e,
+            Self::MissingFile => io::Error::other("no file"),
+            Self::Stopped => io::Error::other("the file writer stopped"),
+            Self::Panicked => io::Error::other("the file writer failed"),
+            Self::AlreadyStopped => io::Error::other("the file writer already stopped"),
+        }
+    }
+
+    fn detailed(self, pending: Option<&PendingPath>) -> OutputError {
+        match self {
+            Self::Io(source) => OutputError::Io {
+                operation: IoOperation::Write,
+                path: pending.and_then(PendingPath::target).map(Path::to_path_buf),
+                source,
+            },
+            failure => OutputError::Worker(failure),
+        }
+    }
 }
 
 pub(crate) struct WriteFile {
@@ -70,16 +139,19 @@ pub(crate) fn temporary(parent: &Path) -> io::Result<NamedTempFile> {
 }
 
 pub(crate) fn replace(temporary: TempPath, target: &Path) -> io::Result<()> {
+    replace_detailed(temporary, target).map_err(OutputError::into_legacy)
+}
+
+fn replace_detailed(temporary: TempPath, target: &Path) -> Result<(), OutputError> {
+    let fault = |operation, source| OutputError::Io { operation, path: Some(target.to_path_buf()), source };
     // An earlier check cannot account for a symlink installed while decoding.
     match fs::symlink_metadata(target) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a symlink is in the way"));
-        }
+        Ok(meta) if meta.file_type().is_symlink() => return Err(OutputError::Symlink(target.to_path_buf())),
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+        Err(e) => return Err(fault(IoOperation::Metadata, e)),
     }
-    temporary.persist(target).map_err(|e| e.error)
+    temporary.persist(target).map_err(|e| fault(IoOperation::Publish, e.error))
 }
 
 enum Inner {
@@ -92,7 +164,22 @@ struct Background {
     /// emptied buffers coming back for reuse
     spare: Receiver<Vec<u8>>,
     cur: Vec<u8>,
-    handle: Option<JoinHandle<io::Result<File>>>,
+    handle: Option<JoinHandle<Result<File, WriterFailure>>>,
+}
+
+impl PendingPath {
+    fn target(&self) -> Option<&Path> {
+        match self {
+            Self::New(cleanup) => cleanup.0.as_deref(),
+            Self::Replacement(_, target) => Some(target),
+        }
+    }
+}
+
+impl WriteFile {
+    pub(crate) fn target(&self) -> Option<&Path> {
+        self.pending.as_ref().and_then(PendingPath::target)
+    }
 }
 
 impl Output {
@@ -107,9 +194,9 @@ impl Output {
         let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(file)));
         let theirs = std::sync::Arc::clone(&slot);
         let spawned = thread::Builder::new().name("zipfast-write".into()).spawn(move || {
-            let mut file = theirs.lock().ok().and_then(|mut f| f.take()).ok_or_else(|| io::Error::other("no file"))?;
+            let mut file = theirs.lock().ok().and_then(|mut f| f.take()).ok_or(WriterFailure::MissingFile)?;
             for mut buf in rx {
-                file.write_all(&buf)?;
+                file.write_all(&buf).map_err(WriterFailure::Io)?;
                 buf.clear();
                 let _ = back.send(buf);
             }
@@ -144,9 +231,17 @@ impl Output {
         output
     }
 
-    pub fn write(&mut self, mut data: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_detailed(&mut self, data: &[u8]) -> Result<(), OutputError> {
+        self.write_inner(data).map_err(|failure| failure.detailed(self.pending.as_ref()))
+    }
+
+    pub fn write(&mut self, data: &[u8]) -> io::Result<()> {
+        self.write_inner(data).map_err(WriterFailure::into_legacy)
+    }
+
+    fn write_inner(&mut self, mut data: &[u8]) -> Result<(), WriterFailure> {
         match &mut self.inner {
-            Inner::Direct(file) => file.write_all(data),
+            Inner::Direct(file) => file.write_all(data).map_err(WriterFailure::Io),
             Inner::Background(b) => {
                 while !data.is_empty() {
                     let take = (CHUNK - b.cur.len()).min(data.len());
@@ -162,8 +257,8 @@ impl Output {
     }
 
     /// Waits for pending writes and hands the file and its cleanup guard to a positional writer.
-    pub fn handoff(self) -> io::Result<WriteFile> {
-        let file = match self.inner {
+    pub(crate) fn handoff_detailed(self) -> Result<WriteFile, OutputError> {
+        let file = (|| match self.inner {
             Inner::Direct(file) => Ok(file),
             Inner::Background(mut b) => {
                 if !b.cur.is_empty() {
@@ -172,7 +267,8 @@ impl Output {
                 b.tx = None;
                 b.join()
             }
-        }?;
+        })()
+        .map_err(|failure| failure.detailed(self.pending.as_ref()))?;
         Ok(WriteFile { file, pending: self.pending })
     }
 
@@ -184,11 +280,15 @@ impl Output {
 
     /// Prepares metadata and publishes a verified replacement after every write has finished.
     pub fn finish(self, prepare: impl FnOnce(&File)) -> io::Result<()> {
-        let WriteFile { file, pending } = self.handoff()?;
+        self.finish_detailed(prepare).map_err(OutputError::into_legacy)
+    }
+
+    pub(crate) fn finish_detailed(self, prepare: impl FnOnce(&File)) -> Result<(), OutputError> {
+        let WriteFile { file, pending } = self.handoff_detailed()?;
         prepare(&file);
         drop(file);
         match pending {
-            Some(PendingPath::Replacement(temporary, target)) => replace(temporary, &target),
+            Some(PendingPath::Replacement(temporary, target)) => replace_detailed(temporary, &target),
             Some(PendingPath::New(mut cleanup)) => {
                 cleanup.0 = None;
                 Ok(())
@@ -199,7 +299,7 @@ impl Output {
 }
 
 impl Background {
-    fn send(&mut self) -> io::Result<()> {
+    fn send(&mut self) -> Result<(), WriterFailure> {
         let next = self.spare.try_recv().unwrap_or_else(|_| Vec::with_capacity(CHUNK));
         let full = std::mem::replace(&mut self.cur, next);
         let sent = self.tx.as_ref().is_some_and(|tx| tx.send(full).is_ok());
@@ -208,14 +308,14 @@ impl Background {
         }
         // the writer stopped: its error says why
         self.tx = None;
-        Err(self.join().err().unwrap_or_else(|| io::Error::other("the file writer stopped")))
+        Err(self.join().err().unwrap_or(WriterFailure::Stopped))
     }
 
-    fn join(&mut self) -> io::Result<File> {
+    fn join(&mut self) -> Result<File, WriterFailure> {
         match self.handle.take().map(JoinHandle::join) {
             Some(Ok(result)) => result,
-            Some(Err(_)) => Err(io::Error::other("the file writer failed")),
-            None => Err(io::Error::other("the file writer already stopped")),
+            Some(Err(_)) => Err(WriterFailure::Panicked),
+            None => Err(WriterFailure::AlreadyStopped),
         }
     }
 }
@@ -282,6 +382,37 @@ mod tests {
         fs::create_dir(&target).unwrap();
         fs::write(target.join("keep"), b"original").unwrap();
         assert!(out.finish(|_| {}).is_err());
+        assert_eq!(fs::read(target.join("keep")).unwrap(), b"original");
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detailed_finish_distinguishes_background_write_and_publish() {
+        use crate::error::{IoOperation, RarFailure};
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        fs::write(&target, b"original").unwrap();
+        let temp = temporary(dir.path()).unwrap();
+        let file = File::open(temp.path()).unwrap();
+        let mut out = Output::staged(file, None, temp.into_temp_path(), target.clone());
+        out.write(b"buffered").unwrap();
+        let fault = out.finish_detailed(|_| panic!("failed write reached publication")).unwrap_err().detailed(false);
+        assert!(matches!(fault.failure.as_ref(), RarFailure::Output {
+            operation: IoOperation::Write, path: Some(path), source, ..
+        } if path == &target && source.raw_os_error() == Some(libc::EBADF)));
+        assert_eq!(fs::read(&target).unwrap(), b"original");
+
+        fs::remove_file(&target).unwrap();
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("keep"), b"original").unwrap();
+        let (file, temp) = temporary(dir.path()).unwrap().into_parts();
+        let mut out = Output::staged(file, Some(4), temp, target.clone());
+        out.write(b"data").unwrap();
+        let fault = out.finish_detailed(|_| {}).unwrap_err().detailed(false);
+        assert!(matches!(fault.failure.as_ref(), RarFailure::Output {
+            operation: IoOperation::Publish, path: Some(path), source, ..
+        } if path == &target && source.raw_os_error().is_some()));
         assert_eq!(fs::read(target.join("keep")).unwrap(), b"original");
         assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }

@@ -597,6 +597,55 @@ pub fn rar5_record_params(record: &[u8]) -> Option<Rar5CryptParams> {
     Some(Rar5CryptParams { kdf_count, salt, iv, check, tweaked_crc: flags & 0x0002 != 0 })
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum Rar5CryptLayout {
+    Header,
+    Member,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Rar5CryptError {
+    Malformed,
+    UnsupportedVersion(u64),
+    KdfLimit(u8),
+    WrongPassword,
+}
+
+pub(crate) fn parse_rar5_crypt(
+    record: &[u8],
+    layout: Rar5CryptLayout,
+) -> std::result::Result<Rar5CryptParams, Rar5CryptError> {
+    use Rar5CryptError::Malformed;
+    let mut cursor = crate::rar5::Cursor::new(record);
+    let version = cursor.vint().map_err(|_| Malformed)?;
+    if version != 0 {
+        return Err(Rar5CryptError::UnsupportedVersion(version));
+    }
+    let flags = cursor.vint().map_err(|_| Malformed)?;
+    let p = cursor.pos();
+    let kdf_count = *record.get(p).ok_or(Malformed)?;
+    let salt = record.get(p + 1..p + 17).ok_or(Malformed)?.try_into().unwrap();
+    let mut at = p + 17;
+    let iv = match layout {
+        Rar5CryptLayout::Header => [0; 16],
+        Rar5CryptLayout::Member => {
+            let iv = record.get(at..at + 16).ok_or(Malformed)?.try_into().unwrap();
+            at += 16;
+            iv
+        }
+    };
+    let check = if flags & 1 == 0 {
+        None
+    } else {
+        let bytes = record.get(at..at + 12).ok_or(Malformed)?;
+        Some((bytes[..8].try_into().unwrap(), bytes[8..].try_into().unwrap()))
+    };
+    if kdf_count > 24 {
+        return Err(Rar5CryptError::KdfLimit(kdf_count));
+    }
+    Ok(Rar5CryptParams { kdf_count, salt, iv, check, tweaked_crc: flags & 2 != 0 })
+}
+
 /// Derives the RAR5 32-byte AES-256 key and 32-byte `HashKey` (for keyed checksums) from `password`, `kdf_count`, and `salt`.
 /// If `check` is `Some((chk, csum))` and `sha256(&chk)[..4] == csum`, verifies the password against `chk`.
 pub fn derive_rar5_key_and_hash_key(
@@ -605,8 +654,24 @@ pub fn derive_rar5_key_and_hash_key(
     salt: &[u8; 16],
     check: Option<([u8; 8], [u8; 4])>,
 ) -> Option<([u8; 32], [u8; 32])> {
+    derive_rar5_keys(password, kdf_count, salt, check).ok().map(|keys| (keys.key, keys.hash_key))
+}
+
+pub(crate) struct Rar5Keys {
+    pub(crate) key: [u8; 32],
+    pub(crate) hash_key: [u8; 32],
+    pub(crate) evidence: crate::error::RarPasswordEvidence,
+}
+
+pub(crate) fn derive_rar5_keys(
+    password: &str,
+    kdf_count: u8,
+    salt: &[u8; 16],
+    check: Option<([u8; 8], [u8; 4])>,
+) -> std::result::Result<Rar5Keys, Rar5CryptError> {
+    use crate::error::{RarPasswordEvidence, RarVerifierUnavailable};
     if kdf_count > 24 {
-        return None;
+        return Err(Rar5CryptError::KdfLimit(kdf_count));
     }
     let keyed = HmacSha256Key::new(password.as_bytes());
     let mut salt_block = [0u8; 20];
@@ -629,9 +694,8 @@ pub fn derive_rar5_key_and_hash_key(
         }
     }
     let hash_key = fn_acc;
-    if let Some((chk, csum)) = check {
-        let digest = sha256(&chk);
-        if digest.get(..4) == Some(csum.as_slice()) {
+    let evidence = match check {
+        Some((chk, csum)) if sha256(&chk)[..4] == csum => {
             for _ in 0..16 {
                 u = keyed.mac_32(&u);
                 for (slot, b) in fn_acc.iter_mut().zip(u) {
@@ -643,11 +707,14 @@ pub fn derive_rar5_key_and_hash_key(
                 folded[i % 8] ^= *b;
             }
             if folded != chk {
-                return None;
+                return Err(Rar5CryptError::WrongPassword);
             }
+            RarPasswordEvidence::VerifierMatched
         }
-    }
-    Some((key, hash_key))
+        Some(_) => RarPasswordEvidence::VerifierUnavailable(RarVerifierUnavailable::CheckChecksumMismatch),
+        None => RarPasswordEvidence::VerifierUnavailable(RarVerifierUnavailable::Absent),
+    };
+    Ok(Rar5Keys { key, hash_key, evidence })
 }
 
 /// Derives the RAR5 32-byte AES-256 key from `password`, `kdf_count`, and `salt`.

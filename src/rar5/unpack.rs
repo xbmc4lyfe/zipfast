@@ -21,6 +21,7 @@
 //! filters over them have run.
 
 use crate::error::{Error, Result};
+use std::alloc::{Layout, alloc_zeroed};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::ptr;
@@ -657,6 +658,7 @@ pub struct Unpacker {
     emitted: u64,
     /// the current file's declared size, None when unknown
     size: Option<u64>,
+    size_failure: Option<(u64, u64)>,
     tables_ready: bool,
     /// the code lengths the next block without tables is read with, which a worker may still be reading, and the
     /// lengths `tables` was last built from
@@ -730,24 +732,79 @@ impl Window {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum WindowError {
+    InvalidDictionary(u64),
+    Size(u64),
+    Capacity(u64),
+    Allocation(u64),
+}
+
+impl WindowError {
+    pub(crate) fn into_legacy(self) -> Error {
+        Error::Unsupported(match self {
+            Self::InvalidDictionary(dictionary) => format!("dictionary size {dictionary}"),
+            Self::Size(_) => "dictionary too large".into(),
+            Self::Capacity(window) | Self::Allocation(window) => format!("can't allocate a {window} byte window"),
+        })
+    }
+
+    pub(crate) fn detailed(self, scope: crate::error::RarScope) -> crate::error::RarFault {
+        use crate::error::{RarFailure, RarFault, RarIntegrityReason, RarPasswordEvidence, RarResource};
+        let failure = match self {
+            Self::InvalidDictionary(requested) => RarFailure::integrity(
+                scope,
+                RarIntegrityReason::InvalidDictionary { requested },
+                RarPasswordEvidence::NotEncrypted,
+                false,
+            ),
+            Self::Size(requested) | Self::Capacity(requested) => RarFailure::Limit {
+                resource: RarResource::DictionarySize,
+                requested: Some(requested),
+                allowed: Some(isize::MAX as u64),
+            },
+            Self::Allocation(requested) => RarFailure::Limit {
+                resource: RarResource::DictionaryAllocation,
+                requested: Some(requested),
+                allowed: None,
+            },
+        };
+        RarFault::new(failure, self.into_legacy())
+    }
+}
+
 /// The window a file needs. Matches reach back as far as its declared dictionary, or no further than the file when
 /// nothing before or after it can refer back into it. Short writes may spill (`Win::spills`) where the window is
 /// longer than that reach by `SPILL` (32) or more: a file on its own gets twice its size anyway, because a filter may
 /// cover up to half the window and a filter may cover the whole file, and one of up to the dictionary gets that
 /// much. Longer streams get twice the dictionary, where that costs no more than `ROOMY_MAX` (32 MiB) extra.
 pub fn window_for(dictionary: u64, unpacked: Option<u64>, solid_stream: bool) -> Result<Window> {
+    window_for_detailed(dictionary, unpacked, solid_stream).map_err(WindowError::into_legacy)
+}
+
+pub(crate) fn window_for_detailed(
+    dictionary: u64,
+    unpacked: Option<u64>,
+    solid_stream: bool,
+) -> std::result::Result<Window, WindowError> {
     if dictionary == 0 || !dictionary.is_power_of_two() {
-        return Err(Error::Unsupported(format!("dictionary size {dictionary}")));
+        return Err(WindowError::InvalidDictionary(dictionary));
     }
     if let Some(size) = unpacked
         && !solid_stream
     {
         // bounded by the dictionary first, so an absurd stated size can't overflow the rounding
-        let need = (size.min(dictionary).max(1) * 2).next_power_of_two().max(128 * 1024);
-        if need <= dictionary {
+        if let Some(need) = size
+            .min(dictionary)
+            .max(1)
+            .checked_mul(2)
+            .and_then(u64::checked_next_power_of_two)
+            .map(|need| need.max(128 * 1024))
+            .filter(|&need| need <= dictionary)
+        {
             return Ok(Window { size: need, reach: need / 2 });
         }
-        if size <= dictionary - SPILL {
+        if dictionary.checked_sub(SPILL).is_some_and(|reach| size <= reach) {
             return Ok(Window { size: dictionary, reach: size });
         }
     }
@@ -758,22 +815,32 @@ pub fn window_for(dictionary: u64, unpacked: Option<u64>, solid_stream: bool) ->
 impl Unpacker {
     /// A fresh stream with the window `window`.
     pub fn new(window: Window) -> Result<Self> {
+        Self::new_detailed(window).map_err(WindowError::into_legacy)
+    }
+
+    pub(crate) fn new_detailed(window: Window) -> std::result::Result<Self, WindowError> {
         let Window { size: window, reach } = window;
         assert!(window.is_power_of_two() && reach <= window, "window {window}, reach {reach}");
-        let size = usize::try_from(window).map_err(|_| Error::Unsupported("dictionary too large".into()))?;
-        // asked first so an absurd size is an error, not an abort; the window itself comes zeroed from the system,
-        // so its pages cost nothing until they are written
-        Vec::<u8>::new()
-            .try_reserve_exact(size)
-            .map_err(|_| Error::Unsupported(format!("can't allocate a {window} byte window")))?;
+        let size = usize::try_from(window).map_err(|_| WindowError::Size(window))?;
+        let layout = Layout::array::<u8>(size).map_err(|_| WindowError::Capacity(window))?;
+        // The allocator can supply zeroed pages without the decoder touching every page up front.
+        // SAFETY: The power-of-two window size is nonzero and the layout passed its size check.
+        let allocation = unsafe { alloc_zeroed(layout) };
+        if allocation.is_null() {
+            return Err(WindowError::Allocation(window));
+        }
+        // SAFETY: The global allocator returned size initialized bytes with u8 alignment.
+        // Vec takes ownership and uses the same layout when it frees the allocation.
+        let window_bytes = unsafe { Vec::from_raw_parts(allocation, size, size) };
         Ok(Unpacker {
-            window: vec![0; size],
+            window: window_bytes,
             mask: window - 1,
             reach,
             sp: 0,
             file_base: 0,
             emitted: 0,
             size: None,
+            size_failure: None,
             tables_ready: false,
             slot: Slot::filled(None),
             built: None,
@@ -897,6 +964,7 @@ impl Unpacker {
         self.file_base = self.sp;
         self.emitted = 0;
         self.size = size;
+        self.size_failure = None;
         self.filters.clear();
         self.input.clear();
         self.parallel = self.wants_parallel();
@@ -1127,6 +1195,10 @@ impl Unpacker {
         Ok(())
     }
 
+    pub(crate) fn take_size_failure(&mut self) -> Option<(u64, u64)> {
+        self.size_failure.take()
+    }
+
     /// Emits the rest of the current file and checks it ended where it should, then hands the sink the file's
     /// CRC32 if it wants it.
     fn check_end(&mut self, sink: &mut dyn Sink) -> Result<()> {
@@ -1136,7 +1208,10 @@ impl Unpacker {
                 return Err(corrupt("a filter runs past the end of the file"));
             }
             match self.size {
-                Some(size) if self.emitted != size => Err(corrupt("decoded size differs from the header")),
+                Some(size) if self.emitted != size => {
+                    self.size_failure = Some((size, self.emitted));
+                    Err(corrupt("decoded size differs from the header"))
+                }
                 _ => Ok(()),
             }
         });
@@ -1222,6 +1297,8 @@ impl Unpacker {
                                 win = unsafe { Win::detached(&mut self.window) }.reaching(self.reach);
                             }
                             if sp >= size_end {
+                                self.size_failure =
+                                    self.size.map(|size| (size, (sp - self.file_base).saturating_add(n as u64)));
                                 break 'apply Err(corrupt("more data than the header says"));
                             }
                             let room = (stop + 1).min(size_end).saturating_sub(sp);
@@ -1244,7 +1321,12 @@ impl Unpacker {
                     _ => {
                         if let Some((len, d)) = resolve(tok, &mut history, &mut last_len) {
                             if let Err(e) = copy::<SPILLS>(win, sp, len, d, size_end) {
-                                break 'apply Err(e);
+                                if matches!(e, MatchCopyError::Size) {
+                                    self.size_failure = self
+                                        .size
+                                        .map(|size| (size, (sp - self.file_base).saturating_add(u64::from(len))));
+                                }
+                                break 'apply Err(e.into_legacy());
                             }
                             sp += u64::from(len);
                         }
@@ -1434,7 +1516,9 @@ impl Unpacker {
         // a copy, so that it can live in registers
         let mut local = *bits_at;
         let bits = &mut local;
-        let Unpacker { window, mask, reach, sp: sp_ref, file_base, size, history, last_len, filters, .. } = self;
+        let Unpacker {
+            window, mask, reach, sp: sp_ref, file_base, size, size_failure, history, last_len, filters, ..
+        } = self;
         let mask = *mask;
         let file_base = *file_base;
         let size_end = size.map_or(u64::MAX, |s| file_base.saturating_add(s));
@@ -1506,6 +1590,7 @@ impl Unpacker {
                 let s = decode!(main);
                 if s < 256 {
                     if sp >= size_end {
+                        *size_failure = size.map(|size| (size, (sp - file_base).saturating_add(1)));
                         break Err(corrupt("more data than the header says"));
                     }
                     put!(s);
@@ -1526,7 +1611,10 @@ impl Unpacker {
             }
             let Some((len, d)) = resolve(tok, &mut hist, &mut last) else { continue };
             if let Err(e) = copy::<SPILLS>(window, sp, len, d, size_end) {
-                break Err(e);
+                if matches!(e, MatchCopyError::Size) {
+                    *size_failure = size.map(|size| (size, (sp - file_base).saturating_add(u64::from(len))));
+                }
+                break Err(e.into_legacy());
             }
             sp += u64::from(len);
         };
@@ -1811,17 +1899,38 @@ fn put_from<const SPILLS: bool>(window: Win<'_>, sp: u64, lits: &[u8], at: usize
     }
 }
 
+#[derive(Debug)]
+enum MatchCopyError {
+    Distance,
+    Size,
+}
+
+impl MatchCopyError {
+    fn into_legacy(self) -> Error {
+        match self {
+            Self::Distance => corrupt("match reaches before the start of the data"),
+            Self::Size => corrupt("more data than the header says"),
+        }
+    }
+}
+
 /// Copies a match inside the window. `sp` is the stream position the copy starts at; nothing may land at or past
 /// `size_end`. With `SPILLS` (which `window` must allow, see [`Win::spills`]) a short copy spills.
 #[inline(always)]
-fn copy<const SPILLS: bool>(window: Win<'_>, sp: u64, len: u32, dist: u64, size_end: u64) -> Result<()> {
+fn copy<const SPILLS: bool>(
+    window: Win<'_>,
+    sp: u64,
+    len: u32,
+    dist: u64,
+    size_end: u64,
+) -> std::result::Result<(), MatchCopyError> {
     debug_assert!(!SPILLS || window.spills());
     let mask = window.mask as u64;
     if dist == 0 || dist > sp || dist > window.reach {
-        return Err(corrupt("match reaches before the start of the data"));
+        return Err(MatchCopyError::Distance);
     }
     if u64::from(len) > size_end - sp {
-        return Err(corrupt("more data than the header says"));
+        return Err(MatchCopyError::Size);
     }
     let n = len as usize;
     let dst = (sp & mask) as usize;
