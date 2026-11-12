@@ -21,6 +21,7 @@
 //! filters over them have run.
 
 use crate::error::{Error, Result};
+use std::alloc::{Layout, alloc_zeroed};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::ptr;
@@ -821,14 +822,18 @@ impl Unpacker {
         let Window { size: window, reach } = window;
         assert!(window.is_power_of_two() && reach <= window, "window {window}, reach {reach}");
         let size = usize::try_from(window).map_err(|_| WindowError::Size(window))?;
-        if size > isize::MAX as usize {
-            return Err(WindowError::Capacity(window));
+        let layout = Layout::array::<u8>(size).map_err(|_| WindowError::Capacity(window))?;
+        // The allocator can supply zeroed pages without the decoder touching every page up front.
+        // SAFETY: The power-of-two window size is nonzero and the layout passed its size check.
+        let allocation = unsafe { alloc_zeroed(layout) };
+        if allocation.is_null() {
+            return Err(WindowError::Allocation(window));
         }
-        // asked first so an absurd size is an error, not an abort; the window itself comes zeroed from the system,
-        // so its pages cost nothing until they are written
-        Vec::<u8>::new().try_reserve_exact(size).map_err(|_| WindowError::Allocation(window))?;
+        // SAFETY: The global allocator returned size initialized bytes with u8 alignment.
+        // Vec takes ownership and uses the same layout when it frees the allocation.
+        let window_bytes = unsafe { Vec::from_raw_parts(allocation, size, size) };
         Ok(Unpacker {
-            window: vec![0; size],
+            window: window_bytes,
             mask: window - 1,
             reach,
             sp: 0,
