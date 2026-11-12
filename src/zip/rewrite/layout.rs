@@ -17,8 +17,8 @@
 use std::{fs::File, io, mem::size_of, ops::Range, os::unix::fs::FileExt};
 
 use zip_container::{
-    AesFields, AesView, CentralHeader, CentralRecord, Directory, DirectoryError, DirectoryParser, EndDiscovery,
-    ExtraIter, LOCAL_HEADER_LEN, Limits, LocalHeader, Profile, local_layout,
+    AesFields, AesView, CentralHeader, Directory, DirectoryError, DirectoryParser, EndDiscovery, ExtraIter,
+    LOCAL_HEADER_LEN, Limits, LocalHeader, Profile, local_layout,
 };
 
 use crate::zip::create::native::{Attempts, add};
@@ -29,6 +29,7 @@ use super::{Result, RewriteError, RewriteLimit};
 
 pub(super) const BUFFER: usize = 64 << 10;
 const EOCD_WINDOW: usize = 22 + u16::MAX as usize;
+const LOCATOR_LEN: usize = 20;
 pub(super) const CLASSIC_SENTINEL: u32 = u32::MAX;
 const DESC_SIGNATURE: u32 = 0x0807_4b50;
 const DESCRIPTOR: u16 = 8;
@@ -148,13 +149,14 @@ pub(super) fn directory(
     }
 
     let alternative =
-        expected_eocd.is_none() && has_alternative_end(reader, len, eocd, &mut core, scratch, usage, &mut buffer)?;
+        expected_eocd.is_none() && has_alternative_end(reader, len, eocd, &mut core, budget, usage, &mut buffer)?;
     let wire_metadata =
         zipfast.metadata_wire_bytes().ok_or(RewriteError::UnsupportedLayout("central declaration is too short"))?;
     core.extra_bytes = core
         .extra_bytes
         .min(budget.metadata.checked_sub(wire_metadata).ok_or(RewriteError::Limit(RewriteLimit::SourceMetadata))?);
-    let parsed = read_anchored(reader, len, eocd, core, scratch, usage, &mut buffer)?;
+    let parser = DirectoryParser::at_eocd_with_scratch_limit(len, eocd, core, scratch).map_err(layout_error)?;
+    let parsed = read_anchored(reader, len, parser, usage, &mut buffer)?;
     ensure(usage.record_capacity <= budget.records, "central record capacity")?;
     if !zipfast.agrees(&parsed) || (expected_eocd.is_some() && parsed.prefix_shift != 0) {
         return Err(RewriteError::AmbiguousDirectory { profile: Profile::Zipfast });
@@ -170,17 +172,14 @@ pub(super) fn directory(
     Ok(parsed)
 }
 
-fn read_anchored(
+fn read_anchored<T>(
     reader: &mut Reader<'_, '_, '_>,
     len: u64,
-    eocd: u64,
-    core: Limits,
-    scratch: usize,
+    mut parser: DirectoryParser<T>,
     usage: &mut VerificationUsage,
     buffer: &mut [u8],
-) -> Result<Directory> {
-    let mut parser = DirectoryParser::at_eocd_with_scratch_limit(len, eocd, core, scratch).map_err(layout_error)?;
-    let mut observe = |parser: &DirectoryParser| {
+) -> Result<Directory<T>> {
+    let mut observe = |parser: &DirectoryParser<T>| {
         usage.directory = parser.usage();
         usage.scratch_capacity = usage.scratch_capacity.max(parser.buffer_usage().capacity_bytes as u64);
     };
@@ -197,9 +196,8 @@ fn read_anchored(
     }
     let parsed = parser.finish().map_err(layout_error)?;
     usage.directory = parsed.usage;
-    let capacity = (parsed.entries.capacity() as u64)
-        .checked_mul(size_of::<CentralRecord>() as u64)
-        .ok_or(CreateError::Overflow)?;
+    let capacity =
+        (parsed.entries.capacity() as u64).checked_mul(size_of::<T>() as u64).ok_or(CreateError::Overflow)?;
     usage.record_capacity = usage.record_capacity.max(capacity);
     Ok(parsed)
 }
@@ -213,17 +211,18 @@ fn has_alternative_end(
     len: u64,
     selected: u64,
     core: &mut Limits,
-    scratch: usize,
+    budget: DirectoryBudget,
     usage: &mut VerificationUsage,
     buffer: &mut [u8],
 ) -> Result<bool> {
-    let size = len.min(EOCD_WINDOW as u64);
+    let size = len.min((EOCD_WINDOW + LOCATOR_LEN) as u64);
     let start = len - size;
-    let mut tail = [0; EOCD_WINDOW];
+    let scan_start = len.saturating_sub(EOCD_WINDOW as u64) - start;
+    let mut tail = [0; EOCD_WINDOW + LOCATOR_LEN];
     let tail = &mut tail[..size as usize];
     charge_discovery(core, usage, size, size)?;
     reader.read(start, tail)?;
-    for (index, fixed) in tail.windows(22).enumerate() {
+    for (index, fixed) in tail.windows(22).enumerate().skip(scan_start as usize) {
         if index & 1023 == 0 {
             reader.attempts.check_cancel()?;
         }
@@ -240,10 +239,11 @@ fn has_alternative_end(
         let count = u64::from(field16(10));
         let size = u64::from(le32(fixed, 12));
         let offset = u64::from(le32(fixed, 16));
-        let wide = count == u16::MAX as u64
+        let wide = field16(8) == u16::MAX
+            || count == u16::MAX as u64
             || size == u32::MAX as u64
             || offset == u32::MAX as u64
-            || index.checked_sub(20).is_some_and(|i| le32(&tail[i..index], 0) == 0x0706_4b50);
+            || index.checked_sub(LOCATOR_LEN).is_some_and(|i| le32(&tail[i..index], 0) == 0x0706_4b50);
         if !wide
             && (u64::from(field16(8)) != count
                 || offset > at
@@ -254,12 +254,18 @@ fn has_alternative_end(
             continue;
         }
         let mut alternative = VerificationUsage::default();
-        let parsed = read_anchored(reader, len, at, *core, scratch, &mut alternative, buffer);
+        let scratch = usize::try_from(budget.scratch).unwrap_or(usize::MAX);
+        let parsed = DirectoryParser::validate_at_eocd_with_scratch_limit(len, at, *core, scratch)
+            .map_err(layout_error)
+            .and_then(|parser| read_anchored(reader, len, parser, &mut alternative, buffer));
         charge_discovery(core, usage, alternative.directory.fetched_bytes, alternative.directory.work_units)?;
         usage.scratch_capacity = usage.scratch_capacity.max(alternative.scratch_capacity);
         usage.record_capacity = usage.record_capacity.max(alternative.record_capacity);
         match parsed {
             Ok(parsed) if envelope(&parsed).is_ok() => {
+                if budget_metadata(&parsed)? > budget.metadata {
+                    return Err(RewriteError::Limit(RewriteLimit::SourceMetadata));
+                }
                 return Ok(true);
             }
             Ok(_) | Err(RewriteError::UnsupportedLayout(_)) => {}
@@ -284,22 +290,25 @@ fn parser_chunk<'a>(range: &Range<u64>, len: u64, buffer: &'a mut [u8]) -> Resul
     Ok(&mut buffer[..(range.end - range.start).min(BUFFER as u64) as usize])
 }
 
-fn budget_metadata(directory: &Directory) -> Result<u64> {
+fn budget_metadata<T>(directory: &Directory<T>) -> Result<u64> {
     // Actual on-wire names, raw extras and comments plus any retained
     // variable-length projection (currently the selected Unicode-path field).
     let fixed = directory.declaration.entries.checked_mul(46).ok_or(CreateError::Overflow)?;
     let variable = directory.declaration.size.checked_sub(fixed).ok_or(CreateError::Overflow)?;
-    Ok(add(add(variable, directory.raw_comment.len() as u64)?, directory.usage.owned.extra_bytes as u64)?)
+    Ok(add(
+        add(variable, directory.comment_range.end - directory.comment_range.start)?,
+        directory.usage.owned.extra_bytes as u64,
+    )?)
 }
 
-fn envelope(dir: &Directory) -> Result<()> {
+fn envelope<T>(dir: &Directory<T>) -> Result<()> {
     let end = &dir.end_record;
     ensure(
         end.disk == 0
             && end.directory_disk == 0
             && end.source.end == dir.comment_range.start
             && dir.comment_range.end == dir.archive_len
-            && dir.raw_comment.len() == usize::from(end.comment_len)
+            && dir.comment_range.end - dir.comment_range.start == u64::from(end.comment_len)
             && dir.observed_range == dir.directory_range
             && dir.logical_range == dir.directory_range
             && dir.declaration.entries == dir.entries.len() as u64

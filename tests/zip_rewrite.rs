@@ -1095,3 +1095,145 @@ fn shared_local_address_and_recognizable_leading_orphan_are_rejected() {
     let bytes = archive(Fixture { prefix: &orphan, ..Fixture::default() });
     assert!(matches!(run(&bytes, opts()), Err(RewriteError::UnsupportedLayout(_))));
 }
+
+fn archive_with_empty_end_in_comment(
+    name: &[u8],
+    member_extra: &[u8],
+    member_comment: &[u8],
+    comment_len: usize,
+    wide: bool,
+) -> (Vec<u8>, u64) {
+    let mut bytes = b"opaque stub".to_vec();
+    let local_at = bytes.len() as u32;
+    bytes.extend(local_record(name, 0, 0));
+    let central_at = bytes.len() as u32;
+    let central = central_record(name, 0, 0, local_at, member_extra, member_comment);
+    bytes.extend(&central);
+    let actual_end = bytes.len() as u64 + if wide { 76 } else { 0 };
+    let mut comment = vec![b'c'; comment_len - 22];
+    let empty_end = (actual_end + comment_len as u64) as u32;
+    end32(&mut comment, 0, 0, empty_end, b"");
+    if wide {
+        end64(&mut bytes, 1, central.len() as u64, u64::from(central_at), &comment);
+        // The disk entry count is the sole classic sentinel. The locator
+        // precedes the standard EOF window at the maximum comment size.
+        let end = actual_end as usize;
+        bytes[end + 10..end + 12].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[end + 12..end + 16].copy_from_slice(&(central.len() as u32).to_le_bytes());
+        bytes[end + 16..end + 20].copy_from_slice(&central_at.to_le_bytes());
+    } else {
+        end32(&mut bytes, 1, central.len() as u32, central_at, &comment);
+    }
+    (bytes, actual_end)
+}
+
+#[test]
+fn zip64_alternate_with_only_disk_count_saturated_is_seen_at_the_tail_boundary() {
+    for len in [65_515, 65_516, 65_535] {
+        let (bytes, anchor) = archive_with_empty_end_in_comment(b"x", b"", b"", len, true);
+        let mut parser =
+            zip_container::DirectoryParser::at_eocd(bytes.len() as u64, anchor, zip_container::Limits::default())
+                .unwrap();
+        while let Some(range) = parser.next_read().unwrap() {
+            parser.supply(range.start, &bytes[range.start as usize..range.end as usize]).unwrap();
+        }
+        let directory = parser.finish().unwrap();
+        assert_eq!(directory.entries.len(), 1);
+        assert_eq!(directory.end_record.disk_entries, u16::MAX);
+        assert_eq!(directory.end_record.entries, 1);
+        assert_eq!(directory.raw_comment.len(), len);
+        assert!(matches!(run(&bytes, opts()), Err(RewriteError::AmbiguousDirectory { .. })), "{len}");
+    }
+}
+
+mod allocation_watch {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+
+    struct ObservedAllocator;
+
+    #[global_allocator]
+    static ALLOCATOR: ObservedAllocator = ObservedAllocator;
+
+    thread_local! {
+        static WATCH: Cell<Option<([usize; 3], usize)>> = const { Cell::new(None) };
+    }
+
+    fn observe(size: usize) {
+        let _ = WATCH.try_with(|watch| {
+            if let Some((sizes, allocations)) = watch.get()
+                && sizes.contains(&size)
+            {
+                watch.set(Some((sizes, allocations + 1)));
+            }
+        });
+    }
+
+    // Allocation and deallocation forward the original pointer and layout
+    // to System. The observer only updates a thread-local counter.
+    unsafe impl GlobalAlloc for ObservedAllocator {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            observe(layout.size());
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            observe(new_size);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    pub(super) fn measure<T>(sizes: [usize; 3], operation: impl FnOnce() -> T) -> (T, usize) {
+        WATCH.set(Some((sizes, 0)));
+        let result = operation();
+        let (_, allocations) = WATCH.replace(None).unwrap();
+        (result, allocations)
+    }
+}
+
+fn assert_alternate_metadata_cap(bytes: &[u8], exact: u64, watched_sizes: [usize; 3]) {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("archive.zip");
+    fs::write(&path, bytes).unwrap();
+    for (maximum, within_budget) in [(20_000, false), (exact - 1, false), (exact, true)] {
+        let mut options = opts();
+        options.limits.source_metadata = maximum;
+        let (result, allocations) = allocation_watch::measure(watched_sizes, || RewritePlan::open(&path, options));
+        assert_eq!(allocations, 0, "alternate materialized variable metadata");
+        if within_budget {
+            assert!(matches!(result, Err(RewriteError::AmbiguousDirectory { .. })));
+        } else {
+            assert!(matches!(result, Err(RewriteError::Limit(RewriteLimit::SourceMetadata))));
+        }
+    }
+    assert_eq!(fs::read(path).unwrap(), bytes);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn alternate_name_and_member_comment_share_the_preallocation_metadata_cap() {
+    let name = vec![b'n'; 12_000];
+    let comment = vec![b'm'; 12_001];
+    let (bytes, _) = archive_with_empty_end_in_comment(&name, b"", &comment, 3_011, false);
+    assert_alternate_metadata_cap(&bytes, 27_012, [name.len(), comment.len(), 3_011]);
+}
+
+#[test]
+fn zip64_alternate_raw_extra_and_unicode_projection_share_the_preallocation_metadata_cap() {
+    let mut extra = vec![0x75, 0x70];
+    u16le(&mut extra, 7_005);
+    extra.push(1);
+    u32le(&mut extra, crc32fast::hash(b"x"));
+    extra.resize(extra.len() + 7_000, b'u');
+    extra.extend([0x0d, 0xf0]);
+    u16le(&mut extra, 5_000);
+    extra.resize(extra.len() + 5_000, 0);
+    let (bytes, _) = archive_with_empty_end_in_comment(b"x", &extra, b"", 3_011, true);
+    assert_alternate_metadata_cap(&bytes, 22_025, [7_000, 7_005, 3_011]);
+}

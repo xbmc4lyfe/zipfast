@@ -55,7 +55,8 @@ pub struct Directory<T = CentralRecord> {
     pub prefix_shift: u64,
     /// Source range of the available archive comment.
     pub comment_range: Range<u64>,
-    /// Available archive comment bytes before decoding.
+    /// Available archive comment bytes before decoding. The validation-only
+    /// parser leaves these bytes in the input and reports their range.
     pub raw_comment: Vec<u8>,
     /// Final cumulative discovery and walk usage.
     pub usage: Usage,
@@ -203,19 +204,7 @@ impl DirectoryParser<CentralRecord> {
         limits: Limits,
         scratch_bytes: usize,
     ) -> Result<Self, DirectoryError> {
-        let profile = Profile::Zipfast;
-        Ok(Self {
-            state: State::Discovery(EndDiscovery::with_end_offset(
-                archive_len,
-                profile,
-                limits,
-                Some(end_offset),
-                scratch_bytes,
-            )?),
-            profile,
-            name_crc32: reducers::ieee_crc32,
-            projection: materialize_record,
-        })
+        Self::anchored(archive_len, end_offset, limits, scratch_bytes, true, materialize_record)
     }
 
     /// Creates a parser using the supplied IEEE CRC-32 function for raw names.
@@ -233,7 +222,48 @@ impl DirectoryParser<CentralRecord> {
     }
 }
 
+impl DirectoryParser<()> {
+    /// Validates an anchored ZIP directory without retaining any variable
+    /// metadata. The parser checks the archive comment range, records one
+    /// unit value per central entry, and charges the same equivalent raw
+    /// metadata and work as the owning parser under the supplied limits.
+    /// `Directory::raw_comment` is empty. Use `Directory::comment_range`
+    /// and `Directory::usage` to inspect its accounted extent.
+    pub fn validate_at_eocd_with_scratch_limit(
+        archive_len: u64,
+        end_offset: u64,
+        limits: Limits,
+        scratch_bytes: usize,
+    ) -> Result<Self, DirectoryError> {
+        Self::anchored(archive_len, end_offset, limits, scratch_bytes, false, |_| Ok(()))
+    }
+}
+
 impl<T> DirectoryParser<T> {
+    fn anchored(
+        archive_len: u64,
+        end_offset: u64,
+        limits: Limits,
+        scratch_bytes: usize,
+        retain_comment: bool,
+        projection: RecordProjection<T>,
+    ) -> Result<Self, DirectoryError> {
+        let profile = Profile::Zipfast;
+        Ok(Self {
+            state: State::Discovery(EndDiscovery::with_end_offset(
+                archive_len,
+                profile,
+                limits,
+                Some(end_offset),
+                scratch_bytes,
+                retain_comment,
+            )?),
+            profile,
+            name_crc32: reducers::ieee_crc32,
+            projection,
+        })
+    }
+
     /// Creates a parser that owns one projected value per admitted record.
     ///
     /// Records become available through [`Self::finish`] after the directory
