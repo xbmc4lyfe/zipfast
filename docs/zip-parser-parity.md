@@ -1,0 +1,74 @@
+# ZIP parser parity baseline
+
+The fixtures in [zip_parity.rs](../tests/zip_parity.rs) exercise zipfast
+`Archive`, zipview `ZipReader`, blocking `ZipIndex`, and incremental
+`ZipIndexOpener` against the same bytes. They characterize the readers at
+`914e005`. The proposed migration requirements below follow the
+[Phase 2 plan](superpowers/plans/2026-11-11-zipview-merge-and-compatibility.md).
+Tests that currently pin a disagreement will need new expectations when
+the corresponding behavior change is implemented.
+
+The [fixture builder](../tests/common/zip_parity_fixture.rs) writes small
+little-endian records with explicit raw names, flags, extras and comments.
+It records the local header, payload, central header and end record
+positions. Most fixtures fit in a few hundred bytes. The maximum-length
+archive comment fixture makes the range reader fetch the central directory
+separately from the tail, and the incremental reader supplies the tail in
+two parts. The range harness records the requested offset and length and
+the exact bytes supplied. Selected-entry tests verify the header and
+payload ranges and compare the returned bytes.
+
+## Observed behavior and migration requirements
+
+| Fixture | Behavior at the baseline | Required result for the shared parser and adapters |
+| --- | --- | --- |
+| Central order and duplicate names | All readers enumerate central order, including duplicates, even when the local headers are in a different order. zipview's exact name lookup returns the first central match. zipfast reads by central ordinal. | Retain each central record and its ordinal, preserve first-match lookup, and read the selected record's local payload. Never sort or deduplicate directory entries. |
+| UTF-8, legacy names and Unicode path extras | Both accept UTF-8 with or without bit 11 and replace invalid flagged bytes. For unflagged `caf\x82.txt`, zipfast yields `café.txt` and zipview yields `caf�.txt`. zipfast uses the CRC-matching Unicode path extra and ignores the bad-CRC variant. zipview ignores both extras for names. | Retain raw bytes and the UTF-8 flag. Make CRC-gated Unicode paths and CP437 fallback available to zipfast and future callers that need them. Preserve zipview's public name projection and lookup behavior during migration. [APPNOTE §4.6.9 and Appendix D](https://pkware.cachefly.net/webdocs/APPNOTE/APPNOTE-6.3.8.TXT) |
+| Archive comments and end-record selection | zipview exposes lossy UTF-8. zipfast exposes no comment and prefers a candidate whose declared comment ends at EOF. With a complete-looking embedded signature and bytes after it, zipview selects the fake record and reports zero entries and an empty comment. Both accept a trailer. zipfast rejects an overlong comment declaration and zipview clamps it to the available bytes. All readers open the empty archive. | Prefer a structurally valid end record whose declared comment ends at EOF. Retain the bounded trailer fallback and preserve the comment byte range. Carry the declared and available lengths for strict and tolerant policies. [APPNOTE §4.3.16 and §§4.4.25–4.4.26](https://pkware.cachefly.net/webdocs/APPNOTE/APPNOTE-6.3.8.TXT) |
+| DOS, extended and NTFS timestamps | zipview exposes DOS parts, including malformed nonzero values, and treats all-zero fields as absent. zipfast interprets valid DOS parts as UTC, applies NTFS and extended mtime overrides in extra order, and includes NTFS fractional seconds. | Retain raw DOS words and extras. Preserve zipview's DOS accessor and zipfast's effective UTC timestamp, precision and override order. [APPNOTE §4.4.6 and §4.5.5](https://pkware.cachefly.net/webdocs/APPNOTE/APPNOTE-6.3.8.TXT) |
+| Host and external attributes | zipfast reports nonzero mode only for host 3 and uses Unix type bits, DOS directory attributes and a slash suffix. zipview reports mode for hosts 3 and 19, including zero, and uses slash or backslash suffixes. zipfast identifies the Unix symlink. | Keep made-by host and version and all external bits. Preserve each adapter's classification and keep path and symlink policy in zipfast. [APPNOTE §4.4.2 and §4.4.15](https://pkware.cachefly.net/webdocs/APPNOTE/APPNOTE-6.3.8.TXT) |
+| AES and encryption flags | Both retain AES strength and method for method 99. zipfast retains the vendor version, counts a valid AES extra alone as encryption, and ignores bits 6 and 13 alone. zipview flags bits 6 and 13 alone and ignores the extra alone. Both ignore strength 4. The conflicting fixture has central AE-2/AES-128/Deflate and local AE-1/AES-256/Stored. zipview lists the central values and probes the password using the local strength. | Retain local and central AES records independently, including vendor version, vendor ID, strength and method. Preserve adapter-specific encryption and password-check decisions during migration. Full AES authentication remains mandatory. Any change to the probe's metadata precedence requires a separate regression. [WinZip AES specification §§II–III](https://www.winzip.com/en/support/aes-encryption/) |
+| ZIP64 and prefixed offsets | All readers resolve ZIP64 entry sizes and offsets and the ZIP64 directory count on an ordinary archive. All readers locate payloads behind the classic prefix. zipfast opens the ZIP64 archive behind the same prefix, while both zipview paths report `BadOffset`. zipfast exposes physical `local_at` and zipview exposes the stored local offset. | Resolve classic and ZIP64 offsets to checked physical positions on both paths, including prefixed ZIP64 end records. Keep the stored offset separately for existing APIs and for rewriting. [APPNOTE §§4.3.14–4.3.16 and §4.5.3](https://pkware.cachefly.net/webdocs/APPNOTE/APPNOTE-6.3.8.TXT) |
+| Data descriptor and conflicting local fields | All readers use the local name and extra lengths to locate the stored payload. Central name, flags, method, sizes and CRC remain the indexed metadata. Changing the local name, flags, method, CRC and sizes leaves the selected bytes intact. The range ends before the descriptor. | Use the bounded local layout for the physical payload start and the central packed size for the span. Preserve both records and their fields. Keep data descriptors outside the payload range, and keep integrity policy with each decoder. [APPNOTE §§4.3.7–4.3.9 and §4.3.12](https://pkware.cachefly.net/webdocs/APPNOTE/APPNOTE-6.3.8.TXT) |
+| Bad directory count, truncated fields and split metadata | zipfast rejects low/high counts. zipview returns the declared subset or stops at the first non-central signature. All reject an overlong central name and a local extra extending beyond EOF at payload read. zipfast rejects an overlong central comment and zipview skips the declared length. With a short ZIP64 extra, zipfast rejects the entry and zipview lists it with the packed-size sentinel and rejects payload read. zipfast rejects a nonzero EOCD disk number and zipview lists the entry. | Bound all reads and record extents and distinguish complete records from unavailable fields. Preserve zipfast's strict extraction behavior and zipview's established listing recovery via explicit policy, with the same outcomes for slice and range under the same policy. Treat unfilled ZIP64 sentinels as unresolved for payload reads. Split archives remain unsupported by zipfast. [APPNOTE §§4.3.12–4.3.16 and §4.5.3](https://pkware.cachefly.net/webdocs/APPNOTE/APPNOTE-6.3.8.TXT) |
+
+## Public metadata boundaries
+
+Neither reader exposes raw entry names, raw entry comments, or unknown
+extra fields. zipfast has no archive comment accessor, and zipview returns
+a lossy archive comment. zipview exposes the AES strength and method but
+omits the vendor version. zipfast exposes the host and all external bits,
+while zipview exposes the host and version, and projects the external bits
+through `unix_mode()`. zipview has no link accessor, and zipfast has no
+public local payload-offset accessor. The fixtures retain the bytes and
+expected positions for future direct checks of shared records.
+
+At the baseline, the source locations below account for the observations.
+
+- zipfast resolves EOCD candidates, ZIP64, directory size and counts in
+  [Archive::open_cancelable](../src/zip.rs#L150). It projects DOS, NTFS,
+  extended timestamps and Unicode extras in
+  [parse_central](../src/zip.rs#L532) and
+  [decode_name](../src/zip.rs#L637).
+- zipview chooses the last EOCD signature in
+  [find_eocd](../crates/zipview/src/lib.rs#L511) and
+  [the ranged locator](../crates/zipview/src/index.rs#L274). Its slice and
+  ranged ZIP64 readers follow the stored offset in
+  [read_zip64](../crates/zipview/src/lib.rs#L529) and
+  [ZipIndexOpener::zip64](../crates/zipview/src/index.rs#L348).
+- zipview uses the count as a loop bound in
+  [ZipReader::new](../crates/zipview/src/lib.rs#L431) and
+  [ZipIndexOpener::walk](../crates/zipview/src/index.rs#L323). The
+  [central parser](../crates/zipview/src/lib.rs#L593) checks the name and
+  extra slices, but advances over the comment using its declared length.
+- The classification differences are in the
+  [zipfast entry methods](../src/zip.rs#L91) and
+  [zipview entry methods](../crates/zipview/src/lib.rs#L340).
+  zipfast's [AES extra parser](../src/crypto.rs#L1052) returns vendor
+  version, while zipview's [AES extra parser](../crates/zipview/src/lib.rs#L1008)
+  returns strength and method.
+- zipview's [password probe](../crates/zipview/src/lib.rs#L799) passes
+  the local extra bytes to its verifier helper. Its
+  [full read](../crates/zipview/src/lib.rs#L825) tries the central AES
+  fields first. zipfast's [payload read](../src/zip.rs#L300) uses central
+  AES fields and the vendor version when applying CRC policy.
