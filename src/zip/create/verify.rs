@@ -443,13 +443,14 @@ impl Reader<'_, '_> {
         let eocd = len
             .checked_sub(22 + options.archive_comment.len() as u64)
             .ok_or(CreateError::Verification("archive is too short for the expected end and comment"))?;
-        let mut parser = DirectoryParser::at_eocd(len, eocd, limits).map_err(CreateError::Directory)?;
+        let mut parser = DirectoryParser::at_eocd_with_scratch_limit(len, eocd, limits, self.scratch_limit())
+            .map_err(parser_error)?;
         let mut at = None;
         loop {
             self.check_parser(&parser)?;
             let request = parser.next_read();
             self.check_parser(&parser)?;
-            let Some(range) = request.map_err(CreateError::Directory)? else { break };
+            let Some(range) = request.map_err(parser_error)? else { break };
             let size = (range.end - range.start).min(buffer.len() as u64) as usize;
             ensure(size != 0 && range.end <= len, "parser requested invalid stage range")?;
             if at != Some(range.start) {
@@ -459,9 +460,9 @@ impl Reader<'_, '_> {
             at = Some(range.start + size as u64);
             let supplied = parser.supply(range.start, &buffer[..size]);
             self.check_parser(&parser)?;
-            supplied.map_err(CreateError::Directory)?;
+            supplied.map_err(parser_error)?;
         }
-        let directory = parser.finish().map_err(CreateError::Directory)?;
+        let directory = parser.finish().map_err(parser_error)?;
         self.usage.record_capacity = directory.entries.capacity() as u64 * size_of::<CentralRecord>() as u64;
         limit(self.usage.record_capacity, options.limits.verification_records, CreateLimit::VerificationRecords)?;
         Ok(directory)
@@ -482,10 +483,11 @@ impl Reader<'_, '_> {
         let baseline_work = self.usage.discovery_work;
         let ambiguity = || CreateError::AmbiguousDirectory { profile };
         let classify = |error| match error {
-            DirectoryError::Limit(_) | DirectoryError::Allocation => CreateError::Directory(error),
+            DirectoryError::Limit(_) | DirectoryError::Allocation => parser_error(error),
             _ => ambiguity(),
         };
-        let mut discovery = EndDiscovery::new(len, profile, limits).map_err(classify)?;
+        let mut discovery =
+            EndDiscovery::new_with_scratch_limit(len, profile, limits, self.scratch_limit()).map_err(classify)?;
         loop {
             if self.options.cancel.is_canceled() {
                 return Err(CreateError::Canceled);
@@ -494,7 +496,7 @@ impl Reader<'_, '_> {
             let usage = discovery.usage();
             self.usage.discovery_bytes = add(baseline_bytes, usage.fetched_bytes)?;
             self.usage.discovery_work = add(baseline_work, usage.work_units)?;
-            self.scratch(discovery.buffer_usage().capacity_bytes)?;
+            self.observe_scratch(discovery.buffer_usage().capacity_bytes);
             let Some(range) = request.map_err(classify)? else { break };
             let size = (range.end - range.start).min(buffer.len() as u64) as usize;
             ensure(size != 0 && range.end <= len, "discovery requested invalid stage range")?;
@@ -504,7 +506,7 @@ impl Reader<'_, '_> {
             let usage = discovery.usage();
             self.usage.discovery_bytes = add(baseline_bytes, usage.fetched_bytes)?;
             self.usage.discovery_work = add(baseline_work, usage.work_units)?;
-            self.scratch(discovery.buffer_usage().capacity_bytes)?;
+            self.observe_scratch(discovery.buffer_usage().capacity_bytes);
             supplied.map_err(classify)?;
         }
         let located = discovery.finish().map_err(classify)?;
@@ -527,13 +529,17 @@ impl Reader<'_, '_> {
             return Err(CreateError::Canceled);
         }
         self.usage.directory = parser.usage();
-        self.scratch(parser.buffer_usage().capacity_bytes)
+        self.observe_scratch(parser.buffer_usage().capacity_bytes);
+        Ok(())
     }
 
-    fn scratch(&mut self, bytes: usize) -> Result<()> {
-        let scratch = bytes as u64;
-        self.usage.scratch_capacity = self.usage.scratch_capacity.max(scratch);
-        limit(scratch, self.options.limits.verification_scratch, CreateLimit::VerificationScratch)
+    fn scratch_limit(&self) -> usize {
+        usize::try_from(self.options.limits.verification_scratch).unwrap_or(usize::MAX)
+    }
+
+    fn observe_scratch(&mut self, bytes: usize) {
+        debug_assert!(bytes <= self.scratch_limit());
+        self.usage.scratch_capacity = self.usage.scratch_capacity.max(bytes as u64);
     }
 
     fn verify_payload(&mut self, receipt: &EntryWritten, buffer: &mut [u8]) -> Result<()> {
@@ -586,6 +592,14 @@ impl Reader<'_, '_> {
         self.usage.decoded_bytes = aggregate;
         crc.update(bytes);
         Ok(())
+    }
+}
+
+fn parser_error(error: DirectoryError) -> CreateError {
+    if error == DirectoryError::Limit(zip_container::LimitKind::ScratchBytes) {
+        CreateError::Limit(CreateLimit::VerificationScratch)
+    } else {
+        CreateError::Directory(error)
     }
 }
 

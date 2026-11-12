@@ -1114,3 +1114,86 @@ fn ambiguous_publish_keeps_an_owned_stage_when_rename_did_not_run() {
     assert_eq!(std::fs::read(&source).unwrap(), b"source data");
     assert!(!output.exists());
 }
+
+#[test]
+fn scratch_ceiling_rejects_discovery_and_fragmented_central_growth_before_reserving() {
+    let directory = test_dir();
+    let source = directory.path().join("empty");
+    let target = directory.path().join("archive.zip");
+    std::fs::write(&source, []).unwrap();
+
+    // The first cap fits only the EOCD tail. The second also fits the
+    // discovery's inline buffers and reaches the fragmented central body.
+    for (cap, reaches_directory) in [(65_633, false), (70_000, true)] {
+        let mut options = CreateOptions::default();
+        options.limits.verification_scratch = cap;
+        let mut plan = CreatePlan::new(&target, options).unwrap();
+        let name = "x".repeat(u16::MAX as usize);
+        let comment = vec![b'a'; u16::MAX as usize];
+        let mut metadata = metadata(&name);
+        metadata.comment = &comment;
+        plan.add_file(&source, metadata, None).unwrap();
+
+        let failure = plan.publish().unwrap_err();
+        assert_eq!(failure.stage, CreateStage::Verify);
+        assert!(matches!(failure.cause, CreateError::Limit(CreateLimit::VerificationScratch)));
+        assert_eq!(failure.publication, Publication::NotPublished);
+        assert!(matches!(failure.cleanup, CleanupState::Clean));
+        assert_eq!(failure.summary.verification.directory.fetched_bytes != 0, reaches_directory);
+        assert!(
+            failure.summary.verification.scratch_capacity <= cap,
+            "scratch reservation exceeded {cap} bytes: {failure:?}"
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"");
+        assert!(!target.exists());
+        assert!(stages(directory.path()).is_empty());
+    }
+}
+
+#[test]
+fn corrupted_central_name_length_cannot_grow_scratch_past_the_cap() {
+    use std::os::unix::fs::FileExt;
+
+    let directory = test_dir();
+    let source = directory.path().join("empty");
+    let target = directory.path().join("archive.zip");
+    std::fs::write(&source, []).unwrap();
+    let cap = 120_000;
+    let first = "a".repeat(48_000);
+    let second = "b".repeat(48_000);
+    let plan_at = |destination: &Path| {
+        let mut options = CreateOptions::default();
+        options.limits.verification_scratch = cap;
+        let mut plan = CreatePlan::new(destination, options).unwrap();
+        plan.add_file(&source, metadata(&first), None).unwrap();
+        plan.add_file(&source, metadata(&second), None).unwrap();
+        plan
+    };
+    let control = directory.path().join("control.zip");
+    let valid = plan_at(&control).publish().unwrap();
+    assert_eq!(valid.summary.verification.payloads, 2);
+    assert!(valid.summary.verification.scratch_capacity <= cap);
+    let control_bytes = std::fs::read(&control).unwrap();
+
+    let central_at = 2 * (30 + 48_000); // Two Stored empty files with no local extras.
+    let failure = with_hook(
+        move |event, path| {
+            if event == Event::BeforeVerify {
+                let file = File::options().write(true).open(path.unwrap())?;
+                file.write_all_at(&u16::MAX.to_le_bytes(), central_at + 28)?;
+            }
+            Ok(())
+        },
+        || plan_at(&target).publish().unwrap_err(),
+    );
+    assert_eq!(failure.stage, CreateStage::Verify);
+    assert!(matches!(failure.cause, CreateError::Limit(CreateLimit::VerificationScratch)));
+    assert_eq!(failure.publication, Publication::NotPublished);
+    assert!(matches!(failure.cleanup, CleanupState::Clean));
+    assert!(failure.summary.verification.directory.fetched_bytes > 0);
+    assert!(failure.summary.verification.scratch_capacity <= cap);
+    assert_eq!(std::fs::read(&source).unwrap(), b"");
+    assert_eq!(std::fs::read(&control).unwrap(), control_bytes);
+    assert!(!target.exists());
+    assert!(stages(directory.path()).is_empty());
+}

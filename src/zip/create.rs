@@ -136,7 +136,7 @@ pub struct CreateLimits {
     pub directory: zip_container::Limits,
     /// Equivalent raw metadata capacity across parser ownership classes.
     pub verification_metadata: u64,
-    /// Maximum observed parser scratch capacity.
+    /// Maximum requested parser scratch capacity, including retained inline buffers.
     pub verification_scratch: u64,
     /// Capacity of the parser's fixed central records.
     pub verification_records: u64,
