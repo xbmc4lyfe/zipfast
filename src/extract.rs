@@ -25,16 +25,27 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::batch::{self, Batch, Done, Job, Outcome};
+use crate::batch::{self, Batch, Done, Job, JobData, Outcome};
 use crate::blake2sp::Blake2sp;
 use crate::error::{Error, Result};
 use crate::output::{Output, temporary};
 use crate::path::sanitize;
-use crate::rar5::reader::{Block, SIGNATURE_PROBE_BYTES, Volume, signature_end};
-use crate::rar5::unpack::{Sink, Unpacker, window_for};
-use crate::rar5::{FileHeader, Redirection};
+use crate::rar5::reader::{Block, ReadDataError, SIGNATURE_PROBE_BYTES, Volume, signature_end};
+use crate::rar5::unpack::{Sink, Unpacker, window_for_detailed};
+use crate::rar5::{FileHeader, MemberCrypt, Redirection};
 use crate::volume::next_volume;
 use crate::zip::{InspectionSource, ReadSession, SessionResult};
+
+mod rar_outcome;
+use crate::error::{
+    IoOperation, RarFailure, RarFault, RarIntegrityReason, RarInternal, RarPolicyReason, RarResource, RarUnsupported,
+};
+pub(crate) use rar_outcome::{EntryContext, RunResult};
+pub use rar_outcome::{
+    RarEntryIdentity, RarEntryOutcome, RarMatchState, RarOutcome, RarOutput, RarRunError, RarRunSummary, RarSkipReason,
+    RarVerification,
+};
+use rar_outcome::{Reports, RunFault};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -70,6 +81,10 @@ pub struct Options {
 
 impl Options {
     pub(crate) fn protecting(&self, input: &Path) -> Result<Cow<'_, Self>> {
+        self.protecting_detailed(input).map_err(RarFault::into_legacy)
+    }
+
+    fn protecting_detailed(&self, input: &Path) -> crate::error::RarResult<Cow<'_, Self>> {
         if self.mode != Mode::Extract {
             return Ok(Cow::Borrowed(self));
         }
@@ -79,7 +94,10 @@ impl Options {
                 opts.protected_paths.insert(canonical);
             }
         }
-        opts.protected_paths.insert(input.canonicalize()?);
+        let canonical = input
+            .canonicalize()
+            .map_err(|e| RarFault::input(IoOperation::Metadata, Some(input.to_path_buf()), None, e))?;
+        opts.protected_paths.insert(canonical);
         Ok(Cow::Owned(opts))
     }
 }
@@ -161,29 +179,64 @@ pub(crate) struct Dirs {
 /// folders are made only once, and a file in a folder this run made is not looked for, since nothing can be there
 /// that the run did not put there.
 pub(crate) fn check_target(opts: &Options, rel: &Path, dirs: Option<&mut Dirs>) -> Result<Checked> {
+    check_target_detailed(opts, rel, dirs)
+        .map(|result| match result {
+            DetailedChecked::Write(place) => Checked::Write(place),
+            DetailedChecked::Exists => Checked::Exists,
+            DetailedChecked::Blocked(reason) => Checked::Blocked(blocked_message(&reason)),
+        })
+        .map_err(RarFault::into_legacy)
+}
+
+enum DetailedChecked {
+    Write(Place),
+    Exists,
+    Blocked(RarPolicyReason),
+}
+
+fn blocked_message(reason: &RarPolicyReason) -> &'static str {
+    match reason {
+        RarPolicyReason::Symlink => "a symlink is in the way",
+        RarPolicyReason::Directory => "a folder is in the way",
+        RarPolicyReason::ProtectedInput => "the output path would replace a protected input",
+        _ => unreachable!("unexpected target policy"),
+    }
+}
+
+fn check_target_detailed(
+    opts: &Options,
+    rel: &Path,
+    dirs: Option<&mut Dirs>,
+) -> crate::error::RarResult<DetailedChecked> {
     let target = opts.dest.join(rel);
     if let Some(parent) = rel.parent() {
         match dirs {
             Some(dirs) => {
-                make_dirs_known(&opts.dest, parent, dirs)?;
+                make_dirs_known_detailed(&opts.dest, parent, dirs)?;
                 let first = dirs.note(rel);
                 if first && dirs.known.get(parent) == Some(&true) {
-                    return Ok(Checked::Write(Place { path: target, replace: false }));
+                    return Ok(DetailedChecked::Write(Place { path: target, replace: false }));
                 }
             }
-            None => make_dirs(&opts.dest, parent)?,
+            None => make_dirs_detailed(&opts.dest, parent)?,
         }
     }
+    let metadata = |e| RarFault::output(IoOperation::Metadata, Some(target.clone()), None, e, false);
     Ok(match fs::symlink_metadata(&target) {
-        Ok(meta) if meta.file_type().is_symlink() => Checked::Blocked("a symlink is in the way"),
-        Ok(_) if opts.overwrite == Overwrite::Skip => Checked::Exists,
-        Ok(meta) if meta.is_dir() => Checked::Blocked("a folder is in the way"),
-        Ok(_) if !opts.protected_paths.is_empty() && opts.protected_paths.contains(&target.canonicalize()?) => {
-            Checked::Blocked("the output path would replace a protected input")
+        Ok(meta) if meta.file_type().is_symlink() => DetailedChecked::Blocked(RarPolicyReason::Symlink),
+        Ok(_) if opts.overwrite == Overwrite::Skip => DetailedChecked::Exists,
+        Ok(meta) if meta.is_dir() => DetailedChecked::Blocked(RarPolicyReason::Directory),
+        Ok(_)
+            if !opts.protected_paths.is_empty()
+                && opts.protected_paths.contains(&target.canonicalize().map_err(metadata)?) =>
+        {
+            DetailedChecked::Blocked(RarPolicyReason::ProtectedInput)
         }
-        Ok(_) => Checked::Write(Place { path: target, replace: true }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Checked::Write(Place { path: target, replace: false }),
-        Err(e) => return Err(e.into()),
+        Ok(_) => DetailedChecked::Write(Place { path: target, replace: true }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            DetailedChecked::Write(Place { path: target, replace: false })
+        }
+        Err(e) => return Err(metadata(e)),
     })
 }
 
@@ -320,37 +373,41 @@ fn walk_until(
     }
 }
 
-fn walk_rar(
-    mut vol: Volume,
-    password: Option<&str>,
-    mut on_block: impl FnMut(&mut Volume, Block, crate::rar5::MemberCrypt) -> Result<()>,
-) -> Result<u64> {
-    use crate::error::RarFault;
-    let mut volumes = 0;
+fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
     loop {
-        volumes += 1;
+        run.reports.volume()?;
         let mut more = vol.main.is_volume();
         let mut saw_end = false;
-        while let Some((block, crypt)) = vol.next_block_detailed().map_err(RarFault::into_legacy)? {
+        while let Some((block, crypt)) = vol.next_block_detailed()? {
             match block {
                 Block::End { more_volumes } => {
                     more = more_volumes;
                     saw_end = true;
                     break;
                 }
-                b => on_block(&mut vol, b, crypt)?,
+                Block::File(h) => run.file_block(&mut vol, h, crypt)?,
+                _ => {}
             }
         }
         if !more {
-            return Ok(volumes);
+            return Ok(());
         }
         let Some(next) = next_volume(&vol.path) else {
-            return if saw_end { Err(Error::UnnamedVolume(vol.path)) } else { Ok(volumes) };
+            return if saw_end {
+                let path = vol.path;
+                Err(RarFault::new(RarFailure::UnnamedVolume { path: path.clone() }, Error::UnnamedVolume(path)).into())
+            } else {
+                Ok(())
+            };
         };
         if !next.exists() {
-            return if saw_end { Err(Error::MissingVolume(next)) } else { Ok(volumes) };
+            return if saw_end {
+                Err(RarFault::new(RarFailure::MissingVolume { path: next.clone() }, Error::MissingVolume(next)).into())
+            } else {
+                Ok(())
+            };
         }
-        vol = Volume::open_detailed(&next, password).map_err(RarFault::into_legacy)?;
+        vol = Volume::open_detailed(&next, run.password)?;
     }
 }
 
@@ -772,7 +829,7 @@ impl CipherBlocks {
 
 /// A file being read, whose data may run on into later volumes.
 struct Pending {
-    name: String,
+    context: EntryContext,
     out: Option<Output>,
     hasher: crate::crc32::Hasher,
     /// the decoder works out the CRC32 instead, and hands it over as `crc`: it does so for every compressed file
@@ -800,9 +857,9 @@ struct Pending {
 }
 
 impl Pending {
-    fn new(h: &FileHeader) -> Self {
+    fn new(h: &FileHeader, context: EntryContext) -> Self {
         Pending {
-            name: h.name.clone(),
+            context,
             out: None,
             hasher: crate::crc32::Hasher::new(),
             decoder_crc: h.method != 0 && !h.encrypted,
@@ -821,9 +878,9 @@ impl Pending {
     }
 
     /// Creates the file at its place, if it has one and isn't created yet.
-    fn open(&mut self, size: Option<u64>) -> Result<()> {
+    fn open(&mut self, size: Option<u64>) -> crate::error::RarResult<()> {
         if let Some(place) = self.place.take() {
-            self.out = Some(create_target(place, size)?);
+            self.out = Some(create_target_detailed(place, size)?);
         }
         Ok(())
     }
@@ -841,12 +898,20 @@ impl Pending {
     }
 
     /// Decoded bytes, to the checksums and the output file.
-    fn take(&mut self, mut chunk: &[u8]) -> Result<()> {
+    fn take(&mut self, chunk: &[u8]) -> Result<()> {
+        self.take_detailed(chunk).map_err(RarFault::into_legacy)
+    }
+
+    fn take_detailed(&mut self, mut chunk: &[u8]) -> crate::error::RarResult<()> {
         if let Some(padding) = self.cipher.as_mut().and_then(|c| c.stored_padding.as_mut()) {
             let count = padding.size.saturating_sub(self.bytes).min(chunk.len() as u64) as usize;
             let skipped = chunk.len() - count;
             if skipped > 15 - padding.skipped {
-                return Err(Error::Corrupt("excess encrypted RAR5 padding"));
+                return Err(batch::decoder_failure(
+                    Error::Corrupt("excess encrypted RAR5 padding"),
+                    self.context.scope(),
+                    self.context.password,
+                ));
             }
             padding.skipped += skipped;
             chunk = &chunk[..count];
@@ -854,9 +919,10 @@ impl Pending {
                 return Ok(());
             }
         }
+        let new_size = self.bytes.checked_add(chunk.len() as u64).ok_or_else(RarFault::counter_limit)?;
         if let Some(mem) = self.mem.as_mut() {
             mem.extend_from_slice(chunk);
-            self.bytes += chunk.len() as u64;
+            self.bytes = new_size;
             return Ok(());
         }
         if !self.decoder_crc {
@@ -866,9 +932,9 @@ impl Pending {
             b.update(chunk);
         }
         if let Some(out) = self.out.as_mut() {
-            out.write_detailed(chunk).map_err(|e| e.detailed(false).into_legacy())?;
+            out.write_detailed(chunk).map_err(|e| e.detailed(false))?;
         }
-        self.bytes += chunk.len() as u64;
+        self.bytes = new_size;
         Ok(())
     }
 }
@@ -884,6 +950,49 @@ impl Sink for Pending {
 
     fn crc(&mut self, crc: u32) {
         self.crc = Some(crc);
+    }
+}
+
+enum MemberDecodeError {
+    Decoder(Error),
+    Sink(RarFault),
+}
+
+struct PendingSink<'a> {
+    pending: &'a mut Pending,
+    fault: Option<RarFault>,
+}
+
+impl Sink for PendingSink<'_> {
+    fn put(&mut self, bytes: &[u8]) -> Result<()> {
+        if self.fault.is_none() {
+            self.fault = self.pending.take_detailed(bytes).err();
+        }
+        if self.fault.is_some() { Err(Error::Corrupt("RAR output stopped")) } else { Ok(()) }
+    }
+
+    fn wants_crc(&self) -> bool {
+        self.pending.wants_crc()
+    }
+
+    fn crc(&mut self, crc: u32) {
+        self.pending.crc(crc);
+    }
+}
+
+fn with_member_sink(
+    pending: &mut Pending,
+    selection: Option<&mut RarSelection<'_>>,
+    decode: impl FnOnce(&mut dyn Sink) -> Result<()>,
+) -> std::result::Result<(), MemberDecodeError> {
+    if let Some(selection) = selection {
+        return decode(&mut SelectedSink { pending, selection }).map_err(MemberDecodeError::Decoder);
+    }
+    let mut sink = PendingSink { pending, fault: None };
+    let result = decode(&mut sink);
+    match sink.fault {
+        Some(fault) => Err(MemberDecodeError::Sink(fault)),
+        None => result.map_err(MemberDecodeError::Decoder),
     }
 }
 
@@ -960,53 +1069,68 @@ const GATHER_MAX: u64 = 1 << 20;
 
 const NEEDS_EARLIER: &str = "needs the files before it in this solid archive, which weren't decoded";
 
-fn fail_to(summary: &mut Summary, report: &mut impl FnMut(&str), name: &str, why: &str) {
-    let line = format!("{name}: {why}");
-    report(&line);
-    summary.errors.push(line);
-}
-
-/// Where finished files are counted and reported, and the workers files are written on. A report waits for the
-/// files the workers hold, so reports keep archive order.
-struct Books<'a, R: FnMut(&str)> {
-    summary: &'a mut Summary,
-    report: &'a mut R,
+struct Books<'a, 'r> {
+    reports: &'a mut Reports<'r>,
     batch: &'a mut Option<Batch>,
+    mode: Mode,
 }
 
-impl<R: FnMut(&str)> Books<'_, R> {
+impl Books<'_, '_> {
     /// Takes in every file the workers hold.
-    fn catch_up(&mut self) -> Result<()> {
+    fn catch_up(&mut self) -> RunResult<()> {
         let Some(batch) = self.batch.as_mut() else { return Ok(()) };
-        let (summary, report) = (&mut *self.summary, &mut *self.report);
-        batch.drain(&mut |done| apply_done(summary, report, done))
+        let mode = self.mode;
+        batch.drain(&mut |done| apply_done(self.reports, mode, done))
     }
 
-    fn fail(&mut self, name: &str, why: &str) -> Result<()> {
-        self.catch_up()?;
-        fail_to(self.summary, self.report, name, why);
-        Ok(())
+    fn catch_up_for_completion(&mut self) -> RunResult<()> {
+        let first = self.catch_up();
+        if self.reports.typed() && matches!(first, Err(RunFault::Reported { .. })) {
+            while matches!(self.catch_up(), Err(RunFault::Reported { .. })) {}
+        }
+        first
+    }
+
+    fn fail(&mut self, ctx: &EntryContext, failure: RarFailure, legacy: impl std::fmt::Display) -> RunResult<()> {
+        let drained = self.catch_up_for_completion();
+        if drained.is_err() && !matches!(drained, Err(RunFault::Reported { .. })) {
+            return drained;
+        }
+        let reported = self.reports.failed(ctx, Arc::new(failure), legacy);
+        drained.and(reported)
+    }
+
+    fn terminal(&mut self, ctx: &EntryContext, fault: RarFault) -> RunFault {
+        // Typed events keep their order even when a worker reports a secondary fatal error.
+        if self.reports.typed() {
+            while matches!(self.catch_up(), Err(RunFault::Reported { .. })) {}
+        }
+        self.reports.terminal(ctx, fault)
     }
 }
 
 /// A file's last part is in: checks it whole and finishes it, or hands it to a worker for that when its bytes were
 /// gathered.
-fn check_and_finish<R: FnMut(&str)>(books: &mut Books<'_, R>, c: &Checks, mut p: Pending) -> Result<()> {
+fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> RunResult<()> {
     if let Some(packed) = p.mem.take() {
         let job = Job {
-            name: std::mem::take(&mut p.name),
-            packed,
-            method: 0,
-            dictionary: 0,
-            size: c.size.unwrap_or(p.bytes),
-            crc32: c.crc32,
-            blake2sp: c.blake2sp,
-            out: p.place.take(),
-            meta: c.meta,
+            context: p.context,
+            data: JobData {
+                packed,
+                method: 0,
+                dictionary: 0,
+                size: c.size.unwrap_or(p.bytes),
+                size_checked: c.size.is_some(),
+                crc32: c.crc32,
+                blake2sp: c.blake2sp,
+                out: p.place.take(),
+                meta: c.meta,
+            },
         };
-        let Some(batch) = books.batch.as_mut() else { return Err(Error::Io(std::io::Error::other("no file workers"))) };
-        let (summary, report) = (&mut *books.summary, &mut *books.report);
-        return batch.submit(job, &mut |done| apply_done(summary, report, done));
+        let Some(batch) = books.batch.as_mut() else {
+            return Err(invariant("no file workers", Error::Io(std::io::Error::other("no file workers"))).into());
+        };
+        return batch.submit(job, &mut |done| apply_done(books.reports, books.mode, done));
     }
     // a CRC the decoder never handed over can't match
     let raw_crc = if p.decoder_crc { p.crc } else { Some(p.hasher.clone().finalize()) };
@@ -1025,7 +1149,11 @@ fn check_and_finish<R: FnMut(&str)>(books: &mut Books<'_, R>, c: &Checks, mut p:
         (Some(_), None) => {
             p.discard();
             if !p.passive {
-                books.fail(&p.name, "its BLAKE2sp hash starts only in a later part, so it can't be checked")?;
+                books.fail(
+                    &p.context,
+                    p.context.integrity(RarIntegrityReason::DeclaredHashUnavailable, false),
+                    "its BLAKE2sp hash starts only in a later part, so it can't be checked",
+                )?;
             }
             return Ok(());
         }
@@ -1036,50 +1164,85 @@ fn check_and_finish<R: FnMut(&str)>(books: &mut Books<'_, R>, c: &Checks, mut p:
     }
     if crc_bad || blake_bad {
         p.discard();
-        return books.fail(&p.name, "checksum error");
+        let failure =
+            p.context.integrity(RarIntegrityReason::FinalChecks { crc32: crc_bad, blake2sp: blake_bad }, true);
+        return books.fail(&p.context, failure, "checksum error");
     }
     // a matching checksum doesn't vouch for the size the header states
     if let Some(size) = c.size
         && p.bytes != size
     {
         p.discard();
-        return books.fail(&p.name, &format!("{} bytes where the header says {size}", p.bytes));
+        let failure = p.context.integrity(RarIntegrityReason::DecodedSize { expected: size, actual: p.bytes }, true);
+        return books.fail(&p.context, failure, format_args!("{} bytes where the header says {size}", p.bytes));
     }
-    if let Some(out) = p.out.take() {
-        // the last of a big file may still be on its way to the disk
-        out.finish(|file| finish_file(file, &c.meta))?;
+    if let Some(out) = p.out.take()
+        && let Err(e) = out.finish_detailed(|file| finish_file(file, &c.meta))
+    {
+        return Err(books.terminal(&p.context, e.detailed(false)));
     }
-    books.summary.files += 1;
-    books.summary.bytes += p.bytes;
-    Ok(())
+    let drained = if books.reports.typed() { books.catch_up_for_completion() } else { Ok(()) };
+    if drained.is_err() && !matches!(drained, Err(RunFault::Reported { .. })) {
+        return drained;
+    }
+    let reported = books.reports.verified(
+        &p.context,
+        p.bytes,
+        p.context.checks(c.size.is_some(), c.crc32.is_some(), c.blake2sp.is_some()),
+        books.mode,
+    );
+    drained.and(reported)
 }
 
 /// Where a solid stream's queued files' bytes go: to the oldest file not yet finished, which an empty slice from the
 /// decoder finishes.
-fn route<'a, 'b: 'a, R: FnMut(&str)>(
-    queued: &'a mut VecDeque<Queued>,
-    books: &'a mut Books<'b, R>,
-) -> Route<'a, 'b, R> {
-    Route { queued, books }
+fn with_route(
+    queued: &mut VecDeque<Queued>,
+    books: &mut Books<'_, '_>,
+    decode: impl FnOnce(&mut dyn Sink) -> Result<()>,
+) -> std::result::Result<(), RouteError> {
+    let mut route = Route { queued, books, fault: None };
+    let result = decode(&mut route);
+    match route.fault {
+        Some(fault) => Err(RouteError::Fatal(fault)),
+        None => result.map_err(RouteError::Decoder),
+    }
 }
 
-struct Route<'a, 'b, R: FnMut(&str)> {
-    queued: &'a mut VecDeque<Queued>,
-    books: &'a mut Books<'b, R>,
+enum RouteError {
+    Decoder(Error),
+    Fatal(RunFault),
 }
 
-impl<R: FnMut(&str)> Sink for Route<'_, '_, R> {
+struct Route<'a, 'b, 'r> {
+    queued: &'a mut VecDeque<Queued>,
+    books: &'a mut Books<'b, 'r>,
+    fault: Option<RunFault>,
+}
+
+impl Sink for Route<'_, '_, '_> {
     fn put(&mut self, chunk: &[u8]) -> Result<()> {
-        if chunk.is_empty() {
-            let Some((p, c)) = self.queued.pop_front() else {
-                return Err(Error::Corrupt("more files than were queued"));
-            };
-            return check_and_finish(self.books, &c, p);
+        if self.fault.is_some() {
+            return Err(Error::Corrupt("RAR output stopped"));
         }
-        match self.queued.front_mut() {
-            Some((p, _)) => p.take(chunk),
-            None => Err(Error::Corrupt("more files than were queued")),
+        let result = if self.queued.is_empty() {
+            let reason = "more files than were queued";
+            Err(invariant(reason, Error::Corrupt(reason)).into())
+        } else if chunk.is_empty() {
+            let (p, c) = self.queued.pop_front().unwrap();
+            check_and_finish(self.books, &c, p)
+        } else {
+            let (p, _) = self.queued.front_mut().unwrap();
+            p.take_detailed(chunk).map_err(|fault| {
+                p.discard();
+                if p.passive { fault.into() } else { self.books.terminal(&p.context, fault) }
+            })
+        };
+        if let Err(fault) = result {
+            self.fault = Some(fault);
+            return Err(Error::Corrupt("RAR output stopped"));
         }
+        Ok(())
     }
 
     fn wants_crc(&self) -> bool {
@@ -1098,14 +1261,23 @@ fn decoding_error(e: &Error) -> bool {
     matches!(e, Error::Corrupt(_) | Error::Unsupported(_) | Error::Truncated)
 }
 
-struct Run<'a, R: FnMut(&str)> {
+type HistoryFailure = (Option<u64>, Option<Arc<RarFailure>>);
+
+fn history_failure(cause: Option<&HistoryFailure>) -> RarFailure {
+    let (predecessor, cause) = cause.cloned().unwrap_or_default();
+    RarFailure::SolidHistoryUnavailable { predecessor, cause }
+}
+
+struct Run<'a, 'r, 'c> {
     opts: &'a Options,
     password: Option<&'a str>,
-    summary: Summary,
+    reports: &'r mut Reports<'c>,
+    order: u64,
+    dir_meta: Vec<(PathBuf, Meta)>,
+    unavailable: Option<HistoryFailure>,
     pending: Option<Pending>,
     /// the decoder, kept between files of a solid stream
     stream: Option<Unpacker>,
-    report: R,
     /// threads for work spread over files; 1 for none
     threads: usize,
     /// small files being decoded and written on other threads
@@ -1124,30 +1296,71 @@ struct Run<'a, R: FnMut(&str)> {
 }
 
 /// A file finished on another thread, counted and reported as if done here.
-fn apply_done(summary: &mut Summary, report: &mut impl FnMut(&str), done: Done) -> Result<()> {
+fn apply_done(reports: &mut Reports<'_>, mode: Mode, done: Done) -> RunResult<()> {
+    let ctx = &done.context;
     match done.outcome {
-        Outcome::Done(bytes) => {
-            summary.files += 1;
-            summary.bytes += bytes;
-            Ok(())
+        Outcome::Done { bytes, size_checked, crc32_checked, blake2sp_checked } => {
+            reports.verified(ctx, bytes, ctx.checks(size_checked, crc32_checked, blake2sp_checked), mode)
         }
-        Outcome::Failed { reason, legacy: why } => {
-            drop(reason);
-            let line = format!("{}: {why}", done.name);
-            report(&line);
-            summary.errors.push(line);
-            Ok(())
-        }
-        Outcome::Fatal(e) => Err(e.into_legacy()),
+        Outcome::Failed { reason, legacy } => reports.failed(ctx, Arc::from(reason), legacy),
+        Outcome::Fatal(fault) => Err(reports.terminal(ctx, fault)),
     }
 }
 
-fn rar_run(first: &Path, opts: &Options, password: Option<&str>, report: impl FnMut(&str)) -> Result<Summary> {
-    if opts.mode == Mode::Extract {
-        fs::create_dir_all(&opts.dest)?;
+fn invariant(reason: &'static str, legacy: Error) -> RarFault {
+    RarFault::new(RarFailure::Internal(RarInternal::Invariant(reason)), legacy)
+}
+
+fn rar_run(first: &Path, opts: &Options, password: Option<&str>, mut report: impl FnMut(&str)) -> Result<Summary> {
+    let mut reports = Reports::Legacy { summary: Summary::default(), callback: &mut report };
+    rar_run_shared(first, opts, password, &mut reports).map_err(RunFault::into_legacy)?;
+    let Reports::Legacy { summary, .. } = reports else { unreachable!() };
+    Ok(summary)
+}
+
+/// Test or extract all logical members of a RAR archive, including RAR with an SFX prefix.
+///
+/// The synchronous callback runs on the calling thread, in archive reporting order. Workers may
+/// publish files independently. A callback panic unwinds without rolling back completed outputs.
+///
+/// A successful traversal can include failed or skipped members. Every normal member counts as a
+/// match, including directories and existing-target skips. An empty archive or a volume containing
+/// only orphan continuations can complete with no matches. A terminal error contains partial
+/// counts for the completions reported before return.
+#[allow(clippy::result_large_err, reason = "the public error carries partial counts and an optional entry identity")]
+pub fn run_rar_with_outcomes(
+    first: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    mut on_entry: impl FnMut(&RarEntryOutcome),
+) -> std::result::Result<RarRunSummary, RarRunError> {
+    let mut reports = Reports::Typed { summary: RarRunSummary::default(), callback: &mut on_entry };
+    let result = rar_run_shared(first, opts, password, &mut reports);
+    let Reports::Typed { summary, .. } = reports else { unreachable!() };
+    match result {
+        Ok(()) => Ok(summary),
+        Err(fault) => Err(fault.into_public(summary)),
     }
-    let first_volume = Volume::open_detailed(first, password).map_err(crate::error::RarFault::into_legacy)?;
-    let mut opts = opts.protecting(first)?;
+}
+
+fn rar_run_shared<'a>(
+    first: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    reports: &mut Reports<'a>,
+) -> RunResult<()> {
+    if opts.mode == Mode::Extract {
+        fs::create_dir_all(&opts.dest)
+            .map_err(|e| RarFault::output(IoOperation::CreateDirectory, Some(opts.dest.clone()), None, e, false))?;
+    }
+    let first_volume = Volume::open_detailed(first, password)?;
+    let mut opts = match opts.protecting_detailed(first) {
+        Ok(opts) => opts,
+        Err(fault) => {
+            reports.volume()?;
+            return Err(fault.into());
+        }
+    };
     if let Cow::Owned(opts) = &mut opts {
         // An end header can request the next volume even if the main header omits the volume flag.
         // Reserve existing consecutive names before any member can replace one.
@@ -1159,42 +1372,41 @@ fn rar_run(first: &Path, opts: &Options, password: Option<&str>, report: impl Fn
                     next = next_volume(&path);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    reports.volume()?;
+                    return Err(RarFault::input(IoOperation::Metadata, Some(path), None, e).into());
+                }
             }
         }
     }
     let threads = opts.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
-    // the hidden size knob is there to test decoding blocks on workers, which batching would bypass
+    // The hidden size knob tests decoding blocks on workers, which batching would bypass.
     let threads = if opts.parallel_min.is_some() { 1 } else { threads };
-    let mut r = Run::new(&opts, password, report, threads);
-    let walked = walk_rar(first_volume, r.password, |vol, block, _| {
-        let Block::File(h) = block else { return Ok(()) };
-        r.file_block(vol, &h)
-    });
-    // files still with the workers come in before anything is summed up or folders are finished
-    let walked = walked.and_then(|v| r.drain().map(|()| v));
+    let mut run = Run::new(&opts, password, reports, threads);
+    let walked = walk_rar(first_volume, &mut run).and_then(|()| run.drain());
     if walked.is_err() {
-        // whatever went wrong, the workers finish (or remove) what they hold
-        let _ = r.drain();
-    }
-    // whatever stopped the walk, a file left half-written is removed
-    let volumes = match walked {
-        Ok(v) => v,
-        Err(e) => {
-            if let Some(mut p) = r.pending.take() {
-                p.discard();
+        // Retain the primary failure. Typed runs report each available genuine completion during cleanup.
+        loop {
+            match run.drain() {
+                Err(RunFault::Reported { .. }) if run.reports.typed() => continue,
+                _ => break,
             }
-            finish_dirs(&mut r.summary);
-            return Err(e);
         }
-    };
-    r.summary.volumes = volumes;
-    if let Some(mut p) = r.pending.take() {
-        r.fail(&p.name, "archive ends before this file does");
-        p.discard();
     }
-    finish_dirs(&mut r.summary);
-    Ok(r.summary)
+    let result = if let Some(mut p) = run.pending.take() {
+        let already_reported = p.failed || p.passive;
+        p.discard();
+        if walked.is_ok() && (!run.reports.typed() || !already_reported) {
+            let failure = p.context.integrity(RarIntegrityReason::MissingSplitContinuation, false);
+            run.reports.failed(&p.context, Arc::new(failure), "archive ends before this file does")
+        } else {
+            walked
+        }
+    } else {
+        walked
+    };
+    finish_dir_meta(&mut run.dir_meta);
+    result
 }
 
 fn rar_read_at(
@@ -1215,7 +1427,9 @@ fn rar_read_at(
         parallel_min: None,
     };
     let cancel = selection.cancel;
-    let mut run = Run::new(&opts, password, |_: &str| {}, 1);
+    let mut callback = |_: &str| {};
+    let mut reports = Reports::Legacy { summary: Summary::default(), callback: &mut callback };
+    let mut run = Run::new(&opts, password, &mut reports, 1);
     run.selection = Some(RarSelection { sink: &mut *selection.sink, ..selection });
     let mut next = 0;
     let mut selected = false;
@@ -1247,12 +1461,16 @@ fn rar_read_at(
         if let Some(selection) = &mut run.selection {
             selection.emit = selected;
         }
-        let before = run.summary.files;
-        run.file_block(volume, &header)?;
-        if let Some(error) = run.summary.errors.first() {
+        let Reports::Legacy { summary, .. } = &run.reports else { unreachable!() };
+        let before = summary.files;
+        let crypt = header.crypt.map(Ok);
+        let split_after = header.split_after();
+        run.file_block(volume, header, crypt).map_err(RunFault::into_legacy)?;
+        let Reports::Legacy { summary, .. } = &run.reports else { unreachable!() };
+        if let Some(error) = summary.errors.first() {
             return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error.clone())));
         }
-        complete = selected && !header.split_after() && run.summary.files > before && run.pending.is_none();
+        complete = selected && !split_after && summary.files > before && run.pending.is_none();
         Ok(complete)
     })?;
     if !complete {
@@ -1261,15 +1479,17 @@ fn rar_read_at(
     Ok(())
 }
 
-impl<'a, R: FnMut(&str)> Run<'a, R> {
-    fn new(opts: &'a Options, password: Option<&'a str>, report: R, threads: usize) -> Self {
+impl<'a, 'r, 'c> Run<'a, 'r, 'c> {
+    fn new(opts: &'a Options, password: Option<&'a str>, reports: &'r mut Reports<'c>, threads: usize) -> Self {
         Self {
             opts,
             password: password.filter(|s| !s.is_empty()),
-            summary: Summary::default(),
+            reports,
+            order: 0,
+            dir_meta: Vec::new(),
+            unavailable: None,
             pending: None,
             stream: None,
-            report,
             threads,
             batch: None,
             batch_paths: HashSet::new(),
@@ -1281,17 +1501,16 @@ impl<'a, R: FnMut(&str)> Run<'a, R> {
     }
 }
 
-impl<R: FnMut(&str)> Run<'_, R> {
+impl Run<'_, '_, '_> {
     /// Finishes everything still on other threads.
-    fn drain(&mut self) -> Result<()> {
+    fn drain(&mut self) -> RunResult<()> {
         self.drain_solid()?;
         self.drain_batch()
     }
 
-    fn drain_batch(&mut self) -> Result<()> {
+    fn drain_batch(&mut self) -> RunResult<()> {
         let Some(mut batch) = self.batch.take() else { return Ok(()) };
-        let (summary, report) = (&mut self.summary, &mut self.report);
-        let result = batch.drain(&mut |done| apply_done(summary, report, done));
+        let result = batch.drain(&mut |done| apply_done(self.reports, self.opts.mode, done));
         self.batch = Some(batch);
         self.batch_paths.clear();
         result
@@ -1303,10 +1522,42 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     /// Reports a failure after every file before it, so reports keep archive order.
-    fn fail_in_order(&mut self, name: &str, why: &str) -> Result<()> {
+    fn fail_in_order(
+        &mut self,
+        ctx: &EntryContext,
+        failure: RarFailure,
+        why: impl std::fmt::Display,
+    ) -> RunResult<Arc<RarFailure>> {
         self.drain()?;
-        self.fail(name, why);
-        Ok(())
+        let failure = Arc::new(failure);
+        self.reports.failed(ctx, Arc::clone(&failure), why)?;
+        Ok(failure)
+    }
+
+    fn terminal(&mut self, ctx: &EntryContext, mut fault: RarFault) -> RunFault {
+        if let RarFailure::Integrity { scope, reason: RarIntegrityReason::TruncatedData, password } =
+            fault.failure.as_mut()
+        {
+            *scope = ctx.scope();
+            *password = ctx.password;
+        }
+        if self.reports.typed() {
+            let _ = self.drain_solid();
+        }
+        Books { reports: self.reports, batch: &mut self.batch, mode: self.opts.mode }.terminal(ctx, fault)
+    }
+
+    fn pending_terminal(&mut self, pending: &Pending, fault: RarFault) -> RunFault {
+        if pending.passive { fault.into() } else { self.terminal(&pending.context, fault) }
+    }
+
+    fn lost_history(&mut self, ctx: &EntryContext, cause: Option<Arc<RarFailure>>) {
+        self.stream = None;
+        self.unavailable = Some((ctx.entry.index, cause));
+    }
+
+    fn dependency_failure(&self) -> RarFailure {
+        history_failure(self.unavailable.as_ref())
     }
 
     /// Whether `h` can go to the workers whole: a small file standing alone in one volume.
@@ -1324,113 +1575,141 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     /// Reads `h`'s data and hands it to the workers.
-    fn send_to_batch(&mut self, vol: &mut Volume, h: &FileHeader, out: Option<Place>) -> Result<()> {
+    fn send_to_batch(
+        &mut self,
+        vol: &mut Volume,
+        h: &FileHeader,
+        ctx: EntryContext,
+        out: Option<Place>,
+    ) -> RunResult<()> {
         let mut packed = Vec::with_capacity(h.packed_size as usize);
-        // stored data is only checked (and written) by the worker; compressed data keeps it busy decoding
         vol.read_fast(h.method == 0);
-        vol.read_data_into(h.data_at, h.packed_size, &mut packed)?;
+        if let Err(ReadDataError::Input(fault)) = vol.read_data_detailed(h.data_at, h.packed_size, |piece, range| {
+            packed.extend_from_slice(&piece.bytes()[range]);
+            Ok::<_, std::convert::Infallible>(())
+        }) {
+            return Err(self.terminal(&ctx, fault));
+        }
         let job = Job {
-            name: h.name.clone(),
-            packed,
-            method: h.method,
-            dictionary: h.dictionary,
-            size: h.unpacked_size,
-            crc32: h.crc32,
-            blake2sp: h.blake2sp,
-            out,
-            meta: Meta::from(h),
+            context: ctx,
+            data: JobData {
+                packed,
+                method: h.method,
+                dictionary: h.dictionary,
+                size: h.unpacked_size,
+                size_checked: true,
+                crc32: h.crc32,
+                blake2sp: h.blake2sp,
+                out,
+                meta: Meta::from(h),
+            },
         };
         let batch = self.batch.get_or_insert_with(|| Batch::new(self.threads));
-        let (summary, report) = (&mut self.summary, &mut self.report);
-        batch.submit(job, &mut |done| apply_done(summary, report, done))
+        batch.submit(job, &mut |done| apply_done(self.reports, self.opts.mode, done))
     }
 
-    fn fail(&mut self, name: &str, why: &str) {
-        fail_to(&mut self.summary, &mut self.report, name, why);
-    }
-
-    fn file_block(&mut self, vol: &mut Volume, h: &FileHeader) -> Result<()> {
-        // a file done here reports as it goes, so the ones before it with the workers come in first (a solid
-        // stream's queued files, and the ones the workers write for it, wait for the next file that can't join
-        // them)
-        if !self.goes_to_batch(vol, h) && !self.queueable(vol, h) && !self.beside_batch(vol, h) {
+    fn file_block(&mut self, vol: &mut Volume, mut h: FileHeader, crypt: MemberCrypt) -> RunResult<()> {
+        let continuation = h.split_before();
+        if continuation && self.pending.as_ref().is_some_and(|p| p.context.entry.name == h.name) {
+            let p = self.pending.take().unwrap();
+            return self.continue_file(vol, &h, p, crypt);
+        }
+        let name = std::mem::take(&mut h.name);
+        let ctx = self.reports.encounter(!continuation, &mut self.order, name, h.method)?;
+        if !self.goes_to_batch(vol, &h) && !self.queueable(vol, &h) && !self.beside_batch(vol, &h) {
             self.drain_batch()?;
         }
-        if h.split_before() {
-            match self.pending.take() {
-                Some(p) if p.name == h.name => return self.continue_file(vol, h, p),
-                Some(mut p) => {
-                    self.fail(&p.name, "next part is missing");
-                    p.discard();
-                    self.stream = None;
+        if let Some(mut p) = self.pending.take() {
+            if !self.reports.typed() || (!p.failed && !p.passive) {
+                let failure = Arc::new(p.context.integrity(RarIntegrityReason::MissingSplitContinuation, false));
+                self.reports.failed(&p.context, Arc::clone(&failure), "next part is missing")?;
+                if p.compressed {
+                    self.lost_history(&p.context, Some(failure));
                 }
-                // the set was opened past the start of this file
-                None => {
-                    self.summary.skipped += 1;
-                    return Ok(());
-                }
+            } else if p.compressed && self.stream.is_some() {
+                self.lost_history(&p.context, None);
             }
-        } else if let Some(mut p) = self.pending.take() {
-            self.fail(&p.name, "next part is missing");
             p.discard();
             self.stream = None;
+        } else if continuation {
+            if self.reports.typed() {
+                self.drain()?;
+            }
+            return self.reports.skipped(&ctx, RarSkipReason::MissingStart);
         }
-        self.start_file(vol, h)
+        self.start_file(vol, &h, ctx, crypt)
     }
 
-    /// Reads past a file this run won't write. In a solid archive its data is still decoded, since the files
-    /// after it build on it.
-    fn pass_over(&mut self, vol: &mut Volume, h: &FileHeader) -> Result<()> {
-        self.pass_over_with_cipher(vol, h, None)
-    }
-
-    fn pass_over_with_cipher(&mut self, vol: &mut Volume, h: &FileHeader, cipher: Option<PendingCipher>) -> Result<()> {
-        if h.method != 0 && (h.algorithm != 0 || (h.encrypted && cipher.is_none())) {
+    /// Decodes usable passive history in a solid archive.
+    fn pass_over(
+        &mut self,
+        vol: &mut Volume,
+        h: &FileHeader,
+        ctx: EntryContext,
+        cipher: Option<PendingCipher>,
+        failure: Option<Arc<RarFailure>>,
+    ) -> RunResult<()> {
+        if h.method != 0
+            && (!vol.main.is_solid()
+                || h.algorithm != 0
+                || h.redirection.is_some()
+                || (h.encrypted && cipher.is_none()))
+        {
             self.drain()?;
-            self.stream = None;
+            self.lost_history(&ctx, failure);
         } else if vol.main.is_solid() && h.method != 0 {
-            let mut p = Pending::new(h);
+            let mut p = Pending::new(h, ctx);
             p.passive = true;
             p.cipher = cipher;
             return self.begin_decoding(vol, h, p);
         }
         if h.split_after() {
-            let mut p = Pending::new(h);
+            let mut p = Pending::new(h, ctx);
             p.failed = true;
             self.pending = Some(p);
         }
         Ok(())
     }
 
-    fn start_file(&mut self, vol: &mut Volume, h: &FileHeader) -> Result<()> {
-        // an older revision shares the current file's name: only the current one is written, but a test checks all
+    fn start_file(
+        &mut self,
+        vol: &mut Volume,
+        h: &FileHeader,
+        mut ctx: EntryContext,
+        crypt: MemberCrypt,
+    ) -> RunResult<()> {
         if let Some(v) = h.version
             && self.opts.mode == Mode::Extract
         {
             self.drain()?;
-            (self.report)(&format!("{}: older version {v}, skipped", h.name));
-            self.summary.skipped += 1;
-            return self.pass_over(vol, h);
+            self.reports.skipped(&ctx, RarSkipReason::OlderVersion(v))?;
+            return self.pass_over(vol, h, ctx, None, None);
         }
         let rel = if self.selection.is_some() {
             PathBuf::new()
         } else {
-            match sanitize(&h.name, !h.is_unix()) {
+            match sanitize(&ctx.entry.name, !h.is_unix()) {
                 Ok(rel) => rel,
                 Err(e) => {
-                    self.fail_in_order(&h.name, &e.to_string())?;
-                    return self.pass_over(vol, h);
+                    let failure = RarFailure::Policy {
+                        reason: RarPolicyReason::UnsafePath,
+                        path: PathBuf::from(&ctx.entry.name),
+                    };
+                    let cause = self.fail_in_order(&ctx, failure, e)?;
+                    return self.pass_over(vol, h, ctx, None, Some(cause));
                 }
             }
         };
-        // U+FFFE marks a Unix name holding bytes that aren't UTF-8, mapped into private-use characters
-        if self.opts.mode == Mode::Extract && h.name.contains('\u{FFFE}') {
-            self.fail_in_order(&h.name, "the name holds bytes that aren't UTF-8, which isn't supported yet")?;
-            return self.pass_over(vol, h);
+        // U+FFFE marks a Unix name holding bytes that aren't UTF-8, mapped into private-use characters.
+        if self.opts.mode == Mode::Extract && ctx.entry.name.contains('\u{FFFE}') {
+            let cause = self.fail_in_order(
+                &ctx,
+                RarFailure::Unsupported(RarUnsupported::NameEncoding),
+                "the name holds bytes that aren't UTF-8, which isn't supported yet",
+            )?;
+            return self.pass_over(vol, h, ctx, None, Some(cause));
         }
         let rel = if self.opts.flatten { PathBuf::from(rel.file_name().unwrap_or_default()) } else { rel };
-        // a file the workers still hold may be written, or removed, at the same place
-        // (a folder on its way to it may still be such a file, too)
         let key = rel.to_string_lossy().to_lowercase();
         if self.opts.mode == Mode::Extract
             && rel.ancestors().any(|a| {
@@ -1441,45 +1720,63 @@ impl<R: FnMut(&str)> Run<'_, R> {
             self.drain()?;
         }
         if h.is_dir() {
-            if self.opts.mode == Mode::Extract && !self.opts.flatten {
-                // a folder made earlier for a file inside it still gets its own times and permissions
-                make_dirs_known(&self.opts.dest, &rel, &mut self.dirs)?;
-                self.summary.dir_meta.push((self.opts.dest.join(&rel), Meta::from(h)));
+            if self.reports.typed() {
+                self.drain()?;
             }
-            self.summary.dirs += 1;
-            return Ok(());
+            if self.opts.mode == Mode::Extract && !self.opts.flatten {
+                make_dirs_known_detailed(&self.opts.dest, &rel, &mut self.dirs).map_err(|e| self.terminal(&ctx, e))?;
+                self.dir_meta.push((self.opts.dest.join(&rel), Meta::from(h)));
+            }
+            return self.reports.directory(&ctx);
         }
-        let refuse = if h.encrypted && (self.password.is_none() || h.crypt.is_none()) {
-            Some("encrypted (password required)".to_string())
+        let refuse = if let Some(Err(e)) = crypt {
+            Some((RarFailure::crypt(e, ctx.scope()), "encrypted (password required)"))
+        } else if h.encrypted && (self.password.is_none() || h.crypt.is_none()) {
+            Some((RarFailure::PasswordRequired { scope: ctx.scope() }, "encrypted (password required)"))
         } else if h.method != 0 && h.algorithm != 0 {
-            Some("RAR 7 compression is not supported yet".to_string())
+            let reason = RarUnsupported::CompressionAlgorithm { algorithm: h.algorithm, method: h.method };
+            Some((RarFailure::Unsupported(reason), "RAR 7 compression is not supported yet"))
         } else {
-            h.redirection.as_ref().map(|link| format!("links are not supported yet ({link:?})"))
+            None
         };
-        if let Some(why) = refuse {
-            self.fail_in_order(&h.name, &why)?;
-            return self.pass_over(vol, h);
+        if let Some((failure, why)) = refuse {
+            let cause = self.fail_in_order(&ctx, failure, why)?;
+            return self.pass_over(vol, h, ctx, None, Some(cause));
         }
-        let cipher = if h.encrypted {
-            let pw = self.password.unwrap_or_default();
-            let cp = h.crypt.as_ref().unwrap();
-            let Some((key, hk)) = crate::crypto::derive_rar5_key_and_hash_key(pw, cp.kdf_count, &cp.salt, cp.check)
-            else {
-                self.fail_in_order(&h.name, "wrong password")?;
-                return self.pass_over(vol, h);
+        if let Some(link) = &h.redirection {
+            let kind = match link {
+                Redirection::UnixSymlink(_) => 1,
+                Redirection::WindowsSymlink(_) => 2,
+                Redirection::Junction(_) => 3,
+                Redirection::HardLink(_) => 4,
+                Redirection::FileCopy(_) => 5,
+                Redirection::Unknown(kind) => *kind,
             };
-            let Some(aes) = crate::crypto::AesKey::new(&key) else {
-                self.fail_in_order(&h.name, "invalid encryption key")?;
-                return self.pass_over(vol, h);
+            let reason = RarFailure::Unsupported(RarUnsupported::Redirection { kind });
+            let cause = self.fail_in_order(&ctx, reason, format_args!("links are not supported yet ({link:?})"))?;
+            return self.pass_over(vol, h, ctx, None, Some(cause));
+        }
+        let cipher = if let (Some(cp), Some(pw)) = (&h.crypt, self.password) {
+            let keys = match crate::crypto::derive_rar5_keys(pw, cp.kdf_count, &cp.salt, cp.check) {
+                Ok(keys) => keys,
+                Err(e) => {
+                    let cause = self.fail_in_order(&ctx, RarFailure::crypt(e, ctx.scope()), "wrong password")?;
+                    return self.pass_over(vol, h, ctx, None, Some(cause));
+                }
             };
-            // An unknown-size stored member has no boundary to distinguish data from alignment padding.
+            ctx.password = keys.evidence;
+            let Some(aes) = crate::crypto::AesKey::new(&keys.key) else {
+                let reason = RarFailure::Internal(RarInternal::Invariant("invalid encryption key"));
+                let cause = self.fail_in_order(&ctx, reason, "invalid encryption key")?;
+                return self.pass_over(vol, h, ctx, None, Some(cause));
+            };
             let stored_padding = (h.method == 0 && !h.size_unknown())
                 .then_some(StoredCipherPadding { size: h.unpacked_size, skipped: 0 });
             Some(PendingCipher {
                 aes,
                 iv: cp.iv,
                 rem: Vec::new(),
-                hash_key: hk,
+                hash_key: keys.hash_key,
                 stored_padding,
                 blocks: (h.method != 0).then(CipherBlocks::default),
             })
@@ -1488,17 +1785,21 @@ impl<R: FnMut(&str)> Run<'_, R> {
         };
 
         let place = if self.opts.mode == Mode::Extract {
-            match check_target(self.opts, &rel, Some(&mut self.dirs))? {
-                Checked::Write(place) => Some(place),
-                Checked::Exists => {
+            match check_target_detailed(self.opts, &rel, Some(&mut self.dirs)).map_err(|e| self.terminal(&ctx, e))? {
+                DetailedChecked::Write(place) => Some(place),
+                DetailedChecked::Exists => {
                     self.drain()?;
-                    (self.report)(&format!("{}: exists, skipped", h.name));
-                    self.summary.skipped += 1;
-                    return self.pass_over_with_cipher(vol, h, cipher);
+                    self.reports.skipped(&ctx, RarSkipReason::ExistingTarget)?;
+                    return self.pass_over(vol, h, ctx, cipher, None);
                 }
-                Checked::Blocked(why) => {
-                    self.fail_in_order(&h.name, why)?;
-                    return self.pass_over_with_cipher(vol, h, cipher);
+                DetailedChecked::Blocked(reason) => {
+                    let message = blocked_message(&reason);
+                    let cause = self.fail_in_order(
+                        &ctx,
+                        RarFailure::Policy { reason, path: self.opts.dest.join(&rel) },
+                        message,
+                    )?;
+                    return self.pass_over(vol, h, ctx, cipher, Some(cause));
                 }
             }
         } else {
@@ -1508,9 +1809,9 @@ impl<R: FnMut(&str)> Run<'_, R> {
             if self.opts.mode == Mode::Extract {
                 self.batch_paths.insert(key);
             }
-            return self.send_to_batch(vol, h, place);
+            return self.send_to_batch(vol, h, ctx, place);
         }
-        let mut p = Pending::new(h);
+        let mut p = Pending::new(h, ctx);
         p.cipher = cipher;
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
         p.place = place;
@@ -1518,7 +1819,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     /// Sets the decoder up for a compressed file, then reads its first part.
-    fn begin_decoding(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending) -> Result<()> {
+    fn begin_decoding(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending) -> RunResult<()> {
         let size = (!h.size_unknown()).then_some(h.unpacked_size);
         let queues = self.queueable(vol, h);
         if queues
@@ -1530,20 +1831,26 @@ impl<R: FnMut(&str)> Run<'_, R> {
             // every queued file holds its output open
             let most = if self.opts.mode == Mode::Extract { MAX_OPEN_QUEUED } else { MAX_TESTED_QUEUED };
             if self.queued.len() >= most {
-                let mut books = Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch };
-                let caught_up = u.catch_up(most as u64 / 2, &mut route(&mut self.queued, &mut books));
-                if let Err(e) = caught_up {
-                    if !decoding_error(&e) {
+                let mut books = Books { reports: self.reports, batch: &mut self.batch, mode: self.opts.mode };
+                let caught_up = with_route(&mut self.queued, &mut books, |sink| u.catch_up(most as u64 / 2, sink));
+                match caught_up {
+                    Ok(()) => {}
+                    Err(RouteError::Decoder(e)) => {
+                        if !decoding_error(&e) {
+                            p.discard();
+                            self.discard_queued();
+                            return Err(invariant("catching up RAR decoder", e).into());
+                        }
+                        let size_failure = u.take_size_failure();
+                        self.fail_queued(Some(e), size_failure)?;
+                        // The earlier decoder failure invalidated this member's history.
+                        return self.begin_decoding(vol, h, p);
+                    }
+                    Err(RouteError::Fatal(fault)) => {
                         p.discard();
                         self.discard_queued();
-                        return Err(e);
+                        return Err(fault);
                     }
-                    // the stream is gone with the file that failed, so this one fails after it
-                    if let Err(e) = self.fail_queued(&e.to_string()) {
-                        p.discard();
-                        return Err(e);
-                    }
-                    return self.begin_decoding(vol, h, p);
                 }
             }
             u.queue_file(size);
@@ -1564,19 +1871,32 @@ impl<R: FnMut(&str)> Run<'_, R> {
                         u.next_file(size);
                         Ok(())
                     }
-                    _ => Err(NEEDS_EARLIER.to_string()),
+                    _ => {
+                        let failure = self.dependency_failure();
+                        p.discard();
+                        self.stream = None;
+                        if !p.passive {
+                            self.fail_in_order(&p.context, failure, NEEDS_EARLIER)?;
+                        }
+                        return self.continue_file(vol, h, p, None);
+                    }
                 }
             } else {
-                match window_for(h.dictionary, size, solid_archive) {
+                self.unavailable = None;
+                match window_for_detailed(h.dictionary, size, solid_archive) {
                     Ok(window) if self.selection.is_some() && window.size > RAR_SELECTED_WINDOW_LIMIT => {
-                        return Err(Error::Unsupported("RAR5 window exceeds the 256 MiB limit".into()));
+                        return Err(invariant(
+                            "selected RAR window limit",
+                            Error::Unsupported("RAR5 window exceeds the 256 MiB limit".into()),
+                        )
+                        .into());
                     }
                     Ok(window) => match self.stream.as_mut().filter(|u| u.fits(window)) {
                         Some(u) => {
                             u.restart(window, size);
                             Ok(())
                         }
-                        None => Unpacker::new(window).map(|mut u| {
+                        None => Unpacker::new_detailed(window).map(|mut u| {
                             if self.opts.threads.is_some() || self.opts.parallel_min.is_some() {
                                 let workers = self.opts.threads.map_or_else(|| u.threads(), |n| n.saturating_sub(1));
                                 u.set_threads(workers, self.opts.parallel_min.unwrap_or(u.parallel_min()));
@@ -1584,17 +1904,19 @@ impl<R: FnMut(&str)> Run<'_, R> {
                             u.reset(size);
                             self.stream = Some(u);
                         }),
-                    }
-                    .map_err(|e| e.to_string()),
-                    Err(e) => Err(e.to_string()),
+                    },
+                    Err(e) => Err(e),
                 }
             };
-            if let Err(why) = ready {
+            if let Err(e) = ready {
                 p.discard();
-                self.stream = None;
-                if !p.passive {
-                    self.fail_in_order(&h.name, &why)?;
-                }
+                let (failure, legacy) = e.detailed(p.context.scope()).into_parts();
+                let cause = if !p.passive {
+                    Some(self.fail_in_order(&p.context, *failure, legacy)?)
+                } else {
+                    Some(Arc::from(failure))
+                };
+                self.lost_history(&p.context, cause);
             } else if queues
                 && let Some(u) = self.stream.as_mut()
                 && u.threads() > 0
@@ -1605,9 +1927,9 @@ impl<R: FnMut(&str)> Run<'_, R> {
         }
         if let Err(e) = p.open(size) {
             p.discard();
-            return Err(e);
+            return Err(self.pending_terminal(&p, e));
         }
-        self.continue_file(vol, h, p)
+        self.continue_file(vol, h, p, None)
     }
 
     /// Whether `h` is a whole compressed file, standing alone, that is decoded on this thread while the workers
@@ -1639,7 +1961,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     /// Feeds a whole file to the decoder behind the queued ones. Its bytes go to it once the ones before are done.
-    fn decode_queued(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending) -> Result<()> {
+    fn decode_queued(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending) -> RunResult<()> {
         // a small file is gathered and written whole on a worker; a bigger one is written as it comes
         let size = h.unpacked_size;
         if p.place.is_some()
@@ -1651,7 +1973,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
             p.decoder_crc = false;
         } else if let Err(e) = p.open(Some(size)) {
             p.discard();
-            return Err(e);
+            return Err(self.pending_terminal(&p, e));
         }
         // registered only now, after any stream before was drained, so a later file at the same place waits for it
         if let Some(key) = p.key.clone() {
@@ -1659,89 +1981,112 @@ impl<R: FnMut(&str)> Run<'_, R> {
         }
         self.queued.push_back((p, Checks::from(h)));
         let mut stream = self.stream.take();
-        let mut fed = false;
-        let mut books = Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch };
+        let mut books = Books { reports: self.reports, batch: &mut self.batch, mode: self.opts.mode };
         let queued = &mut self.queued;
         vol.read_fast(false);
-        let read = vol.read_data_shared(h.data_at, h.packed_size, |piece, range| {
-            let Some(u) = stream.as_mut() else { return Err(Error::Corrupt("no decoder for a queued file")) };
-            let r = u.feed_shared(piece, range, &mut route(queued, &mut books));
-            fed = r.is_err();
-            r
+        let read = vol.read_data_detailed(h.data_at, h.packed_size, |piece, range| {
+            let Some(u) = stream.as_mut() else {
+                return Err(RouteError::Fatal(
+                    invariant("no decoder for a queued file", Error::Corrupt("no decoder for a queued file")).into(),
+                ));
+            };
+            with_route(queued, &mut books, |sink| u.feed_shared(piece, range, sink))
         });
         match read {
             Ok(()) => {
                 self.stream = stream;
                 Ok(())
             }
-            // the oldest file still queued is the one the decoder was on
-            Err(e) if fed && decoding_error(&e) => self.fail_queued(&e.to_string()),
-            Err(e) if fed => {
-                self.discard_queued();
-                Err(e)
+            // The oldest file still queued is the one the decoder was on.
+            Err(ReadDataError::Sink(RouteError::Decoder(e))) if decoding_error(&e) => {
+                self.fail_queued(Some(e), stream.as_mut().and_then(Unpacker::take_size_failure))
             }
-            // the archive can't be read on: the files before this one are whole, so they are finished first
-            Err(e) => {
+            Err(ReadDataError::Sink(RouteError::Decoder(e))) => {
+                self.discard_queued();
+                Err(invariant("feeding queued RAR decoder", e).into())
+            }
+            Err(ReadDataError::Sink(RouteError::Fatal(fault))) => {
+                self.discard_queued();
+                Err(fault)
+            }
+            Err(ReadDataError::Input(fault)) => {
+                let context = self.queued.back().and_then(|(p, _)| (!p.passive).then(|| p.context.clone()));
                 if let Some(u) = stream.as_mut() {
-                    let mut books =
-                        Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch };
-                    let waited = u.wait(&mut route(&mut self.queued, &mut books));
-                    if let Err(d) = waited
-                        && decoding_error(&d)
+                    let mut books = Books { reports: self.reports, batch: &mut self.batch, mode: self.opts.mode };
+                    let waited = with_route(&mut self.queued, &mut books, |sink| u.wait(sink));
+                    if let Err(RouteError::Decoder(e)) = waited
+                        && decoding_error(&e)
                     {
-                        let _ = self.fail_queued(&d.to_string());
+                        if self.reports.typed()
+                            && let Some((mut p, _)) = self.queued.pop_back()
+                        {
+                            p.discard();
+                            let _ = self.fail_queued(Some(e), u.take_size_failure());
+                            return Err(self.pending_terminal(&p, fault));
+                        }
+                        let _ = self.fail_queued(Some(e), u.take_size_failure());
+                        return Err(fault.into());
                     }
                 }
                 self.discard_queued();
-                Err(e)
+                Err(match context {
+                    Some(ctx) => self.terminal(&ctx, fault),
+                    None => fault.into(),
+                })
             }
         }
     }
 
     /// Decodes the queued files to their end and finishes them.
-    fn drain_solid(&mut self) -> Result<()> {
+    fn drain_solid(&mut self) -> RunResult<()> {
         if self.queued.is_empty() {
             return Ok(());
         }
-        let Some(mut u) = self.stream.take() else { return self.fail_queued(NEEDS_EARLIER) };
-        let mut books = Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch };
-        let finished = u.finish(&mut route(&mut self.queued, &mut books));
+        let Some(mut u) = self.stream.take() else { return self.fail_queued(None, None) };
+        let mut books = Books { reports: self.reports, batch: &mut self.batch, mode: self.opts.mode };
+        let finished = with_route(&mut self.queued, &mut books, |sink| u.finish(sink));
         match finished {
             Ok(()) => {
                 self.stream = Some(u);
-                // files still being written on the workers keep their places guarded
                 self.batch_paths.extend(self.queued_paths.drain());
-                // every file but the last was finished where the next began
                 let Some((p, c)) = self.queued.pop_front() else { return Ok(()) };
                 debug_assert!(self.queued.is_empty());
-                check_and_finish(
-                    &mut Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch },
-                    &c,
-                    p,
-                )
+                check_and_finish(&mut books, &c, p)
             }
-            Err(e) if decoding_error(&e) => self.fail_queued(&e.to_string()),
+            Err(RouteError::Decoder(e)) if decoding_error(&e) => self.fail_queued(Some(e), u.take_size_failure()),
             Err(e) => {
                 self.discard_queued();
-                Err(e)
+                Err(match e {
+                    RouteError::Decoder(e) => invariant("draining queued RAR decoder", e).into(),
+                    RouteError::Fatal(fault) => fault,
+                })
             }
         }
     }
 
-    /// The decoder failed on the oldest queued file: the ones after it can't be decoded either.
-    fn fail_queued(&mut self, why: &str) -> Result<()> {
-        // the files before them that the workers hold come in first
+    /// The oldest queued file failed. Later dependents refer directly to that cause.
+    fn fail_queued(&mut self, decoder: Option<Error>, size: Option<(u64, u64)>) -> RunResult<()> {
         if let Err(e) = self.drain_batch() {
             self.discard_queued();
             return Err(e);
         }
-        let mut why = why;
-        while let Some((mut p, _)) = self.queued.pop_front() {
+        if let Some(e) = decoder
+            && let Some((mut p, _)) = self.queued.pop_front()
+        {
+            let (failure, legacy) =
+                batch::decoder_failure_with_size(e, p.context.scope(), p.context.password, size).into_parts();
+            let cause: Arc<RarFailure> = Arc::from(failure);
             if !p.passive {
-                self.fail(&p.name, why);
+                self.reports.failed(&p.context, Arc::clone(&cause), legacy)?;
             }
             p.discard();
-            why = NEEDS_EARLIER;
+            self.lost_history(&p.context, Some(cause));
+        }
+        while let Some((mut p, _)) = self.queued.pop_front() {
+            if !p.passive {
+                self.reports.failed(&p.context, Arc::new(self.dependency_failure()), NEEDS_EARLIER)?;
+            }
+            p.discard();
         }
         self.stream = None;
         self.queued_paths.clear();
@@ -1758,7 +2103,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     /// Reads this volume's part of a file and, at its last part, checks and finishes it.
-    fn continue_file(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending) -> Result<()> {
+    fn continue_file(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending, crypt: MemberCrypt) -> RunResult<()> {
         let split_after = h.split_after();
         if p.failed {
             if split_after {
@@ -1766,23 +2111,38 @@ impl<R: FnMut(&str)> Run<'_, R> {
             }
             return Ok(());
         }
-        if (h.method != 0) != p.compressed || h.encrypted != p.encrypted {
+        let changed = (h.method != 0) != p.compressed || h.encrypted != p.encrypted;
+        if changed || matches!(crypt, Some(Err(_))) {
+            let (failure, legacy) = match crypt {
+                Some(Err(e)) if !changed => (RarFailure::crypt(e, p.context.scope()), "encrypted (password required)"),
+                _ => (
+                    p.context.integrity(RarIntegrityReason::ChangedContinuationEncoding, false),
+                    "a later part is packed differently",
+                ),
+            };
+            let failure = Arc::new(failure);
             if !p.passive {
-                self.fail(&p.name, "a later part is packed differently");
+                self.reports.failed(&p.context, Arc::clone(&failure), legacy)?;
             }
             p.discard();
-            self.stream = None;
+            if p.compressed {
+                self.lost_history(&p.context, Some(failure));
+            } else {
+                self.stream = None;
+            }
             if split_after {
                 self.pending = Some(p);
             }
             return Ok(());
         }
         if let Some(selection) = &mut self.selection {
-            selection.cancel.check_io()?;
-            selection.packed_left = selection
-                .packed_left
-                .checked_sub(h.packed_size)
-                .ok_or_else(|| Error::Unsupported("RAR5 decoding exceeds the packed byte limit".into()))?;
+            selection.cancel.check_io().map_err(|e| invariant("selected RAR cancellation", e.into()))?;
+            selection.packed_left = selection.packed_left.checked_sub(h.packed_size).ok_or_else(|| {
+                invariant(
+                    "selected RAR packed budget",
+                    Error::Unsupported("RAR5 decoding exceeds the packed byte limit".into()),
+                )
+            })?;
         }
         // a part's checksums cover only its own packed bytes
         let mut part = crate::crc32::Hasher::new();
@@ -1801,9 +2161,9 @@ impl<R: FnMut(&str)> Run<'_, R> {
         vol.read_fast(self.threads > 1 && !p.compressed && p.cipher.is_none());
         // The decoder needs the pending member as a sink while the framing state is borrowed.
         let mut blocks = p.cipher.as_mut().and_then(|cipher| cipher.blocks.take());
-        let read = vol.read_data_shared(h.data_at, h.packed_size, |piece, range| {
+        let read = vol.read_data_detailed(h.data_at, h.packed_size, |piece, range| {
             if let Some(selection) = &self.selection {
-                selection.cancel.check_io()?;
+                selection.cancel.check_io().map_err(|e| MemberDecodeError::Decoder(e.into()))?;
             }
             let chunk = &piece.bytes()[range.clone()];
             if split_after {
@@ -1828,73 +2188,96 @@ impl<R: FnMut(&str)> Run<'_, R> {
                     aes.decrypt_cbc_in_place(iv, &mut dec_buf);
                     &dec_buf
                 };
-                let mut selected_sink;
-                let sink: &mut dyn Sink = match self.selection.as_mut() {
-                    Some(selection) => {
-                        selected_sink = SelectedSink { pending: &mut p, selection };
-                        &mut selected_sink
-                    }
-                    None => &mut p,
-                };
-                match stream.as_mut() {
+                with_member_sink(&mut p, self.selection.as_mut(), |sink| match stream.as_mut() {
                     Some(decoder) => blocks
                         .as_mut()
                         .ok_or(Error::Corrupt("missing encrypted block state"))?
                         .feed(to_feed, decoder, sink),
                     None => sink.put(to_feed),
-                }
-            } else if let Some(selection) = &mut self.selection {
-                let mut sink = SelectedSink { pending: &mut p, selection };
-                match stream.as_mut() {
-                    Some(u) => u.feed_shared(piece, range, &mut sink),
-                    None => sink.put(chunk),
-                }
+                })
             } else {
-                match stream.as_mut() {
-                    Some(u) => u.feed_shared(piece, range, &mut p),
-                    None => p.take(chunk),
-                }
+                with_member_sink(&mut p, self.selection.as_mut(), |sink| match stream.as_mut() {
+                    Some(u) => u.feed_shared(piece, range, sink),
+                    None => sink.put(chunk),
+                })
             }
         });
         if let Some(cipher) = p.cipher.as_mut() {
             cipher.blocks = blocks;
         }
-        // a decoder error is this file's problem; an archive read error ends the run
+        let decoder_fault = |e: Error, p: &Pending, size| {
+            batch::decoder_failure_with_size(e, p.context.scope(), p.context.password, size)
+        };
+        let sink_fault = |e, p: &Pending, size| match e {
+            MemberDecodeError::Decoder(e) => decoder_fault(e, p, size),
+            MemberDecodeError::Sink(e) => e,
+        };
         let decoded = match read {
             Ok(()) if !split_after => {
                 let padding = match p.cipher.as_ref() {
-                    Some(cipher) if !cipher.rem.is_empty() => Err(Error::Truncated),
-                    Some(cipher) => cipher.blocks.as_ref().map_or(Ok(()), CipherBlocks::finish),
+                    Some(cipher) if !cipher.rem.is_empty() => Err(RarFault::new(
+                        p.context.integrity(RarIntegrityReason::IncompleteCipherBlock, false),
+                        Error::Truncated,
+                    )),
+                    Some(cipher) => cipher
+                        .blocks
+                        .as_ref()
+                        .map_or(Ok(()), CipherBlocks::finish)
+                        .map_err(|e| decoder_fault(e, &p, None)),
                     None => Ok(()),
                 };
                 padding.and_then(|()| match stream.as_mut() {
-                    Some(u) => match self.selection.as_mut() {
-                        Some(selection) => u.finish(&mut SelectedSink { pending: &mut p, selection }),
-                        None => u.finish(&mut p),
-                    },
+                    Some(u) => with_member_sink(&mut p, self.selection.as_mut(), |sink| u.finish(sink))
+                        .map_err(|e| sink_fault(e, &p, u.take_size_failure())),
                     None => Ok(()),
                 })
             }
             Ok(()) => Ok(()),
-            Err(e @ (Error::Corrupt(_) | Error::Unsupported(_)))
+            Err(ReadDataError::Sink(MemberDecodeError::Decoder(e @ (Error::Corrupt(_) | Error::Unsupported(_)))))
                 if self.selection.is_none() && (p.compressed || p.encrypted) =>
             {
-                Err(e)
+                Err(decoder_fault(e, &p, stream.as_mut().and_then(Unpacker::take_size_failure)))
             }
-            Err(e) => {
+            Err(ReadDataError::Sink(MemberDecodeError::Sink(fault)))
+                if matches!(
+                    fault.failure.as_ref(),
+                    RarFailure::Integrity { .. } | RarFailure::EncryptedIntegrity { .. }
+                ) =>
+            {
+                Err(fault)
+            }
+            Err(ReadDataError::Input(fault) | ReadDataError::Sink(MemberDecodeError::Sink(fault))) => {
                 p.discard();
-                return Err(e);
+                return Err(self.pending_terminal(&p, fault));
+            }
+            Err(ReadDataError::Sink(MemberDecodeError::Decoder(e))) => {
+                p.discard();
+                let fault = decoder_fault(e, &p, stream.as_mut().and_then(Unpacker::take_size_failure));
+                return Err(self.pending_terminal(&p, fault));
             }
         };
-        if let Err(e) = decoded {
+        if let Err(fault) = decoded {
             p.discard();
+            if matches!(
+                fault.failure.as_ref(),
+                RarFailure::Output { .. }
+                    | RarFailure::Internal(_)
+                    | RarFailure::Limit { resource: RarResource::Counter, .. }
+            ) {
+                return Err(self.pending_terminal(&p, fault));
+            }
             if self.selection.is_some() {
-                return Err(e);
+                return Err(fault.into());
             }
-            if !p.passive {
-                self.fail_in_order(&p.name, &e.to_string())?;
+            let (failure, legacy) = fault.into_parts();
+            let cause = if !p.passive {
+                Some(self.fail_in_order(&p.context, *failure, legacy)?)
+            } else {
+                Some(Arc::from(failure))
+            };
+            if p.compressed {
+                self.lost_history(&p.context, cause);
             }
-            // the stream's state is lost with it
             if split_after {
                 self.pending = Some(p);
             }
@@ -1913,12 +2296,15 @@ impl<R: FnMut(&str)> Run<'_, R> {
                 hash_key.map_or(digest, |key| crate::crypto::rar5_tweak_blake2sp(&digest, key)) != want
             });
             if crc_bad || blake_bad {
+                let keyed = hash_key.is_some();
+                let reason = RarIntegrityReason::PackedPiece { crc32: crc_bad, blake2sp: blake_bad, keyed };
+                let failure = Arc::new(p.context.integrity(reason, keyed));
                 if !p.passive {
-                    self.fail(&p.name, "checksum error in a volume's part");
+                    self.reports.failed(&p.context, Arc::clone(&failure), "checksum error in a volume's part")?;
                 }
                 p.discard();
                 if p.compressed {
-                    self.stream = None;
+                    self.lost_history(&p.context, Some(failure));
                 }
             }
             self.pending = Some(p);
@@ -1928,29 +2314,30 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     /// A file's last part is in: checks it whole and finishes it.
-    fn finish_file_checks(&mut self, h: &FileHeader, p: Pending) -> Result<()> {
+    fn finish_file_checks(&mut self, h: &FileHeader, p: Pending) -> RunResult<()> {
         check_and_finish(
-            &mut Books { summary: &mut self.summary, report: &mut self.report, batch: &mut self.batch },
+            &mut Books { reports: self.reports, batch: &mut self.batch, mode: self.opts.mode },
             &Checks::from(h),
             p,
         )
     }
 }
 
-impl<R: FnMut(&str)> Run<'_, R> {
+impl Run<'_, '_, '_> {
     /// A big part of a stored file, checked (and copied) on several threads. Ends as [`Self::continue_file`] does.
-    fn stored_parallel(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending) -> Result<()> {
+    fn stored_parallel(&mut self, vol: &mut Volume, h: &FileHeader, mut p: Pending) -> RunResult<()> {
         let split_after = h.split_after();
         if h.data_at.checked_add(h.packed_size).is_none_or(|end| end > vol.len()) {
             p.discard();
-            return Err(Error::Truncated);
+            let failure = p.context.integrity(RarIntegrityReason::TruncatedData, false);
+            return Err(self.pending_terminal(&p, RarFault::new(failure, Error::Truncated)));
         }
         // the pieces are written by position, so the writer thread hands the file over first
         let file = match p.out.take().map(Output::handoff_detailed).transpose() {
             Ok(f) => f,
             Err(e) => {
                 p.discard();
-                return Err(e.detailed(false).into_legacy());
+                return Err(self.terminal(&p.context, e.detailed(false)));
             }
         };
         let volume_path = vol.path.clone();
@@ -1961,24 +2348,23 @@ impl<R: FnMut(&str)> Run<'_, R> {
             file.as_ref().map(|f| (&f.file, f.target())),
             p.bytes,
             self.threads,
-        )
-        .map_err(crate::error::RarFault::into_legacy);
+        );
         let part = match part {
             Ok(part) => part,
             Err(e) => {
                 drop(file);
                 p.discard();
-                return Err(e);
+                return Err(self.pending_terminal(&p, e));
             }
         };
         p.hasher.combine(&part);
-        p.bytes += h.packed_size;
+        p.bytes =
+            p.bytes.checked_add(h.packed_size).ok_or_else(|| self.pending_terminal(&p, RarFault::counter_limit()))?;
         if let Some(mut file) = file {
-            use std::io::{Seek, SeekFrom};
-            if let Err(e) = file.file.seek(SeekFrom::Start(p.bytes)) {
+            if let Err(fault) = seek_output(&mut file, p.bytes) {
                 drop(file);
                 p.discard();
-                return Err(e.into());
+                return Err(self.pending_terminal(&p, fault));
             }
             let left = (!h.size_unknown()).then(|| h.unpacked_size.saturating_sub(p.bytes));
             p.out = Some(Output::resume(file, left));
@@ -1986,7 +2372,12 @@ impl<R: FnMut(&str)> Run<'_, R> {
         if split_after {
             if h.crc32.is_some_and(|want| part.finalize() != want) {
                 if !p.passive {
-                    self.fail(&p.name, "checksum error in a volume's part");
+                    let reason = RarIntegrityReason::PackedPiece { crc32: true, blake2sp: false, keyed: false };
+                    self.reports.failed(
+                        &p.context,
+                        Arc::new(p.context.integrity(reason, false)),
+                        "checksum error in a volume's part",
+                    )?;
                 }
                 p.discard();
             }
@@ -1997,10 +2388,22 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 }
 
+fn seek_output(file: &mut crate::output::WriteFile, offset: u64) -> crate::error::RarResult<()> {
+    use std::io::{Seek, SeekFrom};
+    file.file
+        .seek(SeekFrom::Start(offset))
+        .map(|_| ())
+        .map_err(|e| RarFault::output(IoOperation::Seek, file.target().map(Path::to_path_buf), Some(offset), e, false))
+}
+
 /// Restores folders' permissions and times, deepest first, after their contents are written: a read-only folder
 /// set first would stop its own files from being created.
 pub(crate) fn finish_dirs(summary: &mut Summary) {
-    let mut dirs = std::mem::take(&mut summary.dir_meta);
+    finish_dir_meta(&mut summary.dir_meta);
+}
+
+fn finish_dir_meta(dir_meta: &mut Vec<(PathBuf, Meta)>) {
+    let mut dirs = std::mem::take(dir_meta);
     dirs.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
     #[cfg(unix)]
     for (path, h) in &dirs {
@@ -2081,10 +2484,14 @@ fn plain_name(name: &str) -> bool {
 /// [`make_dirs`] for a run that remembers the folders it has made or checked, in `dirs`. It starts below the
 /// deepest one already known, and tries to make each folder before looking at what is there, so a new folder costs
 /// one call.
-pub(crate) fn make_dirs_known(root: &Path, rel: &Path, dirs: &mut Dirs) -> Result<()> {
+fn directory_policy(reason: RarPolicyReason, path: &Path, legacy: String) -> RarFault {
+    RarFault::new(RarFailure::Policy { reason, path: path.to_path_buf() }, Error::UnsafePath(legacy))
+}
+
+fn make_dirs_known_detailed(root: &Path, rel: &Path, dirs: &mut Dirs) -> crate::error::RarResult<()> {
     let known =
         rel.ancestors().find(|a| a.as_os_str().is_empty() || dirs.known.contains_key(*a)).unwrap_or(Path::new(""));
-    let Ok(rest) = rel.strip_prefix(known) else { return make_dirs(root, rel) };
+    let Ok(rest) = rel.strip_prefix(known) else { return make_dirs_detailed(root, rel) };
     let mut at = root.join(known);
     let mut sub = known.to_path_buf();
     for part in rest.components() {
@@ -2095,13 +2502,19 @@ pub(crate) fn make_dirs_known(root: &Path, rel: &Path, dirs: &mut Dirs) -> Resul
             // something is there already: only a real folder will do, never a link to one
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => match fs::symlink_metadata(&at) {
                 Ok(meta) if meta.file_type().is_symlink() => {
-                    return Err(Error::UnsafePath(rel.display().to_string()));
+                    return Err(directory_policy(RarPolicyReason::Symlink, &at, rel.display().to_string()));
                 }
                 Ok(meta) if meta.is_dir() => false,
-                Ok(_) => return Err(Error::UnsafePath(format!("{}: a file is in the way", rel.display()))),
-                Err(e) => return Err(e.into()),
+                Ok(_) => {
+                    return Err(directory_policy(
+                        RarPolicyReason::ParentIsFile,
+                        &at,
+                        format!("{}: a file is in the way", rel.display()),
+                    ));
+                }
+                Err(e) => return Err(RarFault::output(IoOperation::Metadata, Some(at.clone()), None, e, false)),
             },
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(RarFault::output(IoOperation::CreateDirectory, Some(at.clone()), None, e, false)),
         };
         // a folder takes its name, so no file is later created over it
         dirs.note(&sub);
@@ -2112,19 +2525,29 @@ pub(crate) fn make_dirs_known(root: &Path, rel: &Path, dirs: &mut Dirs) -> Resul
 
 /// Creates `rel` under `root` one folder at a time, refusing to pass through a link.
 pub(crate) fn make_dirs(root: &Path, rel: &Path) -> Result<()> {
+    make_dirs_detailed(root, rel).map_err(RarFault::into_legacy)
+}
+
+fn make_dirs_detailed(root: &Path, rel: &Path) -> crate::error::RarResult<()> {
     let mut at = root.to_path_buf();
     for part in rel.components() {
         at.push(part);
         match fs::symlink_metadata(&at) {
             Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(Error::UnsafePath(rel.display().to_string()));
+                return Err(directory_policy(RarPolicyReason::Symlink, &at, rel.display().to_string()));
             }
             Ok(meta) if meta.is_dir() => {}
-            Ok(_) => return Err(Error::UnsafePath(format!("{}: a file is in the way", rel.display()))),
+            Ok(_) => {
+                return Err(directory_policy(
+                    RarPolicyReason::ParentIsFile,
+                    &at,
+                    format!("{}: a file is in the way", rel.display()),
+                ));
+            }
             Err(_) => match fs::create_dir(&at) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(e) => return Err(e.into()),
+                Err(e) => return Err(RarFault::output(IoOperation::CreateDirectory, Some(at.clone()), None, e, false)),
             },
         }
     }
@@ -2135,6 +2558,56 @@ pub(crate) fn make_dirs(root: &Path, rel: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn create_and_seek_report_the_actual_output_operations() {
+        use std::os::fd::OwnedFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("target");
+        fs::write(&path, b"original").unwrap();
+        let fault = create_target_detailed(Place { path: path.clone(), replace: false }, Some(0)).err().unwrap();
+        assert!(matches!(fault.failure.as_ref(), RarFailure::Output {
+            operation: IoOperation::CreateFile, path: Some(actual), source, ..
+        } if actual == &path && source.raw_os_error() == Some(libc::EEXIST)));
+        let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let fd: OwnedFd = socket.into();
+        let mut output = Output::new(File::from(fd), Some(1)).handoff_detailed().unwrap();
+        let fault = seek_output(&mut output, 1).unwrap_err();
+        assert!(matches!(fault.failure.as_ref(), RarFailure::Output {
+            operation: IoOperation::Seek, offset: Some(1), source, ..
+        } if source.raw_os_error() == Some(libc::ESPIPE)));
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pending_sink_retains_first_write_error_when_decoder_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("readonly");
+        fs::write(&path, b"keep").unwrap();
+        let mut pending = Pending::new(&FileHeader::default(), empty_context());
+        pending.out = Some(Output::new(File::open(&path).unwrap(), Some(1)));
+        let result = with_member_sink(&mut pending, None, |sink| {
+            let _ = sink.put(b"x");
+            let _ = sink.put(b"y");
+            Ok(())
+        });
+        let Err(MemberDecodeError::Sink(fault)) = result else { panic!("decoder swallowed the sink error") };
+        assert!(matches!(fault.failure.as_ref(), RarFailure::Output {
+            operation: IoOperation::Write, source, ..
+        } if source.raw_os_error() == Some(libc::EBADF)));
+        assert_eq!(pending.bytes, 0);
+        assert_eq!(fs::read(path).unwrap(), b"keep");
+    }
+
+    fn empty_context() -> EntryContext {
+        EntryContext {
+            entry: RarEntryIdentity { index: None, order: 0, name: String::new() },
+            method: 0,
+            password: crate::error::RarPasswordEvidence::NotEncrypted,
+        }
+    }
+
     #[test]
     fn encrypted_compressed_framing_bounds_padding_across_chunks() {
         use crate::rar5::testenc::{Op, block};
@@ -2143,10 +2616,12 @@ mod tests {
         let ops: Vec<_> = expected.iter().copied().map(Op::Lit).collect();
         let packed = block(&ops, true, true);
         for piece in [1, 7, packed.len()] {
-            let mut decoder = Unpacker::new(window_for(1 << 20, Some(expected.len() as u64), false).unwrap()).unwrap();
+            let mut decoder =
+                Unpacker::new(crate::rar5::unpack::window_for(1 << 20, Some(expected.len() as u64), false).unwrap())
+                    .unwrap();
             decoder.set_threads(0, u64::MAX);
             decoder.reset(Some(expected.len() as u64));
-            let mut sink = Pending::new(&FileHeader::default());
+            let mut sink = Pending::new(&FileHeader::default(), empty_context());
             sink.mem = Some(Vec::new());
             let mut blocks = CipherBlocks::default();
 
@@ -2163,7 +2638,7 @@ mod tests {
             decoder.finish(&mut sink).unwrap();
             assert_eq!(sink.mem.unwrap(), expected);
 
-            let mut sink = Pending::new(&FileHeader::default());
+            let mut sink = Pending::new(&FileHeader::default(), empty_context());
             assert!(matches!(blocks.feed(&[0], &mut decoder, &mut sink), Err(Error::Corrupt(_))));
         }
     }

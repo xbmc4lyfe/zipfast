@@ -62,21 +62,12 @@ fn read_failure(e: PositionReadError, path: Option<PathBuf>, reason: RarIntegrit
     }
 }
 
+#[derive(Debug)]
 enum SourceError {
     Read(PositionReadError),
     Clone(std::io::Error),
     Spawn(std::io::Error),
     Stopped,
-}
-
-impl std::fmt::Debug for SourceError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Read(e) => e.fmt(f),
-            Self::Clone(e) | Self::Spawn(e) => e.fmt(f),
-            Self::Stopped => f.write_str("read-ahead worker stopped"),
-        }
-    }
 }
 
 impl SourceError {
@@ -325,6 +316,12 @@ pub struct Volume {
 
 pub(crate) const SIGNATURE_PROBE_BYTES: u64 = MAX_SFX + SIGNATURE.len() as u64;
 
+fn volume_length(path: &Path, metadata: impl FnOnce() -> std::io::Result<std::fs::Metadata>) -> RarResult<u64> {
+    metadata()
+        .map(|meta| meta.len())
+        .map_err(|e| RarFault::input(IoOperation::Metadata, Some(path.to_path_buf()), None, e))
+}
+
 pub(crate) fn signature_end(head: &[u8]) -> Result<u64> {
     if head.starts_with(SIGNATURE) {
         return Ok(SIGNATURE.len() as u64);
@@ -361,10 +358,7 @@ impl Volume {
             File::open(path).map_err(|e| RarFault::input(IoOperation::Open, Some(path.to_path_buf()), None, e))?;
         #[cfg(all(test, unix))]
         VOLUME_OPENS.set(VOLUME_OPENS.get() + 1);
-        let len = file
-            .metadata()
-            .map_err(|e| RarFault::input(IoOperation::Metadata, Some(path.to_path_buf()), None, e))?
-            .len();
+        let len = volume_length(path, || file.metadata())?;
         let mut head = vec![0u8; len.min(SIGNATURE_PROBE_BYTES) as usize];
         read_at_detailed(&file, &mut head, 0)
             .map_err(|e| read_failure(e, Some(path.to_path_buf()), RarIntegrityReason::TruncatedHeader))?;
@@ -685,6 +679,91 @@ impl Volume {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn volume_metadata_retains_the_original_io_error() {
+        let path = Path::new("volume");
+        let fault = volume_length(path, || Err(std::io::Error::from_raw_os_error(libc::EACCES))).unwrap_err();
+        assert!(matches!(fault.failure.as_ref(), RarFailure::Input {
+            operation: IoOperation::Metadata, path: Some(actual), source, ..
+        } if actual == path && source.raw_os_error() == Some(libc::EACCES)));
+        assert!(matches!(fault.into_legacy(), Error::Io(e) if e.raw_os_error() == Some(libc::EACCES)));
+    }
+
+    #[test]
+    fn transport_eof_keeps_its_original_cause_and_never_calls_the_sink() {
+        #[derive(Debug)]
+        struct Transport;
+        impl std::fmt::Display for Transport {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("transport sentinel")
+            }
+        }
+        impl std::error::Error for Transport {}
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume");
+        std::fs::write(&path, b"data").unwrap();
+        let file = File::open(&path).unwrap();
+        let mut volume = Volume {
+            path: path.clone(),
+            src: Source::new(file, 1),
+            next: 0,
+            len: 1,
+            main: MainHeader::default(),
+            password: None,
+            header_key: None,
+        };
+        let (send, recv) = sync_channel(1);
+        let (spare, _) = channel();
+        volume.src.ahead = Some(Ahead { pieces: vec![recv], turn: 0, spare, next: 0 });
+        send.send(Err(PositionReadError::Io {
+            offset: 0,
+            source: std::io::Error::new(std::io::ErrorKind::UnexpectedEof, Transport),
+        }))
+        .unwrap();
+        let result = volume.read_data_detailed::<()>(0, 1, |_, _| panic!("sink called after input failure"));
+        let Err(ReadDataError::Input(fault)) = result else { panic!("expected input failure") };
+        assert!(matches!(fault.failure.as_ref(), RarFailure::Input {
+            operation: IoOperation::Read, path: Some(actual), offset: Some(0), ..
+        } if actual == &path));
+        use std::error::Error as _;
+        let source = fault.failure.source().unwrap().downcast_ref::<std::io::Error>().unwrap();
+        assert!(source.get_ref().unwrap().is::<Transport>());
+        assert!(matches!(fault.into_legacy(), Error::Truncated));
+    }
+
+    #[test]
+    fn data_read_distinguishes_synthetic_eof_from_sink_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("piece");
+        std::fs::write(&path, b"one byte").unwrap();
+        let mut volume = Volume {
+            path: path.clone(),
+            src: Source::new(File::open(&path).unwrap(), 1),
+            next: 0,
+            len: 1,
+            main: MainHeader::default(),
+            password: None,
+            header_key: None,
+        };
+        let Err(ReadDataError::Input(fault)) = volume.read_data_detailed::<()>(0, 2, |_, _| panic!("out of bounds"))
+        else {
+            panic!("expected structural failure")
+        };
+        assert!(matches!(
+            fault.failure.as_ref(),
+            RarFailure::Integrity { reason: RarIntegrityReason::TruncatedData, .. }
+        ));
+        assert!(std::error::Error::source(fault.failure.as_ref()).is_none());
+        let sink_error = std::io::Error::from_raw_os_error(libc::ENOSPC);
+        let Err(ReadDataError::Sink(e)) =
+            volume.read_data_detailed(0, 1, |_, _| Err(std::io::Error::from_raw_os_error(libc::ENOSPC)))
+        else {
+            panic!("expected sink failure")
+        };
+        assert_eq!(e.raw_os_error(), sink_error.raw_os_error());
+    }
 
     #[test]
     fn pieces_read_ahead_on_several_threads_come_in_order() {

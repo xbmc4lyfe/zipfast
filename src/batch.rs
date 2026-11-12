@@ -32,7 +32,7 @@ use crate::blake2sp::Blake2sp;
 use crate::error::{
     Error, IoOperation, RarFailure, RarFault, RarIntegrityReason, RarPasswordEvidence, RarResult, RarScope, Result,
 };
-use crate::extract::{Meta, Place, create_target_detailed, finish_file};
+use crate::extract::{EntryContext, Meta, Place, RunResult, create_target_detailed, finish_file};
 use crate::rar5::unpack::{Sink, Unpacker, window_for_detailed};
 
 /// Files up to this size, packed and unpacked, go to the workers whole.
@@ -54,12 +54,17 @@ const GROUP_FILES: usize = 64;
 
 /// One file, read whole, to be decoded, checked and written.
 pub(crate) struct Job {
-    pub name: String,
+    pub context: EntryContext,
+    pub data: JobData,
+}
+
+pub(crate) struct JobData {
     pub packed: Vec<u8>,
     /// 0 for stored
     pub method: u8,
     pub dictionary: u64,
     pub size: u64,
+    pub size_checked: bool,
     pub crc32: Option<u32>,
     pub blake2sp: Option<[u8; 32]>,
     /// where it is written, created by the worker
@@ -70,7 +75,7 @@ pub(crate) struct Job {
 /// How a file went.
 pub(crate) enum Outcome {
     /// checked (and written), this many bytes
-    Done(u64),
+    Done { bytes: u64, size_checked: bool, crc32_checked: bool, blake2sp_checked: bool },
     /// this file failed, for this reason; the run goes on
     Failed { reason: Box<RarFailure>, legacy: LegacyFailure },
     /// writing failed: the run stops
@@ -94,7 +99,7 @@ impl std::fmt::Display for LegacyFailure {
 }
 
 pub(crate) struct Done {
-    pub name: String,
+    pub context: EntryContext,
     pub outcome: Outcome,
 }
 
@@ -165,7 +170,7 @@ impl Batch {
     /// Hands `job` over, first taking back finished files while too much is waiting. Finished files go to `apply`
     /// in archive order.
     /// Small files wait to be sent in a group; [`Self::send`] sends what is waiting.
-    pub(crate) fn submit(&mut self, job: Job, apply: &mut dyn FnMut(Done) -> Result<()>) -> Result<()> {
+    pub(crate) fn submit(&mut self, job: Job, apply: &mut dyn FnMut(Done) -> RunResult<()>) -> RunResult<()> {
         let weight = weight(&job);
         while self.next - self.applied >= (4 * self.workers * GROUP_FILES) as u64
             || (self.next > self.applied && self.bytes + weight > BYTES_IN_FLIGHT)
@@ -177,7 +182,7 @@ impl Batch {
         }
         if self.tx.is_none() {
             discard(job);
-            return Err(stopped());
+            return Err(stopped().into());
         }
         self.group.push((self.next, job));
         self.group_bytes += weight;
@@ -190,34 +195,34 @@ impl Batch {
     }
 
     /// Sends the files waiting in a group to the workers.
-    pub(crate) fn send(&mut self) -> Result<()> {
+    pub(crate) fn send(&mut self) -> RunResult<()> {
         if self.group.is_empty() {
             return Ok(());
         }
         let group = std::mem::take(&mut self.group);
         self.group_bytes = 0;
-        let Some(tx) = self.tx.as_ref() else { return Err(stopped()) };
+        let Some(tx) = self.tx.as_ref() else { return Err(stopped().into()) };
         if let Err(mpsc::SendError(group)) = tx.send(group) {
             // every worker is gone; can't happen while one is alive
             group.into_iter().for_each(|(_, job)| discard(job));
-            return Err(stopped());
+            return Err(stopped().into());
         }
         Ok(())
     }
 
     /// Waits for every file handed over, applying them in order.
-    pub(crate) fn drain(&mut self, apply: &mut dyn FnMut(Done) -> Result<()>) -> Result<()> {
+    pub(crate) fn drain(&mut self, apply: &mut dyn FnMut(Done) -> RunResult<()>) -> RunResult<()> {
         while self.applied < self.next {
             self.take_one(apply)?;
         }
         Ok(())
     }
 
-    fn take_one(&mut self, apply: &mut dyn FnMut(Done) -> Result<()>) -> Result<()> {
+    fn take_one(&mut self, apply: &mut dyn FnMut(Done) -> RunResult<()>) -> RunResult<()> {
         // the file waited for may still be in the group
         self.send()?;
         while !self.ready.contains_key(&self.applied) {
-            let Ok(dones) = self.rx.recv() else { return Err(stopped()) };
+            let Ok(dones) = self.rx.recv() else { return Err(stopped().into()) };
             for (seq, done, weight) in dones {
                 self.ready.insert(seq, (done, weight));
             }
@@ -245,20 +250,36 @@ fn discard(job: Job) {
 
 /// What a job counts for against [`BYTES_IN_FLIGHT`] and [`GROUP_BYTES`].
 fn weight(job: &Job) -> usize {
-    job.packed.len() + job.size as usize
+    job.data.packed.len() + job.data.size as usize
 }
 
-fn stopped() -> Error {
-    Error::Io(std::io::Error::other("file workers stopped"))
+fn stopped() -> RarFault {
+    RarFault::new(
+        RarFailure::Internal(crate::error::RarInternal::WorkerStopped),
+        Error::Io(std::io::Error::other("file workers stopped")),
+    )
 }
 
 fn run(job: Job, unpacker: &mut Option<Unpacker>) -> Done {
-    let Job { name, packed, method, dictionary, size, crc32, blake2sp, out, meta } = job;
+    let Job { context, data } = job;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_job(&context, data, unpacker)))
+        .unwrap_or_else(|_| {
+            *unpacker = None;
+            Outcome::Fatal(RarFault::new(
+                RarFailure::Internal(crate::error::RarInternal::WorkerPanic),
+                Error::Io(std::io::Error::other("file workers stopped")),
+            ))
+        });
+    Done { context, outcome }
+}
+
+fn run_job(context: &EntryContext, data: JobData, unpacker: &mut Option<Unpacker>) -> Outcome {
+    let JobData { packed, method, dictionary, size, size_checked, crc32, blake2sp, out, meta } = data;
     let mut hasher = crate::crc32::Hasher::new();
     let mut blake = blake2sp.map(|_| Blake2sp::new());
     let mut out = match out.map(|place| create_target_detailed(place, Some(size))).transpose() {
         Ok(out) => out,
-        Err(e) => return Done { name, outcome: Outcome::Fatal(e) },
+        Err(e) => return Outcome::Fatal(e),
     };
     let mut bytes = 0u64;
     let mut output_fault = None;
@@ -266,6 +287,9 @@ fn run(job: Job, unpacker: &mut Option<Unpacker>) -> Done {
         hasher.update(chunk);
         if let Some(b) = blake.as_mut() {
             b.update(chunk);
+        }
+        if output_fault.is_some() {
+            return Err(Error::Corrupt("RAR output stopped"));
         }
         if let Some(o) = out.as_mut()
             && let Err(e) = o.write_detailed(chunk)
@@ -276,45 +300,57 @@ fn run(job: Job, unpacker: &mut Option<Unpacker>) -> Done {
         bytes += chunk.len() as u64;
         Ok(())
     };
-    let scope = RarScope::Member { index: None };
+    let scope = context.scope();
     let decoded = if method == 0 {
         sink(&packed).map_err(|e| decoder_failure(e, scope.clone(), RarPasswordEvidence::NotEncrypted))
     } else {
         decode(&packed, dictionary, size, unpacker, &mut sink, scope.clone())
     };
-    let fail = |outcome| Done { name: name.clone(), outcome };
     if let Some(fault) = output_fault {
-        return fail(Outcome::Fatal(fault));
+        return Outcome::Fatal(fault);
     }
     if let Err(fault) = decoded {
         let (reason, legacy) = fault.into_parts();
-        return fail(Outcome::Failed { reason, legacy: LegacyFailure::Decoder(legacy) });
+        return Outcome::Failed { reason, legacy: LegacyFailure::Decoder(legacy) };
     }
     let crc_bad = crc32.is_some_and(|want| hasher.finalize() != want);
     let blake_bad = blake2sp.zip(blake).is_some_and(|(want, got)| got.finish() != want);
     if crc_bad || blake_bad {
         let reason = RarIntegrityReason::FinalChecks { crc32: crc_bad, blake2sp: blake_bad };
-        return fail(Outcome::Failed {
+        return Outcome::Failed {
             reason: Box::new(RarFailure::integrity(scope, reason, RarPasswordEvidence::NotEncrypted, true)),
             legacy: LegacyFailure::Checksum,
-        });
+        };
     }
     if bytes != size {
         let reason = RarIntegrityReason::DecodedSize { expected: size, actual: bytes };
-        return fail(Outcome::Failed {
+        return Outcome::Failed {
             reason: Box::new(RarFailure::integrity(scope, reason, RarPasswordEvidence::NotEncrypted, true)),
             legacy: LegacyFailure::Size { expected: size, actual: bytes },
-        });
+        };
     }
     if let Some(o) = out
         && let Err(e) = o.finish_detailed(|file| finish_file(file, &meta))
     {
-        return fail(Outcome::Fatal(e.detailed(true)));
+        return Outcome::Fatal(e.detailed(true));
     }
-    Done { name, outcome: Outcome::Done(bytes) }
+    Outcome::Done { bytes, size_checked, crc32_checked: crc32.is_some(), blake2sp_checked: blake2sp.is_some() }
 }
 
 pub(crate) fn decoder_failure(e: Error, scope: RarScope, evidence: RarPasswordEvidence) -> RarFault {
+    decoder_failure_with_size(e, scope, evidence, None)
+}
+
+pub(crate) fn decoder_failure_with_size(
+    e: Error,
+    scope: RarScope,
+    evidence: RarPasswordEvidence,
+    size: Option<(u64, u64)>,
+) -> RarFault {
+    if let Some((expected, actual)) = size {
+        let reason = RarIntegrityReason::DecodedSize { expected, actual };
+        return RarFault::new(RarFailure::integrity(scope, reason, evidence, true), e);
+    }
     use crate::error::{RarInternal, RarUnsupported};
     let reason = match e {
         Error::Corrupt(reason) => RarIntegrityReason::Decoder(reason),
@@ -348,7 +384,7 @@ fn decode(
     u.restart(window, Some(size));
     u.feed(packed, sink)
         .and_then(|()| u.finish(sink))
-        .map_err(|e| decoder_failure(e, scope, RarPasswordEvidence::NotEncrypted))
+        .map_err(|e| decoder_failure_with_size(e, scope, RarPasswordEvidence::NotEncrypted, u.take_size_failure()))
 }
 
 /// Checks (and, given `out`, copies to `out` from `out_at` on) `len` stored bytes at `at` in the open `volume`, on
@@ -527,6 +563,35 @@ fn write_at(file: &File, mut buf: &[u8], mut at: u64, path: Option<&Path>) -> Ra
         at += n as u64;
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod positional_tests {
+    use super::*;
+    use std::fs::{self, OpenOptions};
+
+    #[test]
+    fn positional_read_and_write_keep_their_direction_and_os_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("input");
+        let output = dir.path().join("output");
+        fs::write(&input, b"abcd").unwrap();
+        fs::write(&output, b"keep").unwrap();
+        let write_only = OpenOptions::new().write(true).open(&input).unwrap();
+        let read_only = File::open(&output).unwrap();
+        let fault = stored_detailed((&write_only, Some(&input)), 1, 1, None, 0, 2).err().unwrap();
+        assert!(matches!(fault.failure.as_ref(), RarFailure::Input {
+            operation: IoOperation::Read, path: Some(path), offset: Some(1), source, ..
+        } if path == &input && source.raw_os_error() == Some(libc::EBADF)));
+        let source_file = File::open(&input).unwrap();
+        let fault =
+            stored_detailed((&source_file, Some(&input)), 1, 1, Some((&read_only, Some(&output))), 2, 2).err().unwrap();
+        assert!(matches!(fault.failure.as_ref(), RarFailure::Output {
+            operation: IoOperation::Write, path: Some(path), offset: Some(2), source, ..
+        } if path == &output && source.raw_os_error() == Some(libc::EBADF)));
+        assert_eq!(fs::read(input).unwrap(), b"abcd");
+        assert_eq!(fs::read(output).unwrap(), b"keep");
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]

@@ -105,16 +105,29 @@ pub enum RarIntegrityReason {
     HeaderFraming(&'static str),
     MalformedEncryptionRecord,
     Decoder(&'static str),
-    FinalChecks { crc32: bool, blake2sp: bool },
-    PackedPiece { crc32: bool, blake2sp: bool, keyed: bool },
-    DecodedSize { expected: u64, actual: u64 },
+    FinalChecks {
+        crc32: bool,
+        blake2sp: bool,
+    },
+    PackedPiece {
+        crc32: bool,
+        blake2sp: bool,
+        keyed: bool,
+    },
+    /// Produced bytes or the byte count required by the first token exceeding the declared size.
+    DecodedSize {
+        expected: u64,
+        actual: u64,
+    },
     TruncatedHeader,
     TruncatedData,
     IncompleteCipherBlock,
     MissingSplitContinuation,
     ChangedContinuationEncoding,
     DeclaredHashUnavailable,
-    InvalidDictionary { requested: u64 },
+    InvalidDictionary {
+        requested: u64,
+    },
 }
 
 #[derive(Debug)]
@@ -296,6 +309,13 @@ impl RarFault {
         preserve_eof: bool,
     ) -> Self {
         Self { failure: Box::new(RarFailure::Output { operation, path, offset, source }), legacy: None, preserve_eof }
+    }
+
+    pub(crate) fn counter_limit() -> Self {
+        Self::new(
+            RarFailure::Limit { resource: RarResource::Counter, requested: None, allowed: Some(u64::MAX) },
+            Error::Unsupported("RAR counter limit".into()),
+        )
     }
 
     pub(crate) fn into_parts(self) -> (Box<RarFailure>, Error) {

@@ -616,11 +616,13 @@ pub(crate) fn parse_rar5_crypt(
     layout: Rar5CryptLayout,
 ) -> std::result::Result<Rar5CryptParams, Rar5CryptError> {
     use Rar5CryptError::Malformed;
-    let (version, p) = vint(record, 0).ok_or(Malformed)?;
+    let mut cursor = crate::rar5::Cursor::new(record);
+    let version = cursor.vint().map_err(|_| Malformed)?;
     if version != 0 {
         return Err(Rar5CryptError::UnsupportedVersion(version));
     }
-    let (flags, p) = vint(record, p).ok_or(Malformed)?;
+    let flags = cursor.vint().map_err(|_| Malformed)?;
+    let p = cursor.pos();
     let kdf_count = *record.get(p).ok_or(Malformed)?;
     let salt = record.get(p + 1..p + 17).ok_or(Malformed)?.try_into().unwrap();
     let mut at = p + 17;
