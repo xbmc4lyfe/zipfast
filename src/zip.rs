@@ -38,6 +38,7 @@ use crate::stream::{LZMA_MEMORY_LIMIT, zstd_decoder};
 
 mod session;
 
+pub(crate) use session::InspectionSource;
 pub use session::{
     EntryId, EntryMetadata, Metadata, ReadSession, SelectedZipEntry, SessionError, SessionResult, SourceChange,
 };

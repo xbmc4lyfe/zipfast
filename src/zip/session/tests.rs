@@ -28,6 +28,7 @@ use super::*;
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum Event {
     Opened,
+    ProbeRead(Range<u64>),
     DirectoryRead(Range<u64>),
     PayloadRead(Range<u64>),
     AfterDecoder,
@@ -397,5 +398,112 @@ impl Seek for ObservedFile<'_> {
     fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
         self.position = self.file.seek(position)?;
         Ok(self.position)
+    }
+}
+
+#[test]
+fn inspection_rejects_replacement_between_probe_and_zip_factory() {
+    let source = archive(3);
+    let replacement = archive(3);
+    let path = source.path().to_path_buf();
+    let mut replaced = false;
+    let result = observing(
+        move |event| match event {
+            Event::ProbeRead(_) if !replaced => {
+                fs::rename(replacement.path(), &path).unwrap();
+                replaced = true;
+            }
+            Event::DirectoryRead(_) => panic!("inspection parsed a source invalidated by probing"),
+            _ => {}
+        },
+        || crate::extract::inspect(source.path()),
+    );
+    assert!(matches!(result, Err(SessionError::SourceChanged { change: SourceChange::StampMismatch, .. })));
+}
+
+#[test]
+fn inspection_cancellation_stops_before_open_or_after_a_probe_chunk() {
+    let source = archive(3);
+    let cancel = Cancellation::default();
+    cancel.cancel();
+    assert!(canceled(observing(
+        |_| panic!("pre-canceled inspection opened the source"),
+        || crate::extract::inspect_cancelable(source.path(), None, &cancel).map(drop),
+    )));
+
+    let sfx = with_sfx_prefix(archive(3 << 20));
+    for (source, stop_after) in [(&source, 1), (&sfx, 2)] {
+        let cancel = Cancellation::default();
+        let signal = cancel.clone();
+        let mut reads = 0;
+        assert!(canceled(observing(
+            move |event| match event {
+                Event::ProbeRead(_) => {
+                    reads += 1;
+                    assert!(reads <= stop_after, "inspection must stop at the canceled chunk");
+                    if reads == stop_after {
+                        signal.cancel();
+                    }
+                }
+                Event::DirectoryRead(_) => panic!("canceled inspection parsed a ZIP directory"),
+                _ => {}
+            },
+            || crate::extract::inspect_cancelable(source.path(), None, &cancel).map(drop),
+        )));
+    }
+}
+
+fn with_sfx_prefix(mut archive: NamedTempFile) -> NamedTempFile {
+    let mut sfx = NamedTempFile::new().unwrap();
+    sfx.write_all(b"launcher").unwrap();
+    archive.rewind().unwrap();
+    io::copy(&mut archive, &mut sfx).unwrap();
+    sfx
+}
+
+#[test]
+fn inspection_reuses_one_open_and_one_parse_for_zip_head_and_sfx() {
+    use crate::rar5::reader::VOLUME_OPENS;
+
+    let ordinary = archive(3 << 20);
+    let sfx = with_sfx_prefix(archive(3 << 20));
+
+    for (source, probe_bytes) in [(&ordinary, 1024), (&sfx, 1024 + (1 << 20) + 8)] {
+        let events = Rc::new(RefCell::new(Vec::new()));
+        let recorded = Rc::clone(&events);
+        VOLUME_OPENS.set(0);
+        let inspected = observing(
+            move |event| recorded.borrow_mut().push(event),
+            || crate::extract::inspect(source.path()).unwrap(),
+        );
+        let crate::extract::Inspection::Zip(session) = inspected else { panic!("expected a ZIP session") };
+        let inspected_events = events.borrow();
+        assert_eq!(VOLUME_OPENS.get(), 0);
+        assert_eq!(inspected_events.iter().filter(|event| **event == Event::Opened).count(), 1);
+        assert_eq!(
+            inspected_events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::ProbeRead(range) => {
+                        assert!(range.end - range.start <= 64 << 10);
+                        Some(range.end - range.start)
+                    }
+                    _ => None,
+                })
+                .sum::<u64>(),
+            probe_bytes
+        );
+
+        let direct_events = Rc::new(RefCell::new(Vec::new()));
+        let recorded = Rc::clone(&direct_events);
+        let direct =
+            observing(move |event| recorded.borrow_mut().push(event), || ReadSession::open(source.path())).unwrap();
+        assert!(
+            inspected_events
+                .iter()
+                .filter(|event| matches!(event, Event::DirectoryRead(_)))
+                .eq(direct_events.borrow().iter().filter(|event| matches!(event, Event::DirectoryRead(_))))
+        );
+        assert_eq!(session.metadata().parser_usage(), direct.metadata().parser_usage());
     }
 }

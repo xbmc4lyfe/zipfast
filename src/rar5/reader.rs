@@ -271,10 +271,16 @@ pub struct Volume {
     header_key: Option<[u8; 32]>,
 }
 
+pub(crate) const SIGNATURE_PROBE_BYTES: u64 = MAX_SFX + SIGNATURE.len() as u64;
+
 /// Finds the signature within the first [`MAX_SFX`] bytes. Returns the offset just past it.
 fn find_signature(file: &File, len: u64) -> Result<u64> {
-    let mut head = vec![0u8; len.min(MAX_SFX + SIGNATURE.len() as u64) as usize];
+    let mut head = vec![0u8; len.min(SIGNATURE_PROBE_BYTES) as usize];
     read_at(file, &mut head, 0)?;
+    signature_end(&head)
+}
+
+pub(crate) fn signature_end(head: &[u8]) -> Result<u64> {
     if head.starts_with(SIGNATURE) {
         return Ok(SIGNATURE.len() as u64);
     }
@@ -287,6 +293,11 @@ fn find_signature(file: &File, len: u64) -> Result<u64> {
         .ok_or(Error::NotAnArchive)
 }
 
+#[cfg(all(test, unix))]
+thread_local! {
+    pub(crate) static VOLUME_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Volume {
     pub fn open(path: &Path) -> Result<Volume> {
         Self::open_with_password(path, None)
@@ -294,6 +305,8 @@ impl Volume {
 
     pub fn open_with_password(path: &Path, password: Option<&str>) -> Result<Volume> {
         let file = File::open(path)?;
+        #[cfg(all(test, unix))]
+        VOLUME_OPENS.set(VOLUME_OPENS.get() + 1);
         let len = file.metadata()?.len();
         let next = find_signature(&file, len)?;
         let mut vol = Volume {

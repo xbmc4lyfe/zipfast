@@ -20,7 +20,7 @@
 
 use std::fmt;
 use std::fs::{self, File, FileType};
-use std::io;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -142,6 +142,7 @@ pub struct ReadSession {
     file: File,
     source: SourceBinding,
     metadata: Arc<Metadata>,
+    dispatch_bytes: u64,
 }
 
 impl ReadSession {
@@ -163,34 +164,49 @@ impl ReadSession {
             return Err(SessionError::UnsupportedIdentity);
         }
         check_cancel(Some(cancel))?;
-        // Keep the absolute spelling, including symlink and parent components.
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            std::env::current_dir().map_err(Error::from)?.join(path)
-        };
+        let path = absolute_spelling(path).map_err(Error::from)?;
         check_cancel(Some(cancel))?;
-        let mut file = open_file(&path).map_err(Error::from)?;
-        #[cfg(all(test, unix))]
-        tests::observe(tests::Event::Opened);
-        let stamp = SourceStamp::capture(&file, &path)
-            .map_err(|change| SessionError::SourceChanged { change, context: None })?;
-        let mut source = SourceBinding { path, stamp, invalid: None };
+        let file = open_file(&path).map_err(Error::from)?;
+        let source = SourceBinding::capture(&file, path)?;
+        Self::parse(file, source, 0, cancel)
+    }
+
+    fn parse(
+        mut file: File,
+        mut source: SourceBinding,
+        dispatch_bytes: u64,
+        cancel: &Cancellation,
+    ) -> SessionResult<Self> {
+        let len = source.stamp.len;
         let parsed = (|| {
             check_cancel(Some(cancel))?;
-            let parser =
-                DirectoryParser::with_name_crc32(stamp.len, Profile::Zipfast, Limits::default(), crate::crc32::hash)
-                    .map_err(directory_error)?;
+            let mut limits = Limits::default();
+            limits.fetched_bytes = limits
+                .fetched_bytes
+                .checked_sub(dispatch_bytes)
+                .filter(|&remaining| remaining > 0)
+                .ok_or_else(|| directory_error(DirectoryError::Limit(LimitKind::FetchedBytes)))?;
+            let parser = DirectoryParser::with_name_crc32(len, Profile::Zipfast, limits, crate::crc32::hash)
+                .map_err(directory_error)?;
             #[cfg(all(test, unix))]
             let file = &mut tests::ObservedFile { file: &mut file, position: 0, event: tests::Event::DirectoryRead };
             #[cfg(not(all(test, unix)))]
             let file = &mut file;
-            let directory = read_directory(file, stamp.len, parser, Some(cancel))?;
+            let directory = read_directory(file, len, parser, Some(cancel))?;
             Metadata::from_directory(directory, cancel)
         })();
         let metadata = source.finish_checked(&file, parsed)?;
         check_cancel(Some(cancel))?;
-        Ok(Self { file, source, metadata: Arc::new(metadata) })
+        Ok(Self { file, source, metadata: Arc::new(metadata), dispatch_bytes })
+    }
+
+    /// Source bytes fetched by format dispatch before ZIP directory parsing.
+    ///
+    /// These bytes and [`Metadata::parser_usage()`] share the same 129 MiB
+    /// cumulative fetch limit. Repeated reads count each time. Sessions opened
+    /// directly with [`Self::open`] or [`Self::open_cancelable`] report zero.
+    pub fn dispatch_bytes(&self) -> u64 {
+        self.dispatch_bytes
     }
 
     /// Shares the snapshot. It remains readable as historical metadata after invalidation or drop.
@@ -221,6 +237,69 @@ impl ReadSession {
         check_selection(entry.is_dir(), entry.is_link(), entry.packed_size(), entry.size(), max_bytes)?;
         let relative_path = sanitize(entry.name(), entry.creator_host() != HOST_UNIX)?;
         Ok(SelectedZipEntry { session: self, ordinal, relative_path, cancel })
+    }
+}
+
+/// The retained data file and original ZIP identity attempt for format inspection.
+pub(crate) struct InspectionSource {
+    file: File,
+    source: SessionResult<SourceBinding>,
+    dispatch_bytes: u64,
+}
+
+impl InspectionSource {
+    pub(crate) fn open(path: &Path, cancel: &Cancellation) -> SessionResult<Self> {
+        check_cancel(Some(cancel))?;
+        let path = absolute_spelling(path).map_err(Error::from)?;
+        check_cancel(Some(cancel))?;
+        let file = open_file(&path).map_err(Error::from)?;
+        // Only ZIP dispatch needs a verified identity. Keep this attempt even
+        // if it fails so the other formats can use their existing readers.
+        let source =
+            if cfg!(unix) { SourceBinding::capture(&file, path) } else { Err(SessionError::UnsupportedIdentity) };
+        Ok(Self { file, source, dispatch_bytes: 0 })
+    }
+
+    pub(crate) fn probe_prefix(&mut self, max_len: u64, cancel: &Cancellation) -> Result<Vec<u8>> {
+        check_cancel(Some(cancel))?;
+        let len = self.file.metadata()?.len().min(max_len) as usize;
+        let mut bytes = vec![0; len];
+        if len > 0 {
+            self.file.seek(SeekFrom::Start(0))?;
+        }
+        if self.read_probe(&mut bytes, cancel)? != len {
+            return Err(Error::Truncated);
+        }
+        Ok(bytes)
+    }
+
+    pub(crate) fn read_probe(&mut self, bytes: &mut [u8], cancel: &Cancellation) -> Result<usize> {
+        const CHUNK_BYTES: usize = 64 << 10;
+        let mut done = 0;
+        while done < bytes.len() {
+            check_cancel(Some(cancel))?;
+            let end = bytes.len().min(done + CHUNK_BYTES);
+            let read = match self.file.read(&mut bytes[done..end]) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            };
+            #[cfg(all(test, unix))]
+            tests::observe(tests::Event::ProbeRead(done as u64..(done + read) as u64));
+            done += read;
+            // The two bounded probes total at most 1024 + 1 MiB + 8 bytes.
+            self.dispatch_bytes += read as u64;
+        }
+        check_cancel(Some(cancel))?;
+        Ok(done)
+    }
+
+    pub(crate) fn into_zip(self, cancel: &Cancellation) -> SessionResult<ReadSession> {
+        let Self { file, source, dispatch_bytes } = self;
+        let mut source = source?;
+        source.finish_checked(&file, check_cancel(Some(cancel)))?;
+        ReadSession::parse(file, source, dispatch_bytes, cancel)
     }
 }
 
@@ -681,6 +760,12 @@ struct SourceBinding {
 }
 
 impl SourceBinding {
+    fn capture(file: &File, path: PathBuf) -> SessionResult<Self> {
+        let stamp = SourceStamp::capture(file, &path)
+            .map_err(|change| SessionError::SourceChanged { change, context: None })?;
+        Ok(Self { path, stamp, invalid: None })
+    }
+
     fn finish_checked<T>(&mut self, file: &File, attempt: Result<T>) -> SessionResult<T> {
         match self.verify(file) {
             Ok(()) => attempt.map_err(SessionError::from),
@@ -746,17 +831,24 @@ impl SourceStamp {
     }
 }
 
-#[cfg(unix)]
-fn open_file(path: &Path) -> io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    // Opening a FIFO for a file-type check must not block waiting for a writer.
-    fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)
+fn absolute_spelling(path: &Path) -> io::Result<PathBuf> {
+    // Keep symlink and parent components in the original absolute spelling.
+    if path.is_absolute() { Ok(path.to_path_buf()) } else { Ok(std::env::current_dir()?.join(path)) }
 }
 
-#[cfg(not(unix))]
-fn open_file(_: &Path) -> io::Result<File> {
-    Err(io::Error::new(io::ErrorKind::Unsupported, "Unix source identity unavailable"))
+fn open_file(path: &Path) -> io::Result<File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        // Opening a FIFO for a file-type check must not block waiting for a writer.
+        fs::OpenOptions::new().read(true).custom_flags(libc::O_NONBLOCK).open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = File::open(path)?;
+    #[cfg(all(test, unix))]
+    tests::observe(tests::Event::Opened);
+    Ok(file)
 }
 
 #[cfg(all(test, unix))]
