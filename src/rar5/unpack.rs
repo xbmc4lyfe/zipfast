@@ -730,24 +730,78 @@ impl Window {
     }
 }
 
+#[derive(Debug)]
+pub(crate) enum WindowError {
+    InvalidDictionary(u64),
+    Size(u64),
+    Allocation(u64),
+}
+
+impl WindowError {
+    pub(crate) fn into_legacy(self) -> Error {
+        Error::Unsupported(match self {
+            Self::InvalidDictionary(dictionary) => format!("dictionary size {dictionary}"),
+            Self::Size(_) => "dictionary too large".into(),
+            Self::Allocation(window) => format!("can't allocate a {window} byte window"),
+        })
+    }
+
+    pub(crate) fn detailed(self, scope: crate::error::RarScope) -> crate::error::RarFault {
+        use crate::error::{RarFailure, RarFault, RarIntegrityReason, RarPasswordEvidence, RarResource};
+        let failure = match self {
+            Self::InvalidDictionary(requested) => RarFailure::integrity(
+                scope,
+                RarIntegrityReason::InvalidDictionary { requested },
+                RarPasswordEvidence::NotEncrypted,
+                false,
+            ),
+            Self::Size(requested) => RarFailure::Limit {
+                resource: RarResource::DictionarySize,
+                requested: Some(requested),
+                allowed: Some(isize::MAX as u64),
+            },
+            Self::Allocation(requested) => RarFailure::Limit {
+                resource: RarResource::DictionaryAllocation,
+                requested: Some(requested),
+                allowed: None,
+            },
+        };
+        RarFault::new(failure, self.into_legacy())
+    }
+}
+
 /// The window a file needs. Matches reach back as far as its declared dictionary, or no further than the file when
 /// nothing before or after it can refer back into it. Short writes may spill (`Win::spills`) where the window is
 /// longer than that reach by `SPILL` (32) or more: a file on its own gets twice its size anyway, because a filter may
 /// cover up to half the window and a filter may cover the whole file, and one of up to the dictionary gets that
 /// much. Longer streams get twice the dictionary, where that costs no more than `ROOMY_MAX` (32 MiB) extra.
 pub fn window_for(dictionary: u64, unpacked: Option<u64>, solid_stream: bool) -> Result<Window> {
+    window_for_detailed(dictionary, unpacked, solid_stream).map_err(WindowError::into_legacy)
+}
+
+pub(crate) fn window_for_detailed(
+    dictionary: u64,
+    unpacked: Option<u64>,
+    solid_stream: bool,
+) -> std::result::Result<Window, WindowError> {
     if dictionary == 0 || !dictionary.is_power_of_two() {
-        return Err(Error::Unsupported(format!("dictionary size {dictionary}")));
+        return Err(WindowError::InvalidDictionary(dictionary));
     }
     if let Some(size) = unpacked
         && !solid_stream
     {
         // bounded by the dictionary first, so an absurd stated size can't overflow the rounding
-        let need = (size.min(dictionary).max(1) * 2).next_power_of_two().max(128 * 1024);
-        if need <= dictionary {
+        if let Some(need) = size
+            .min(dictionary)
+            .max(1)
+            .checked_mul(2)
+            .and_then(u64::checked_next_power_of_two)
+            .map(|need| need.max(128 * 1024))
+            .filter(|&need| need <= dictionary)
+        {
             return Ok(Window { size: need, reach: need / 2 });
         }
-        if size <= dictionary - SPILL {
+        if dictionary.checked_sub(SPILL).is_some_and(|reach| size <= reach) {
             return Ok(Window { size: dictionary, reach: size });
         }
     }
@@ -758,14 +812,16 @@ pub fn window_for(dictionary: u64, unpacked: Option<u64>, solid_stream: bool) ->
 impl Unpacker {
     /// A fresh stream with the window `window`.
     pub fn new(window: Window) -> Result<Self> {
+        Self::new_detailed(window).map_err(WindowError::into_legacy)
+    }
+
+    pub(crate) fn new_detailed(window: Window) -> std::result::Result<Self, WindowError> {
         let Window { size: window, reach } = window;
         assert!(window.is_power_of_two() && reach <= window, "window {window}, reach {reach}");
-        let size = usize::try_from(window).map_err(|_| Error::Unsupported("dictionary too large".into()))?;
+        let size = usize::try_from(window).map_err(|_| WindowError::Size(window))?;
         // asked first so an absurd size is an error, not an abort; the window itself comes zeroed from the system,
         // so its pages cost nothing until they are written
-        Vec::<u8>::new()
-            .try_reserve_exact(size)
-            .map_err(|_| Error::Unsupported(format!("can't allocate a {window} byte window")))?;
+        Vec::<u8>::new().try_reserve_exact(size).map_err(|_| WindowError::Allocation(window))?;
         Ok(Unpacker {
             window: vec![0; size],
             mask: window - 1,

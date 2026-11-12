@@ -22,15 +22,18 @@
 
 use std::collections::BTreeMap;
 use std::fs::File;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
 use crate::blake2sp::Blake2sp;
-use crate::error::{Error, Result};
-use crate::extract::{Meta, Place, create_target, finish_file};
-use crate::rar5::unpack::{Sink, Unpacker, window_for};
+use crate::error::{
+    Error, IoOperation, RarFailure, RarFault, RarIntegrityReason, RarPasswordEvidence, RarResult, RarScope, Result,
+};
+use crate::extract::{Meta, Place, create_target_detailed, finish_file};
+use crate::rar5::unpack::{Sink, Unpacker, window_for_detailed};
 
 /// Files up to this size, packed and unpacked, go to the workers whole.
 pub(crate) const JOB_MAX: u64 = 16 << 20;
@@ -69,9 +72,25 @@ pub(crate) enum Outcome {
     /// checked (and written), this many bytes
     Done(u64),
     /// this file failed, for this reason; the run goes on
-    Failed(String),
+    Failed { reason: Box<RarFailure>, legacy: LegacyFailure },
     /// writing failed: the run stops
-    Fatal(Error),
+    Fatal(RarFault),
+}
+
+pub(crate) enum LegacyFailure {
+    Decoder(Error),
+    Checksum,
+    Size { expected: u64, actual: u64 },
+}
+
+impl std::fmt::Display for LegacyFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Decoder(error) => error.fmt(f),
+            Self::Checksum => f.write_str("checksum error"),
+            Self::Size { expected, actual } => write!(f, "{actual} bytes where the header says {expected}"),
+        }
+    }
 }
 
 pub(crate) struct Done {
@@ -237,44 +256,75 @@ fn run(job: Job, unpacker: &mut Option<Unpacker>) -> Done {
     let Job { name, packed, method, dictionary, size, crc32, blake2sp, out, meta } = job;
     let mut hasher = crate::crc32::Hasher::new();
     let mut blake = blake2sp.map(|_| Blake2sp::new());
-    let mut out = match out.map(|place| create_target(place, Some(size))).transpose() {
+    let mut out = match out.map(|place| create_target_detailed(place, Some(size))).transpose() {
         Ok(out) => out,
         Err(e) => return Done { name, outcome: Outcome::Fatal(e) },
     };
     let mut bytes = 0u64;
+    let mut output_fault = None;
     let mut sink = |chunk: &[u8]| -> Result<()> {
         hasher.update(chunk);
         if let Some(b) = blake.as_mut() {
             b.update(chunk);
         }
-        if let Some(o) = out.as_mut() {
-            o.write(chunk).map_err(Error::Io)?;
+        if let Some(o) = out.as_mut()
+            && let Err(e) = o.write_detailed(chunk)
+        {
+            output_fault = Some(e.detailed(true));
+            return Err(Error::Corrupt("RAR output stopped"));
         }
         bytes += chunk.len() as u64;
         Ok(())
     };
-    let decoded = if method == 0 { sink(&packed) } else { decode(&packed, dictionary, size, unpacker, &mut sink) };
+    let scope = RarScope::Member { index: None };
+    let decoded = if method == 0 {
+        sink(&packed).map_err(|e| decoder_failure(e, scope.clone(), RarPasswordEvidence::NotEncrypted))
+    } else {
+        decode(&packed, dictionary, size, unpacker, &mut sink, scope.clone())
+    };
     let fail = |outcome| Done { name: name.clone(), outcome };
-    match decoded {
-        // only writing out gives an OS error; the decoder's own are about the data
-        Err(Error::Io(e)) => return fail(Outcome::Fatal(Error::Io(e))),
-        Err(e) => return fail(Outcome::Failed(e.to_string())),
-        Ok(()) => {}
+    if let Some(fault) = output_fault {
+        return fail(Outcome::Fatal(fault));
+    }
+    if let Err(fault) = decoded {
+        let (reason, legacy) = fault.into_parts();
+        return fail(Outcome::Failed { reason, legacy: LegacyFailure::Decoder(legacy) });
     }
     let crc_bad = crc32.is_some_and(|want| hasher.finalize() != want);
     let blake_bad = blake2sp.zip(blake).is_some_and(|(want, got)| got.finish() != want);
     if crc_bad || blake_bad {
-        return fail(Outcome::Failed("checksum error".into()));
+        let reason = RarIntegrityReason::FinalChecks { crc32: crc_bad, blake2sp: blake_bad };
+        return fail(Outcome::Failed {
+            reason: Box::new(RarFailure::integrity(scope, reason, RarPasswordEvidence::NotEncrypted, true)),
+            legacy: LegacyFailure::Checksum,
+        });
     }
     if bytes != size {
-        return fail(Outcome::Failed(format!("{bytes} bytes where the header says {size}")));
+        let reason = RarIntegrityReason::DecodedSize { expected: size, actual: bytes };
+        return fail(Outcome::Failed {
+            reason: Box::new(RarFailure::integrity(scope, reason, RarPasswordEvidence::NotEncrypted, true)),
+            legacy: LegacyFailure::Size { expected: size, actual: bytes },
+        });
     }
     if let Some(o) = out
-        && let Err(e) = o.finish(|file| finish_file(file, &meta))
+        && let Err(e) = o.finish_detailed(|file| finish_file(file, &meta))
     {
-        return fail(Outcome::Fatal(Error::Io(e)));
+        return fail(Outcome::Fatal(e.detailed(true)));
     }
     Done { name, outcome: Outcome::Done(bytes) }
+}
+
+pub(crate) fn decoder_failure(e: Error, scope: RarScope, evidence: RarPasswordEvidence) -> RarFault {
+    use crate::error::{RarInternal, RarUnsupported};
+    let reason = match e {
+        Error::Corrupt(reason) => RarIntegrityReason::Decoder(reason),
+        Error::Truncated => RarIntegrityReason::TruncatedData,
+        Error::Unsupported(ref reason) => {
+            return RarFault::new(RarFailure::Unsupported(RarUnsupported::Decoder(reason.clone())), e);
+        }
+        _ => return RarFault::new(RarFailure::Internal(RarInternal::Invariant("unexpected RAR decoder error")), e),
+    };
+    RarFault::new(RarFailure::integrity(scope, reason, evidence, true), e)
 }
 
 fn decode(
@@ -283,42 +333,44 @@ fn decode(
     size: u64,
     unpacker: &mut Option<Unpacker>,
     sink: &mut dyn Sink,
-) -> Result<()> {
-    let window = window_for(dictionary, Some(size), false)?;
+    scope: RarScope,
+) -> RarResult<()> {
+    let window = window_for_detailed(dictionary, Some(size), false).map_err(|e| e.detailed(scope.clone()))?;
     let u = match unpacker.as_mut().filter(|u| u.fits(window)) {
         Some(u) => u,
         None => {
-            let mut u = Unpacker::new(window)?;
+            let mut u = Unpacker::new_detailed(window).map_err(|e| e.detailed(scope.clone()))?;
             // the files themselves are the parallel work; each decodes on its own thread
             u.set_threads(0, u64::MAX);
             unpacker.insert(u)
         }
     };
     u.restart(window, Some(size));
-    u.feed(packed, sink)?;
-    u.finish(sink)
+    u.feed(packed, sink)
+        .and_then(|()| u.finish(sink))
+        .map_err(|e| decoder_failure(e, scope, RarPasswordEvidence::NotEncrypted))
 }
 
 /// Checks (and, given `out`, copies to `out` from `out_at` on) `len` stored bytes at `at` in the open `volume`, on
 /// `threads` threads (no more than [`STORED_THREADS`]). Returns the CRC32 of the bytes.
-pub(crate) fn stored(
-    volume: &File,
+pub(crate) fn stored_detailed(
+    (volume, volume_path): (&File, Option<&Path>),
     at: u64,
     len: u64,
-    out: Option<&File>,
+    out: Option<(&File, Option<&Path>)>,
     out_at: u64,
     threads: usize,
-) -> Result<crate::crc32::Hasher> {
+) -> RarResult<crate::crc32::Hasher> {
     let pieces = len.div_ceil(PIECE) as usize;
     let crcs: Vec<Mutex<Option<crate::crc32::Hasher>>> = (0..pieces).map(|_| Mutex::new(None)).collect();
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
-    let first_error: Mutex<Option<Error>> = Mutex::new(None);
-    let flusher = out.filter(|f| defers_to_close(f)).map(Flusher::new);
+    let first_error: Mutex<Option<RarFault>> = Mutex::new(None);
+    let flusher = out.map(|(file, _)| file).filter(|f| defers_to_close(f)).map(Flusher::new);
     thread::scope(|s| {
         for _ in 0..threads.min(STORED_THREADS).min(pieces).max(1) {
             s.spawn(|| {
-                let result = (|| -> Result<()> {
+                let result = (|| -> RarResult<()> {
                     let mut buf = vec![0u8; PIECE as usize];
                     loop {
                         if stop.load(Ordering::Relaxed) {
@@ -330,11 +382,29 @@ pub(crate) fn stored(
                         }
                         let off = i as u64 * PIECE;
                         let n = PIECE.min(len - off) as usize;
-                        read_at(volume, &mut buf[..n], at + off)?;
+                        read_at_detailed(volume, &mut buf[..n], at + off).map_err(|e| match e {
+                            PositionReadError::Eof => RarFault::new(
+                                RarFailure::integrity(
+                                    RarScope::Header {
+                                        volume: volume_path.unwrap_or_else(|| Path::new("")).to_path_buf(),
+                                    },
+                                    RarIntegrityReason::TruncatedData,
+                                    RarPasswordEvidence::NotEncrypted,
+                                    false,
+                                ),
+                                Error::Truncated,
+                            ),
+                            PositionReadError::Io { offset, source } => RarFault::input(
+                                IoOperation::Read,
+                                volume_path.map(Path::to_path_buf),
+                                Some(offset),
+                                source,
+                            ),
+                        })?;
                         let mut h = crate::crc32::Hasher::new();
                         h.update(&buf[..n]);
-                        if let Some(out) = out {
-                            write_at(out, &buf[..n], out_at + off)?;
+                        if let Some((out, path)) = out {
+                            write_at(out, &buf[..n], out_at + off, path)?;
                             if let Some(f) = &flusher {
                                 f.wrote(n as u64);
                             }
@@ -420,15 +490,22 @@ fn flush_data(file: &File) {
 #[cfg(not(target_os = "macos"))]
 fn flush_data(_file: &File) {}
 
-pub(crate) fn read_at(file: &File, buf: &mut [u8], mut at: u64) -> Result<()> {
+#[derive(Debug)]
+pub(crate) enum PositionReadError {
+    Eof,
+    Io { offset: u64, source: std::io::Error },
+}
+
+pub(crate) fn read_at_detailed(file: &File, buf: &mut [u8], mut at: u64) -> std::result::Result<(), PositionReadError> {
     let mut done = 0;
     while done < buf.len() {
         #[cfg(unix)]
-        let n = std::os::unix::fs::FileExt::read_at(file, &mut buf[done..], at)?;
+        let n = std::os::unix::fs::FileExt::read_at(file, &mut buf[done..], at);
         #[cfg(windows)]
-        let n = std::os::windows::fs::FileExt::seek_read(file, &mut buf[done..], at)?;
+        let n = std::os::windows::fs::FileExt::seek_read(file, &mut buf[done..], at);
+        let n = n.map_err(|source| PositionReadError::Io { offset: at, source })?;
         if n == 0 {
-            return Err(Error::Truncated);
+            return Err(PositionReadError::Eof);
         }
         done += n;
         at += n as u64;
@@ -436,14 +513,15 @@ pub(crate) fn read_at(file: &File, buf: &mut [u8], mut at: u64) -> Result<()> {
     Ok(())
 }
 
-fn write_at(file: &File, mut buf: &[u8], mut at: u64) -> Result<()> {
+fn write_at(file: &File, mut buf: &[u8], mut at: u64, path: Option<&Path>) -> RarResult<()> {
+    let fault = |at, e| RarFault::output(IoOperation::Write, path.map(Path::to_path_buf), Some(at), e, false);
     while !buf.is_empty() {
         #[cfg(unix)]
-        let n = std::os::unix::fs::FileExt::write_at(file, buf, at)?;
+        let n = std::os::unix::fs::FileExt::write_at(file, buf, at).map_err(|e| fault(at, e))?;
         #[cfg(windows)]
-        let n = std::os::windows::fs::FileExt::seek_write(file, buf, at)?;
+        let n = std::os::windows::fs::FileExt::seek_write(file, buf, at).map_err(|e| fault(at, e))?;
         if n == 0 {
-            return Err(Error::Io(std::io::ErrorKind::WriteZero.into()));
+            return Err(fault(at, std::io::ErrorKind::WriteZero.into()));
         }
         buf = &buf[n..];
         at += n as u64;

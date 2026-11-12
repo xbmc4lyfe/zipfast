@@ -339,3 +339,36 @@ fn selected_encrypted_rar_rejects_a_modified_ciphertext() {
     assert_ne!(provisional, plain);
     assert!(error.to_string().contains("checksum error"), "{error}");
 }
+
+#[test]
+fn truncated_declared_password_check_never_publishes_plaintext() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("test.rar");
+    let out = dir.path().join("out");
+    let plain = b"authenticated framing";
+    let encrypted = encrypted_data(plain, 0);
+    let mut extra = encryption_record(false);
+    extra[3] = 1; // a verifier is declared, but its bytes are absent
+    let spec = FileSpec { size: Some(plain.len() as u64), extra, ..FileSpec::new("f", &encrypted) };
+    fs::write(&archive, archive_with(&[(spec, crc32fast::hash(plain))], false)).unwrap();
+    fs::create_dir_all(&out).unwrap();
+    fs::write(out.join("f"), b"original").unwrap();
+    let summary = extract::run_with_password(&archive, &options(&out, Mode::Extract), Some(PASSWORD), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (0, 1));
+    assert_eq!(fs::read(out.join("f")).unwrap(), b"original");
+}
+
+#[test]
+fn truncated_member_iv_never_publishes_an_empty_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("test.rar");
+    let out = dir.path().join("out");
+    let mut extra = encryption_record(false);
+    extra[0] -= 1;
+    extra.pop();
+    let spec = FileSpec { extra, ..FileSpec::new("f", b"") };
+    fs::write(&archive, archive_with(&[(spec, 0)], false)).unwrap();
+    let summary = extract::run_with_password(&archive, &options(&out, Mode::Extract), Some(PASSWORD), |_| {}).unwrap();
+    assert_eq!((summary.files, summary.errors.len()), (0, 1));
+    assert!(!out.join("f").exists());
+}

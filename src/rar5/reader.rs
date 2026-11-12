@@ -22,10 +22,13 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 
-use crate::batch::read_at;
+use crate::batch::{PositionReadError, read_at_detailed};
 
 use super::*;
-use crate::error::{Error, Result};
+use crate::error::{
+    Error, IoOperation, RarFailure, RarFault, RarIntegrityReason, RarInternal, RarPasswordEvidence, RarResult,
+    RarScope, RarUnsupported, Result,
+};
 
 pub enum Block {
     Main(MainHeader),
@@ -37,6 +40,54 @@ pub enum Block {
     /// Headers from here on are encrypted.
     Crypt,
     Unknown,
+}
+
+pub(crate) enum ReadDataError<E> {
+    Input(RarFault),
+    Sink(E),
+}
+
+fn read_failure(e: PositionReadError, path: Option<PathBuf>, reason: RarIntegrityReason) -> RarFault {
+    match e {
+        PositionReadError::Eof => RarFault::new(
+            RarFailure::integrity(
+                RarScope::Header { volume: path.unwrap_or_default() },
+                reason,
+                RarPasswordEvidence::NotEncrypted,
+                false,
+            ),
+            Error::Truncated,
+        ),
+        PositionReadError::Io { offset, source } => RarFault::input(IoOperation::Read, path, Some(offset), source),
+    }
+}
+
+enum SourceError {
+    Read(PositionReadError),
+    Clone(std::io::Error),
+    Spawn(std::io::Error),
+    Stopped,
+}
+
+impl std::fmt::Debug for SourceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Read(e) => e.fmt(f),
+            Self::Clone(e) | Self::Spawn(e) => e.fmt(f),
+            Self::Stopped => f.write_str("read-ahead worker stopped"),
+        }
+    }
+}
+
+impl SourceError {
+    fn detailed(self, path: &Path, reason: RarIntegrityReason) -> RarFault {
+        match self {
+            Self::Read(e) => read_failure(e, Some(path.to_path_buf()), reason),
+            Self::Clone(e) => RarFault::input(IoOperation::Open, Some(path.to_path_buf()), None, e),
+            Self::Spawn(e) => RarFault::new(RarFailure::Internal(RarInternal::WorkerStopped), e.into()),
+            Self::Stopped => RarFault::new(RarFailure::Internal(RarInternal::WorkerStopped), Error::Truncated),
+        }
+    }
 }
 
 /// Bytes read from a volume at a time. Headers and the data of small files after them come in together, so a
@@ -108,34 +159,35 @@ struct Source {
 
 /// The threads reading ahead, the one the next piece comes from, and where that piece starts.
 struct Ahead {
-    pieces: Vec<Receiver<Result<Vec<u8>>>>,
+    pieces: Vec<Receiver<std::result::Result<Vec<u8>, PositionReadError>>>,
     turn: usize,
     spare: Sender<Vec<u8>>,
     next: u64,
 }
 
 impl Ahead {
-    fn start(file: &File, from: u64, len: u64, readers: usize) -> Result<Ahead> {
+    fn start(file: &File, from: u64, len: u64, readers: usize) -> std::result::Result<Ahead, SourceError> {
         let (spare, spares) = channel::<Vec<u8>>();
         let spares = Arc::new(std::sync::Mutex::new(spares));
         let mut pieces = Vec::with_capacity(readers);
         for k in 0..readers {
-            let file = file.try_clone()?;
-            let (send, recv) = sync_channel::<Result<Vec<u8>>>(AHEAD);
+            let file = file.try_clone().map_err(SourceError::Clone)?;
+            let (send, recv) = sync_channel(AHEAD);
             let spares = Arc::clone(&spares);
             std::thread::Builder::new()
                 .name("rar5-read".into())
-                .spawn(move || read_ahead(&file, from + (k * READ) as u64, readers, len, &send, &spares))?;
+                .spawn(move || read_ahead(&file, from + (k * READ) as u64, readers, len, &send, &spares))
+                .map_err(SourceError::Spawn)?;
             pieces.push(recv);
         }
         Ok(Ahead { pieces, turn: 0, spare, next: from })
     }
 
     /// The next piece, in order.
-    fn recv(&mut self) -> Result<Vec<u8>> {
-        let piece = self.pieces[self.turn].recv().map_err(|_| Error::Truncated)?;
+    fn recv(&mut self) -> std::result::Result<Vec<u8>, SourceError> {
+        let piece = self.pieces[self.turn].recv().map_err(|_| SourceError::Stopped)?;
         self.turn = (self.turn + 1) % self.pieces.len();
-        piece
+        piece.map_err(SourceError::Read)
     }
 }
 
@@ -145,14 +197,14 @@ fn read_ahead(
     mut at: u64,
     readers: usize,
     len: u64,
-    send: &SyncSender<Result<Vec<u8>>>,
+    send: &SyncSender<std::result::Result<Vec<u8>, PositionReadError>>,
     spares: &std::sync::Mutex<Receiver<Vec<u8>>>,
 ) {
     while at < len {
         let n = (len - at).min(READ as u64) as usize;
         let mut buf = spares.lock().ok().and_then(|s| s.try_recv().ok()).unwrap_or_default();
         buf.resize(n, 0);
-        let read = read_at(file, &mut buf, at).map(|()| buf);
+        let read = read_at_detailed(file, &mut buf, at).map(|()| buf);
         let failed = read.is_err();
         if send.send(read).is_err() || failed {
             return;
@@ -219,7 +271,7 @@ impl Source {
     }
 
     /// Makes sure the piece in use has bytes left, unless the file ends. False at the end of the file.
-    fn fill(&mut self) -> Result<bool> {
+    fn fill(&mut self) -> std::result::Result<bool, SourceError> {
         while self.off >= self.piece.bytes.len() {
             let skip = self.off - self.piece.bytes.len();
             let from = self.at + self.piece.bytes.len() as u64;
@@ -248,7 +300,7 @@ impl Source {
                     // the first piece after a move is read here; read on past it, and the thread takes over
                     let mut buf = used;
                     buf.resize((self.len - from).min(READ as u64) as usize, 0);
-                    read_at(&self.file, &mut buf, from)?;
+                    read_at_detailed(&self.file, &mut buf, from).map_err(SourceError::Read)?;
                     self.sequential = true;
                     Piece::new(buf, None)
                 }
@@ -268,17 +320,10 @@ pub struct Volume {
     len: u64,
     pub main: MainHeader,
     password: Option<String>,
-    header_key: Option<[u8; 32]>,
+    header_key: Option<crate::crypto::Rar5Keys>,
 }
 
 pub(crate) const SIGNATURE_PROBE_BYTES: u64 = MAX_SFX + SIGNATURE.len() as u64;
-
-/// Finds the signature within the first [`MAX_SFX`] bytes. Returns the offset just past it.
-fn find_signature(file: &File, len: u64) -> Result<u64> {
-    let mut head = vec![0u8; len.min(SIGNATURE_PROBE_BYTES) as usize];
-    read_at(file, &mut head, 0)?;
-    signature_end(&head)
-}
 
 pub(crate) fn signature_end(head: &[u8]) -> Result<u64> {
     if head.starts_with(SIGNATURE) {
@@ -304,11 +349,32 @@ impl Volume {
     }
 
     pub fn open_with_password(path: &Path, password: Option<&str>) -> Result<Volume> {
-        let file = File::open(path)?;
+        Self::open_impl(path, password, false).map_err(RarFault::into_legacy)
+    }
+
+    pub(crate) fn open_detailed(path: &Path, password: Option<&str>) -> RarResult<Volume> {
+        Self::open_impl(path, password, true)
+    }
+
+    fn open_impl(path: &Path, password: Option<&str>, detailed: bool) -> RarResult<Volume> {
+        let file =
+            File::open(path).map_err(|e| RarFault::input(IoOperation::Open, Some(path.to_path_buf()), None, e))?;
         #[cfg(all(test, unix))]
         VOLUME_OPENS.set(VOLUME_OPENS.get() + 1);
-        let len = file.metadata()?.len();
-        let next = find_signature(&file, len)?;
+        let len = file
+            .metadata()
+            .map_err(|e| RarFault::input(IoOperation::Metadata, Some(path.to_path_buf()), None, e))?
+            .len();
+        let mut head = vec![0u8; len.min(SIGNATURE_PROBE_BYTES) as usize];
+        read_at_detailed(&file, &mut head, 0)
+            .map_err(|e| read_failure(e, Some(path.to_path_buf()), RarIntegrityReason::TruncatedHeader))?;
+        let next = signature_end(&head).map_err(|e| {
+            let failure = match e {
+                Error::NotAnArchive => RarFailure::NotRar,
+                _ => RarFailure::Unsupported(RarUnsupported::ArchiveVersion(4)),
+            };
+            RarFault::new(failure, e)
+        })?;
         let mut vol = Volume {
             path: path.to_path_buf(),
             src: Source::new(file, len),
@@ -318,116 +384,169 @@ impl Volume {
             password: password.filter(|s| !s.is_empty()).map(str::to_owned),
             header_key: None,
         };
-        match vol.next_block()? {
-            Some(Block::Main(m)) => vol.main = m,
-            Some(Block::Crypt) => return Err(Error::Encrypted),
-            _ => return Err(Error::Corrupt("main archive header missing")),
+        match vol.next_block_impl(detailed)? {
+            Some((Block::Main(m), _)) => vol.main = m,
+            Some((Block::Crypt, _)) => return Err(vol.password_required()),
+            _ => {
+                return Err(vol.header_fault(
+                    RarIntegrityReason::HeaderFraming("main archive header missing"),
+                    Error::Corrupt("main archive header missing"),
+                    true,
+                ));
+            }
         }
         Ok(vol)
     }
 
     /// The next block, or None at the physical end of the volume.
     pub fn next_block(&mut self) -> Result<Option<Block>> {
+        self.next_block_impl(false).map(|result| result.map(|(block, _)| block)).map_err(RarFault::into_legacy)
+    }
+
+    pub(crate) fn next_block_detailed(&mut self) -> RarResult<Option<(Block, MemberCrypt)>> {
+        self.next_block_impl(true)
+    }
+
+    fn scope(&self) -> RarScope {
+        RarScope::Header { volume: self.path.clone() }
+    }
+
+    fn password_required(&self) -> RarFault {
+        RarFault::new(RarFailure::PasswordRequired { scope: self.scope() }, Error::Encrypted)
+    }
+
+    fn header_fault(&self, reason: RarIntegrityReason, legacy: Error, plaintext_dependent: bool) -> RarFault {
+        let password = self.header_key.as_ref().map_or(RarPasswordEvidence::NotEncrypted, |keys| keys.evidence);
+        RarFault::new(RarFailure::integrity(self.scope(), reason, password, plaintext_dependent), legacy)
+    }
+
+    fn framing(&self, reason: &'static str, legacy: Error) -> RarFault {
+        self.header_fault(RarIntegrityReason::HeaderFraming(reason), legacy, true)
+    }
+
+    fn parse_fault(&self, e: Error) -> RarFault {
+        match e {
+            Error::Truncated => self.header_fault(RarIntegrityReason::TruncatedHeader, e, true),
+            Error::Corrupt(reason) => self.framing(reason, e),
+            _ => RarFault::new(RarFailure::Internal(RarInternal::Invariant("unexpected RAR header error")), e),
+        }
+    }
+
+    fn next_block_impl(&mut self, detailed: bool) -> RarResult<Option<(Block, MemberCrypt)>> {
         loop {
             if self.next >= self.len {
                 return Ok(None);
             }
-            self.seek(self.next)?;
+            self.src.seek(self.next);
             let start = self.next;
-            let (body, header_end) = if let Some(key) = self.header_key {
+            let (body, header_end) = if let Some(key) = self.header_key.as_ref().map(|keys| keys.key) {
                 if start.checked_add(32).is_none_or(|e| e > self.len) {
-                    return Err(Error::Truncated);
+                    return Err(self.header_fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false));
                 }
                 let mut iv = [0u8; 16];
                 let mut first_ct = [0u8; 16];
-                self.read_exact(&mut iv)?;
-                self.read_exact(&mut first_ct)?;
-                let first_dec = crate::crypto::decrypt_cbc(&key, &iv, &first_ct).ok_or(Error::Encrypted)?;
+                self.read_header_exact(&mut iv)?;
+                self.read_header_exact(&mut first_ct)?;
+                let first_dec = crate::crypto::decrypt_cbc(&key, &iv, &first_ct)
+                    .ok_or_else(|| self.framing("encrypted header block", Error::Encrypted))?;
                 let mut size = 0u64;
                 let mut size_len = 0usize;
                 for i in 0..3 {
-                    let b = *first_dec.get(4 + i).ok_or(Error::Encrypted)?;
+                    let b = first_dec[4 + i];
                     size |= u64::from(b & 0x7f) << (7 * i);
                     size_len = i + 1;
                     if b & 0x80 == 0 {
                         break;
                     }
                     if i == 2 {
-                        return Err(Error::Encrypted);
+                        return Err(self.framing("encrypted header size", Error::Encrypted));
                     }
                 }
                 if size == 0 || size > MAX_HEADER {
-                    return Err(Error::Encrypted);
+                    return Err(self.framing("encrypted header size", Error::Encrypted));
                 }
                 let plain_need = 4 + size_len + size as usize;
-                let padded_len = plain_need.checked_next_multiple_of(16).ok_or(Error::Encrypted)?;
-                let header_end = start.checked_add(16 + padded_len as u64).ok_or(Error::Corrupt("header size"))?;
+                let padded_len = plain_need
+                    .checked_next_multiple_of(16)
+                    .ok_or_else(|| self.framing("encrypted header size", Error::Encrypted))?;
+                let header_end = start
+                    .checked_add(16 + padded_len as u64)
+                    .ok_or_else(|| self.framing("header size", Error::Corrupt("header size")))?;
                 if header_end > self.len {
-                    return Err(Error::Truncated);
+                    return Err(self.header_fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, true));
                 }
                 let mut ct = vec![0u8; padded_len];
                 ct[..16].copy_from_slice(&first_ct);
                 if padded_len > 16 {
-                    self.read_exact(&mut ct[16..])?;
+                    self.read_header_exact(&mut ct[16..])?;
                 }
-                let dec = crate::crypto::decrypt_cbc(&key, &iv, &ct).ok_or(Error::Encrypted)?;
+                let dec = crate::crypto::decrypt_cbc(&key, &iv, &ct)
+                    .ok_or_else(|| self.framing("encrypted header block", Error::Encrypted))?;
                 let stored_crc = u32::from_le_bytes(dec[..4].try_into().unwrap());
                 if crate::crc32::hash(&dec[4..plain_need]) != stored_crc {
-                    return Err(Error::Encrypted);
+                    return Err(self.header_fault(RarIntegrityReason::HeaderCrc, Error::Encrypted, true));
                 }
                 (dec[4 + size_len..plain_need].to_vec(), header_end)
             } else {
                 let mut crc_bytes = [0u8; 4];
-                self.read_exact(&mut crc_bytes)?;
+                self.read_header_exact(&mut crc_bytes)?;
                 let stored_crc = u32::from_le_bytes(crc_bytes);
                 // the size field is a vint of at most 3 bytes
                 let mut size_field = Vec::with_capacity(3);
                 let mut size = 0u64;
                 for i in 0..3 {
                     let mut b = [0u8; 1];
-                    self.read_exact(&mut b)?;
+                    self.read_header_exact(&mut b)?;
                     size_field.push(b[0]);
                     size |= u64::from(b[0] & 0x7f) << (7 * i);
                     if b[0] & 0x80 == 0 {
                         break;
                     }
                     if i == 2 {
-                        return Err(Error::Corrupt("header size field too long"));
+                        return Err(
+                            self.framing("header size field too long", Error::Corrupt("header size field too long"))
+                        );
                     }
                 }
                 if size == 0 || size > MAX_HEADER {
-                    return Err(Error::Corrupt("header size"));
+                    return Err(self.framing("header size", Error::Corrupt("header size")));
                 }
                 let header_end = start + 4 + size_field.len() as u64 + size;
                 if header_end > self.len {
-                    return Err(Error::Truncated);
+                    return Err(self.header_fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false));
                 }
                 let mut body = vec![0u8; size as usize];
-                self.read_exact(&mut body)?;
+                self.read_header_exact(&mut body)?;
                 let mut hasher = crate::crc32::Hasher::new();
                 hasher.update(&size_field);
                 hasher.update(&body);
                 if hasher.finalize() != stored_crc {
-                    return Err(Error::Corrupt("header checksum mismatch"));
+                    return Err(self.header_fault(
+                        RarIntegrityReason::HeaderCrc,
+                        Error::Corrupt("header checksum mismatch"),
+                        false,
+                    ));
                 }
                 (body, header_end)
             };
 
             let mut c = Cursor::new(&body);
-            let kind = c.vint()?;
-            let flags = c.vint()?;
-            let extra_size = if flags & HFL_EXTRA != 0 { c.vsize()? } else { 0 };
-            let data_size = if flags & HFL_DATA != 0 { c.vint()? } else { 0 };
+            let kind = c.vint().map_err(|e| self.parse_fault(e))?;
+            let flags = c.vint().map_err(|e| self.parse_fault(e))?;
+            let extra_size = if flags & HFL_EXTRA != 0 { c.vsize().map_err(|e| self.parse_fault(e))? } else { 0 };
+            let data_size = if flags & HFL_DATA != 0 { c.vint().map_err(|e| self.parse_fault(e))? } else { 0 };
             let fields_end = body.len().checked_sub(extra_size).filter(|&e| e >= c.pos());
             let Some(fields_end) = fields_end else {
-                return Err(Error::Corrupt("extra area size"));
+                return Err(self.framing("extra area size", Error::Corrupt("extra area size")));
             };
             let fields = &body[c.pos()..fields_end];
             let extra = &body[fields_end..];
-            let data_end = header_end.checked_add(data_size).ok_or(Error::Corrupt("data size"))?;
+            let data_end = header_end
+                .checked_add(data_size)
+                .ok_or_else(|| self.framing("data size", Error::Corrupt("data size")))?;
             // checked here, not only when the data is read, since skipped blocks are never read
             if data_end > self.len {
-                return Err(Error::Truncated);
+                return Err(self.header_fault(RarIntegrityReason::TruncatedData, Error::Truncated, false));
             }
             self.next = data_end;
             let head = BlockHead { kind, flags, data_size, data_at: header_end };
@@ -435,29 +554,36 @@ impl Volume {
             match kind {
                 HEAD_MAIN => {
                     let mut f = Cursor::new(fields);
-                    let flags = f.vint()?;
-                    let volume_number = if flags & MHFL_VOLNUMBER != 0 { f.vint()? } else { 0 };
-                    return Ok(Some(Block::Main(MainHeader { flags, volume_number })));
+                    let flags = f.vint().map_err(|e| self.parse_fault(e))?;
+                    let volume_number =
+                        if flags & MHFL_VOLNUMBER != 0 { f.vint().map_err(|e| self.parse_fault(e))? } else { 0 };
+                    return Ok(Some((Block::Main(MainHeader { flags, volume_number }), None)));
                 }
-                HEAD_FILE => return Ok(Some(Block::File(parse_file(&head, fields, extra)?))),
-                HEAD_SERVICE => return Ok(Some(Block::Service(parse_file(&head, fields, extra)?))),
+                HEAD_FILE | HEAD_SERVICE => {
+                    let (h, crypt) = parse_file_detailed(&head, fields, extra).map_err(|e| self.parse_fault(e))?;
+                    let block = if kind == HEAD_FILE { Block::File(h) } else { Block::Service(h) };
+                    return Ok(Some((block, crypt)));
+                }
                 HEAD_CRYPT => {
-                    if let Some(pw) = self.password.as_deref() {
-                        let params = crate::crypto::rar5_record_params(fields).ok_or(Error::Encrypted)?;
-                        let key = crate::crypto::derive_rar5_key(pw, params.kdf_count, &params.salt, params.check)
-                            .ok_or(Error::Encrypted)?;
-                        self.header_key = Some(key);
-                        continue;
+                    if !detailed && self.password.is_none() {
+                        return Ok(Some((Block::Crypt, None)));
                     }
-                    return Ok(Some(Block::Crypt));
+                    let crypt_fault = |e| RarFault::new(RarFailure::crypt(e, self.scope()), Error::Encrypted);
+                    let params = crate::crypto::parse_rar5_crypt(fields, crate::crypto::Rar5CryptLayout::Header)
+                        .map_err(crypt_fault)?;
+                    let pw = self.password.as_deref().ok_or_else(|| self.password_required())?;
+                    let keys = crate::crypto::derive_rar5_keys(pw, params.kdf_count, &params.salt, params.check)
+                        .map_err(crypt_fault)?;
+                    self.header_key = Some(keys);
+                    continue;
                 }
                 HEAD_END => {
                     let mut f = Cursor::new(fields);
                     let flags = f.vint().unwrap_or(0);
                     self.next = self.len;
-                    return Ok(Some(Block::End { more_volumes: flags & EOAFL_MORE_VOLUMES != 0 }));
+                    return Ok(Some((Block::End { more_volumes: flags & EOAFL_MORE_VOLUMES != 0 }, None)));
                 }
-                _ => return Ok(Some(Block::Unknown)),
+                _ => return Ok(Some((Block::Unknown, None))),
             }
         }
     }
@@ -479,15 +605,10 @@ impl Volume {
         self.len
     }
 
-    fn seek(&mut self, at: u64) -> Result<()> {
-        self.src.seek(at);
-        Ok(())
-    }
-
-    fn read_exact(&mut self, mut out: &mut [u8]) -> Result<()> {
+    fn read_header_exact(&mut self, mut out: &mut [u8]) -> RarResult<()> {
         while !out.is_empty() {
-            if !self.src.fill()? {
-                return Err(Error::Truncated);
+            if !self.src.fill().map_err(|e| e.detailed(&self.path, RarIntegrityReason::TruncatedHeader))? {
+                return Err(self.header_fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false));
             }
             let held = self.src.held();
             let n = held.len().min(out.len());
@@ -520,22 +641,41 @@ impl Volume {
         &mut self,
         at: u64,
         len: u64,
-        mut sink: impl FnMut(&Arc<Piece>, Range<usize>) -> Result<()>,
+        sink: impl FnMut(&Arc<Piece>, Range<usize>) -> Result<()>,
     ) -> Result<()> {
+        self.read_data_detailed(at, len, sink).map_err(|e| match e {
+            ReadDataError::Input(e) => e.into_legacy(),
+            ReadDataError::Sink(e) => e,
+        })
+    }
+
+    pub(crate) fn read_data_detailed<E>(
+        &mut self,
+        at: u64,
+        len: u64,
+        mut sink: impl FnMut(&Arc<Piece>, Range<usize>) -> std::result::Result<(), E>,
+    ) -> std::result::Result<(), ReadDataError<E>> {
+        let truncated = |this: &Self| {
+            ReadDataError::Input(this.header_fault(RarIntegrityReason::TruncatedData, Error::Truncated, false))
+        };
         if at.checked_add(len).is_none_or(|end| end > self.len) {
-            return Err(Error::Truncated);
+            return Err(truncated(self));
         }
-        self.seek(at)?;
+        self.src.seek(at);
         let mut left = len;
         while left > 0 {
-            if !self.src.fill()? {
-                return Err(Error::Truncated);
+            if !self
+                .src
+                .fill()
+                .map_err(|e| ReadDataError::Input(e.detailed(&self.path, RarIntegrityReason::TruncatedData)))?
+            {
+                return Err(truncated(self));
             }
             let (piece, off) = self.src.held_shared();
             let n = ((piece.bytes.len() - off) as u64).min(left) as usize;
             let result = sink(piece, off..off + n);
             self.src.consume(n);
-            result?;
+            result.map_err(ReadDataError::Sink)?;
             left -= n as u64;
         }
         Ok(())

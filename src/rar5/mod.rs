@@ -213,6 +213,13 @@ impl FileHeader {
 
 /// The body of a file or service header, from the file flags on. `extra` is the extra area, if any.
 pub fn parse_file(head: &BlockHead, body: &[u8], extra: &[u8]) -> Result<FileHeader> {
+    parse_file_detailed(head, body, extra).map(|(file, _)| file)
+}
+
+pub(crate) type MemberCrypt =
+    Option<std::result::Result<crate::crypto::Rar5CryptParams, crate::crypto::Rar5CryptError>>;
+
+pub(crate) fn parse_file_detailed(head: &BlockHead, body: &[u8], extra: &[u8]) -> Result<(FileHeader, MemberCrypt)> {
     let mut c = Cursor::new(body);
     let mut f = FileHeader {
         service: head.kind == HEAD_SERVICE,
@@ -248,11 +255,12 @@ pub fn parse_file(head: &BlockHead, body: &[u8], extra: &[u8]) -> Result<FileHea
     f.host_os = c.vint()?;
     let name_len = c.vsize()?;
     f.name = String::from_utf8_lossy(c.bytes(name_len)?).into_owned();
-    parse_file_extra(&mut f, extra)?;
-    Ok(f)
+    let crypt = parse_file_extra(&mut f, extra)?;
+    Ok((f, crypt))
 }
 
-fn parse_file_extra(f: &mut FileHeader, extra: &[u8]) -> Result<()> {
+fn parse_file_extra(f: &mut FileHeader, extra: &[u8]) -> Result<MemberCrypt> {
+    let mut crypt = None;
     let mut c = Cursor::new(extra);
     while c.remaining() > 0 {
         let size = c.vsize()?;
@@ -262,7 +270,10 @@ fn parse_file_extra(f: &mut FileHeader, extra: &[u8]) -> Result<()> {
         match kind {
             FHEXTRA_CRYPT => {
                 f.encrypted = true;
-                f.crypt = crate::crypto::rar5_record_params(r.bytes(r.remaining())?);
+                let record = r.bytes(r.remaining())?;
+                let parsed = crate::crypto::parse_rar5_crypt(record, crate::crypto::Rar5CryptLayout::Member);
+                f.crypt = parsed.ok();
+                crypt = Some(parsed);
             }
             FHEXTRA_HASH => {
                 if r.vint()? == 0 {
@@ -292,7 +303,7 @@ fn parse_file_extra(f: &mut FileHeader, extra: &[u8]) -> Result<()> {
             _ => {}
         }
     }
-    Ok(())
+    Ok(crypt)
 }
 
 /// Windows FILETIME is 100 ns ticks since 1601.

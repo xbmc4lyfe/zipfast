@@ -193,12 +193,23 @@ const PREALLOCATE_MIN: u64 = 1 << 20;
 
 /// The second half of [`open_target`].
 pub(crate) fn create_target(place: Place, size: Option<u64>) -> Result<Output> {
+    create_target_detailed(place, size).map_err(crate::error::RarFault::into_legacy)
+}
+
+pub(crate) fn create_target_detailed(place: Place, size: Option<u64>) -> crate::error::RarResult<Output> {
+    use crate::error::{IoOperation, RarFailure, RarFault, RarPolicyReason};
+    let create_fault = |e| RarFault::output(IoOperation::CreateFile, Some(place.path.clone()), None, e, false);
     let (file, staged) = if place.replace {
-        let parent = place.path.parent().ok_or_else(|| Error::UnsafePath(place.path.display().to_string()))?;
-        let (file, path) = temporary(parent)?.into_parts();
+        let parent = place.path.parent().ok_or_else(|| {
+            RarFault::new(
+                RarFailure::Policy { reason: RarPolicyReason::UnsafePath, path: place.path.clone() },
+                Error::UnsafePath(place.path.display().to_string()),
+            )
+        })?;
+        let (file, path) = temporary(parent).map_err(create_fault)?.into_parts();
         (file, Some(path))
     } else {
-        let file = OpenOptions::new().write(true).create_new(true).open(&place.path)?;
+        let file = OpenOptions::new().write(true).create_new(true).open(&place.path).map_err(create_fault)?;
         (file, None)
     };
     if let Some(size) = size.filter(|&s| s >= PREALLOCATE_MIN) {
@@ -306,6 +317,40 @@ fn walk_until(
             return Ok(volumes);
         }
         vol = Volume::open_with_password(&next, password)?;
+    }
+}
+
+fn walk_rar(
+    mut vol: Volume,
+    password: Option<&str>,
+    mut on_block: impl FnMut(&mut Volume, Block, crate::rar5::MemberCrypt) -> Result<()>,
+) -> Result<u64> {
+    use crate::error::RarFault;
+    let mut volumes = 0;
+    loop {
+        volumes += 1;
+        let mut more = vol.main.is_volume();
+        let mut saw_end = false;
+        while let Some((block, crypt)) = vol.next_block_detailed().map_err(RarFault::into_legacy)? {
+            match block {
+                Block::End { more_volumes } => {
+                    more = more_volumes;
+                    saw_end = true;
+                    break;
+                }
+                b => on_block(&mut vol, b, crypt)?,
+            }
+        }
+        if !more {
+            return Ok(volumes);
+        }
+        let Some(next) = next_volume(&vol.path) else {
+            return if saw_end { Err(Error::UnnamedVolume(vol.path)) } else { Ok(volumes) };
+        };
+        if !next.exists() {
+            return if saw_end { Err(Error::MissingVolume(next)) } else { Ok(volumes) };
+        }
+        vol = Volume::open_detailed(&next, password).map_err(RarFault::into_legacy)?;
     }
 }
 
@@ -821,7 +866,7 @@ impl Pending {
             b.update(chunk);
         }
         if let Some(out) = self.out.as_mut() {
-            out.write(chunk)?;
+            out.write_detailed(chunk).map_err(|e| e.detailed(false).into_legacy())?;
         }
         self.bytes += chunk.len() as u64;
         Ok(())
@@ -1086,13 +1131,14 @@ fn apply_done(summary: &mut Summary, report: &mut impl FnMut(&str), done: Done) 
             summary.bytes += bytes;
             Ok(())
         }
-        Outcome::Failed(why) => {
+        Outcome::Failed { reason, legacy: why } => {
+            drop(reason);
             let line = format!("{}: {why}", done.name);
             report(&line);
             summary.errors.push(line);
             Ok(())
         }
-        Outcome::Fatal(e) => Err(e),
+        Outcome::Fatal(e) => Err(e.into_legacy()),
     }
 }
 
@@ -1100,7 +1146,7 @@ fn rar_run(first: &Path, opts: &Options, password: Option<&str>, report: impl Fn
     if opts.mode == Mode::Extract {
         fs::create_dir_all(&opts.dest)?;
     }
-    let first_volume = Volume::open_with_password(first, password)?;
+    let first_volume = Volume::open_detailed(first, password).map_err(crate::error::RarFault::into_legacy)?;
     let mut opts = opts.protecting(first)?;
     if let Cow::Owned(opts) = &mut opts {
         // An end header can request the next volume even if the main header omits the volume flag.
@@ -1121,7 +1167,7 @@ fn rar_run(first: &Path, opts: &Options, password: Option<&str>, report: impl Fn
     // the hidden size knob is there to test decoding blocks on workers, which batching would bypass
     let threads = if opts.parallel_min.is_some() { 1 } else { threads };
     let mut r = Run::new(&opts, password, report, threads);
-    let walked = walk(first_volume, r.password, |vol, block| {
+    let walked = walk_rar(first_volume, r.password, |vol, block, _| {
         let Block::File(h) = block else { return Ok(()) };
         r.file_block(vol, &h)
     });
@@ -1897,15 +1943,23 @@ impl<R: FnMut(&str)> Run<'_, R> {
             return Err(Error::Truncated);
         }
         // the pieces are written by position, so the writer thread hands the file over first
-        let file = match p.out.take().map(Output::handoff).transpose() {
+        let file = match p.out.take().map(Output::handoff_detailed).transpose() {
             Ok(f) => f,
             Err(e) => {
                 p.discard();
-                return Err(e.into());
+                return Err(e.detailed(false).into_legacy());
             }
         };
-        let part =
-            batch::stored(vol.file(), h.data_at, h.packed_size, file.as_ref().map(|f| &f.file), p.bytes, self.threads);
+        let volume_path = vol.path.clone();
+        let part = batch::stored_detailed(
+            (vol.file(), Some(&volume_path)),
+            h.data_at,
+            h.packed_size,
+            file.as_ref().map(|f| (&f.file, f.target())),
+            p.bytes,
+            self.threads,
+        )
+        .map_err(crate::error::RarFault::into_legacy);
         let part = match part {
             Ok(part) => part,
             Err(e) => {

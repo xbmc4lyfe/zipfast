@@ -38,6 +38,19 @@ pub(crate) struct Output {
     pending: Option<PendingPath>,
 }
 
+#[derive(Debug)]
+pub(crate) struct OutputError {
+    pub(crate) operation: crate::error::IoOperation,
+    pub(crate) path: Option<PathBuf>,
+    pub(crate) source: io::Error,
+}
+
+impl OutputError {
+    pub(crate) fn detailed(self, preserve_eof: bool) -> crate::error::RarFault {
+        crate::error::RarFault::output(self.operation, self.path, None, self.source, preserve_eof)
+    }
+}
+
 pub(crate) struct WriteFile {
     pub file: File,
     pending: Option<PendingPath>,
@@ -70,16 +83,25 @@ pub(crate) fn temporary(parent: &Path) -> io::Result<NamedTempFile> {
 }
 
 pub(crate) fn replace(temporary: TempPath, target: &Path) -> io::Result<()> {
+    replace_detailed(temporary, target).map_err(|e| e.source)
+}
+
+fn replace_detailed(temporary: TempPath, target: &Path) -> Result<(), OutputError> {
+    use crate::error::IoOperation;
+    let fault = |operation, source| OutputError { operation, path: Some(target.to_path_buf()), source };
     // An earlier check cannot account for a symlink installed while decoding.
     match fs::symlink_metadata(target) {
         Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(io::Error::new(io::ErrorKind::AlreadyExists, "a symlink is in the way"));
+            return Err(fault(
+                IoOperation::Publish,
+                io::Error::new(io::ErrorKind::AlreadyExists, "a symlink is in the way"),
+            ));
         }
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
+        Err(e) => return Err(fault(IoOperation::Metadata, e)),
     }
-    temporary.persist(target).map_err(|e| e.error)
+    temporary.persist(target).map_err(|e| fault(IoOperation::Publish, e.error))
 }
 
 enum Inner {
@@ -93,6 +115,21 @@ struct Background {
     spare: Receiver<Vec<u8>>,
     cur: Vec<u8>,
     handle: Option<JoinHandle<io::Result<File>>>,
+}
+
+impl PendingPath {
+    fn target(&self) -> Option<&Path> {
+        match self {
+            Self::New(cleanup) => cleanup.0.as_deref(),
+            Self::Replacement(_, target) => Some(target),
+        }
+    }
+}
+
+impl WriteFile {
+    pub(crate) fn target(&self) -> Option<&Path> {
+        self.pending.as_ref().and_then(PendingPath::target)
+    }
 }
 
 impl Output {
@@ -144,6 +181,14 @@ impl Output {
         output
     }
 
+    pub(crate) fn write_detailed(&mut self, data: &[u8]) -> Result<(), OutputError> {
+        self.write(data).map_err(|source| OutputError {
+            operation: crate::error::IoOperation::Write,
+            path: self.pending.as_ref().and_then(PendingPath::target).map(Path::to_path_buf),
+            source,
+        })
+    }
+
     pub fn write(&mut self, mut data: &[u8]) -> io::Result<()> {
         match &mut self.inner {
             Inner::Direct(file) => file.write_all(data),
@@ -162,8 +207,8 @@ impl Output {
     }
 
     /// Waits for pending writes and hands the file and its cleanup guard to a positional writer.
-    pub fn handoff(self) -> io::Result<WriteFile> {
-        let file = match self.inner {
+    pub(crate) fn handoff_detailed(self) -> Result<WriteFile, OutputError> {
+        let file = (|| match self.inner {
             Inner::Direct(file) => Ok(file),
             Inner::Background(mut b) => {
                 if !b.cur.is_empty() {
@@ -172,7 +217,12 @@ impl Output {
                 b.tx = None;
                 b.join()
             }
-        }?;
+        })()
+        .map_err(|source| OutputError {
+            operation: crate::error::IoOperation::Write,
+            path: self.pending.as_ref().and_then(PendingPath::target).map(Path::to_path_buf),
+            source,
+        })?;
         Ok(WriteFile { file, pending: self.pending })
     }
 
@@ -184,11 +234,15 @@ impl Output {
 
     /// Prepares metadata and publishes a verified replacement after every write has finished.
     pub fn finish(self, prepare: impl FnOnce(&File)) -> io::Result<()> {
-        let WriteFile { file, pending } = self.handoff()?;
+        self.finish_detailed(prepare).map_err(|e| e.source)
+    }
+
+    pub(crate) fn finish_detailed(self, prepare: impl FnOnce(&File)) -> Result<(), OutputError> {
+        let WriteFile { file, pending } = self.handoff_detailed()?;
         prepare(&file);
         drop(file);
         match pending {
-            Some(PendingPath::Replacement(temporary, target)) => replace(temporary, &target),
+            Some(PendingPath::Replacement(temporary, target)) => replace_detailed(temporary, &target),
             Some(PendingPath::New(mut cleanup)) => {
                 cleanup.0 = None;
                 Ok(())
