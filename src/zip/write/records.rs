@@ -119,6 +119,24 @@ impl Member {
         if self.width.sizes { 20 } else { 12 }
     }
 
+    pub(super) fn descriptor_len(&self) -> u64 {
+        if self.width.sizes { 24 } else { 16 }
+    }
+
+    pub(super) fn descriptor(&self, crc: u32, decoded: u64, packed: u64) -> Result<Record<24>, WriteError> {
+        let mut r = Record::new();
+        r.u32(0x0807_4b50);
+        r.u32(crc);
+        if self.width.sizes {
+            r.u64(packed);
+            r.u64(decoded);
+        } else {
+            r.u32(self.width.size32(packed)?);
+            r.u32(self.width.size32(decoded)?);
+        }
+        Ok(r)
+    }
+
     fn zip64_len(&self, central: bool) -> u16 {
         16 * u16::from(self.width.sizes) + 8 * u16::from(central && self.width.offset)
     }

@@ -14,9 +14,10 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-//! Creates a fresh ZIP archive on an exclusively held seekable sink.
+//! Creates fresh ZIP archives with a seekable [`ZipWriter`] or a forward-only
+//! [`ZipStreamWriter`].
 //!
-//! Call [`ZipWriter::finish`] to write the central directory and flush the sink.
+//! Call the writer's finish method to write the central directory and flush the sink.
 //! Dropping the writer leaves any provisional bytes in place. A generic sink
 //! cannot prevent other handles from changing it. Finishing provides no
 //! filesystem durability guarantee.
@@ -61,6 +62,8 @@ use crate::zip::{FLAG_UTF8, S_IFDIR};
 use records::{End, Member, Width};
 
 mod records;
+mod stream;
+pub use stream::ZipStreamWriter;
 #[cfg(test)]
 mod tests;
 
@@ -296,6 +299,7 @@ pub enum IoStage {
     SourceRead,
     LocalHeader,
     Payload,
+    DataDescriptor,
     BackpatchSeek,
     BackpatchWrite,
     BackpatchRestore,
@@ -353,10 +357,7 @@ impl<W: Write + Seek> ZipWriter<W> {
 
     pub(super) fn new_accounted(sink: W, options: WriterOptions<'_>) -> Result<Self, (WriteError, WriteUsage)> {
         let before_io = |error| (error, WriteUsage::default());
-        let comment_len = metadata_len(options.comment, "archive comment exceeds 65,535 bytes").map_err(before_io)?;
-        let max_buffer = isize::MAX as u64;
-        bound(options.limits.central_bytes, max_buffer, Limit::CentralBytes).map_err(before_io)?;
-        bound(options.limits.metadata_capacity, max_buffer, Limit::MetadataCapacity).map_err(before_io)?;
+        let comment_len = archive_comment_len(&options).map_err(before_io)?;
 
         let mut writer = Self {
             output: Output::new(sink, options.limits, options.cancel),
@@ -410,6 +411,7 @@ impl<W: Write + Seek> ZipWriter<W> {
     pub fn add_directory(&mut self, options: EntryOptions<'_>) -> Result<EntryWritten, WriteError> {
         let (member, entries) = self.prepare(options, InputLength::Exact(0), true)?;
         let result = self
+            .output
             .write_local(&member, options.name.bytes())
             .and_then(|()| self.complete(options, &member, entries, 0, 0, 0));
         self.remember_failure(result)
@@ -445,14 +447,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         let central_offset = self.output.position;
         let end = End::new(usage.entries, usage.central_bytes, central_offset, self.wide_member, self.comment_len);
         self.output.check_tail(end, 0)?;
-        let record = end.record()?;
-        for chunk in self.central.chunks(BUFFER) {
-            self.output.write(chunk, IoStage::CentralDirectory)?;
-        }
-        self.output.write(record.as_bytes(), IoStage::EndRecord)?;
-        self.output.write(&self.comment, IoStage::EndRecord)?;
-        self.output.flush()?;
-        self.output.work.check_canceled()?;
+        self.output.write_tail(end, &self.central, &self.comment)?;
         Ok(WriteSummary { usage: self.usage(), central_offset, zip64: end.is_wide() })
     }
 
@@ -477,40 +472,9 @@ impl<W: Write + Seek> ZipWriter<W> {
         directory: bool,
     ) -> Result<(Member, u64), WriteError> {
         self.check_failed()?;
-        let name = options.name.bytes();
-        let name_len = metadata_len(name, "entry name exceeds 65,535 bytes")?;
-        let comment_len = metadata_len(options.comment, "entry comment exceeds 65,535 bytes")?;
-        let flags = if matches!(options.name, EntryName::Utf8(_)) {
-            if std::str::from_utf8(options.comment).is_err() {
-                return Err(WriteError::InvalidMetadata("UTF-8 entry requires a UTF-8 comment"));
-            }
-            FLAG_UTF8
-        } else {
-            0
-        };
-        let slash = name.ends_with(b"/");
-        if directory {
-            if !slash || name.ends_with(b"//") || options.method != Method::Stored {
-                return Err(WriteError::InvalidMetadata("directory requires Stored and exactly one terminal slash"));
-            }
-        } else if slash {
-            return Err(WriteError::InvalidMetadata("file name ends with slash"));
-        }
-        let empty = matches!(length, InputLength::Exact(0));
-        let method = if empty { Method::Stored } else { options.method };
-        let (type_bits, dos_attributes) = if directory { (S_IFDIR, 0x10) } else { (0o100000, 0) };
         let local_at = self.output.position;
-        let member = Member {
-            width: Width::new(method, length, local_at, empty),
-            method,
-            flags,
-            dos: options.modified,
-            name_len,
-            comment_len,
-            external: ((type_bits | u32::from(options.permissions.0)) << 16) | dos_attributes,
-            mtime: options.extended_mtime,
-            local_at,
-        };
+        let member = prepare_member(options, length, directory, local_at)?;
+        let empty = matches!(length, InputLength::Exact(0));
 
         let usage = self.output.work.usage;
         let limits = self.output.work.limits;
@@ -518,18 +482,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         bound(entries, limits.entries, Limit::Entries)?;
         let central = add(self.central.len() as u64, member.central_len())?;
         bound(central, limits.central_bytes, Limit::CentralBytes)?;
-        let payload_min = match length {
-            _ if directory => 0,
-            InputLength::Exact(size) => {
-                bound(size, limits.entry_decoded_bytes, Limit::EntryDecodedBytes)?;
-                bound(add(add(usage.source_bytes, size)?, 1)?, limits.source_bytes, Limit::SourceBytes)?;
-                if method == Method::Stored { size } else { 0 }
-            }
-            InputLength::Unknown => {
-                bound(add(usage.source_bytes, 1)?, limits.source_bytes, Limit::SourceBytes)?;
-                0
-            }
-        };
+        let payload_min = if directory { 0 } else { self.output.work.payload_min(length, member.method)? };
         let local_and_payload = add(member.local_len(), payload_min)?;
         let payload_end = add(local_at, local_and_payload)?;
         let end = End::new(entries, central, payload_end, self.wide_member || member.width.is_wide(), self.comment_len);
@@ -542,15 +495,7 @@ impl<W: Write + Seek> ZipWriter<W> {
 
     fn reserve_central(&mut self, needed: u64) -> Result<(), WriteError> {
         let max = self.output.work.limits.metadata_capacity - self.comment.capacity() as u64;
-        bound(needed, max, Limit::MetadataCapacity)?;
-        let needed = usize::try_from(needed).map_err(|_| WriteError::Overflow)?;
-        let capacity = self.central.capacity();
-        if needed > capacity {
-            let new_capacity = needed.max(capacity.saturating_mul(2)).min(max as usize);
-            self.central.try_reserve_exact(new_capacity - self.central.len()).map_err(WriteError::Allocation)?;
-            bound(self.central.capacity() as u64, max, Limit::MetadataCapacity)?;
-        }
-        Ok(())
+        reserve_central(&mut self.central, needed, max)
     }
 
     fn write_file<R: Read + ?Sized>(
@@ -565,36 +510,14 @@ impl<W: Write + Seek> ZipWriter<W> {
         if first == 0 {
             member.method = Method::Stored;
             member.width = Width::new(Method::Stored, InputLength::Exact(0), member.local_at, true);
-            self.write_local(&member, options.name.bytes())?;
+            self.output.write_local(&member, options.name.bytes())?;
             return self.complete(options, &member, entries, 0, 0, 0);
         }
 
-        self.write_local(&member, options.name.bytes())?;
-        let payload_at = self.output.position;
-        let mut crc = Hasher::new();
-        let mut chunk = first;
-        let mut encoder = match member.method {
-            Method::Stored => None,
-            Method::Deflate(level) => Some(Compress::new(Compression::new(level.0), false)),
-        };
-        let mut compressed = [0; BUFFER];
-        while chunk != 0 {
-            let bytes = &input[..chunk];
-            crc.update(bytes);
-            if let Some(encoder) = &mut encoder {
-                self.output.deflate(encoder, bytes, &mut compressed, FlushCompress::None)?;
-            } else {
-                self.output.write(bytes, IoStage::Payload)?;
-            }
-            chunk = file.read(&mut self.output.work, &mut input)?;
-        }
-        if let Some(encoder) = &mut encoder {
-            self.output.deflate(encoder, &[], &mut compressed, FlushCompress::Finish)?;
-        }
+        self.output.write_local(&member, options.name.bytes())?;
+        let (crc, packed) = self.output.write_payload(member.method, &mut file, &mut input, first)?;
         let payload_end = self.output.position;
-        let packed = payload_end.checked_sub(payload_at).ok_or(WriteError::Overflow)?;
         let decoded = file.decoded;
-        let crc = crc.finalize();
 
         let central = add(self.central.len() as u64, member.central_len())?;
         let end = End::new(entries, central, payload_end, self.wide_member || member.width.is_wide(), self.comment_len);
@@ -612,12 +535,6 @@ impl<W: Write + Seek> ZipWriter<W> {
         }
         self.output.seek_to(payload_end, IoStage::BackpatchRestore)?;
         self.complete(options, &member, entries, crc, decoded, packed)
-    }
-
-    fn write_local(&mut self, member: &Member, name: &[u8]) -> Result<(), WriteError> {
-        self.output.write(member.local().as_bytes(), IoStage::LocalHeader)?;
-        self.output.write(name, IoStage::LocalHeader)?;
-        self.output.write(member.local_extra().as_bytes(), IoStage::LocalHeader)
     }
 
     fn complete(
@@ -653,6 +570,67 @@ impl<W: Write + Seek> ZipWriter<W> {
     }
 }
 
+fn archive_comment_len(options: &WriterOptions<'_>) -> Result<u16, WriteError> {
+    let len = metadata_len(options.comment, "archive comment exceeds 65,535 bytes")?;
+    let max_buffer = isize::MAX as u64;
+    bound(options.limits.central_bytes, max_buffer, Limit::CentralBytes)?;
+    bound(options.limits.metadata_capacity, max_buffer, Limit::MetadataCapacity)?;
+    Ok(len)
+}
+
+fn prepare_member(
+    options: EntryOptions<'_>,
+    length: InputLength,
+    directory: bool,
+    local_at: u64,
+) -> Result<Member, WriteError> {
+    let name = options.name.bytes();
+    let name_len = metadata_len(name, "entry name exceeds 65,535 bytes")?;
+    let comment_len = metadata_len(options.comment, "entry comment exceeds 65,535 bytes")?;
+    let flags = if matches!(options.name, EntryName::Utf8(_)) {
+        if std::str::from_utf8(options.comment).is_err() {
+            return Err(WriteError::InvalidMetadata("UTF-8 entry requires a UTF-8 comment"));
+        }
+        FLAG_UTF8
+    } else {
+        0
+    };
+    let slash = name.ends_with(b"/");
+    if directory {
+        if !slash || name.ends_with(b"//") || options.method != Method::Stored {
+            return Err(WriteError::InvalidMetadata("directory requires Stored and exactly one terminal slash"));
+        }
+    } else if slash {
+        return Err(WriteError::InvalidMetadata("file name ends with slash"));
+    }
+    let empty = matches!(length, InputLength::Exact(0));
+    let method = if empty { Method::Stored } else { options.method };
+    let (type_bits, dos_attributes) = if directory { (S_IFDIR, 0x10) } else { (0o100000, 0) };
+    Ok(Member {
+        width: Width::new(method, length, local_at, empty),
+        method,
+        flags,
+        dos: options.modified,
+        name_len,
+        comment_len,
+        external: ((type_bits | u32::from(options.permissions.0)) << 16) | dos_attributes,
+        mtime: options.extended_mtime,
+        local_at,
+    })
+}
+
+fn reserve_central(central: &mut Vec<u8>, needed: u64, max: u64) -> Result<(), WriteError> {
+    bound(needed, max, Limit::MetadataCapacity)?;
+    let needed = usize::try_from(needed).map_err(|_| WriteError::Overflow)?;
+    let capacity = central.capacity();
+    if needed > capacity {
+        let new_capacity = needed.max(capacity.saturating_mul(2)).min(max as usize);
+        central.try_reserve_exact(new_capacity - central.len()).map_err(WriteError::Allocation)?;
+        bound(central.capacity() as u64, max, Limit::MetadataCapacity)?;
+    }
+    Ok(())
+}
+
 const BUFFER: usize = 64 << 10;
 
 impl<'a> EntryName<'a> {
@@ -683,6 +661,22 @@ struct Work {
 }
 
 impl Work {
+    fn payload_min(&self, length: InputLength, method: Method) -> Result<u64, WriteError> {
+        let usage = self.usage;
+        let limits = self.limits;
+        Ok(match length {
+            InputLength::Exact(size) => {
+                bound(size, limits.entry_decoded_bytes, Limit::EntryDecodedBytes)?;
+                bound(add(add(usage.source_bytes, size)?, 1)?, limits.source_bytes, Limit::SourceBytes)?;
+                if method == Method::Stored { size } else { 0 }
+            }
+            InputLength::Unknown => {
+                bound(add(usage.source_bytes, 1)?, limits.source_bytes, Limit::SourceBytes)?;
+                0
+            }
+        })
+    }
+
     fn check_canceled(&self) -> Result<(), WriteError> {
         if self.cancel.as_ref().is_some_and(Cancellation::is_canceled) {
             return Err(WriteError::Canceled);
@@ -755,7 +749,7 @@ struct Output<W> {
     position: u64,
 }
 
-impl<W: Write + Seek> Output<W> {
+impl<W: Write> Output<W> {
     fn new(sink: W, limits: WriteLimits, cancel: Option<Cancellation>) -> Self {
         Self { sink, work: Work { limits, cancel, usage: WriteUsage::default() }, position: 0 }
     }
@@ -764,22 +758,6 @@ impl<W: Write + Seek> Output<W> {
         bound(end.archive_extent()?, self.work.limits.archive_extent, Limit::ArchiveExtent)?;
         let output_bytes = add(add(self.work.usage.output_bytes, before_tail)?, end.trailer_len()?)?;
         bound(output_bytes, self.work.limits.output_bytes, Limit::OutputBytes)
-    }
-
-    fn seek(&mut self, from: SeekFrom, stage: IoStage) -> Result<u64, WriteError> {
-        let position = self.work.io(stage, || self.sink.seek(from))?;
-        self.position = position;
-        Ok(position)
-    }
-
-    fn seek_to(&mut self, position: u64, stage: IoStage) -> Result<(), WriteError> {
-        if self.seek(SeekFrom::Start(position), stage)? != position {
-            return Err(WriteError::io(
-                stage,
-                io::Error::new(ErrorKind::InvalidData, "seek returned an unexpected position"),
-            ));
-        }
-        Ok(())
     }
 
     fn write(&mut self, mut bytes: &[u8], stage: IoStage) -> Result<(), WriteError> {
@@ -830,8 +808,77 @@ impl<W: Write + Seek> Output<W> {
         }
     }
 
+    fn write_local(&mut self, member: &Member, name: &[u8]) -> Result<(), WriteError> {
+        self.write(member.local().as_bytes(), IoStage::LocalHeader)?;
+        self.write(name, IoStage::LocalHeader)?;
+        self.write(member.local_extra().as_bytes(), IoStage::LocalHeader)
+    }
+
+    fn write_payload<R: Read + ?Sized>(
+        &mut self,
+        method: Method,
+        file: &mut FileInput<'_, R>,
+        input: &mut [u8; BUFFER],
+        first: usize,
+    ) -> Result<(u32, u64), WriteError> {
+        let payload_at = self.position;
+        let mut crc = Hasher::new();
+        let mut chunk = first;
+        let mut encoder = match method {
+            Method::Stored => None,
+            Method::Deflate(level) => Some(Compress::new(Compression::new(level.0), false)),
+        };
+        let mut compressed = [0; BUFFER];
+        while chunk != 0 {
+            let bytes = &input[..chunk];
+            crc.update(bytes);
+            if let Some(encoder) = &mut encoder {
+                self.deflate(encoder, bytes, &mut compressed, FlushCompress::None)?;
+            } else {
+                self.write(bytes, IoStage::Payload)?;
+            }
+            chunk = file.read(&mut self.work, input)?;
+        }
+        if let Some(encoder) = &mut encoder {
+            self.deflate(encoder, &[], &mut compressed, FlushCompress::Finish)?;
+        }
+        let payload_end = self.position;
+        let packed = payload_end.checked_sub(payload_at).ok_or(WriteError::Overflow)?;
+        Ok((crc.finalize(), packed))
+    }
+
+    fn write_tail(&mut self, end: End, central: &[u8], comment: &[u8]) -> Result<(), WriteError> {
+        let record = end.record()?;
+        for chunk in central.chunks(BUFFER) {
+            self.write(chunk, IoStage::CentralDirectory)?;
+        }
+        self.write(record.as_bytes(), IoStage::EndRecord)?;
+        self.write(comment, IoStage::EndRecord)?;
+        self.flush()?;
+        self.work.check_canceled()?;
+        Ok(())
+    }
+
     fn flush(&mut self) -> Result<(), WriteError> {
         self.work.io(IoStage::Flush, || self.sink.flush())
+    }
+}
+
+impl<W: Write + Seek> Output<W> {
+    fn seek(&mut self, from: SeekFrom, stage: IoStage) -> Result<u64, WriteError> {
+        let position = self.work.io(stage, || self.sink.seek(from))?;
+        self.position = position;
+        Ok(position)
+    }
+
+    fn seek_to(&mut self, position: u64, stage: IoStage) -> Result<(), WriteError> {
+        if self.seek(SeekFrom::Start(position), stage)? != position {
+            return Err(WriteError::io(
+                stage,
+                io::Error::new(ErrorKind::InvalidData, "seek returned an unexpected position"),
+            ));
+        }
+        Ok(())
     }
 }
 
