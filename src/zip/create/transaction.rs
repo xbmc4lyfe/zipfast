@@ -229,7 +229,7 @@ impl CreatePlan {
                     attempts.run(|| (&*file).seek(SeekFrom::Start(0))).at(CreateStage::SourceRead)?;
                     #[cfg(test)]
                     tests::event(tests::Event::BeforeSourceRead, Some(&source.path)).at(CreateStage::SourceRead)?;
-                    let mut input = SourceInput { file, attempts, offset: 0 };
+                    let mut input = SourceInput::new(file, attempts);
                     let receipt = writer
                         .add_file(entry.options(), &mut input, InputLength::Exact(source.stamp.len))
                         .map_err(classify_member_error)?;
@@ -273,7 +273,7 @@ fn classify_member_error(error: WriteError) -> Stopped {
     Stopped::at(stage, writer_error(error))
 }
 
-fn writer_error(error: WriteError) -> CreateError {
+pub(in crate::zip) fn writer_error(error: WriteError) -> CreateError {
     if let WriteError::Io { source, .. } = &error
         && let Some(error) = source.get_ref().and_then(|e| e.downcast_ref::<CreateError>())
     {
@@ -291,7 +291,7 @@ pub(super) fn verify_stamp(expected: Stamp, actual: Stamp, id: CreateEntryId) ->
     if actual == expected { Ok(()) } else { Err(CreateError::SourceChanged(id)) }
 }
 
-enum Aftermath {
+pub(in crate::zip) enum Aftermath {
     Clean,
     Foreign,
     Retained,
@@ -299,7 +299,7 @@ enum Aftermath {
 }
 
 impl Aftermath {
-    fn into_public(self, stage: Stage) -> CleanupState {
+    pub(in crate::zip) fn into_public(self, stage: Stage) -> CleanupState {
         match self {
             Self::Clean => CleanupState::Clean,
             Self::Foreign => CleanupState::ForeignStageName { path: stage.into_path() },
@@ -309,7 +309,12 @@ impl Aftermath {
     }
 }
 
-fn cleanup(parent: &Parent, stage: &Stage, publication: Publication, budget: &Attempts<'_>) -> Aftermath {
+pub(in crate::zip) fn cleanup(
+    parent: &Parent,
+    stage: &Stage,
+    publication: Publication,
+    budget: &Attempts<'_>,
+) -> Aftermath {
     let examine = || -> Result<Aftermath> {
         #[cfg(test)]
         tests::event(tests::Event::BeforeCleanup, Some(stage.path()))?;
@@ -358,21 +363,31 @@ impl<T> AtStage<T> for Result<T> {
     }
 }
 
-struct RawIo<'a> {
+pub(in crate::zip) struct RawIo<'a> {
     file: &'a File,
     attempts: Attempts<'a>,
     #[cfg(test)]
     position: u64,
+    #[cfg(test)]
+    rewrite_hooks: bool,
 }
 
 impl<'a> RawIo<'a> {
-    fn new(file: &'a File, attempts: Attempts<'a>) -> Self {
+    pub(in crate::zip) fn new(file: &'a File, attempts: Attempts<'a>) -> Self {
         Self {
             file,
             attempts,
             #[cfg(test)]
             position: 0,
+            #[cfg(test)]
+            rewrite_hooks: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::zip) fn with_rewrite_hooks(mut self) -> Self {
+        self.rewrite_hooks = true;
+        self
     }
 
     fn charge(&self) -> io::Result<()> {
@@ -387,10 +402,16 @@ fn into_io(error: CreateError) -> io::Error {
     }
 }
 
-struct SourceInput<'a> {
+pub(in crate::zip) struct SourceInput<'a> {
     file: &'a File,
     attempts: Attempts<'a>,
     offset: u64,
+}
+
+impl<'a> SourceInput<'a> {
+    pub(in crate::zip) fn new(file: &'a File, attempts: Attempts<'a>) -> Self {
+        Self { file, attempts, offset: 0 }
+    }
 }
 
 impl Read for SourceInput<'_> {
@@ -415,6 +436,10 @@ impl Write for RawIo<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         self.charge()?;
         #[cfg(test)]
+        if self.rewrite_hooks {
+            crate::zip::rewrite::test_event(crate::zip::rewrite::Event::Write, None)?;
+        }
+        #[cfg(test)]
         tests::event_io(
             tests::Event::SinkWrite { at: self.position, signature: bytes.get(..4).map(|b| b.try_into().unwrap()) },
             None,
@@ -431,6 +456,10 @@ impl Write for RawIo<'_> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.charge()?;
+        #[cfg(test)]
+        if self.rewrite_hooks {
+            crate::zip::rewrite::test_event(crate::zip::rewrite::Event::Flush, None)?;
+        }
         #[cfg(test)]
         tests::event_io(tests::Event::SinkFlush, None)?;
         self.file.flush()

@@ -53,7 +53,7 @@ use super::write::{WriteError, WriteLimits, WriteUsage};
 use crate::extract::Cancellation;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-mod native;
+pub(super) mod native;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub use native::CreatePlan;
 
@@ -66,7 +66,7 @@ const MIB: u64 = 1 << 20;
 const TIB: u64 = 1 << 40;
 const FINALIZATION_RESERVE: u64 = 64;
 const MAX_FIELD: usize = u16::MAX as usize;
-type Result<T> = std::result::Result<T, CreateError>;
+pub(super) type Result<T> = std::result::Result<T, CreateError>;
 
 /// Options for a verified new archive.
 #[derive(Clone)]
@@ -203,7 +203,7 @@ impl CollisionPath {
 
 /// A member's zero-based admission ordinal.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CreateEntryId(usize);
+pub struct CreateEntryId(pub(super) usize);
 
 impl CreateEntryId {
     /// Return the position of the member in the planned archive.
@@ -413,7 +413,7 @@ pub enum CreateStage {
 pub enum Publication {
     /// The transaction did not publish the destination.
     NotPublished,
-    /// Native no-replace rename succeeded.
+    /// Native publication succeeded.
     Published,
     /// The native error does not establish whether publication occurred.
     Unknown,

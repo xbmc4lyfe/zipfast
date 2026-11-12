@@ -23,20 +23,21 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 use flate2::{Decompress, FlushDecompress, Status};
 use zip_container::{
-    CentralRecord, Directory, DirectoryDeclaration, DirectoryError, DirectoryParser, EndDiscovery, EndRecord,
-    ExtraIter, LOCAL_HEADER_LEN, LocalHeader, Profile, Zip64End, Zip64Locator, local_layout,
+    CentralRecord, Directory, DirectoryDeclaration, DirectoryError, DirectoryLocation, DirectoryParser, EndDiscovery,
+    EndRecord, ExtraIter, LOCAL_HEADER_LEN, LocalHeader, Profile, Zip64End, Zip64Locator, local_layout,
 };
 
 use crate::crc32::Hasher;
 use crate::zip::{FLAG_UTF8, HOST_UNIX, METHOD_DEFLATE, METHOD_STORED, S_IFDIR};
 
 use super::{
-    Attempts, CreateError, CreateLimit, CreateOptions, PlannedEntry, Result, Stamp, VerificationUsage, add, limit, unix,
+    Attempts, CreateError, CreateLimit, CreateLimits, CreateOptions, PlannedEntry, Result, Stamp, VerificationUsage,
+    add, limit, unix,
 };
 use crate::zip::write::{EntryWritten, Method, WriteSummary};
 
 const BUFFER: usize = 64 << 10;
-pub(super) const DISCOVERY_TAIL_BYTES: u64 = 22 + u16::MAX as u64 + 56 + 20;
+pub(in crate::zip) const DISCOVERY_TAIL_BYTES: u64 = 22 + u16::MAX as u64 + 56 + 20;
 const MAX_EXTRA: usize = 37;
 const SIZE_SENTINEL: u64 = u32::MAX as u64;
 
@@ -61,7 +62,8 @@ pub(super) fn verify_created(
             && entries.len() as u64 == summary.usage.entries,
         "wrong created archive length or receipt count",
     )?;
-    let mut reader = Reader { file, options, attempts, usage };
+    let mut reader =
+        Reader { file, limits: options.limits, archive_comment: &options.archive_comment, attempts, usage };
     let mut input = [0; BUFFER];
     // Drop each default discovery's buffers and raw comment before
     // materializing the strict directory. Keep only its checked geometry.
@@ -70,9 +72,9 @@ pub(super) fn verify_created(
         reader.discover(stamp.len, Profile::Zipview, &mut input)?,
     ];
     let directory = reader.read_directory(stamp.len, entries, &mut input)?;
-    check_directory(&directory, receipts, summary, &options.archive_comment)?;
+    check_directory(&directory, receipts.len(), summary, &options.archive_comment)?;
     for (profile, observed) in [Profile::Zipfast, Profile::Zipview].into_iter().zip(ordinary) {
-        if !observed.agrees(&directory) {
+        if !observed.agrees(&directory) || directory.prefix_shift != 0 {
             return Err(CreateError::AmbiguousDirectory { profile });
         }
     }
@@ -100,7 +102,7 @@ pub(super) fn verify_created(
         record.check_central(&mut reader)?;
         let payload_end = record.check_local(&mut reader, directory.directory_range.start, &mut input)?;
         if expected.source.is_some() {
-            reader.verify_payload(receipt, &mut input)?;
+            reader.verify_payload((*receipt).into(), &mut input)?;
             reader.usage.payloads += 1;
         }
         local_at = payload_end;
@@ -123,9 +125,9 @@ pub(super) fn verify_created(
     Ok(VerifiedCreation { stamp })
 }
 
-fn check_directory(
+pub(in crate::zip) fn check_directory(
     directory: &Directory,
-    receipts: &[EntryWritten],
+    entries: usize,
     summary: WriteSummary,
     expected_comment: &[u8],
 ) -> Result<()> {
@@ -134,8 +136,8 @@ fn check_directory(
     let central = &directory.directory_range;
     ensure(
         directory.prefix_shift == 0
-            && directory.entries.len() == receipts.len()
-            && declared.entries == receipts.len() as u64
+            && directory.entries.len() == entries
+            && declared.entries == entries as u64
             && declared.size == summary.usage.central_bytes
             && declared.offset == summary.central_offset
             && central.start == declared.offset
@@ -188,7 +190,8 @@ fn check_directory(
     }
 }
 
-struct Geometry {
+#[derive(PartialEq, Eq)]
+pub(in crate::zip) struct Geometry {
     end: EndRecord,
     zip64_end: Option<Zip64End>,
     locator: Option<Zip64Locator>,
@@ -199,13 +202,38 @@ struct Geometry {
 }
 
 impl Geometry {
-    fn agrees(&self, strict: &Directory) -> bool {
+    pub(in crate::zip) fn from_location(located: &DirectoryLocation) -> Self {
+        Self {
+            end: located.end_record().clone(),
+            zip64_end: located.zip64_end().cloned(),
+            locator: located.zip64_locator().cloned(),
+            declaration: located.declaration(),
+            directory: located.directory_range(),
+            prefix_shift: located.prefix_shift(),
+            comment: located.comment_range(),
+        }
+    }
+
+    pub(in crate::zip) fn eocd(&self) -> u64 {
+        self.end.source.start
+    }
+    pub(in crate::zip) fn comment_end(&self) -> u64 {
+        self.comment.end
+    }
+    pub(in crate::zip) fn metadata_wire_bytes(&self) -> Option<u64> {
+        self.declaration
+            .size
+            .checked_sub(self.declaration.entries.checked_mul(46)?)?
+            .checked_add(u64::from(self.end.comment_len))
+    }
+
+    pub(in crate::zip) fn agrees(&self, strict: &Directory) -> bool {
         self.end == strict.end_record
             && self.zip64_end == strict.zip64_end
             && self.locator == strict.zip64_locator
             && self.declaration == strict.declaration
             && self.directory == strict.directory_range
-            && self.prefix_shift == 0
+            && self.prefix_shift == strict.prefix_shift
             && self.comment == strict.comment_range
     }
 }
@@ -386,14 +414,69 @@ fn expect_qword(bytes: &mut &[u8], expected: u64) -> Result<()> {
     ensure(field == expected.to_le_bytes(), "wrong ZIP64 extra value")
 }
 
-struct Reader<'a, 'b> {
+pub(in crate::zip) struct Reader<'a, 'b> {
     file: &'a mut File,
-    options: &'a CreateOptions,
+    limits: CreateLimits,
+    archive_comment: &'a [u8],
     attempts: &'a Attempts<'b>,
     usage: &'a mut VerificationUsage,
 }
 
-impl Reader<'_, '_> {
+#[derive(Clone, Copy)]
+pub(in crate::zip) struct Payload {
+    pub(crate) method: u16,
+    pub(crate) packed_size: u64,
+    pub(crate) decoded_size: u64,
+    pub(crate) crc32: u32,
+}
+
+impl From<EntryWritten> for Payload {
+    fn from(receipt: EntryWritten) -> Self {
+        let method = match receipt.method {
+            Method::Stored => METHOD_STORED,
+            Method::Deflate(_) => METHOD_DEFLATE,
+        };
+        Self { method, packed_size: receipt.packed_size, decoded_size: receipt.decoded_size, crc32: receipt.crc32 }
+    }
+}
+
+impl<'a, 'b> Reader<'a, 'b> {
+    pub(in crate::zip) fn new(
+        file: &'a mut File,
+        limits: CreateLimits,
+        attempts: &'a Attempts<'b>,
+        usage: &'a mut VerificationUsage,
+    ) -> Self {
+        Self { file, limits, archive_comment: &[], attempts, usage }
+    }
+
+    pub(in crate::zip) fn check_new(
+        &mut self,
+        central: &CentralRecord,
+        expected: &PlannedEntry,
+        receipt: &EntryWritten,
+        boundary: u64,
+        buffer: &mut [u8],
+    ) -> Result<bool> {
+        let framing = Framing::new(expected, receipt)?;
+        let record = Member { central, expected, receipt, framing };
+        record.check_central(self)?;
+        let payload_end = record.check_local(self, boundary, buffer)?;
+        ensure(payload_end == boundary, "new entry leaves a gap before the next record")?;
+        if expected.source.is_some() {
+            self.verify_payload((*receipt).into(), buffer)?;
+            self.usage.payloads += 1;
+        }
+        Ok(record.framing.version == 45)
+    }
+
+    pub(in crate::zip) fn check_payload(&mut self, at: u64, payload: Payload, buffer: &mut [u8]) -> Result<()> {
+        self.seek(at)?;
+        self.verify_payload(payload, buffer)?;
+        self.usage.payloads += 1;
+        Ok(())
+    }
+
     fn seek(&mut self, at: u64) -> Result<()> {
         let actual = self.attempts.run(|| {
             #[cfg(test)]
@@ -404,7 +487,7 @@ impl Reader<'_, '_> {
     }
 
     fn read_exact(&mut self, mut bytes: &mut [u8]) -> Result<()> {
-        let maximum = self.options.limits.verification_read_bytes;
+        let maximum = self.limits.verification_read_bytes;
         limit(add(self.usage.read_bytes, bytes.len() as u64)?, maximum, CreateLimit::VerificationReadBytes)?;
         while !bytes.is_empty() {
             let count = self.attempts.run(|| {
@@ -422,28 +505,27 @@ impl Reader<'_, '_> {
     }
 
     fn read_directory(&mut self, len: u64, entries: &[PlannedEntry], buffer: &mut [u8]) -> Result<Directory> {
-        let options = self.options;
-        let mut limits = self.parser_budget()?;
-        limits.entries = limits.entries.min(options.limits.directory_entries()).min(entries.len() as u64);
+        let limits = self.limits;
+        let comment = self.archive_comment;
+        let mut parser_limits = self.parser_budget()?;
+        parser_limits.entries = parser_limits.entries.min(limits.directory_entries()).min(entries.len() as u64);
         // Only the exact expected raw name and comment totals may be owned.
         // The admitted extra types use scalar projections, with no owned
         // variable-length Unicode path or other variable-length summary.
         let mut names = 0;
-        let mut comments = options.archive_comment.len() as u64;
+        let mut comments = comment.len() as u64;
         for entry in entries {
-            if options.cancel.is_canceled() {
-                return Err(CreateError::Canceled);
-            }
+            self.attempts.check_cancel()?;
             names = add(names, entry.name.len() as u64)?;
             comments = add(comments, entry.comment.len() as u64)?;
         }
-        limits.name_bytes = limits.name_bytes.min(names);
-        limits.comment_bytes = limits.comment_bytes.min(comments);
-        limits.extra_bytes = 0;
+        parser_limits.name_bytes = parser_limits.name_bytes.min(names);
+        parser_limits.comment_bytes = parser_limits.comment_bytes.min(comments);
+        parser_limits.extra_bytes = 0;
         let eocd = len
-            .checked_sub(22 + options.archive_comment.len() as u64)
+            .checked_sub(22 + comment.len() as u64)
             .ok_or(CreateError::Verification("archive is too short for the expected end and comment"))?;
-        let mut parser = DirectoryParser::at_eocd_with_scratch_limit(len, eocd, limits, self.scratch_limit())
+        let mut parser = DirectoryParser::at_eocd_with_scratch_limit(len, eocd, parser_limits, self.scratch_limit())
             .map_err(parser_error)?;
         let mut at = None;
         loop {
@@ -464,12 +546,12 @@ impl Reader<'_, '_> {
         }
         let directory = parser.finish().map_err(parser_error)?;
         self.usage.record_capacity = directory.entries.capacity() as u64 * size_of::<CentralRecord>() as u64;
-        limit(self.usage.record_capacity, options.limits.verification_records, CreateLimit::VerificationRecords)?;
+        limit(self.usage.record_capacity, limits.verification_records, CreateLimit::VerificationRecords)?;
         Ok(directory)
     }
 
     fn parser_budget(&self) -> Result<zip_container::Limits> {
-        let mut limits = self.options.limits.directory;
+        let mut limits = self.limits.directory;
         limits.fetched_bytes =
             limits.fetched_bytes.checked_sub(self.usage.discovery_bytes).ok_or(CreateError::Overflow)?;
         limits.work_units = limits.work_units.checked_sub(self.usage.discovery_work).ok_or(CreateError::Overflow)?;
@@ -478,7 +560,7 @@ impl Reader<'_, '_> {
 
     fn discover(&mut self, len: u64, profile: Profile, buffer: &mut [u8]) -> Result<Geometry> {
         let mut limits = self.parser_budget()?;
-        limits.comment_bytes = limits.comment_bytes.min(self.options.archive_comment.len() as u64);
+        limits.comment_bytes = limits.comment_bytes.min(self.archive_comment.len() as u64);
         let baseline_bytes = self.usage.discovery_bytes;
         let baseline_work = self.usage.discovery_work;
         let ambiguity = || CreateError::AmbiguousDirectory { profile };
@@ -489,9 +571,7 @@ impl Reader<'_, '_> {
         let mut discovery =
             EndDiscovery::new_with_scratch_limit(len, profile, limits, self.scratch_limit()).map_err(classify)?;
         loop {
-            if self.options.cancel.is_canceled() {
-                return Err(CreateError::Canceled);
-            }
+            self.attempts.check_cancel()?;
             let request = discovery.next_read();
             let usage = discovery.usage();
             self.usage.discovery_bytes = add(baseline_bytes, usage.fetched_bytes)?;
@@ -510,31 +590,21 @@ impl Reader<'_, '_> {
             supplied.map_err(classify)?;
         }
         let located = discovery.finish().map_err(classify)?;
-        if located.raw_comment() != self.options.archive_comment {
+        if located.raw_comment() != self.archive_comment {
             return Err(ambiguity());
         }
-        Ok(Geometry {
-            end: located.end_record().clone(),
-            zip64_end: located.zip64_end().cloned(),
-            locator: located.zip64_locator().cloned(),
-            declaration: located.declaration(),
-            directory: located.directory_range(),
-            prefix_shift: located.prefix_shift(),
-            comment: located.comment_range(),
-        })
+        Ok(Geometry::from_location(&located))
     }
 
     fn check_parser(&mut self, parser: &DirectoryParser) -> Result<()> {
-        if self.options.cancel.is_canceled() {
-            return Err(CreateError::Canceled);
-        }
+        self.attempts.check_cancel()?;
         self.usage.directory = parser.usage();
         self.observe_scratch(parser.buffer_usage().capacity_bytes);
         Ok(())
     }
 
     fn scratch_limit(&self) -> usize {
-        usize::try_from(self.options.limits.verification_scratch).unwrap_or(usize::MAX)
+        usize::try_from(self.limits.verification_scratch).unwrap_or(usize::MAX)
     }
 
     fn observe_scratch(&mut self, bytes: usize) {
@@ -542,11 +612,11 @@ impl Reader<'_, '_> {
         self.usage.scratch_capacity = self.usage.scratch_capacity.max(bytes as u64);
     }
 
-    fn verify_payload(&mut self, receipt: &EntryWritten, buffer: &mut [u8]) -> Result<()> {
+    fn verify_payload(&mut self, receipt: Payload, buffer: &mut [u8]) -> Result<()> {
         let mut remaining = receipt.packed_size;
         let mut decoded = 0;
         let mut crc = Hasher::new();
-        if receipt.method == Method::Stored {
+        if receipt.method == METHOD_STORED {
             while remaining != 0 {
                 let len = remaining.min(buffer.len() as u64) as usize;
                 self.read_exact(&mut buffer[..len])?;
@@ -554,6 +624,7 @@ impl Reader<'_, '_> {
                 remaining -= len as u64;
             }
         } else {
+            ensure(receipt.method == METHOD_DEFLATE, "unsupported strict payload verification method")?;
             let mut inflate = Decompress::new(false);
             let mut output = [0; BUFFER];
             let mut current = 0..0;
@@ -583,11 +654,11 @@ impl Reader<'_, '_> {
         ensure(decoded == receipt.decoded_size && crc.finalize() == receipt.crc32, "decoded length or CRC differs")
     }
 
-    fn decoded(&mut self, crc: &mut Hasher, member: &mut u64, receipt: &EntryWritten, bytes: &[u8]) -> Result<()> {
+    fn decoded(&mut self, crc: &mut Hasher, member: &mut u64, receipt: Payload, bytes: &[u8]) -> Result<()> {
         *member = add(*member, bytes.len() as u64)?;
         let aggregate = add(self.usage.decoded_bytes, bytes.len() as u64)?;
-        limit(*member, self.options.limits.verification_entry_bytes, CreateLimit::VerificationEntryBytes)?;
-        limit(aggregate, self.options.limits.verification_decoded_bytes, CreateLimit::VerificationDecodedBytes)?;
+        limit(*member, self.limits.verification_entry_bytes, CreateLimit::VerificationEntryBytes)?;
+        limit(aggregate, self.limits.verification_decoded_bytes, CreateLimit::VerificationDecodedBytes)?;
         ensure(*member <= receipt.decoded_size, "payload exceeds the declared decoded length")?;
         self.usage.decoded_bytes = aggregate;
         crc.update(bytes);
