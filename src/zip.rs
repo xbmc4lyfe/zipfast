@@ -23,6 +23,10 @@ use std::io::{BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use flate2::{Decompress, FlushDecompress, Status};
+use zip_container::{
+    AesFields, CentralHeader, Directory, DirectoryError, DirectoryParser, ExtraMtime, LOCAL_HEADER_LEN, Limits,
+    LocalHeader, OwnershipError, ParseError, Profile, ReducedCentralRecord, ResolvedFields, local_layout,
+};
 
 use crate::error::{Error, Result};
 use crate::extract::{
@@ -31,12 +35,6 @@ use crate::extract::{
 use crate::path::sanitize;
 use crate::rar5::Redirection;
 use crate::stream::{LZMA_MEMORY_LIMIT, zstd_decoder};
-
-const SIG_LOCAL: u32 = 0x0403_4b50;
-const SIG_CENTRAL: u32 = 0x0201_4b50;
-const SIG_END: u32 = 0x0605_4b50;
-const SIG_END64: u32 = 0x0606_4b50;
-const SIG_END64_LOCATOR: u32 = 0x0706_4b50;
 
 const FLAG_ENCRYPTED: u16 = 0x0001;
 const FLAG_UTF8: u16 = 0x0800;
@@ -62,9 +60,9 @@ const S_IFLNK: u32 = 0o120000;
 
 const BUF: usize = 1 << 20;
 const ENCRYPTED_PACKED_LIMIT: u64 = 128 << 20;
-const DIRECTORY_BYTE_LIMIT: u64 = 128 << 20;
-const DIRECTORY_ENTRY_LIMIT: u64 = 1_000_000;
-const CENTRAL_HEADER_LEN: usize = 46;
+// A cancelable parse polls between bounded reads and parser supplies. The
+// shared parser also bounds the tail it may consume from cache in one poll.
+const CANCELABLE_DIRECTORY_CHUNK: usize = 64 << 10;
 
 /// Whether the file starts the way a ZIP archive does.
 pub fn sniff(head: &[u8]) -> bool {
@@ -116,23 +114,75 @@ impl ZipEntry {
     }
 }
 
-fn le16(b: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([b[at], b[at + 1]])
-}
-
-fn le32(b: &[u8], at: usize) -> u32 {
-    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
-}
-
-fn le64(b: &[u8], at: usize) -> u64 {
-    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
-}
-
-fn read_at(file: &mut File, at: u64, len: usize) -> Result<Vec<u8>> {
+fn read_local_header(file: &mut File, at: u64) -> Result<[u8; LOCAL_HEADER_LEN]> {
     file.seek(SeekFrom::Start(at))?;
-    let mut buf = vec![0u8; len];
+    let mut buf = [0; LOCAL_HEADER_LEN];
     file.read_exact(&mut buf)?;
     Ok(buf)
+}
+
+fn directory_error(error: DirectoryError) -> Error {
+    match error {
+        DirectoryError::NotZip => Error::NotAnArchive,
+        DirectoryError::MalformedEnd => Error::Corrupt("central directory size or offset"),
+        DirectoryError::MalformedZip64 => Error::Corrupt("ZIP64 metadata"),
+        DirectoryError::EntryCount { .. } => Error::Corrupt("central directory entry count"),
+        DirectoryError::InvalidLocalOffset => Error::Corrupt("local header offset"),
+        DirectoryError::UnsupportedDisk => Error::Unsupported("split ZIP archives (.z01 and on)".into()),
+        DirectoryError::Limit(_)
+        | DirectoryError::Ownership(OwnershipError::CounterOverflow { .. } | OwnershipError::LimitExceeded { .. }) => {
+            Error::Unsupported("ZIP directory exceeds the listing limit".into())
+        }
+        DirectoryError::Allocation | DirectoryError::Ownership(OwnershipError::Allocation { .. }) => {
+            Error::Unsupported("cannot allocate ZIP directory metadata".into())
+        }
+        DirectoryError::Supply(_) => Error::Corrupt("ZIP directory source range"),
+        DirectoryError::Incomplete => Error::Truncated,
+        DirectoryError::Parse(_) => Error::Corrupt("central directory record"),
+    }
+}
+
+fn check_cancel(cancel: Option<&Cancellation>) -> Result<()> {
+    Ok(cancel.map_or(Ok(()), Cancellation::check_io)?)
+}
+
+fn read_directory<T>(
+    file: &mut (impl Read + Seek),
+    len: u64,
+    mut parser: DirectoryParser<T>,
+    cancel: Option<&Cancellation>,
+) -> Result<Directory<T>> {
+    let mut buf = Vec::new();
+    let mut file_at = None;
+    loop {
+        check_cancel(cancel)?;
+        let Some(range) = parser.next_read().map_err(directory_error)? else { break };
+        // DirectoryParser checks each pending range and cumulative source
+        // usage against Limits before issuing a request.
+        let size = range
+            .end
+            .checked_sub(range.start)
+            .filter(|&size| size != 0 && range.end <= len)
+            .and_then(|size| usize::try_from(size).ok())
+            .ok_or(Error::Corrupt("ZIP directory source range"))?;
+        let chunk_size = if cancel.is_some() { size.min(CANCELABLE_DIRECTORY_CHUNK) } else { size };
+        if chunk_size > buf.len() {
+            buf.try_reserve_exact(chunk_size - buf.len()).map_err(|_| directory_error(DirectoryError::Allocation))?;
+            buf.resize(chunk_size, 0);
+        }
+        check_cancel(cancel)?;
+        if file_at != Some(range.start) {
+            file.seek(SeekFrom::Start(range.start))?;
+        }
+        file.read_exact(&mut buf[..chunk_size])?;
+        file_at = Some(range.start + chunk_size as u64);
+        check_cancel(cancel)?;
+        parser.supply(range.start, &buf[..chunk_size]).map_err(directory_error)?;
+        // A strict walk can finish at a noncentral trailer before the end
+        // of a pending range. Poll again before reading any remainder.
+    }
+    check_cancel(cancel)?;
+    parser.finish().map_err(directory_error)
 }
 
 /// An open archive: the file and its central directory.
@@ -150,112 +200,43 @@ impl Archive {
     pub(crate) fn open_cancelable(path: &Path, cancel: Option<&Cancellation>) -> Result<Archive> {
         let mut file = File::open(path)?;
         let len = file.metadata()?.len();
-        // the end record is 22 bytes plus a comment of at most 65535
-        let tail_len = len.min(22 + 65535);
-        let tail = read_at(&mut file, len - tail_len, tail_len as usize)?;
-        // the real end record's comment runs exactly to the end of the file; one whose comment would stop short
-        // is more likely a signature inside a comment, so it is only a fallback, for files with bytes appended
-        let candidates = || (0..tail.len().saturating_sub(21)).rev().filter(|&i| le32(&tail, i) == SIG_END);
-        let end = candidates()
-            .find(|&i| i + 22 + le16(&tail, i + 20) as usize == tail.len())
-            .or_else(|| candidates().find(|&i| i + 22 + le16(&tail, i + 20) as usize <= tail.len()))
-            .ok_or(Error::NotAnArchive)?;
-        let end_at = len - tail_len + end as u64;
-        let e = &tail[end..end + 22];
-        let (disk, cd_disk) = (le16(e, 4), le16(e, 6));
-        let mut count = u64::from(le16(e, 10));
-        let mut cd_size = u64::from(le32(e, 12));
-        let mut cd_at = u64::from(le32(e, 16));
-        let mut cd_end = end_at;
-        let mut multi_disk = disk != 0 || cd_disk != 0;
-        if end_at >= 20 {
-            let loc = read_at(&mut file, end_at - 20, 20)?;
-            if le32(&loc, 0) == SIG_END64_LOCATOR {
-                let stored_at = le64(&loc, 8);
-                multi_disk |= le32(&loc, 16) > 1;
-                // the stored offset, or, behind a self-extracting stub, where a plain 56-byte record would sit
-                let mut rec = None;
-                for at in [Some(stored_at), (end_at - 20).checked_sub(56)].into_iter().flatten() {
-                    if at.checked_add(56).is_some_and(|e| e <= end_at - 20) {
-                        let r = read_at(&mut file, at, 56)?;
-                        if le32(&r, 0) == SIG_END64 {
-                            rec = Some((at, r));
-                            break;
-                        }
-                    }
-                }
-                let Some((rec_at, rec)) = rec else { return Err(Error::Corrupt("ZIP64 end record")) };
-                multi_disk |= le32(&rec, 16) != 0 || le32(&rec, 20) != 0;
-                count = le64(&rec, 32);
-                cd_size = le64(&rec, 40);
-                cd_at = le64(&rec, 48);
-                cd_end = end_at - 20;
-                // the ZIP64 record itself sits between the directory and its locator
-                cd_end = cd_end.min(rec_at);
+        check_cancel(cancel)?;
+        let parser = DirectoryParser::with_projection_and_name_crc32(
+            len,
+            Profile::Zipfast,
+            Limits::default(),
+            crate::crc32::hash,
+            project_record,
+        )
+        .map_err(directory_error)?;
+        let directory = read_directory(&mut file, len, parser, cancel)?;
+        let mut entries = directory.entries;
+        if directory.prefix_shift != 0 {
+            for entry in &mut entries {
+                check_cancel(cancel)?;
+                entry.local_at = entry
+                    .local_at
+                    .checked_add(directory.prefix_shift)
+                    .filter(|&at| at < len)
+                    .ok_or(Error::Corrupt("local header offset"))?;
             }
         }
-        if multi_disk {
-            return Err(Error::Unsupported("split ZIP archives (.z01 and on)".into()));
-        }
-        // bytes in front of the archive (a self-extracting stub) shift every stored offset by the same amount
-        let shift = cd_end
-            .checked_sub(cd_size)
-            .and_then(|real| real.checked_sub(cd_at))
-            .ok_or(Error::Corrupt("central directory size or offset"))?;
-        let cd_start = cd_at + shift;
-        if cd_start.checked_add(cd_size).is_none_or(|e| e > len) {
-            return Err(Error::Corrupt("central directory size or offset"));
-        }
-        if cd_size > DIRECTORY_BYTE_LIMIT || count > DIRECTORY_ENTRY_LIMIT {
-            return Err(Error::Unsupported("ZIP directory exceeds the listing limit".into()));
-        }
-        let cd_len = usize::try_from(cd_size).map_err(|_| Error::Corrupt("central directory size"))?;
-        let cd = if let Some(cancel) = cancel {
-            file.seek(SeekFrom::Start(cd_start))?;
-            let mut cd = vec![0; cd_len];
-            for chunk in cd.chunks_mut(BUF) {
-                cancel.check_io()?;
-                file.read_exact(chunk)?;
-            }
-            cd
-        } else {
-            read_at(&mut file, cd_start, cd_len)?
-        };
-        let mut entries = Vec::with_capacity((count as usize).min(cd_len / CENTRAL_HEADER_LEN));
-        let mut at = 0usize;
-        while at + CENTRAL_HEADER_LEN <= cd.len() && le32(&cd, at) == SIG_CENTRAL {
-            if let Some(cancel) = cancel {
-                cancel.check_io()?;
-            }
-            if entries.len() as u64 >= count {
-                return Err(Error::Corrupt("central directory entry count"));
-            }
-            let (entry, next) = parse_central(&cd, at)?;
-            let local_at = entry.local_at.checked_add(shift).filter(|&a| a < len);
-            let local_at = local_at.ok_or(Error::Corrupt("local header offset"))?;
-            entries.push(ZipEntry { local_at, ..entry });
-            at = next;
-        }
-        if entries.len() as u64 != count {
-            return Err(Error::Corrupt("central directory entry count"));
-        }
+        check_cancel(cancel)?;
         Ok(Archive { file, len, entries })
     }
 
     /// Where an entry's data starts, from its local header.
     fn data_at(&mut self, e: &ZipEntry) -> Result<u64> {
-        if e.local_at.checked_add(30).is_none_or(|end| end > self.len) {
+        if e.local_at.checked_add(LOCAL_HEADER_LEN as u64).is_none_or(|end| end > self.len) {
             return Err(Error::Truncated);
         }
-        let head = read_at(&mut self.file, e.local_at, 30)?;
-        if le32(&head, 0) != SIG_LOCAL {
-            return Err(Error::Corrupt("local header signature"));
-        }
-        let at = e.local_at + 30 + u64::from(le16(&head, 26)) + u64::from(le16(&head, 28));
-        if at.checked_add(e.packed).is_none_or(|end| end > self.len) {
-            return Err(Error::Truncated);
-        }
-        Ok(at)
+        let head = read_local_header(&mut self.file, e.local_at)?;
+        let header = LocalHeader::parse(&head).map_err(|error| match error {
+            ParseError::BadSignature { .. } => Error::Corrupt("local header signature"),
+            _ => Error::Truncated,
+        })?;
+        let layout = local_layout(header, e.local_at, self.len).map_err(|_| Error::Truncated)?;
+        Ok(layout.payload_range(e.packed, self.len).map_err(|_| Error::Truncated)?.start)
     }
 
     /// Decodes the entry at a zero-based index and checks its integrity.
@@ -347,7 +328,7 @@ impl Archive {
                     .ok_or(Error::Corrupt("wrong password or damaged AES stream"))?
             } else {
                 let check = if e.flags & 0x0008 != 0 {
-                    let head = read_at(&mut self.file, e.local_at, 30)?;
+                    let head = read_local_header(&mut self.file, e.local_at)?;
                     head[11]
                 } else {
                     (e.crc32 >> 24) as u8
@@ -528,89 +509,50 @@ fn stream_decoder<'a>(e: &ZipEntry, method: u16, packed: impl BufRead + 'a) -> R
     })
 }
 
-/// One central directory record at `at`: the entry and where the next record starts.
-fn parse_central(cd: &[u8], at: usize) -> Result<(ZipEntry, usize)> {
-    let h = &cd[at..at + CENTRAL_HEADER_LEN];
-    let name_len = le16(h, 28) as usize;
-    let extra_len = le16(h, 30) as usize;
-    let comment_len = le16(h, 32) as usize;
-    let name_end = at + CENTRAL_HEADER_LEN + name_len;
-    let extra_end = name_end + extra_len;
-    let next = extra_end + comment_len;
-    if next > cd.len() {
-        return Err(Error::Corrupt("central directory record"));
-    }
-    let raw_name = &cd[at + CENTRAL_HEADER_LEN..name_end];
-    let extra = &cd[name_end..extra_end];
-    let flags = le16(h, 8);
-    let mut e = ZipEntry {
-        name: String::new(),
-        flags,
-        method: le16(h, 10),
-        host: h[5],
-        crc32: le32(h, 16),
-        packed: u64::from(le32(h, 20)),
-        size: u64::from(le32(h, 24)),
-        local_at: u64::from(le32(h, 42)),
-        external: le32(h, 38),
-        mtime: dos_time(le16(h, 12), le16(h, 14)),
-        nanos: 0,
-        aes_info: crate::crypto::aes_extra_info(extra),
-    };
-    let disk_start = le16(h, 34);
-    e.name = decode_name(raw_name, flags & FLAG_UTF8 != 0);
-    let mut x = 0;
-    while x + 4 <= extra.len() {
-        let id = le16(extra, x);
-        let len = le16(extra, x + 2) as usize;
-        let Some(body) = extra.get(x + 4..x + 4 + len) else { break };
-        match id {
-            // ZIP64: only the fields whose 32-bit versions are saturated are present, in this order
-            0x0001 => {
-                let mut f = 0;
-                let mut take = |want: bool| -> Result<Option<u64>> {
-                    if !want {
-                        return Ok(None);
-                    }
-                    let v = body.get(f..f + 8).ok_or(Error::Corrupt("ZIP64 extra field"))?;
-                    f += 8;
-                    Ok(Some(u64::from_le_bytes(v.try_into().unwrap())))
-                };
-                if let Some(v) = take(e.size == 0xFFFF_FFFF)? {
-                    e.size = v;
-                }
-                if let Some(v) = take(e.packed == 0xFFFF_FFFF)? {
-                    e.packed = v;
-                }
-                if let Some(v) = take(e.local_at == 0xFFFF_FFFF)? {
-                    e.local_at = v;
-                }
-            }
-            // NTFS times: tag 1 holds modification, access and creation FILETIMEs
-            0x000a if body.len() >= 32 && le16(body, 4) == 1 && le16(body, 6) >= 24 => {
-                let ticks = le64(body, 8);
-                if ticks > 0 {
-                    e.mtime = Some((ticks / 10_000_000) as i64 - 11_644_473_600);
-                    e.nanos = ((ticks % 10_000_000) * 100) as u32;
-                }
-            }
-            // extended timestamp: a flags byte, then the modification time when bit 0 is set
-            0x5455 if body.len() >= 5 && body[0] & 1 != 0 => {
-                e.mtime = Some(i64::from(le32(body, 1) as i32));
-                e.nanos = 0;
-            }
-            // Info-ZIP Unicode path: used when it was made from the very name stored here
-            0x7075 if body.len() >= 5 && body[0] == 1 && le32(body, 1) == crate::crc32::hash(raw_name) => {
-                e.name = String::from_utf8_lossy(&body[5..]).into_owned();
-            }
-            _ => {}
+fn project_record(record: ReducedCentralRecord<'_>) -> std::result::Result<ZipEntry, DirectoryError> {
+    let view = record.view();
+    let known = record.known();
+    project_entry(
+        view.header(),
+        record.resolved(),
+        view.raw_name(),
+        known.unicode_path.map(|path| path.path_bytes()),
+        known.mtime_override,
+        known.aes,
+    )
+}
+
+fn project_entry(
+    header: CentralHeader,
+    resolved: ResolvedFields,
+    raw_name: &[u8],
+    unicode_path: Option<&[u8]>,
+    mtime_override: Option<ExtraMtime>,
+    aes: Option<AesFields>,
+) -> std::result::Result<ZipEntry, DirectoryError> {
+    let (mtime, nanos) = match mtime_override {
+        Some(ExtraMtime::NtfsFiletime(ticks)) => {
+            (Some((ticks / 10_000_000) as i64 - 11_644_473_600), ((ticks % 10_000_000) * 100) as u32)
         }
-        x += 4 + len;
-    }
-    if disk_start != 0 && disk_start != 0xFFFF {
-        return Err(Error::Unsupported("split ZIP archives (.z01 and on)".into()));
-    }
-    Ok((e, next))
+        Some(ExtraMtime::UnixSeconds(seconds)) => (Some(i64::from(seconds)), 0),
+        None => (dos_time(header.mod_time, header.mod_date), 0),
+    };
+    Ok(ZipEntry {
+        name: decode_name(unicode_path.unwrap_or(raw_name), unicode_path.is_some() || header.flags & FLAG_UTF8 != 0)?,
+        flags: header.flags,
+        method: header.method,
+        host: (header.version_made_by >> 8) as u8,
+        crc32: header.crc32,
+        packed: resolved.packed_size,
+        size: resolved.unpacked_size,
+        local_at: resolved.local_header_offset,
+        external: header.external_attributes,
+        mtime,
+        nanos,
+        aes_info: aes
+            .filter(|fields| (1..=3).contains(&fields.strength))
+            .map(|fields| (fields.strength, fields.vendor_version, fields.method)),
+    })
 }
 
 /// MS-DOS date and time, which carry no time zone: read as UTC.
@@ -632,18 +574,43 @@ fn dos_time(time: u16, date: u16) -> Option<i64> {
 }
 
 /// The high half of code page 437, the encoding of names without the UTF-8 flag.
-const CP437_HIGH: &str = "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■\u{a0}";
+const CP437_HIGH: [char; 128] = [
+    'Ç', 'ü', 'é', 'â', 'ä', 'à', 'å', 'ç', 'ê', 'ë', 'è', 'ï', 'î', 'ì', 'Ä', 'Å', 'É', 'æ', 'Æ', 'ô', 'ö', 'ò', 'û',
+    'ù', 'ÿ', 'Ö', 'Ü', '¢', '£', '¥', '₧', 'ƒ', 'á', 'í', 'ó', 'ú', 'ñ', 'Ñ', 'ª', 'º', '¿', '⌐', '¬', '½', '¼', '¡',
+    '«', '»', '░', '▒', '▓', '│', '┤', '╡', '╢', '╖', '╕', '╣', '║', '╗', '╝', '╜', '╛', '┐', '└', '┴', '┬', '├', '─',
+    '┼', '╞', '╟', '╚', '╔', '╩', '╦', '╠', '═', '╬', '╧', '╨', '╤', '╥', '╙', '╘', '╒', '╓', '╫', '╪', '┘', '┌', '█',
+    '▄', '▌', '▐', '▀', 'α', 'ß', 'Γ', 'π', 'Σ', 'σ', 'µ', 'τ', 'Φ', 'Θ', 'Ω', 'δ', '∞', 'φ', 'ε', '∩', '≡', '±', '≥',
+    '≤', '⌠', '⌡', '÷', '≈', '°', '∙', '·', '√', 'ⁿ', '²', '■', '\u{a0}',
+];
 
-fn decode_name(raw: &[u8], utf8: bool) -> String {
-    if utf8 {
-        return String::from_utf8_lossy(raw).into_owned();
+fn cp437(byte: u8) -> char {
+    if byte < 0x80 { byte as char } else { CP437_HIGH[usize::from(byte - 0x80)] }
+}
+
+fn decode_name(raw: &[u8], utf8: bool) -> std::result::Result<String, DirectoryError> {
+    let mut name = String::new();
+    // Many tools write valid UTF-8 without setting the flag.
+    if let Ok(valid) = std::str::from_utf8(raw) {
+        name.try_reserve_exact(valid.len()).map_err(|_| DirectoryError::Allocation)?;
+        name.push_str(valid);
+    } else if utf8 {
+        // Raw names and Unicode extra bodies are bounded by wire u16 lengths.
+        // Utf8Chunks reproduces from_utf8_lossy's replacement boundaries.
+        let len =
+            raw.utf8_chunks().map(|chunk| chunk.valid().len() + 3 * usize::from(!chunk.invalid().is_empty())).sum();
+        name.try_reserve_exact(len).map_err(|_| DirectoryError::Allocation)?;
+        for chunk in raw.utf8_chunks() {
+            name.push_str(chunk.valid());
+            if !chunk.invalid().is_empty() {
+                name.push('\u{fffd}');
+            }
+        }
+    } else {
+        let len = raw.iter().copied().map(|byte| cp437(byte).len_utf8()).sum();
+        name.try_reserve_exact(len).map_err(|_| DirectoryError::Allocation)?;
+        name.extend(raw.iter().copied().map(cp437));
     }
-    // many tools write UTF-8 without setting the flag; anything else is taken as code page 437
-    if let Ok(s) = std::str::from_utf8(raw) {
-        return s.to_string();
-    }
-    let high: Vec<char> = CP437_HIGH.chars().collect();
-    raw.iter().map(|&b| if b < 0x80 { b as char } else { high[(b - 0x80) as usize] }).collect()
+    Ok(name)
 }
 
 pub fn list(path: &Path) -> Result<Vec<Entry>> {
@@ -770,6 +737,144 @@ pub fn run_with_password(
 mod tests {
     use super::*;
 
+    use std::io::{self, Write};
+    use std::ops::Range;
+
+    fn sparse_directory(entries: u16, comment_len: u16, directory_size: u32) -> (tempfile::NamedTempFile, u64) {
+        let mut archive = tempfile::NamedTempFile::new().unwrap();
+        let mut central = [0; 50];
+        central[..4].copy_from_slice(b"PK\x01\x02");
+        central[28..30].copy_from_slice(&4u16.to_le_bytes());
+        central[32..34].copy_from_slice(&comment_len.to_le_bytes());
+        central[46..].copy_from_slice(b"item");
+        for ordinal in 0..u64::from(entries) {
+            let at = 30 + ordinal * (50 + u64::from(comment_len));
+            archive.seek(SeekFrom::Start(at)).unwrap();
+            archive.write_all(&central).unwrap();
+        }
+
+        let mut end = [0; 22];
+        end[..4].copy_from_slice(b"PK\x05\x06");
+        end[8..10].copy_from_slice(&entries.to_le_bytes());
+        end[10..12].copy_from_slice(&entries.to_le_bytes());
+        end[12..16].copy_from_slice(&directory_size.to_le_bytes());
+        end[16..20].copy_from_slice(&30u32.to_le_bytes());
+        archive.seek(SeekFrom::Start(30 + u64::from(directory_size))).unwrap();
+        archive.write_all(&end).unwrap();
+        (archive, 30 + u64::from(directory_size) + 22)
+    }
+
+    #[derive(Default)]
+    struct ReadTrace {
+        at: u64,
+        ranges: Vec<Range<u64>>,
+    }
+
+    struct TracedFile<'a> {
+        file: File,
+        trace: ReadTrace,
+        cancel_on_read_at: Option<(u64, &'a Cancellation)>,
+    }
+
+    impl Read for TracedFile<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let n = self.file.read(buf)?;
+            let at = self.trace.at;
+            self.trace.at += n as u64;
+            self.trace.ranges.push(at..self.trace.at);
+            if let Some((target, cancel)) = self.cancel_on_read_at
+                && at == target
+            {
+                cancel.cancel();
+            }
+            Ok(n)
+        }
+    }
+
+    impl Seek for TracedFile<'_> {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.trace.at = self.file.seek(pos)?;
+            Ok(self.trace.at)
+        }
+    }
+
+    fn read_traced_directory(
+        file: &mut TracedFile<'_>,
+        len: u64,
+        cancel: Option<&Cancellation>,
+    ) -> Result<Directory<ZipEntry>> {
+        let parser = DirectoryParser::with_projection_and_name_crc32(
+            len,
+            Profile::Zipfast,
+            Limits::default(),
+            crate::crc32::hash,
+            project_record,
+        )
+        .unwrap();
+        read_directory(file, len, parser, cancel)
+    }
+
+    #[test]
+    fn cancelable_open_accepts_a_large_directory_with_a_noncentral_trailer() {
+        let (file, _) = sparse_directory(2, 0, 128 << 20);
+        let cancel = Cancellation::default();
+        let archive = Archive::open_cancelable(file.path(), Some(&cancel)).unwrap();
+        assert_eq!(archive.entries.len(), 2);
+        assert!(archive.entries.iter().all(|entry| entry.name == "item"));
+    }
+
+    #[test]
+    fn directory_driver_bounds_source_requests_and_avoids_local_payloads() {
+        const COUNT: u16 = 260;
+        let (file, len) = sparse_directory(COUNT, u16::MAX, u32::from(COUNT) * (50 + u32::from(u16::MAX)));
+        let mut file =
+            TracedFile { file: file.reopen().unwrap(), trace: ReadTrace::default(), cancel_on_read_at: None };
+        let parsed = read_traced_directory(&mut file, len, None).unwrap();
+        assert_eq!(parsed.entries.len(), usize::from(COUNT));
+        let sizes = file.trace.ranges.iter().map(|r| r.end - r.start);
+        assert!(sizes.clone().max().unwrap() <= 16 << 20);
+        assert!(file.trace.ranges.iter().all(|r| r.start >= 30 && r.end <= len));
+        assert_eq!(sizes.sum::<u64>(), parsed.usage.fetched_bytes);
+        assert!((16 << 20..=129 << 20).contains(&parsed.usage.fetched_bytes));
+    }
+
+    #[test]
+    fn directory_byte_limit_stops_before_reading_the_sparse_directory() {
+        let (file, len) = sparse_directory(2, 0, (128 << 20) + 1);
+        let mut file =
+            TracedFile { file: file.reopen().unwrap(), trace: ReadTrace::default(), cancel_on_read_at: None };
+        assert!(matches!(read_traced_directory(&mut file, len, None), Err(Error::Unsupported(_))));
+        assert_eq!(file.trace.ranges, vec![len - 65_633..len]);
+    }
+
+    #[test]
+    fn directory_driver_stops_at_the_first_canceled_chunk() {
+        let (file, len) = sparse_directory(2, 0, 128 << 20);
+        let cancel = Cancellation::default();
+        let mut file = TracedFile {
+            file: file.reopen().unwrap(),
+            trace: ReadTrace::default(),
+            cancel_on_read_at: Some((76, &cancel)),
+        };
+        assert!(matches!(
+            read_traced_directory(&mut file, len, Some(&cancel)),
+            Err(Error::Io(error)) if error.kind() == io::ErrorKind::ConnectionAborted
+        ));
+        assert_eq!(file.trace.ranges.last(), Some(&(76..76 + (64 << 10))));
+    }
+
+    #[test]
+    fn canceled_open_does_not_read_directory_metadata() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), [0; 22]).unwrap();
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        assert!(matches!(
+            Archive::open_cancelable(file.path(), Some(&cancel)),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::ConnectionAborted
+        ));
+    }
+
     #[test]
     fn dos_times() {
         // 2024-02-29 13:37:58
@@ -781,9 +886,8 @@ mod tests {
 
     #[test]
     fn names() {
-        assert_eq!(decode_name(b"caf\x82", false), "café");
-        assert_eq!(decode_name("café".as_bytes(), false), "café");
-        assert_eq!(decode_name(b"a\xffb", true), "a\u{fffd}b");
-        assert_eq!(CP437_HIGH.chars().count(), 128);
+        assert_eq!(decode_name(b"caf\x82", false).unwrap(), "café");
+        assert_eq!(decode_name("café".as_bytes(), false).unwrap(), "café");
+        assert_eq!(decode_name(b"a\xffb", true).unwrap(), "a\u{fffd}b");
     }
 }

@@ -568,7 +568,9 @@ fn prefixed_extensible_zip64_resolves_local_addresses() {
     fixture.bytes.splice(locator..locator, [0x5a; 9]);
     fixture.eocd += 9;
 
-    assert!(matches!(open_fast(&fixture.bytes), Err(Error::Corrupt("ZIP64 end record"))));
+    let mut fast = open_fast(&fixture.bytes).unwrap();
+    assert_eq!(fast.entries[0].local_at, prefix.len() as u64);
+    assert_eq!(read_fast(&mut fast, 0).unwrap(), b"data");
     let (view, indexes, _) = open_view(&fixture);
     let parsed = shared_directory(&fixture.bytes, zip_container::Profile::Zipview);
     assert_eq!(parsed.zip64_end.unwrap().extension, locator as u64..(locator + 9) as u64);
@@ -589,6 +591,7 @@ fn directory_count_budget_rejects_an_over_limit_zip64_declaration() {
     let count = 1_000_001u64.to_le_bytes();
     fixture.bytes[record + 24..record + 32].copy_from_slice(&count);
     fixture.bytes[record + 32..record + 40].copy_from_slice(&count);
+    assert!(matches!(open_fast(&fixture.bytes), Err(Error::Unsupported(_))));
     assert_eq!(ZipReader::new(&fixture.bytes).unwrap_err(), ZipReadError::BadOffset);
     let (indexes, reads) = open_indexes(&fixture.bytes);
     assert_eq!(reads.len(), 1);
@@ -609,6 +612,12 @@ fn short_local_header_preserves_signature_and_clipping_precedence() {
         (len + 1, None, ZipReadError::BadOffset),
     ] {
         fixture.bytes[central + 42..central + 46].copy_from_slice(&offset.to_le_bytes());
+        if offset < len {
+            let mut fast = open_fast(&fixture.bytes).unwrap();
+            assert!(matches!(read_fast(&mut fast, 0), Err(Error::Truncated)));
+        } else {
+            assert!(matches!(open_fast(&fixture.bytes), Err(Error::Corrupt("local header offset"))));
+        }
         let (view, indexes, _) = open_view(&fixture);
         assert_eq!(view.read_by_name("item"), Err(expected.clone()));
         for index in indexes {
@@ -759,7 +768,7 @@ fn short_zip64_extra_leaves_a_sentinel_only_in_zipview() {
         build(&[Member { central_extra: &zip64, ..Member::stored(b"item", b"data") }], &[0], &[], &[], false);
     let central = fixture.central[0];
     fixture.bytes[central + 20..central + 28].fill(0xff);
-    assert!(matches!(open_fast(&fixture.bytes), Err(Error::Corrupt("ZIP64 extra field"))));
+    assert!(matches!(open_fast(&fixture.bytes), Err(Error::Corrupt("ZIP64 metadata"))));
     let (view, indexes, _) = open_view(&fixture);
     let entry = view.by_index(0).unwrap();
     assert_eq!(entry.size(), 4);
@@ -778,6 +787,9 @@ fn unresolved_packed_size_blocks_payload_reads_but_preserves_password_preview() 
     let mut fixture = build(&[Member { flags: 1, ..Member::stored(b"item", payload) }], &[0], &[], &[], false);
     let central = fixture.central[0];
     fixture.bytes[central + 20..central + 24].fill(0xff);
+    let mut fast = open_fast(&fixture.bytes).unwrap();
+    assert_eq!(fast.entries[0].packed, u64::from(u32::MAX));
+    assert!(matches!(fast.read_at(0, None, u64::MAX, |_| Ok(())), Err(Error::Truncated)));
     let (view, indexes, _) = open_view(&fixture);
     let expected = Some(PasswordCheck::Crypto { header: *payload, check: (crc32fast::hash(payload) >> 24) as u8 });
     assert_eq!(view.password_check(view.by_index(0).unwrap()), expected);
@@ -820,6 +832,7 @@ fn unresolved_zip64_local_offset_is_visible_but_cannot_address_local_data() {
     let mut fixture = build(&[Member::stored(b"item", b"data")], &[0], &[], &[], false);
     let central = fixture.central[0];
     fixture.bytes[central + 42..central + 46].fill(0xff);
+    assert!(matches!(open_fast(&fixture.bytes), Err(Error::Corrupt("local header offset"))));
     let (view, indexes, _) = open_view(&fixture);
     assert_eq!(view.by_index(0).unwrap().local_header_offset(), u64::from(u32::MAX));
     assert_eq!(view.read_by_name("item"), Err(ZipReadError::BadOffset));
@@ -1009,7 +1022,7 @@ fn shared_directory_retains_raw_generated_fixture_metadata() {
 }
 
 #[test]
-fn shared_directory_skips_an_overclaimed_aes_extra_that_legacy_root_accepted() {
+fn adapters_skip_an_overclaimed_central_aes_extra() {
     use zip_container::Profile;
 
     let mut aes = extra(0x9901, &[2, 0, b'A', b'E', 1, 8, 0]);
@@ -1021,7 +1034,7 @@ fn shared_directory_skips_an_overclaimed_aes_extra_that_legacy_root_accepted() {
         &[],
         false,
     );
-    assert_eq!(open_fast(&fixture.bytes).unwrap().entries[0].aes_info, Some((1, 2, 8)));
+    assert_eq!(open_fast(&fixture.bytes).unwrap().entries[0].aes_info, None);
     let (view, _, _) = open_view(&fixture);
     assert_eq!(view.by_index(0).unwrap().aes_info(), None);
     for profile in [Profile::Zipfast, Profile::Zipview] {
@@ -1029,4 +1042,51 @@ fn shared_directory_skips_an_overclaimed_aes_extra_that_legacy_root_accepted() {
         assert_eq!(parsed.entries[0].known.aes, None);
         assert_eq!(range_bytes(&fixture.bytes, parsed.entries[0].source.extra_range()), aes);
     }
+}
+
+#[test]
+fn root_checks_zip64_end_record_framing() {
+    let mut fixture = build(&[Member::stored(b"item", b"data")], &[0], &[], &[], true);
+    let record = fixture.eocd - 76;
+    // The declared size must reach the adjacent locator exactly.
+    fixture.bytes[record + 4..record + 12].copy_from_slice(&45u64.to_le_bytes());
+    assert!(matches!(open_fast(&fixture.bytes), Err(Error::Corrupt(_))));
+}
+
+#[test]
+fn root_empty_directory_accepts_noncentral_trailer_but_rejects_central_signature() {
+    let mut fixture = build(&[], &[], &[], &[], false);
+    fixture.bytes.splice(..0, *b"abcd");
+    fixture.eocd += 4;
+    fixture.bytes[fixture.eocd + 12..fixture.eocd + 16].copy_from_slice(&4u32.to_le_bytes());
+    assert!(open_fast(&fixture.bytes).unwrap().entries.is_empty());
+
+    fixture.bytes[..4].copy_from_slice(b"PK\x01\x02");
+    assert!(matches!(open_fast(&fixture.bytes), Err(Error::Corrupt("central directory entry count"))));
+}
+
+#[test]
+fn root_disk_start_sentinel_keeps_single_disk_legacy_projection() {
+    let mut fixture = build(&[Member::stored(b"item", b"data")], &[0], &[], &[], false);
+    let central = fixture.central[0];
+    fixture.bytes[central + 34..central + 36].copy_from_slice(&u16::MAX.to_le_bytes());
+    let mut fast = open_fast(&fixture.bytes).unwrap();
+    assert_eq!(read_fast(&mut fast, 0).unwrap(), b"data");
+
+    fixture.bytes[central + 34..central + 36].copy_from_slice(&1u16.to_le_bytes());
+    assert!(matches!(open_fast(&fixture.bytes), Err(Error::Unsupported(_))));
+}
+
+#[test]
+fn root_listing_keeps_directory_crc_hidden() {
+    let mut fixture = build(&[Member::stored(b"dir/", b"")], &[0], &[], &[], false);
+    let central = fixture.central[0];
+    fixture.bytes[central + 16..central + 20].copy_from_slice(&123u32.to_le_bytes());
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), &fixture.bytes).unwrap();
+
+    assert_eq!(Archive::open(file.path()).unwrap().entries[0].crc32, 123);
+    let entries = zipfast::zip::list(file.path()).unwrap();
+    assert!(entries[0].dir);
+    assert_eq!(entries[0].crc32, None);
 }
