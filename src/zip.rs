@@ -37,6 +37,7 @@ use crate::rar5::Redirection;
 use crate::stream::{LZMA_MEMORY_LIMIT, zstd_decoder};
 
 mod session;
+pub mod write;
 
 pub(crate) use session::InspectionSource;
 pub use session::{
