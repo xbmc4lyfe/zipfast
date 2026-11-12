@@ -23,6 +23,8 @@ use std::path::Path;
 
 use flate2::bufread::MultiGzDecoder;
 
+pub mod gzip;
+
 pub(crate) const LZMA_MEMORY_LIMIT: u64 = 256 << 20;
 const ZSTD_WINDOW_LOG_LIMIT: u32 = 27;
 
