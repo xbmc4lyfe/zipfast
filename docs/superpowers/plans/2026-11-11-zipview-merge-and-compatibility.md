@@ -151,13 +151,13 @@ additional gzip options, and RAR decoder expansion follow in their own PRs.
 
 ## Phase 2. Use one ZIP container parser
 
-- [ ] Add fixture parity tests before changing either reader. Compare central
+- [x] Add fixture parity tests before changing either reader. Compare central
   directory order, duplicate names, raw and decoded names, archive comments,
   timestamps, Unix attributes, encryption fields, ZIP64, prefixed archives,
   and local payload offsets. Exercise slice and ranged readers with the same
   inputs. Record existing disagreements and choose the required result for
   each case.
-- [ ] Start with the existing zipview directory and range implementation.
+- [x] Start with the existing zipview directory and range implementation.
   Move only format parsing shared by both readers into an internal workspace
   package under `crates/zip-container/`. Give it bounded slice and range
   access and entry records that retain raw names, entry comments, AES
@@ -168,7 +168,7 @@ additional gzip options, and RAR decoder expansion follow in their own PRs.
   password handling with the caller. Preserve public `ZipEntry`,
   `ZipReadError`, and `PasswordCheck` types through the existing APIs,
   including zipfast's public entry fields.
-- [ ] Define caller-supplied limits for directory bytes, entry count, total
+- [x] Define caller-supplied limits for directory bytes, entry count, total
   owned name, extra-field, and comment bytes, cumulative fetched bytes,
   individual ranges, and parser work. Support cancellation between range
   requests. Check arithmetic before allocating or requesting bytes.
@@ -177,22 +177,27 @@ additional gzip options, and RAR decoder expansion follow in their own PRs.
   metadata read ceiling during the cutover. Keep zipfast's streaming
   extraction and decoder limits at its boundary. Test that a large
   streamed entry succeeds while the equivalent zipview allocation fails.
-- [ ] Adapt zipfast's `src/zip.rs` to the shared records. Preserve ZIP
+- [x] Adapt zipfast's `src/zip.rs` to the shared records. Preserve ZIP
   method dispatch, data descriptor handling, bounds, full CRC and AES tag
   checks, and the exact entry selected when names repeat. Keep packed and
   unpacked read limits.
-- [ ] Expose ZIP metadata and stable entry IDs from the same open archive
+- [x] Expose ZIP metadata and stable entry IDs from the same open archive
   that supports selected reads. Bind IDs to the archive instance and reject
   reuse against a different archive or a changed input. Test replacement
   and in-place mutation between listing and reading. Switch Prybar's ZIP
   inspect and explorer paths to that API. Remove the second open and
   metadata matching once the CLI and terminal tests pass against the new
   revision.
-- [ ] Compare cold and warm metadata lookup on large ZIP directories,
+- [x] Compare cold and warm metadata lookup on large ZIP directories,
   ranged bytes and request counts, peak allocation, and extraction
   throughput. Record results against the original builds with the same
   inputs and backend features. Investigate material regressions before
   removing either old parser path.
+
+[Parser parity](../../zip-parser-parity.md) ·
+[Reader performance](../../zipview-parser-performance.md) ·
+[Root reader performance](../../zipfast-parser-performance.md) ·
+[Session and caller verification](../../zip-read-session.md)
 
 ## Phase 3. Build the ZIP writer and Info-ZIP adapter
 

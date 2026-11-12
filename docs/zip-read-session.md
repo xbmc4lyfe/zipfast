@@ -83,10 +83,9 @@ also made three handle/path/handle checks. This added about 3.3 microseconds
 per selection versus same-commit Archive; one standalone check took about
 1.1 to 1.2 microseconds. The traces were separate from timed runs.
 
-These costs are accepted for the additive engine API. The full Prybar
-inspect/explorer comparison must include its previous two-reader path;
-this engine result alone does not establish a caller improvement or complete
-Phase 2. Historical implementations and downstream pins remain available.
+These costs are accepted for the additive engine API. The separate Prybar comparison below includes its previous two-reader path.
+This engine result alone does not establish a caller improvement. Historical
+implementations and downstream source snapshots remain available.
 
 ## Format-aware inspection
 
@@ -118,3 +117,63 @@ one open for ordinary ZIP (1,024 probe plus 65,633 parser bytes) and one for
 self-extracting ZIP (1,049,608 probe plus 65,633 parser bytes). Genuine RAR
 still uses its existing listing reader. These trace results do not replace
 the separate caller performance comparison.
+
+
+## Prybar caller comparison
+
+Prybar code `b3462ee10739d3077532f2e9b5d8ed9e4d58be8e` uses the
+inspection API at engine `d9a7b32c314d1bab9b5129f56faba79738745a7d`.
+It retains one reader and one immutable snapshot for the explorer. Rows
+supply the original ordinal's entry ID; rendering does not lock the reader.
+Detected source changes clear the preview and disable new jobs until reopen.
+Non-ZIP paths keep their existing selected readers and source guards.
+
+The actual CLI and PTY comparison used baseline Prybar
+`d3b8aa32a7c7214919b9c973588a9aa97a6a0e88`, matched default Cargo
+release profiles, flate2 1.1.11 and zlib-rs 0.6.8 with runtime detection.
+All 500 timed invocations and 144 correctness and instrumentation cases
+passed on Apple M4, macOS 27.3 and Rust 1.99.1. These caller builds used
+Prybar's release profile, separate from the engine benchmark profile.
+Five paired trials per operation and cache condition alternated order.
+Caches were not evicted; the table shows file-primed medians.
+
+| Caller operation | Baseline | Candidate |
+| --- | ---: | ---: |
+| Rich 200k archive inspect | 70.50 ms | 46.25 ms |
+| Rich 200k explorer open | 64.63 ms | 51.74 ms |
+| Unicode 200k archive inspect | 76.68 ms | 47.27 ms |
+| Short 200k archive inspect | 24.19 ms | 27.04 ms |
+| Rich 200k browse through extraction: opens | 7 | 1 |
+| Rich 200k browse through extraction: bytes read | 476,261,347 | 119,000,136 |
+| Rich 200k browse through extraction: peak Rust allocation | 289.37 MiB | 143.63 MiB |
+| Rich 200k browse through extraction: peak process RSS | 317.09 MiB | 155.36 MiB |
+
+The short-name fixture remains 12% slower, and its peak Rust allocation
+rises from 53.82 to 78.01 MiB. Retained raw metadata and the temporary
+record conversion remain costs of the session API. Rich inspection makes
+more small reads because cancellation is checked between 64 KiB chunks,
+but reads half as many source bytes. Each tiny preview or extraction then
+adds only two reads and 36 bytes, without reopening the archive.
+
+Preview and extraction UI completion stayed around 43–47 ms. These times
+include the UI's 40 ms worker poll and do not isolate worker latency.
+Independent review approved the caller and repeated its 61 tests and PTY
+checks, including duplicate payloads, corruption beyond the preview prefix,
+replacement, restored-mtime edits, compressed TAR and terminal restoration.
+The [Prybar benchmark report](https://github.com/xbmc4lyfe/prybar/blob/5effb7df70e1e8beb93ac5b753bfdfca78289620/docs/zip-session-benchmark.md)
+records every fixture, reproduction commands, cache conditions, raw evidence
+locations and remaining performance tradeoffs.
+
+
+The exact caller commit also passed Linux ARM64 formatting, strict Clippy,
+all 61 tests, strict documentation, the release-fixture smoke test, the
+expanded PTY script, Google Vale, and the existing pinned archive, gzip and
+PAR2 differential suite. Cargo-audit 0.23.0 found no advisories among 155
+lockfile dependencies using RustSec revision
+`fd6f39814c4d3c359fdbe223d0280dec4933f78f`. The lockfile stayed unchanged.
+Engine PRs 45–59 merged before the caller PR; all five hosted engine checks
+passed on merged main `6d3dfcde42cec8123ad03806dc930bb562f4a369`.
+[Prybar PR 4](https://github.com/xbmc4lyfe/prybar/pull/4) stacks on its
+existing compatibility branch and carries the caller's separate hosted
+checks. These results complete the Phase 2 implementation acceptance;
+combined-distribution licensing still gates a binary release.
