@@ -108,3 +108,34 @@ malformed. A lone `1f` after a member is a truncated next member.
   member. The locked flate2 1.1.10 parser accepts up to 65,535 bytes for each
   optional field, so the maximum wire header is 196,621 bytes. This wire
   bound excludes allocator capacity, flate2 state, and caller-owned buffers.
+
+## Root gzip and tar behavior
+
+The archive entry points use a pull reader.
+`Codec::sniff` requires `1f 8b 08` for initial gzip recognition. The generic
+scanner commits at `1f 8b` and returns a replayable non-gzip outcome for an
+initial lone `1f`. The root reader and strict scanner reject nonempty tails.
+The root reader can report a short tail as truncation because its decoder
+tries to read another fixed header. The strict scanner reports trailing data
+unless the prefix indicates a next member.
+
+The root reader classifies the decoded stream as tar or a standalone file.
+For tar it emits member contents and drains the compressed stream past the
+tar end marker to verify later gzip members. The scanner emits all decoded
+bytes, including tar headers, padding, and bytes after the tar end marker.
+An all-zero stream is recognized as empty tar only for whole 512-byte blocks
+from 1 KiB through 1 MiB. Other standalone streams replay the bytes used for
+classification and produce one list entry sized across all members.
+
+The standalone name comes from the first gzip header if usable, with text
+conversion and path sanitization applied by root. Otherwise it comes from
+the source basename, with `.tgz` and `.taz` mapping to `.tar`. The public
+`gzip_name(path)` helper opens the path independently and reads through FNAME.
+It can return a name even when a later header field or FHCRC fails validation.
+Taking a name from the same stream during a future reader change is an
+integration decision.
+
+Root stages replacement output until verification succeeds. A selected read
+may emit its payload before final verification and may be cancelled during
+the drain. Standalone extraction that skips an existing destination stops
+after classification and can leave later members unverified.
