@@ -1690,7 +1690,7 @@ fn read_lengths(pre: &mut Huff, bits: &mut Bits<'_>, end: usize) -> Result<Lengt
 
 /// A block header at the start of `b`: its length, its payload's length and its flags. None until all of the
 /// header is there.
-fn block_header(b: &[u8]) -> Result<Option<(usize, usize, u8)>> {
+pub(crate) fn block_header(b: &[u8]) -> Result<Option<(usize, usize, u8)>> {
     let Some(&flags) = b.first() else { return Ok(None) };
     let size_len = usize::from((flags >> 3) & 7) + 1;
     if size_len > 3 {
