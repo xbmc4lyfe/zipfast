@@ -255,13 +255,14 @@ fn main() {
         0
     });
 
-    // A whole AES-256 entry: derive, verify, decrypt (Stored inside).
+    // A whole AES-256 entry: derive, authenticate, and decrypt (Stored inside).
     let derived = zipview::aes_derive(b"secret", &salt, 32).unwrap();
     let plain = text(1 << 20, 7);
     let mut payload = salt.to_vec();
     payload.extend_from_slice(&derived[64..66]);
     payload.extend_from_slice(&zipview::decrypt_winzip_ctr(&derived[..32], &plain).unwrap());
-    payload.extend_from_slice(&[0u8; 10]);
+    // Python HMAC-SHA1 tag for the deterministic salt and ciphertext above.
+    payload.extend_from_slice(&[175, 113, 164, 43, 42, 219, 59, 139, 64, 6]);
     let full = Some(payload.len() as u64);
     case("aes256-entry-1M", rounds, 2, || {
         zipview::decrypt_winzip_aes("secret", 3, &payload, full)

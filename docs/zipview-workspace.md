@@ -36,18 +36,19 @@ Use `-p zipview` to select the library or `--workspace` to select both
 packages. The separate fuzz workspace has its own lockfile under
 `crates/zipview/fuzz`.
 
-The root lockfile retains every dependency version from the two standalone
-library lockfiles. It adds the zipview package entry to the original zipfast
-lockfile. The root release profile applies fat LTO, one codegen unit, and
-abort on panic. Zipview's previous standalone profile set abort on panic and
-used Cargo's other profile defaults. A downstream Cargo root controls its own
-profile.
+At import, the root lockfile retained every dependency version from the two
+standalone library lockfiles and added the zipview package entry. The root
+release profile applies fat LTO, one codegen unit, and abort on panic.
+Zipview's previous standalone profile set abort on panic and used Cargo's
+other profile defaults. A downstream Cargo root controls its own profile.
 
 A build of zipview alone enables flate2's `zlib-rs` and
-`runtime_detection` features. Its active dependency graph contains flate2 and
-zlib-rs. The standalone lockfile also records crc32fast and cfg-if. A workspace-wide build also enables
-zipfast's flate2 defaults, adding miniz_oxide and its dependencies to the
-graph. Flate2 1.1.10 selects zlib-rs when both Rust backends are enabled.
+`runtime_detection` features. Its active dependency graph contains `flate2`,
+`zlib-rs`, and `subtle`. WinZip AES uses `subtle` for constant-time verifier
+and authentication tag comparisons. The packaged lockfile also records
+`crc32fast` and `cfg-if`. A workspace-wide build also enables zipfast's
+flate2 defaults, adding miniz_oxide and its dependencies to the graph.
+Flate2 1.1.10 selects zlib-rs when both Rust backends are enabled.
 A zipfast-only build selects miniz_oxide. A downstream build that selects a
 native flate2 backend can affect backend selection through feature
 unification.
@@ -128,10 +129,10 @@ changes the working directory.
 | `cargo info zipview@0.1.0 --registry crates-io` | Cargo found no release for this version. |
 | `vale --config=/Users/allen/git.xbmc4lyfe/prybar/.vale.ini README.md docs/zipview-workspace.md` | Vale 3.26.0 with Google style 0.7.1 reported zero findings in the two changed documents. |
 
-`cargo tree --locked -p zipview -e features` matched the archived standalone
-checkout's `cargo tree --locked -e features` apart from the package path.
-The feature graph also matched clean consumers on both platforms. The clean
-consumer lockfiles initially selected flate2 1.1.11. Pinning the macOS
+At import, `cargo tree --locked -p zipview -e features` matched the archived
+standalone checkout's `cargo tree --locked -e features` apart from the package
+path. The feature graph also matched clean consumers on both platforms. The
+clean consumer lockfiles initially selected flate2 1.1.11. Pinning the macOS
 consumer to 1.1.10 with `cargo update -p flate2 --precise 1.1.10` produced
 the same graph with identical versions. The combined feature graph was
 recorded using `cargo tree --locked --workspace -e features`.

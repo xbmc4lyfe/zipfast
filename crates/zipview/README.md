@@ -1,11 +1,9 @@
 # zipview
 
-Read-only ZIP container reader for Rust. Opens an archive (in memory, or read a
-byte range at a time), lists its entries, inflates the ones you ask for. That is
-all it does.
-
-It **cannot** write an archive, extract to disk, decrypt, or touch the
-filesystem. That is the point.
+Read-only ZIP container reader for Rust. Opens an archive from memory or
+byte ranges, lists its entries, and reads Stored and Deflate entries. It
+supports ZipCrypto and WinZip AES decryption and operates on bytes supplied
+by the caller.
 
 ```rust
 let archive = zipview::ZipReader::new(bytes)?;
@@ -76,8 +74,7 @@ wanted them.
 ## When not to use this
 
 Use [`zip`](https://crates.io/crates/zip) if you need to write archives, extract
-files, decrypt, or decompress beyond Stored and Deflate. It is a good crate; it
-is just much more crate than a metadata reader needs.
+files, or decompress beyond Stored and Deflate.
 
 This is for reading metadata out of ZIP containers — OOXML (`.docx`/`.xlsx`/
 `.pptx`), EPUB, iWork, ODF, JAR, APK.
@@ -91,10 +88,14 @@ complete.
 
 ## Design
 
-One dependency: `flate2`. Reimplementing inflate would be a bad trade — it is
-the one part of this problem where a subtle bug is both likely and hard to find.
-It runs on the `zlib-rs` backend, a Rust port of zlib, for speed: it inflates
-2.3–2.6× faster than flate2's default `miniz_oxide` on Apple M4/M5 cores.
+The reader uses `flate2` with the `zlib-rs` backend for Deflate and
+`subtle` for constant-time WinZip AES verifier and tag comparisons.
+
+Full WinZip AES reads through `ZipReader` and `ZipIndex` verify the
+authentication tag before decrypting. A failed check returns
+`ZipReadError::BadPassword`. `PasswordCheck` tests the encryption header
+alone, and `decrypt_winzip_aes` with `full_packed: None` provides an
+unauthenticated ciphertext preview.
 
 Every field is read through bounds-checked helpers, so a truncated or hostile
 archive yields `Err`, never a panic. Parsing has no `unsafe`. The crate's only

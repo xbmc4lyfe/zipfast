@@ -18,9 +18,9 @@
 
 //! Read-only ZIP container reader.
 //!
-//! Opens an in-memory archive, lists its entries, and inflates the ones you
-//! ask for. That is all it does. It **cannot** write an archive, extract to
-//! disk, decrypt, or touch the filesystem at all.
+//! Opens an in-memory archive, lists its entries, and reads Stored and Deflate
+//! entries, including those encrypted with ZipCrypto or WinZip AES. The reader
+//! operates on bytes supplied by the caller.
 //!
 //! # Archives that aren't in memory
 //!
@@ -50,7 +50,7 @@
 //!
 //! So: use this if you read metadata out of ZIP containers -- OOXML, EPUB,
 //! iWork, JAR, APK, ODF. Use [`zip`](https://crates.io/crates/zip) if you need
-//! to write archives, extract files, decrypt, or decompress anything beyond
+//! to write archives, extract files, or decompress anything beyond
 //! Stored and Deflate.
 //!
 //! # What it does not decompress
@@ -132,6 +132,7 @@ mod index;
 pub use index::{ZipIndex, ZipIndexOpener};
 
 use std::borrow::Cow;
+use subtle::ConstantTimeEq;
 
 /// Local file header signature, `PK\x03\x04`.
 const LOCAL_HEADER_SIG: u32 = 0x0403_4b50;
@@ -184,7 +185,7 @@ pub enum ZipReadError {
     EntryTooLarge(u64),
     /// The entry is encrypted and no password was provided.
     Encrypted,
-    /// The provided password was rejected by the entry's password verifier.
+    /// The entry's password verifier or WinZip AES authentication check failed.
     BadPassword,
 }
 
@@ -956,6 +957,9 @@ impl PasswordCheck {
     }
 
     /// True if `password` satisfies the encryption header check.
+    ///
+    /// This is a preliminary check. A full WinZip AES read also verifies
+    /// the ciphertext authentication tag.
     pub fn accepts(&self, password: &str) -> bool {
         match self {
             Self::Crypto { header, check } => crypto_check(password.as_bytes(), header) == *check,
@@ -968,7 +972,7 @@ impl PasswordCheck {
                 let key_len = (usize::from(*strength) + 1) * 8;
                 salt.get(..salt_len)
                     .and_then(|s| aes_verifier(password.as_bytes(), s, key_len))
-                    .is_some_and(|found| found == *verifier)
+                    .is_some_and(|found| bool::from(found.ct_eq(verifier)))
             }
         }
     }
@@ -1342,7 +1346,22 @@ fn aes_verifier(password: &[u8], salt: &[u8], key_len: usize) -> Option<[u8; 2]>
     aes_verifier_with(&HmacSha1::new(password), salt, key_len)
 }
 
-/// Decrypts a WinZip AES (method 99) entry starting at `data` (`salt + verifier + ciphertext [+ 10-byte auth]`).
+const WINZIP_AES_TAG_LEN: usize = 10;
+
+fn winzip_aes_auth_tag(key: &[u8], ciphertext: &[u8]) -> [u8; WINZIP_AES_TAG_LEN] {
+    let mut tag = [0u8; WINZIP_AES_TAG_LEN];
+    for (bytes, word) in tag.chunks_mut(4).zip(HmacSha1::new(key).mac(ciphertext)) {
+        bytes.copy_from_slice(&word.to_be_bytes()[..bytes.len()]);
+    }
+    tag
+}
+
+/// Decrypts a WinZip AES (method 99) payload starting with the salt and verifier.
+///
+/// With `Some(packed)`, `data` must contain exactly `packed` bytes, including
+/// the 10-byte tag. The ciphertext is authenticated before decryption.
+/// With `None`, the bytes after the verifier are decrypted as an unauthenticated
+/// ciphertext prefix for preview.
 pub fn decrypt_winzip_aes(
     password: &str,
     strength: u8,
@@ -1354,22 +1373,49 @@ pub fn decrypt_winzip_aes(
     }
     let salt_len = usize::from(strength) * 4 + 4;
     let key_len = (usize::from(strength) + 1) * 8;
+    let ciphertext_end = if let Some(packed) = full_packed {
+        if usize::try_from(packed).ok()? != data.len() {
+            return None;
+        }
+        data.len().checked_sub(WINZIP_AES_TAG_LEN)?
+    } else {
+        data.len()
+    };
     let salt = data.get(..salt_len)?;
     let verifier = data.get(salt_len..salt_len + 2)?;
-    // The verifier first: a wrong password costs one PBKDF2 block, and the
-    // MAC key between the AES key and the verifier is never derived.
+    let ciphertext = data.get(salt_len + 2..ciphertext_end)?;
+
+    // A wrong password costs one PBKDF2 block. Keep the key bytes from that
+    // block so authenticating a full read does not derive it twice.
     let mac = HmacSha1::new(password.as_bytes());
-    if aes_verifier_with(&mac, salt, key_len)?[..] != *verifier {
+    let verifier_offset = key_len * 2;
+    let block_start = verifier_offset / 20 * 20;
+    let verifier_block = pbkdf2_sha1(
+        &mac,
+        salt,
+        WINZIP_ITERATIONS,
+        block_start,
+        verifier_offset + 2,
+    )?;
+    let (key_tail, derived_verifier) = verifier_block.split_at(verifier_offset - block_start);
+    if !bool::from(derived_verifier.ct_eq(verifier)) {
         return None;
     }
-    let key = pbkdf2_sha1(&mac, salt, WINZIP_ITERATIONS, 0, key_len)?;
-    let key = &key[..];
-    let ct_end = match full_packed.and_then(|p| usize::try_from(p).ok()) {
-        Some(p) if p >= salt_len + 12 => data.len().min(p - 10),
-        _ => data.len(),
+
+    let keys_end = if full_packed.is_some() {
+        verifier_offset
+    } else {
+        key_len
     };
-    let ct = data.get(salt_len + 2..ct_end)?;
-    decrypt_winzip_ctr(key, ct)
+    let mut keys = pbkdf2_sha1(&mac, salt, WINZIP_ITERATIONS, 0, keys_end.min(block_start))?;
+    if full_packed.is_some() {
+        keys.extend_from_slice(key_tail);
+        let tag = winzip_aes_auth_tag(&keys[key_len..], ciphertext);
+        if !bool::from(tag.ct_eq(&data[ciphertext_end..])) {
+            return None;
+        }
+    }
+    decrypt_winzip_ctr(&keys[..key_len], ciphertext)
 }
 
 const SBOX: [u8; 256] = [
@@ -2339,7 +2385,7 @@ mod tests {
         aes_payload.extend_from_slice(&salt);
         aes_payload.extend_from_slice(&[0xa3, 0x36]);
         aes_payload.extend_from_slice(&ct);
-        aes_payload.extend_from_slice(&[0u8; 10]);
+        aes_payload.extend_from_slice(&winzip_aes_auth_tag(&derived[32..64], &ct));
         let dec = decrypt_winzip_aes("secret", 3, &aes_payload, Some(aes_payload.len() as u64))
             .expect("decrypt winzip aes");
         assert_eq!(dec, b"winzip aes payload");
