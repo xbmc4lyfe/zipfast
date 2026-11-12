@@ -162,6 +162,7 @@ pub struct EndDiscovery {
     pending: Option<Pending>,
     tail: Vec<u8>,
     tail_start: u64,
+    end_offset: Option<u64>,
     rank: Rank,
     cursor: usize,
     rejected: Option<DirectoryError>,
@@ -174,6 +175,21 @@ pub struct EndDiscovery {
 impl EndDiscovery {
     /// Creates discovery state without fetching or allocating source buffers.
     pub fn new(archive_len: u64, profile: Profile, limits: Limits) -> Result<Self, DirectoryError> {
+        Self::with_end_offset(archive_len, profile, limits, None)
+    }
+
+    fn with_end_offset(
+        archive_len: u64,
+        profile: Profile,
+        limits: Limits,
+        end_offset: Option<u64>,
+    ) -> Result<Self, DirectoryError> {
+        if let Some(offset) = end_offset {
+            let comment_len = offset.checked_add(END_LEN as u64).and_then(|end| archive_len.checked_sub(end));
+            if comment_len.is_none_or(|len| len > u64::from(u16::MAX)) {
+                return Err(DirectoryError::MalformedEnd);
+            }
+        }
         if archive_len < END_LEN as u64 {
             return Err(DirectoryError::NotZip);
         }
@@ -186,6 +202,7 @@ impl EndDiscovery {
             pending: None,
             tail: Vec::new(),
             tail_start,
+            end_offset,
             rank: Rank::Exact,
             cursor: 0,
             rejected: None,
@@ -289,7 +306,9 @@ impl EndDiscovery {
                 Stage::Tail => {
                     let next = self.tail_start + self.tail.len() as u64;
                     if next == self.len {
-                        self.cursor = self.tail.len() - END_LEN + 1;
+                        self.cursor = self
+                            .end_offset
+                            .map_or(self.tail.len() - END_LEN + 1, |offset| (offset - self.tail_start) as usize + 1);
                         self.stage = Stage::Candidate;
                     } else {
                         self.request_required(next..self.len, Purpose::Tail)?;
@@ -342,7 +361,9 @@ impl EndDiscovery {
     }
 
     fn scan_candidates(&mut self) -> Result<(), DirectoryError> {
-        let minimum = self.tail.len().saturating_sub(END_SEARCH);
+        let minimum = self
+            .end_offset
+            .map_or(self.tail.len().saturating_sub(END_SEARCH), |offset| (offset - self.tail_start) as usize);
         while self.cursor > minimum {
             self.accounting.charge(1)?;
             self.cursor -= 1;
@@ -386,6 +407,9 @@ impl EndDiscovery {
                 self.begin_directory();
             }
             return Ok(());
+        }
+        if self.end_offset.is_some() {
+            return Err(DirectoryError::MalformedEnd);
         }
         self.rank = match (self.rank, self.profile) {
             (Rank::Exact, _) => Rank::Trailing,
@@ -694,7 +718,7 @@ impl EndDiscovery {
     }
 
     fn reject(&mut self, error: DirectoryError) -> Result<(), DirectoryError> {
-        if self.candidate().zip64.is_some() {
+        if self.end_offset.is_some() || self.candidate().zip64.is_some() {
             return Err(error);
         }
         if self.rejected.is_none() {
