@@ -151,10 +151,8 @@ fn assert_payload(
     assert_eq!(read_fast(fast, central).unwrap(), expected);
     assert_eq!(view.read_entry(view.by_index(central).unwrap()).unwrap(), expected);
     let start = fixture.local[local] as u64;
-    let payload_start = fixture.payload[local] as u64;
-    let payload_end = payload_start + expected.len() as u64;
+    let payload_end = fixture.payload[local].end as u64;
     assert_eq!(fast.entries[central].local_at, start);
-    assert_eq!(range_bytes(&fixture.bytes, payload_start..payload_end), expected);
     for index in indexes {
         let entry = index.by_index(central).unwrap();
         let header = index.header_range(entry).unwrap();
@@ -458,7 +456,7 @@ fn aes_fields_use_central_metadata_but_password_check_uses_local_strength() {
         let entry = index.by_index(0).unwrap();
         let mut source = RangeSource::new(&fixture.bytes);
         assert_eq!(index.fetch_password_check(entry, |at, buf| source.read(at, buf)).unwrap(), expected);
-        let end = fixture.payload[0] + 18;
+        let end = fixture.payload[0].start + 18;
         assert_eq!(
             source.reads,
             [
@@ -473,7 +471,9 @@ fn aes_fields_use_central_metadata_but_password_check_uses_local_strength() {
 
 #[test]
 fn zip64_size_offset_and_counts_with_optional_prefix() {
-    let members = [Member::stored(b"first", b"one"), Member { zip64: true, ..Member::stored(b"wide", b"two") }];
+    let packed = b"\x2b\x29\xcf\x07\x00"; // raw DEFLATE of "two"
+    let members =
+        [Member::stored(b"first", b"one"), Member { zip64: true, ..Member::deflated(b"wide", packed, b"two") }];
     for (prefix, zip64_end) in
         [(b"".as_slice(), true), (b"MZ synthetic prefix".as_slice(), false), (b"MZ synthetic prefix".as_slice(), true)]
     {
@@ -482,7 +482,8 @@ fn zip64_size_offset_and_counts_with_optional_prefix() {
         assert_eq!(fast.entries.len(), 2);
         assert_eq!(fast.entries[1].name, "wide");
         assert_eq!(fast.entries[1].size, 3);
-        assert_eq!(fast.entries[1].packed, 3);
+        assert_eq!(fast.entries[1].packed, 5);
+        assert_eq!(&fixture.bytes[fixture.payload[1].clone()], packed);
         assert_eq!(fast.entries[1].local_at, fixture.local[1] as u64);
         assert_eq!(read_fast(&mut fast, 1).unwrap(), b"two");
         if zip64_end && !prefix.is_empty() {
@@ -505,36 +506,43 @@ fn zip64_size_offset_and_counts_with_optional_prefix() {
 #[test]
 fn local_variable_fields_locate_payload_and_descriptor_stays_outside() {
     let unknown = extra(0xbeef, b"opaque local bytes");
+    let packed = b"\x2b\x2e\xc9\x2f\x4a\x4d\x01\x00"; // raw DEFLATE of "stored"
     let fixture = build(
         &[Member {
             flags: 8,
             local_name: Some(b"different-local-name"),
             local_extra: &unknown,
-            ..Member::stored(b"central", b"stored")
+            ..Member::deflated(b"central", packed, b"stored")
         }],
         &[0],
         &[],
         &[],
         false,
     );
-    assert_eq!(&fixture.bytes[fixture.payload[0] + 6..][..4], b"PK\x07\x08");
+    assert_eq!(&fixture.bytes[fixture.payload[0].clone()], packed);
+    let descriptor = &fixture.bytes[fixture.payload[0].end..fixture.central[0]];
+    assert_eq!(&descriptor[..4], b"PK\x07\x08");
+    assert_eq!(&descriptor[8..16], &[8, 0, 0, 0, 6, 0, 0, 0]);
     let mut fast = open_fast(&fixture.bytes).unwrap();
     let (view, indexes, _) = open_view(&fixture);
     assert_eq!(fast.entries[0].name, "central");
     assert_eq!(view.entries()[0].name(), "central");
     assert_eq!(view.entries()[0].flags(), 8);
+    assert_eq!(view.entries()[0].compressed_size(), 8);
+    assert_eq!(view.entries()[0].size(), 6);
+    assert_shared_metadata(&fast.entries[0], &view.entries()[0]);
     assert_payload(&fixture, &mut fast, &view, &indexes, 0, 0, b"stored");
 
     // Contradict the central flags, method, CRC and sizes. The local name
-    // and extra lengths still identify the same stored payload.
+    // and extra lengths still identify the same compressed payload.
     let mut conflicting = fixture;
     conflicting.bytes[6..8].copy_from_slice(&1u16.to_le_bytes());
-    conflicting.bytes[8..10].copy_from_slice(&8u16.to_le_bytes());
+    conflicting.bytes[8..10].copy_from_slice(&0u16.to_le_bytes());
     conflicting.bytes[14..26].fill(0xff);
     let mut fast = open_fast(&conflicting.bytes).unwrap();
     let (view, indexes, _) = open_view(&conflicting);
     assert_eq!(fast.entries[0].flags, 8);
-    assert_eq!(view.entries()[0].compression(), 0);
+    assert_eq!(view.entries()[0].compression(), 8);
     assert_payload(&conflicting, &mut fast, &view, &indexes, 0, 0, b"stored");
 }
 
@@ -578,6 +586,28 @@ fn directory_count_mismatches_expose_strict_and_listing_policies() {
         let (view, _, _) = open_view(&fixture);
         assert_eq!(view.len(), parsed);
         assert_eq!(view.by_index(0).unwrap().name(), "a");
+    }
+}
+
+#[test]
+fn zip64_count_overrides_classic_sentinel() {
+    let mut fixture =
+        build(&[Member::stored(b"first", b"A"), Member::stored(b"second", b"B")], &[0, 1], &[], &[], true);
+    let record = fixture.eocd - 20 - 56; // locator, then the fixed ZIP64 EOCD
+    assert_eq!(&fixture.bytes[record..record + 4], b"PK\x06\x06");
+    assert_eq!(&fixture.bytes[fixture.eocd + 8..fixture.eocd + 12], &[0xff; 4]);
+    fixture.bytes[record + 24..record + 32].copy_from_slice(&1u64.to_le_bytes());
+    fixture.bytes[record + 32..record + 40].copy_from_slice(&1u64.to_le_bytes());
+
+    assert!(matches!(open_fast(&fixture.bytes), Err(Error::Corrupt("central directory entry count"))));
+    let (view, indexes, _) = open_view(&fixture);
+    assert_eq!(view.len(), 1);
+    assert_eq!(view.by_index(0).unwrap().name(), "first");
+    assert!(!view.contains("second"));
+    for index in indexes {
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.by_index(0).unwrap().name(), "first");
+        assert!(!index.contains("second"));
     }
 }
 

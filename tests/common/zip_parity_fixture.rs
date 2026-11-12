@@ -14,9 +14,12 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
+use std::ops::Range;
+
 pub struct Member<'a> {
     pub name: &'a [u8],
     pub payload: &'a [u8],
+    pub decoded: Option<&'a [u8]>,
     pub flags: u16,
     pub method: u16,
     pub made_by: u16,
@@ -36,6 +39,7 @@ impl<'a> Member<'a> {
         Self {
             name,
             payload,
+            decoded: None,
             flags: 0,
             method: 0,
             made_by: 0x0314,
@@ -50,12 +54,24 @@ impl<'a> Member<'a> {
             zip64: false,
         }
     }
+
+    pub fn deflated(name: &'a [u8], packed: &'a [u8], decoded: &'a [u8]) -> Self {
+        Self { method: 8, decoded: Some(decoded), ..Self::stored(name, packed) }
+    }
+
+    fn decoded(&self) -> &'a [u8] {
+        self.decoded.unwrap_or(self.payload)
+    }
+
+    fn crc(&self) -> u32 {
+        self.crc.unwrap_or_else(|| crc32fast::hash(self.decoded()))
+    }
 }
 
 pub struct Fixture {
     pub bytes: Vec<u8>,
     pub local: Vec<usize>,
-    pub payload: Vec<usize>,
+    pub payload: Vec<Range<usize>>,
     pub central: Vec<usize>,
     pub eocd: usize,
 }
@@ -84,22 +100,25 @@ pub fn build(
     for member in members {
         local.push(bytes.len());
         let name = member.local_name.unwrap_or(member.name);
-        let crc = member.crc.unwrap_or_else(|| crc32fast::hash(member.payload));
-        let size = word(member.payload.len());
+        let crc = member.crc();
+        let packed = word(member.payload.len());
+        let size = word(member.decoded().len());
         let descriptor = member.flags & 8 != 0;
         let mut local_extra = member.local_extra.to_vec();
         if member.zip64 {
             let mut body = Vec::new();
             put64(&mut body, u64::from(size));
-            put64(&mut body, u64::from(size));
+            put64(&mut body, u64::from(packed));
             local_extra.extend(extra(1, &body));
         }
-        let local_size = if descriptor {
-            0
-        } else if member.zip64 {
-            u32::MAX
-        } else {
-            size
+        let local_size = |value| {
+            if descriptor {
+                0
+            } else if member.zip64 {
+                u32::MAX
+            } else {
+                value
+            }
         };
         put32(&mut bytes, 0x04034b50);
         put16(&mut bytes, if member.zip64 { 45 } else { 20 });
@@ -108,19 +127,20 @@ pub fn build(
         put16(&mut bytes, member.dos_time);
         put16(&mut bytes, member.dos_date);
         put32(&mut bytes, if descriptor { 0 } else { crc });
-        put32(&mut bytes, local_size);
-        put32(&mut bytes, local_size);
+        put32(&mut bytes, local_size(packed));
+        put32(&mut bytes, local_size(size));
         put16(&mut bytes, short(name.len()));
         put16(&mut bytes, short(local_extra.len()));
         bytes.extend(name);
         bytes.extend(local_extra);
-        payload.push(bytes.len());
+        let payload_start = bytes.len();
         bytes.extend(member.payload);
+        payload.push(payload_start..bytes.len());
         if descriptor {
             assert!(!member.zip64, "fixture uses a classic descriptor");
             put32(&mut bytes, 0x08074b50);
             put32(&mut bytes, crc);
-            put32(&mut bytes, size);
+            put32(&mut bytes, packed);
             put32(&mut bytes, size);
         }
     }
@@ -129,12 +149,13 @@ pub fn build(
         let member = &members[member_index];
         central.push(bytes.len());
         let offset = word(local[member_index] - prefix.len());
-        let size = word(member.payload.len());
+        let packed = word(member.payload.len());
+        let size = word(member.decoded().len());
         let mut central_extra = member.central_extra.to_vec();
         if member.zip64 {
             let mut body = Vec::new();
             put64(&mut body, u64::from(size));
-            put64(&mut body, u64::from(size));
+            put64(&mut body, u64::from(packed));
             put64(&mut body, u64::from(offset));
             central_extra.extend(extra(1, &body));
         }
@@ -145,10 +166,10 @@ pub fn build(
         put16(&mut bytes, member.method);
         put16(&mut bytes, member.dos_time);
         put16(&mut bytes, member.dos_date);
-        put32(&mut bytes, member.crc.unwrap_or_else(|| crc32fast::hash(member.payload)));
-        let stored_size = if member.zip64 { u32::MAX } else { size };
-        put32(&mut bytes, stored_size);
-        put32(&mut bytes, stored_size);
+        put32(&mut bytes, member.crc());
+        let stored_size = |value| if member.zip64 { u32::MAX } else { value };
+        put32(&mut bytes, stored_size(packed));
+        put32(&mut bytes, stored_size(size));
         put16(&mut bytes, short(member.name.len()));
         put16(&mut bytes, short(central_extra.len()));
         put16(&mut bytes, short(member.comment.len()));
