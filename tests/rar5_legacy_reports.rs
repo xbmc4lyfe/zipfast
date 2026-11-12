@@ -98,7 +98,8 @@ fn mixed_members_keep_exact_reports_and_counts_in_extract_and_test() {
     let scratch = tempfile::tempdir().unwrap();
     let arc = scratch.path().join("mixed.rar");
     let key = derive_rar5_key(PASSWORD, KDF_COUNT, &SALT, None).unwrap();
-    let ciphertext = encrypt_cbc(&key, &IV, b"secret payload!!").unwrap();
+    let secret = b"secret payload!!";
+    let ciphertext = encrypt_cbc(&key, &IV, secret).unwrap();
     let (packed_data, plain) = packed("good", &[Op::Lit(b'a'), Op::Match(9, 1)]);
     let good = FileSpec { method: 3, size: Some(plain.len() as u64), ..FileSpec::new("good", &packed_data) };
     let old = FileSpec { extra: extra_record(4, &[0, 2]), ..FileSpec::new("versioned", b"old") };
@@ -111,7 +112,7 @@ fn mixed_members_keep_exact_reports_and_counts_in_extract_and_test() {
     bytes.extend(stored_block(&dir));
     bytes.extend(stored_block(&old));
     bytes.extend(stored_block(&FileSpec::new("versioned", b"new")));
-    bytes.extend(stored_block(&encrypted));
+    bytes.extend(file_block(&encrypted, &ciphertext, crc32fast::hash(secret), false, false));
     bytes.extend(stored_block(&FileSpec::new("exists", b"replacement")));
     bytes.extend(stored_block(&FileSpec::new("empty", b"")));
     bytes.extend(unsupported_block(&packed_data, &plain));
@@ -173,6 +174,27 @@ fn mixed_members_keep_exact_reports_and_counts_in_extract_and_test() {
                 assert_eq!(fs::read(out.join("good")).unwrap(), plain);
             }
         }
+        let out = scratch.path().join(format!("right-password-{threads}"));
+        let mut lines = Vec::new();
+        let summary = extract::run_with_password(&arc, &options(&out, threads), Some(PASSWORD), |line| {
+            lines.push(line.to_owned());
+        })
+        .unwrap();
+        assert_eq!(
+            lines,
+            [
+                "keep: checksum error",
+                "versioned: older version 2, skipped",
+                "unsupported: RAR 7 compression is not supported yet",
+                "remove: checksum error",
+            ]
+        );
+        assert_eq!(
+            summary.errors,
+            ["keep: checksum error", "unsupported: RAR 7 compression is not supported yet", "remove: checksum error",]
+        );
+        assert_eq!(counters(&summary), (5, 1, 40, 1, 1));
+        assert_eq!(fs::read(out.join("encrypted")).unwrap(), secret);
     }
     assert_eq!(fs::read(arc).unwrap(), bytes);
 }
