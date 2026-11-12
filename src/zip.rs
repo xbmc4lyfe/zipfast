@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 
 use flate2::{Decompress, FlushDecompress, Status};
 use zip_container::{
-    AesFields, CentralHeader, Directory, DirectoryError, DirectoryParser, ExtraMtime, LOCAL_HEADER_LEN, Limits,
-    LocalHeader, OwnershipError, ParseError, Profile, ReducedCentralRecord, ResolvedFields, local_layout,
+    Directory, DirectoryError, DirectoryParser, LOCAL_HEADER_LEN, Limits, LocalHeader, OwnershipError, ParseError,
+    Profile, ReducedCentralRecord, local_layout,
 };
 
 use crate::error::{Error, Result};
@@ -35,6 +35,16 @@ use crate::extract::{
 use crate::path::sanitize;
 use crate::rar5::Redirection;
 use crate::stream::{LZMA_MEMORY_LIMIT, zstd_decoder};
+
+mod session;
+
+pub use session::{
+    EntryId, EntryMetadata, Metadata, ReadSession, SelectedZipEntry, SessionError, SessionResult, SourceChange,
+};
+pub use zip_container::{
+    AesFields, CentralHeader, CentralLocation, DirectoryDeclaration, EndRecord, ExtraMtime, ResolvedFields, Usage,
+    Zip64End, Zip64Fields, Zip64Locator,
+};
 
 const FLAG_ENCRYPTED: u16 = 0x0001;
 const FLAG_UTF8: u16 = 0x0800;
@@ -88,25 +98,36 @@ pub struct ZipEntry {
 
 impl ZipEntry {
     pub fn unix_mode(&self) -> Option<u32> {
-        (self.host == HOST_UNIX && self.external >> 16 != 0).then_some(self.external >> 16)
+        extraction_unix_mode(self.host, self.external)
     }
 
     pub fn is_dir(&self) -> bool {
-        self.name.ends_with('/')
-            || self.unix_mode().is_some_and(|m| m & S_IFMT == S_IFDIR)
-            || (self.host != HOST_UNIX && self.external & 0x10 != 0)
+        is_dir(&self.name, self.host, self.external)
     }
 
     pub fn is_link(&self) -> bool {
-        self.unix_mode().is_some_and(|m| m & S_IFMT == S_IFLNK)
+        is_link(self.host, self.external)
     }
 
     pub fn encrypted(&self) -> bool {
-        self.flags & FLAG_ENCRYPTED != 0 || self.method == 99 || self.aes_info.is_some()
+        self.read_description().encrypted()
     }
 
     pub fn effective_method(&self) -> u16 {
-        if self.method == 99 { self.aes_info.map_or(self.method, |(_, _, m)| m) } else { self.method }
+        self.read_description().effective_method()
+    }
+
+    fn read_description(&self) -> ReadDescription<'_> {
+        ReadDescription {
+            name: &self.name,
+            flags: self.flags,
+            method: self.method,
+            crc32: self.crc32,
+            packed: self.packed,
+            size: self.size,
+            local_at: self.local_at,
+            aes_info: self.aes_info,
+        }
     }
 
     fn meta(&self) -> Meta {
@@ -114,7 +135,52 @@ impl ZipEntry {
     }
 }
 
-fn read_local_header(file: &mut File, at: u64) -> Result<[u8; LOCAL_HEADER_LEN]> {
+fn extraction_unix_mode(host: u8, external: u32) -> Option<u32> {
+    (host == HOST_UNIX && external >> 16 != 0).then_some(external >> 16)
+}
+
+fn is_dir(name: &str, host: u8, external: u32) -> bool {
+    name.ends_with('/')
+        || extraction_unix_mode(host, external).is_some_and(|mode| mode & S_IFMT == S_IFDIR)
+        || (host != HOST_UNIX && external & 0x10 != 0)
+}
+
+fn is_link(host: u8, external: u32) -> bool {
+    extraction_unix_mode(host, external).is_some_and(|mode| mode & S_IFMT == S_IFLNK)
+}
+
+struct ReadDescription<'a> {
+    name: &'a str,
+    flags: u16,
+    method: u16,
+    crc32: u32,
+    packed: u64,
+    size: u64,
+    local_at: u64,
+    aes_info: Option<(u8, u16, u16)>,
+}
+
+impl ReadDescription<'_> {
+    fn encrypted(&self) -> bool {
+        self.flags & FLAG_ENCRYPTED != 0 || self.method == 99 || self.aes_info.is_some()
+    }
+
+    fn effective_method(&self) -> u16 {
+        if self.method == 99 { self.aes_info.map_or(self.method, |(_, _, m)| m) } else { self.method }
+    }
+}
+
+fn check_selection(is_dir: bool, is_link: bool, packed: u64, size: u64, limit: u64) -> Result<()> {
+    if is_dir || is_link {
+        return Err(Error::Unsupported("the selected ZIP entry is not a regular file".into()));
+    }
+    if packed > limit || size > limit {
+        return Err(Error::Unsupported("the selected ZIP entry exceeds the byte limit".into()));
+    }
+    Ok(())
+}
+
+fn read_local_header(file: &mut (impl Read + Seek), at: u64) -> Result<[u8; LOCAL_HEADER_LEN]> {
     file.seek(SeekFrom::Start(at))?;
     let mut buf = [0; LOCAL_HEADER_LEN];
     file.read_exact(&mut buf)?;
@@ -225,20 +291,6 @@ impl Archive {
         Ok(Archive { file, len, entries })
     }
 
-    /// Where an entry's data starts, from its local header.
-    fn data_at(&mut self, e: &ZipEntry) -> Result<u64> {
-        if e.local_at.checked_add(LOCAL_HEADER_LEN as u64).is_none_or(|end| end > self.len) {
-            return Err(Error::Truncated);
-        }
-        let head = read_local_header(&mut self.file, e.local_at)?;
-        let header = LocalHeader::parse(&head).map_err(|error| match error {
-            ParseError::BadSignature { .. } => Error::Corrupt("local header signature"),
-            _ => Error::Truncated,
-        })?;
-        let layout = local_layout(header, e.local_at, self.len).map_err(|_| Error::Truncated)?;
-        Ok(layout.payload_range(e.packed, self.len).map_err(|_| Error::Truncated)?.start)
-    }
-
     /// Decodes the entry at a zero-based index and checks its integrity.
     ///
     /// Both its packed and unpacked sizes must be at most `max_bytes`.
@@ -255,12 +307,7 @@ impl Archive {
 
     pub(crate) fn selected_entry(&self, index: usize, limit: u64) -> Result<&ZipEntry> {
         let entry = self.entries.get(index).ok_or_else(|| Error::Unsupported("entry index is out of range".into()))?;
-        if entry.is_dir() || entry.is_link() {
-            return Err(Error::Unsupported("the selected ZIP entry is not a regular file".into()));
-        }
-        if entry.packed > limit || entry.size > limit {
-            return Err(Error::Unsupported("the selected ZIP entry exceeds the byte limit".into()));
-        }
+        check_selection(entry.is_dir(), entry.is_link(), entry.packed, entry.size, limit)?;
         Ok(entry)
     }
 
@@ -272,194 +319,132 @@ impl Archive {
         cancel: Option<&Cancellation>,
         mut sink: impl FnMut(&[u8]) -> Result<()>,
     ) -> Result<()> {
-        let entry = self.selected_entry(index, limit)?.clone();
+        self.selected_entry(index, limit)?;
+        let entry = self.entries[index].read_description();
         let mut buffer = vec![0; BUF];
-        self.read_entry(&entry, password, &mut buffer, &mut sink, cancel)
+        read_entry(&mut self.file, self.len, &entry, password, &mut buffer, &mut sink, cancel)
     }
+}
 
-    /// Reads an entry's data, decompressed, into `sink`, and checks its size and CRC.
-    fn read_entry(
-        &mut self,
-        e: &ZipEntry,
-        password: Option<&str>,
-        buf: &mut [u8],
-        sink: &mut dyn FnMut(&[u8]) -> Result<()>,
-        cancel: Option<&Cancellation>,
-    ) -> Result<()> {
-        let check = || cancel.map_or(Ok(()), Cancellation::check_io);
-        check()?;
-        let at = self.data_at(e)?;
-        self.file.seek(SeekFrom::Start(at))?;
-        let mut crc = crate::crc32::Hasher::new();
-        let mut size = 0u64;
-        let mut emit = |chunk: &[u8]| -> Result<()> {
-            size += chunk.len() as u64;
-            if size > e.size {
-                return Err(Error::Corrupt("more data than the directory says"));
-            }
-            crc.update(chunk);
-            sink(chunk)
-        };
-        if e.encrypted() {
-            if e.packed > ENCRYPTED_PACKED_LIMIT {
-                return Err(Error::Unsupported("encrypted ZIP entry exceeds the 128 MiB packed limit".into()));
-            }
-            let pw = password
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| Error::Unsupported("encrypted (password required)".into()))?;
-            let packed_len = usize::try_from(e.packed).map_err(|_| Error::Corrupt("encrypted entry too large"))?;
-            let mut raw = vec![0u8; packed_len];
-            if cancel.is_some() {
-                for chunk in raw.chunks_mut(buf.len()) {
-                    check()?;
-                    self.file.read_exact(chunk)?;
-                }
-                check()?;
-            } else {
-                self.file.read_exact(&mut raw)?;
-            }
-            let mut skip_crc = false;
-            let decrypted = if e.method == 99 || e.aes_info.is_some() {
-                let (strength, vendor, _) = e.aes_info.ok_or(Error::Corrupt("missing WinZip AES extra field"))?;
-                if vendor == 2 {
-                    skip_crc = true;
-                }
-                crate::crypto::decrypt_winzip_aes(pw, strength, &raw, Some(e.packed))
-                    .ok_or(Error::Corrupt("wrong password or damaged AES stream"))?
-            } else {
-                let check = if e.flags & 0x0008 != 0 {
-                    let head = read_local_header(&mut self.file, e.local_at)?;
-                    head[11]
-                } else {
-                    (e.crc32 >> 24) as u8
-                };
-                crate::crypto::decrypt_zipcrypto(pw, check, &raw).ok_or(Error::Corrupt("wrong password"))?
-            };
-            let method = e.effective_method();
-            match method {
-                METHOD_STORED => {
-                    if decrypted.len() as u64 != e.size {
-                        return Err(Error::Corrupt("stored entry's sizes differ"));
-                    }
-                    if cancel.is_some() {
-                        for chunk in decrypted.chunks(buf.len()) {
-                            check()?;
-                            emit(chunk)?;
-                        }
-                    } else {
-                        emit(&decrypted)?;
-                    }
-                }
-                METHOD_DEFLATE => {
-                    let mut z = Decompress::new(false);
-                    let mut out = vec![0u8; BUF];
-                    let mut input = decrypted.as_slice();
-                    loop {
-                        check()?;
-                        let (before_in, before_out) = (z.total_in(), z.total_out());
-                        let status = z
-                            .decompress(input, &mut out, FlushDecompress::None)
-                            .map_err(|_| Error::Corrupt("deflate data"))?;
-                        let used = (z.total_in() - before_in) as usize;
-                        let made = (z.total_out() - before_out) as usize;
-                        input = &input[used..];
-                        emit(&out[..made])?;
-                        if status == Status::StreamEnd {
-                            break;
-                        }
-                        if made == out.len() {
-                            continue;
-                        }
-                        if input.is_empty() || (used == 0 && made == 0) {
-                            return Err(Error::Corrupt("deflate data"));
-                        }
-                    }
-                }
-                METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
-                    let mut dec = stream_decoder(e, method, BufReader::new(Cursor::new(&decrypted)))?;
-                    loop {
-                        check()?;
-                        let n = dec.read(buf).map_err(|_| Error::Corrupt("compressed data is damaged"))?;
-                        if n == 0 {
-                            break;
-                        }
-                        emit(&buf[..n])?;
-                    }
-                }
-                m => return Err(Error::Unsupported(format!("compression method {m}"))),
-            }
-            if size != e.size {
-                return Err(Error::Corrupt("less data than the directory says"));
-            }
-            if !skip_crc && crc.finalize() != e.crc32 {
-                return Err(Error::BadChecksum(e.name.clone()));
-            }
-            return Ok(());
+/// Where an entry's data starts, from its local header.
+fn data_at(file: &mut (impl Read + Seek), len: u64, e: &ReadDescription<'_>) -> Result<u64> {
+    if e.local_at.checked_add(LOCAL_HEADER_LEN as u64).is_none_or(|end| end > len) {
+        return Err(Error::Truncated);
+    }
+    let head = read_local_header(file, e.local_at)?;
+    let header = LocalHeader::parse(&head).map_err(|error| match error {
+        ParseError::BadSignature { .. } => Error::Corrupt("local header signature"),
+        _ => Error::Truncated,
+    })?;
+    let layout = local_layout(header, e.local_at, len).map_err(|_| Error::Truncated)?;
+    Ok(layout.payload_range(e.packed, len).map_err(|_| Error::Truncated)?.start)
+}
+
+/// Reads an entry's data, decompressed, into `sink`, and checks its size and CRC.
+fn read_entry(
+    file: &mut (impl Read + Seek),
+    len: u64,
+    e: &ReadDescription<'_>,
+    password: Option<&str>,
+    buf: &mut [u8],
+    sink: &mut dyn FnMut(&[u8]) -> Result<()>,
+    cancel: Option<&Cancellation>,
+) -> Result<()> {
+    let check = || cancel.map_or(Ok(()), Cancellation::check_io);
+    check()?;
+    let at = data_at(file, len, e)?;
+    file.seek(SeekFrom::Start(at))?;
+    let mut crc = crate::crc32::Hasher::new();
+    let mut size = 0u64;
+    let mut emit = |chunk: &[u8]| -> Result<()> {
+        size += chunk.len() as u64;
+        if size > e.size {
+            return Err(Error::Corrupt("more data than the directory says"));
         }
-        let mut left = e.packed;
-        match e.method {
+        crc.update(chunk);
+        check()?;
+        sink(chunk)
+    };
+    if e.encrypted() {
+        if e.packed > ENCRYPTED_PACKED_LIMIT {
+            return Err(Error::Unsupported("encrypted ZIP entry exceeds the 128 MiB packed limit".into()));
+        }
+        let pw = password
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| Error::Unsupported("encrypted (password required)".into()))?;
+        let packed_len = usize::try_from(e.packed).map_err(|_| Error::Corrupt("encrypted entry too large"))?;
+        let mut raw = vec![0u8; packed_len];
+        if cancel.is_some() {
+            for chunk in raw.chunks_mut(buf.len()) {
+                check()?;
+                file.read_exact(chunk)?;
+            }
+            check()?;
+        } else {
+            file.read_exact(&mut raw)?;
+        }
+        let mut skip_crc = false;
+        let decrypted = if e.method == 99 || e.aes_info.is_some() {
+            let (strength, vendor, _) = e.aes_info.ok_or(Error::Corrupt("missing WinZip AES extra field"))?;
+            if vendor == 2 {
+                skip_crc = true;
+            }
+            crate::crypto::decrypt_winzip_aes(pw, strength, &raw, Some(e.packed))
+                .ok_or(Error::Corrupt("wrong password or damaged AES stream"))?
+        } else {
+            let check = if e.flags & 0x0008 != 0 {
+                let head = read_local_header(file, e.local_at)?;
+                head[11]
+            } else {
+                (e.crc32 >> 24) as u8
+            };
+            crate::crypto::decrypt_zipcrypto(pw, check, &raw).ok_or(Error::Corrupt("wrong password"))?
+        };
+        let method = e.effective_method();
+        match method {
             METHOD_STORED => {
-                if e.packed != e.size {
+                if decrypted.len() as u64 != e.size {
                     return Err(Error::Corrupt("stored entry's sizes differ"));
                 }
-                while left > 0 {
-                    check()?;
-                    let n = (left.min(buf.len() as u64)) as usize;
-                    self.file.read_exact(&mut buf[..n])?;
-                    emit(&buf[..n])?;
-                    left -= n as u64;
+                if cancel.is_some() {
+                    for chunk in decrypted.chunks(buf.len()) {
+                        check()?;
+                        emit(chunk)?;
+                    }
+                } else {
+                    emit(&decrypted)?;
                 }
             }
             METHOD_DEFLATE => {
                 let mut z = Decompress::new(false);
                 let mut out = vec![0u8; BUF];
-                let mut done = false;
-                while !done {
-                    let n = (left.min(buf.len() as u64)) as usize;
-                    self.file.read_exact(&mut buf[..n])?;
-                    left -= n as u64;
-                    let mut input = &buf[..n];
-                    loop {
-                        check()?;
-                        let (before_in, before_out) = (z.total_in(), z.total_out());
-                        let status = z
-                            .decompress(input, &mut out, FlushDecompress::None)
-                            .map_err(|_| Error::Corrupt("deflate data"))?;
-                        let used = (z.total_in() - before_in) as usize;
-                        let made = (z.total_out() - before_out) as usize;
-                        input = &input[used..];
-                        emit(&out[..made])?;
-                        if status == Status::StreamEnd {
-                            done = true;
-                            break;
-                        }
-                        // a full output buffer means there may be more to come from the same input
-                        if made == out.len() {
-                            continue;
-                        }
-                        if input.is_empty() {
-                            if left == 0 {
-                                return Err(Error::Corrupt("deflate data ends early"));
-                            }
-                            break;
-                        }
-                        if used == 0 && made == 0 {
-                            return Err(Error::Corrupt("deflate data"));
-                        }
+                let mut input = decrypted.as_slice();
+                loop {
+                    check()?;
+                    let (before_in, before_out) = (z.total_in(), z.total_out());
+                    let status = z
+                        .decompress(input, &mut out, FlushDecompress::None)
+                        .map_err(|_| Error::Corrupt("deflate data"))?;
+                    let used = (z.total_in() - before_in) as usize;
+                    let made = (z.total_out() - before_out) as usize;
+                    input = &input[used..];
+                    emit(&out[..made])?;
+                    if status == Status::StreamEnd {
+                        break;
+                    }
+                    if made == out.len() {
+                        continue;
+                    }
+                    if input.is_empty() || (used == 0 && made == 0) {
+                        return Err(Error::Corrupt("deflate data"));
                     }
                 }
             }
             METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
-                let packed = BufReader::with_capacity(1 << 20, (&mut self.file).take(e.packed));
-                let mut dec = stream_decoder(e, e.method, packed)?;
+                let mut dec = stream_decoder(e, method, BufReader::new(Cursor::new(&decrypted)))?;
                 loop {
                     check()?;
-                    let n = match dec.read(buf) {
-                        Ok(n) => n,
-                        Err(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => return Err(Error::Truncated),
-                        Err(io) if io.raw_os_error().is_some() => return Err(Error::Io(io)),
-                        Err(_) => return Err(Error::Corrupt("compressed data is damaged")),
-                    };
+                    let n = dec.read(buf).map_err(|_| Error::Corrupt("compressed data is damaged"))?;
                     if n == 0 {
                         break;
                     }
@@ -471,15 +456,112 @@ impl Archive {
         if size != e.size {
             return Err(Error::Corrupt("less data than the directory says"));
         }
-        if crc.finalize() != e.crc32 {
-            return Err(Error::BadChecksum(e.name.clone()));
+        if !skip_crc && crc.finalize() != e.crc32 {
+            return Err(Error::BadChecksum(e.name.to_owned()));
         }
-        Ok(())
+        return Ok(());
+    }
+    let mut left = e.packed;
+    match e.method {
+        METHOD_STORED => {
+            if e.packed != e.size {
+                return Err(Error::Corrupt("stored entry's sizes differ"));
+            }
+            while left > 0 {
+                check()?;
+                let n = (left.min(buf.len() as u64)) as usize;
+                file.read_exact(&mut buf[..n])?;
+                emit(&buf[..n])?;
+                left -= n as u64;
+            }
+        }
+        METHOD_DEFLATE => {
+            let mut z = Decompress::new(false);
+            let mut out = vec![0u8; BUF];
+            let mut done = false;
+            while !done {
+                let n = (left.min(buf.len() as u64)) as usize;
+                file.read_exact(&mut buf[..n])?;
+                left -= n as u64;
+                let mut input = &buf[..n];
+                loop {
+                    check()?;
+                    let (before_in, before_out) = (z.total_in(), z.total_out());
+                    let status = z
+                        .decompress(input, &mut out, FlushDecompress::None)
+                        .map_err(|_| Error::Corrupt("deflate data"))?;
+                    let used = (z.total_in() - before_in) as usize;
+                    let made = (z.total_out() - before_out) as usize;
+                    input = &input[used..];
+                    emit(&out[..made])?;
+                    if status == Status::StreamEnd {
+                        done = true;
+                        break;
+                    }
+                    // a full output buffer means there may be more to come from the same input
+                    if made == out.len() {
+                        continue;
+                    }
+                    if input.is_empty() {
+                        if left == 0 {
+                            return Err(Error::Corrupt("deflate data ends early"));
+                        }
+                        break;
+                    }
+                    if used == 0 && made == 0 {
+                        return Err(Error::Corrupt("deflate data"));
+                    }
+                }
+            }
+        }
+        METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
+            let packed = BufReader::with_capacity(1 << 20, CheckedInput { input: file.take(e.packed), cancel });
+            let mut dec = stream_decoder(e, e.method, packed)?;
+            loop {
+                check()?;
+                let decoded = dec.read(buf);
+                check()?;
+                let n = match decoded {
+                    Ok(n) => n,
+                    Err(io) if io.kind() == std::io::ErrorKind::UnexpectedEof => return Err(Error::Truncated),
+                    Err(io) if io.raw_os_error().is_some() => return Err(Error::Io(io)),
+                    Err(_) => return Err(Error::Corrupt("compressed data is damaged")),
+                };
+                if n == 0 {
+                    break;
+                }
+                emit(&buf[..n])?;
+            }
+        }
+        m => return Err(Error::Unsupported(format!("compression method {m}"))),
+    }
+    if size != e.size {
+        return Err(Error::Corrupt("less data than the directory says"));
+    }
+    if crc.finalize() != e.crc32 {
+        return Err(Error::BadChecksum(e.name.to_owned()));
+    }
+    Ok(())
+}
+
+// The buffered codecs may consume several input windows before producing
+// output. Poll at the source as well as between decoder output chunks.
+struct CheckedInput<'a, R> {
+    input: R,
+    cancel: Option<&'a Cancellation>,
+}
+
+impl<R: Read> Read for CheckedInput<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if let Some(cancel) = self.cancel {
+            cancel.check_io()?;
+        }
+        self.input.read(buffer)
     }
 }
 
 /// A reader of an entry's data for the methods that have a stream decoder.
-fn stream_decoder<'a>(e: &ZipEntry, method: u16, packed: impl BufRead + 'a) -> Result<Box<dyn Read + 'a>> {
+fn stream_decoder<'a>(e: &ReadDescription<'_>, method: u16, packed: impl BufRead + 'a) -> Result<Box<dyn Read + 'a>> {
     Ok(match method {
         METHOD_BZIP2 => Box::new(bzip2::bufread::MultiBzDecoder::new(packed)),
         METHOD_ZSTD => Box::new(zstd_decoder(packed)?),
@@ -530,13 +612,7 @@ fn project_entry(
     mtime_override: Option<ExtraMtime>,
     aes: Option<AesFields>,
 ) -> std::result::Result<ZipEntry, DirectoryError> {
-    let (mtime, nanos) = match mtime_override {
-        Some(ExtraMtime::NtfsFiletime(ticks)) => {
-            (Some((ticks / 10_000_000) as i64 - 11_644_473_600), ((ticks % 10_000_000) * 100) as u32)
-        }
-        Some(ExtraMtime::UnixSeconds(seconds)) => (Some(i64::from(seconds)), 0),
-        None => (dos_time(header.mod_time, header.mod_date), 0),
-    };
+    let (mtime, nanos) = project_mtime(header, mtime_override);
     Ok(ZipEntry {
         name: decode_name(unicode_path.unwrap_or(raw_name), unicode_path.is_some() || header.flags & FLAG_UTF8 != 0)?,
         flags: header.flags,
@@ -549,10 +625,23 @@ fn project_entry(
         external: header.external_attributes,
         mtime,
         nanos,
-        aes_info: aes
-            .filter(|fields| (1..=3).contains(&fields.strength))
-            .map(|fields| (fields.strength, fields.vendor_version, fields.method)),
+        aes_info: project_aes(aes),
     })
+}
+
+fn project_mtime(header: CentralHeader, mtime_override: Option<ExtraMtime>) -> (Option<i64>, u32) {
+    match mtime_override {
+        Some(ExtraMtime::NtfsFiletime(ticks)) => {
+            (Some((ticks / 10_000_000) as i64 - 11_644_473_600), ((ticks % 10_000_000) * 100) as u32)
+        }
+        Some(ExtraMtime::UnixSeconds(seconds)) => (Some(i64::from(seconds)), 0),
+        None => (dos_time(header.mod_time, header.mod_date), 0),
+    }
+}
+
+fn project_aes(aes: Option<AesFields>) -> Option<(u8, u16, u16)> {
+    aes.filter(|fields| (1..=3).contains(&fields.strength))
+        .map(|fields| (fields.strength, fields.vendor_version, fields.method))
 }
 
 /// MS-DOS date and time, which carry no time zone: read as UTC.
@@ -588,17 +677,33 @@ fn cp437(byte: u8) -> char {
 }
 
 fn decode_name(raw: &[u8], utf8: bool) -> std::result::Result<String, DirectoryError> {
-    let mut name = String::new();
     // Many tools write valid UTF-8 without setting the flag.
     if let Ok(valid) = std::str::from_utf8(raw) {
+        let mut name = String::new();
         name.try_reserve_exact(valid.len()).map_err(|_| DirectoryError::Allocation)?;
         name.push_str(valid);
-    } else if utf8 {
-        // Raw names and Unicode extra bodies are bounded by wire u16 lengths.
+        return Ok(name);
+    }
+    decode_invalid_name(raw, utf8, |_| Ok(()))
+}
+
+// Charge the exact additional allocation before reserving a decoded name.
+// Raw names and Unicode extra bodies are bounded by wire u16 lengths.
+fn decode_invalid_name(
+    raw: &[u8],
+    utf8: bool,
+    charge: impl FnOnce(usize) -> std::result::Result<(), DirectoryError>,
+) -> std::result::Result<String, DirectoryError> {
+    let len = if utf8 {
         // Utf8Chunks reproduces from_utf8_lossy's replacement boundaries.
-        let len =
-            raw.utf8_chunks().map(|chunk| chunk.valid().len() + 3 * usize::from(!chunk.invalid().is_empty())).sum();
-        name.try_reserve_exact(len).map_err(|_| DirectoryError::Allocation)?;
+        raw.utf8_chunks().map(|chunk| chunk.valid().len() + 3 * usize::from(!chunk.invalid().is_empty())).sum()
+    } else {
+        raw.iter().copied().map(|byte| cp437(byte).len_utf8()).sum()
+    };
+    charge(len)?;
+    let mut name = String::new();
+    name.try_reserve_exact(len).map_err(|_| DirectoryError::Allocation)?;
+    if utf8 {
         for chunk in raw.utf8_chunks() {
             name.push_str(chunk.valid());
             if !chunk.invalid().is_empty() {
@@ -606,8 +711,6 @@ fn decode_name(raw: &[u8], utf8: bool) -> std::result::Result<String, DirectoryE
             }
         }
     } else {
-        let len = raw.iter().copied().map(|byte| cp437(byte).len_utf8()).sum();
-        name.try_reserve_exact(len).map_err(|_| DirectoryError::Allocation)?;
         name.extend(raw.iter().copied().map(cp437));
     }
     Ok(name)
@@ -700,9 +803,18 @@ pub fn run_with_password(
                 }
             }
         }
+        let entry = e.read_description();
         let read = match target.as_mut() {
-            Some(out) => archive.read_entry(e, password, &mut buf, &mut |chunk| Ok(out.write(chunk)?), None),
-            None => archive.read_entry(e, password, &mut buf, &mut |_| Ok(()), None),
+            Some(out) => read_entry(
+                &mut archive.file,
+                archive.len,
+                &entry,
+                password,
+                &mut buf,
+                &mut |chunk| Ok(out.write(chunk)?),
+                None,
+            ),
+            None => read_entry(&mut archive.file, archive.len, &entry, password, &mut buf, &mut |_| Ok(()), None),
         };
         match read {
             Ok(()) => {

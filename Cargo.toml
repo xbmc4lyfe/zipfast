@@ -38,7 +38,7 @@ tempfile = "3.27"
 zip-container = { version = "0.1.0", path = "crates/zip-container" }
 zstd = "0.14.3"
 
-[target.'cfg(target_os = "macos")'.dependencies]
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [[bin]]
