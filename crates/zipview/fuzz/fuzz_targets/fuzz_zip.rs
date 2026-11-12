@@ -106,7 +106,9 @@ fuzz_target!(|data: &[u8]| {
         );
         assert_eq!(
             reader.password_check(entry),
-            index.fetch_password_check(entry, read).expect("reads succeed")
+            index
+                .fetch_password_check(entry, read)
+                .expect("reads succeed")
         );
 
         // Name-based lookup must agree that an enumerated entry exists, and

@@ -38,6 +38,14 @@ threads (default: one per core).
 
 Exit status: 0 all good, 1 some files failed, 2 the archive couldn't be read.
 
+Extraction protects the input archive and existing consecutive RAR volume names. It refuses destination symlinks.
+A successful overwrite atomically replaces the destination name. Replacing a separate hard-link name leaves the
+original archive inode and its bytes intact.
+
+For compressed TAR, extraction stages member payloads and archive-supplied directory metadata until the outer
+stream passes verification. Pending payloads use temporary disk space. Members publish in archive order, so a
+publication failure can leave earlier verified members in place.
+
 ## Builds tuned for a processor
 
 A plain `cargo build --release` runs on any x86-64 or Apple silicon processor, and picks AVX2 at run time where

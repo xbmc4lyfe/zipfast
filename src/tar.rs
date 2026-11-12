@@ -23,8 +23,11 @@ use std::io::{self, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
-use crate::extract::{Entry, Meta, Mode, Options, Summary, Target, finish_dirs, finish_file, make_dirs, open_target};
-use crate::output::Output;
+use crate::extract::{
+    Checked, Entry, Meta, Mode, Options, Overwrite, Place, Summary, check_target, create_target, finish_dirs,
+    finish_file, make_dirs,
+};
+use crate::output::{Output, replace, temporary};
 use crate::path::sanitize;
 use crate::rar5::Redirection;
 use crate::stream::{self, Codec};
@@ -604,6 +607,7 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
 pub fn run(path: &Path, opts: &Options, mut report: impl FnMut(&str)) -> Result<Summary> {
     let threads = opts.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     let mut reader = Reader::open(path, threads)?;
+    let opts = &*opts.protecting(path)?;
     if opts.mode == Mode::Extract {
         std::fs::create_dir_all(&opts.dest)?;
     }
@@ -631,19 +635,8 @@ fn target(
     size: Option<u64>,
     summary: &mut Summary,
     report: &mut impl FnMut(&str),
-) -> Result<Option<(Output, PathBuf)>> {
-    match open_target(opts, rel, size)? {
-        Target::Write(file, path) => Ok(Some((Output::new(file, size), path))),
-        Target::Exists => {
-            report(&format!("{name}: exists, skipped"));
-            summary.skipped += 1;
-            Ok(None)
-        }
-        Target::Blocked(why) => {
-            fail(summary, report, name, why);
-            Ok(None)
-        }
-    }
+) -> Result<Option<Output>> {
+    checked_place(opts, rel, name, summary, report)?.map(|place| create_target(place, size)).transpose()
 }
 
 /// How a member's data went: written whole, or the error that stopped it.
@@ -653,19 +646,95 @@ enum Outcome {
     Archive(Error),
 }
 
+enum StagedMember {
+    Directory(PathBuf, Meta),
+    File { relative: PathBuf, name: String, temporary: tempfile::TempPath, size: u64 },
+}
+
+#[derive(Default)]
+struct StagedTar {
+    members: Vec<StagedMember>,
+}
+
+impl StagedTar {
+    fn publish(self, opts: &Options, summary: &mut Summary, report: &mut impl FnMut(&str)) -> Result<()> {
+        for member in self.members {
+            match member {
+                StagedMember::Directory(relative, meta) => {
+                    make_dirs(&opts.dest, &relative)?;
+                    summary.dir_meta.push((opts.dest.join(relative), meta));
+                    summary.dirs += 1;
+                }
+                StagedMember::File { relative, name, temporary, size } => {
+                    let Some(place) = checked_place(opts, &relative, &name, summary, report)? else { continue };
+                    if place.replace {
+                        replace(temporary, &place.path)?;
+                    } else if let Err(error) = temporary.persist_noclobber(place.path) {
+                        if opts.overwrite == Overwrite::Skip && error.error.kind() == io::ErrorKind::AlreadyExists {
+                            report(&format!("{name}: exists, skipped"));
+                            summary.skipped += 1;
+                            continue;
+                        }
+                        return Err(error.error.into());
+                    }
+                    summary.files += 1;
+                    summary.bytes += size;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn checked_place(
+    opts: &Options,
+    relative: &Path,
+    name: &str,
+    summary: &mut Summary,
+    report: &mut impl FnMut(&str),
+) -> Result<Option<Place>> {
+    match check_target(opts, relative, None)? {
+        Checked::Write(place) => Ok(Some(place)),
+        Checked::Exists => {
+            report(&format!("{name}: exists, skipped"));
+            summary.skipped += 1;
+            Ok(None)
+        }
+        Checked::Blocked(why) => {
+            fail(summary, report, name, why);
+            Ok(None)
+        }
+    }
+}
+
+fn staging_parent(destination: &Path, relative: &Path) -> Result<PathBuf> {
+    let mut directory = destination.to_path_buf();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            let next = directory.join(component);
+            match std::fs::symlink_metadata(&next) {
+                Ok(metadata) if metadata.is_dir() => directory = next,
+                Ok(_) => return Err(Error::UnsafePath(next.display().to_string())),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(directory)
+}
+
 /// Reads one member's data into its output (or nowhere, when testing), finishing or removing the output file.
 /// A failure to write stops the run; a failure in the archive's data fails the member.
 fn copy_out(
-    target: Option<(Output, PathBuf)>,
+    mut target: Option<Output>,
     meta: &Meta,
     read: impl FnOnce(&mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>,
 ) -> Result<Outcome> {
-    let mut target = target;
     // write errors are kept apart from read errors so the two can be told apart afterwards
     let mut write_error: Option<io::Error> = None;
     let read = {
         let mut sink = |chunk: &[u8]| -> Result<()> {
-            if let Some((out, _)) = target.as_mut()
+            if let Some(out) = target.as_mut()
                 && let Err(e) = out.write(chunk)
             {
                 write_error = Some(e);
@@ -676,37 +745,18 @@ fn copy_out(
         read(&mut sink)
     };
     if let Some(e) = write_error {
-        if let Some((out, path)) = target.take() {
-            drop(out);
-            let _ = std::fs::remove_file(path);
-        }
         return Err(Error::Io(e));
     }
     match read {
         Ok(()) => {
-            if let Some((out, path)) = target.take() {
-                match out.finish() {
-                    Ok(file) => finish_file(&file, meta),
-                    Err(e) => {
-                        let _ = std::fs::remove_file(path);
-                        return Err(Error::Io(e));
-                    }
-                }
+            if let Some(out) = target {
+                out.finish(|file| finish_file(file, meta))?;
             }
             Ok(Outcome::Done)
         }
-        Err(e) => {
-            if let Some((out, path)) = target.take() {
-                // waits for anything still being written, so the removal is the last word
-                drop(out);
-                let _ = std::fs::remove_file(path);
-            }
-            match e {
-                // the disk under the archive failed: stop
-                Error::Io(io) => Err(Error::Io(io)),
-                other => Ok(Outcome::Archive(other)),
-            }
-        }
+        // the disk under the archive failed: stop
+        Err(Error::Io(io)) => Err(Error::Io(io)),
+        Err(other) => Ok(Outcome::Archive(other)),
     }
 }
 
@@ -749,6 +799,7 @@ fn run_tar(
     buf: &mut [u8],
     report: &mut impl FnMut(&str),
 ) -> Result<()> {
+    let mut staged = (opts.mode == Mode::Extract && reader.src.codec().is_some()).then(StagedTar::default);
     loop {
         let m = match reader.next() {
             Ok(Some(m)) => m,
@@ -758,8 +809,14 @@ fn run_tar(
                     match reader.drain(buf) {
                         Ok(()) => {}
                         Err(Error::Io(e)) => return Err(Error::Io(e)),
-                        Err(e) => fail(summary, report, "archive", &e.to_string()),
+                        Err(e) => {
+                            fail(summary, report, "archive", &e.to_string());
+                            return Ok(());
+                        }
                     }
+                }
+                if let Some(staged) = staged {
+                    staged.publish(opts, summary, report)?;
                 }
                 return Ok(());
             }
@@ -785,6 +842,10 @@ fn run_tar(
         let why = match m.kind {
             Kind::Dir => {
                 if opts.mode == Mode::Extract && !opts.flatten {
+                    if let Some(staged) = &mut staged {
+                        staged.members.push(StagedMember::Directory(rel, m.meta()));
+                        continue;
+                    }
                     make_dirs(&opts.dest, &rel)?;
                     summary.dir_meta.push((opts.dest.join(&rel), m.meta()));
                 }
@@ -800,6 +861,26 @@ fn run_tar(
         };
         if let Some(why) = why {
             fail(summary, report, &m.name, why);
+            continue;
+        }
+        if let Some(staged) = &mut staged {
+            let parent = staging_parent(&opts.dest, &rel)?;
+            if opts.dest.join(&rel).parent() == Some(parent.as_path())
+                && checked_place(opts, &rel, &m.name, summary, report)?.is_none()
+            {
+                continue;
+            }
+            let (file, temporary) = temporary(&parent)?.into_parts();
+            let output = Output::new(file, Some(m.size));
+            match copy_out(Some(output), &m.meta(), |sink| reader.read_data(m.size, buf, sink))? {
+                Outcome::Done => {
+                    staged.members.push(StagedMember::File { relative: rel, name: m.name, temporary, size: m.size });
+                }
+                Outcome::Archive(error) => {
+                    fail(summary, report, &m.name, &error.to_string());
+                    return Ok(());
+                }
+            }
             continue;
         }
         let mut out = None;

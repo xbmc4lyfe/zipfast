@@ -168,6 +168,7 @@ fn opts(dest: &Path) -> Options {
         overwrite: Overwrite::Skip,
         flatten: false,
         threads: None,
+        protected_paths: Default::default(),
         parallel_min: None,
     }
 }
@@ -566,4 +567,113 @@ fn damaged_or_short_compressed_entries_fail() {
     fs::write(&arc, zip(&zs)).unwrap();
     let s = extract::run(&arc, &test_opts(&dir), |_| {}).unwrap();
     assert_eq!((s.files, s.errors.len()), (0, 9), "{:?}", s.errors);
+}
+
+#[test]
+fn a_failed_overwrite_preserves_the_existing_file() {
+    let dir = tmp("overwrite-failure");
+    let arc = dir.join("bad.zip");
+    let output = dir.join("out");
+    fs::create_dir_all(&output).unwrap();
+    let keep = output.join("keep.txt");
+    fs::write(&keep, b"Keep this file.").unwrap();
+    let before = fs::metadata(&keep).unwrap();
+    let mut bad = Z::new("keep.txt", b"Invalid replacement.");
+    bad.crc = Some(0);
+    fs::write(&arc, zip(&[bad])).unwrap();
+    let options = Options { overwrite: Overwrite::Always, ..opts(&output) };
+    let result = extract::run(&arc, &options, |_| {}).unwrap();
+    assert_eq!(result.errors.len(), 1);
+    assert_eq!(fs::read(&keep).expect("original output still exists"), b"Keep this file.");
+    let after = fs::metadata(&keep).unwrap();
+    assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+    assert_eq!(after.permissions(), before.permissions());
+    assert_eq!(fs::read_dir(&output).unwrap().count(), 1);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn zip_extraction_preserves_its_input() {
+    let dir = tmp("archive-collision");
+    let arc = dir.join("self.zip");
+    let bytes = zip(&[Z::new("self.zip", b"replacement")]);
+    let options = Options { overwrite: Overwrite::Always, ..opts(&dir) };
+    for direct in [false, true] {
+        fs::write(&arc, &bytes).unwrap();
+        let result = if direct {
+            zipfast::zip::run(&arc, &options, |_| {}).unwrap()
+        } else {
+            extract::run(&arc, &options, |_| {}).unwrap()
+        };
+        assert_eq!(fs::read(&arc).unwrap(), bytes);
+        assert_eq!((result.files, result.errors.len()), (0, 1));
+    }
+    let result = std::process::Command::new(env!("CARGO_BIN_EXE_zipfast"))
+        .current_dir(&dir)
+        .args(["x", "-o+", "self.zip"])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert_eq!(fs::read(&arc).unwrap(), bytes);
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn zip_refuses_archive_directory_aliases_and_target_symlinks() {
+    use std::os::unix::fs::symlink;
+
+    let dir = tmp("input-aliases");
+    let input = dir.join("input");
+    fs::create_dir(&input).unwrap();
+    let alias = dir.join("alias");
+    symlink(&input, &alias).unwrap();
+    let arc = input.join("self.zip");
+    let bytes = zip(&[Z::new("self.zip", b"replacement"), Z::new("target", b"replacement")]);
+    fs::write(&arc, &bytes).unwrap();
+    let link = input.join("target");
+    symlink(&arc, &link).unwrap();
+    let options = Options { overwrite: Overwrite::Always, ..opts(&alias) };
+    let result = zipfast::zip::run(&arc, &options, |_| {}).unwrap();
+    assert_eq!(fs::read(&arc).unwrap(), bytes);
+    assert_eq!(fs::read_link(&link).expect("target symlink stays in place"), arc);
+    assert_eq!((result.files, result.errors.len()), (0, 2));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn replacing_a_hard_link_name_does_not_modify_the_input_inode() {
+    let dir = tmp("hard-link");
+    let arc = dir.join("input.zip");
+    let target = dir.join("target");
+    let bytes = zip(&[Z::new("target", b"replacement")]);
+    fs::write(&arc, &bytes).unwrap();
+    fs::hard_link(&arc, &target).unwrap();
+    let options = Options { overwrite: Overwrite::Always, ..opts(&dir) };
+    let result = extract::run(&arc, &options, |_| {}).unwrap();
+    assert!(result.errors.is_empty());
+    assert_eq!(fs::read(&arc).unwrap(), bytes);
+    assert_eq!(fs::read(&target).unwrap(), b"replacement");
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn caller_protected_paths_are_merged_with_automatic_input_protection() {
+    let dir = tmp("protected-paths");
+    let arc = dir.join("self.zip");
+    let keep = dir.join("keep");
+    let bytes = zip(&[Z::new("self.zip", b"replacement"), Z::new("keep", b"replacement")]);
+    fs::write(&arc, &bytes).unwrap();
+    fs::write(&keep, b"original").unwrap();
+    let options = Options {
+        overwrite: Overwrite::Always,
+        protected_paths: [dir.join(".").join("keep")].into_iter().collect(),
+        ..opts(&dir)
+    };
+    let result = zipfast::zip::run_with_password(&arc, &options, None, |_| {}).unwrap();
+    assert_eq!((result.files, result.errors.len()), (0, 2));
+    assert_eq!(fs::read(&arc).unwrap(), bytes);
+    assert_eq!(fs::read(&keep).unwrap(), b"original");
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 2);
+    fs::remove_dir_all(&dir).unwrap();
 }

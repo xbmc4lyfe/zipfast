@@ -9,7 +9,7 @@ by the caller.
 let archive = zipview::ZipReader::new(bytes)?;
 
 for entry in archive.entries() {
-    println!("{} — {} bytes, {}", entry.name(), entry.size(), entry.compression_name());
+    println!("{}—{} bytes, {}", entry.name(), entry.size(), entry.compression_name());
 }
 
 let xml = archive.read_to_string("docProps/core.xml")?;
@@ -30,7 +30,7 @@ let read = |offset: u64, buf: &mut [u8]| file.read_exact_at(buf, offset);
 let index = zipview::ZipIndex::open(file.metadata()?.len(), read)?;
 
 for entry in index.entries() {
-    println!("{} — {} bytes", entry.name(), entry.size());
+    println!("{}—{} bytes", entry.name(), entry.size());
 }
 if let Some(entry) = index.by_name("release.nfo") {
     let nfo = index.fetch_entry(entry, None, read)?; // two reads: header, entry
@@ -42,7 +42,7 @@ if let Some(entry) = index.by_name("release.nfo") {
 read by offset, HTTP range requests, pieces fetched from elsewhere. Where reads
 are asynchronous, `ZipIndexOpener` does the opening one read at a time —
 `next_read` names the bytes it needs, you `supply` them however you fetch, and
-`finish` gives the index — and `header_range`, `entry_range` and
+`finish` gives the index—and `header_range`, `entry_range` and
 `password_check_range` do the same for an entry, with `read_entry` and
 `password_check` finishing from the bytes.
 
@@ -54,8 +54,8 @@ are read.
 ## Why
 
 Written to replace the `zip` crate in a metadata tool that needed about five
-percent of what it does — open an archive, find an entry by name, inflate a few
-small XML members — and was inheriting its whole dependency tree for the
+percent of what it does—open an archive, find an entry by name, inflate a few
+small XML members—and was inheriting its whole dependency tree for the
 privilege. Removing it dropped **27 crates** from that project's lockfile,
 including an AES/cipher stack and three `zstd` crates it never used.
 
@@ -63,7 +63,7 @@ Seven RUSTSEC advisories went with them:
 
 | Advisories | What they were |
 |---|---|
-| RUSTSEC-2026-0367/0368/0369 | SUID/SGID preservation, symlink escape, permissions through symlinks — all in `ZipArchive::extract` |
+| RUSTSEC-2026-0367/0368/0369 | SUID/SGID preservation, symlink escape, permissions through symlinks—all in `ZipArchive::extract` |
 | RUSTSEC-2026-0391/0398/0403/0410 | `zstd`, `zstd-safe`, `zstd-sys`, transitive, only so Zstd entries could be decompressed |
 
 The first three are the interesting part. A reader that **cannot extract** makes
@@ -76,13 +76,13 @@ wanted them.
 Use [`zip`](https://crates.io/crates/zip) if you need to write archives, extract
 files, or decompress beyond Stored and Deflate.
 
-This is for reading metadata out of ZIP containers — OOXML (`.docx`/`.xlsx`/
+This is for reading metadata out of ZIP containers—OOXML (`.docx`/`.xlsx`/
 `.pptx`), EPUB, iWork, ODF, JAR, APK.
 
 ### Unsupported methods still enumerate
 
 Only Stored and Deflate are decompressed. An entry in any other method is still
-**fully enumerated** — name, sizes, CRC, timestamp, mode, method name — and only
+**fully enumerated**—name, sizes, CRC, timestamp, mode, method name—and only
 reading its bytes fails. Metadata about a Zstd or LZMA entry is still correct and
 complete.
 
@@ -112,7 +112,7 @@ portable code runs, and the tests hold both to the same reference.
   payload, so trusting them is wrong.
 - **Inflation is capped at the declared size.** A zip bomb that lies about its
   size errors instead of allocating unboundedly. A stream that inflates to a
-  *different* size than declared also errors — a silently short XML document
+  *different* size than declared also errors—a silently short XML document
   parses into wrong values, which is worse than no values.
 - **The declared entry count is a hint, not a promise.** It is clamped against
   what the buffer could hold, since each central directory header needs ≥46
@@ -123,7 +123,7 @@ portable code runs, and the tests hold both to the same reference.
 ## Testing
 
 No dev-dependencies. The whole point is having nothing worth auditing, and
-`cargo audit` reads dev-dependencies too — a ZIP writer pulled in for fixtures
+`cargo audit` reads dev-dependencies too—a ZIP writer pulled in for fixtures
 would undo that. `tests/writer.rs` builds archives byte by byte instead, and
 duplicates the four ZIP signatures rather than importing them from the reader,
 so a round-trip cannot pass by sharing a wrong constant.
@@ -163,8 +163,8 @@ Passing `fuzz/seeds` first makes the run mutate the curated seeds in place.
 **Pass the seeds.** Unseeded, this target is close to useless: random bytes
 almost never contain a valid end-of-central-directory signature, so the fuzzer
 bails at the first check and never reaches the parser. A measured 181-second
-unseeded run managed 437,933 executions at **30 edges covered** — almost all of
-them "not a zip, return". The seeds are valid archives, including the
+unseeded run managed 437,933 executions at **30 edges covered**—almost all of
+them "not a zip, return." The seeds are valid archives, including the
 self-extracting prefix and an entry in a method the reader cannot decompress,
 so mutation starts inside the parser.
 
@@ -182,7 +182,7 @@ agrees with itself.
 
 The reader originally treated the end-of-central-directory's offset as absolute.
 For a self-extracting archive that is wrong, and the result was **zero entries,
-silently** — no error, no panic, just an empty archive.
+silently**—no error, no panic, just an empty archive.
 
 Nothing in the code looked wrong. It was caught by differential testing against
 the `zip` crate, which proved the reader correct before that dependency was

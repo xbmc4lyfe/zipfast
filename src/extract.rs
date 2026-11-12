@@ -17,6 +17,7 @@
 //! Lists, tests and extracts an archive. RAR 5.0 lives here: its volumes are followed in order and compressed files
 //! decoded. Other formats have modules of their own.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
@@ -25,7 +26,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::batch::{self, Batch, Done, Job, Outcome};
 use crate::blake2sp::Blake2sp;
 use crate::error::{Error, Result};
-use crate::output::Output;
+use crate::output::{Output, temporary};
 use crate::path::sanitize;
 use crate::rar5::reader::{Block, Volume};
 use crate::rar5::unpack::{Sink, Unpacker, window_for};
@@ -57,9 +58,27 @@ pub struct Options {
     pub flatten: bool,
     /// threads to decode with, counting the one that writes the output; None for one per core
     pub threads: Option<usize>,
+    /// Additional existing paths to preserve. Extraction also protects its archive and RAR volumes.
+    pub protected_paths: HashSet<PathBuf>,
     /// the smallest file decoded on several threads; None for the decoder's default
     #[doc(hidden)]
     pub parallel_min: Option<u64>,
+}
+
+impl Options {
+    pub(crate) fn protecting(&self, input: &Path) -> Result<Cow<'_, Self>> {
+        if self.mode != Mode::Extract {
+            return Ok(Cow::Borrowed(self));
+        }
+        let mut opts = self.clone();
+        for path in &self.protected_paths {
+            if let Ok(canonical) = path.canonicalize() {
+                opts.protected_paths.insert(canonical);
+            }
+        }
+        opts.protected_paths.insert(input.canonicalize()?);
+        Ok(Cow::Owned(opts))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -93,14 +112,14 @@ impl From<&FileHeader> for Meta {
 
 /// Where a file's data is to go, once the destination has been checked.
 pub(crate) enum Target {
-    Write(File, PathBuf),
+    Write(Output),
     /// already there and not to be overwritten
     Exists,
     /// something else stands in the way
     Blocked(&'static str),
 }
 
-/// A checked place for a file not created yet: `replace` when something there is to be removed first.
+/// A checked output path. A replacement is staged until verification.
 pub(crate) struct Place {
     pub path: PathBuf,
     pub replace: bool,
@@ -117,10 +136,7 @@ pub(crate) enum Checked {
 /// link left at the target. `size` is preallocated when known.
 pub(crate) fn open_target(opts: &Options, rel: &Path, size: Option<u64>) -> Result<Target> {
     Ok(match check_target(opts, rel, None)? {
-        Checked::Write(place) => {
-            let file = create_target(&place, size)?;
-            Target::Write(file, place.path)
-        }
+        Checked::Write(place) => Target::Write(create_target(place, size)?),
         Checked::Exists => Target::Exists,
         Checked::Blocked(why) => Target::Blocked(why),
     })
@@ -156,10 +172,15 @@ pub(crate) fn check_target(opts: &Options, rel: &Path, dirs: Option<&mut Dirs>) 
         }
     }
     Ok(match fs::symlink_metadata(&target) {
+        Ok(meta) if meta.file_type().is_symlink() => Checked::Blocked("a symlink is in the way"),
         Ok(_) if opts.overwrite == Overwrite::Skip => Checked::Exists,
         Ok(meta) if meta.is_dir() => Checked::Blocked("a folder is in the way"),
+        Ok(_) if !opts.protected_paths.is_empty() && opts.protected_paths.contains(&target.canonicalize()?) => {
+            Checked::Blocked("the output path would replace a protected input")
+        }
         Ok(_) => Checked::Write(Place { path: target, replace: true }),
-        Err(_) => Checked::Write(Place { path: target, replace: false }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Checked::Write(Place { path: target, replace: false }),
+        Err(e) => return Err(e.into()),
     })
 }
 
@@ -168,21 +189,23 @@ pub(crate) fn check_target(opts: &Options, rel: &Path, dirs: Option<&mut Dirs>) 
 const PREALLOCATE_MIN: u64 = 1 << 20;
 
 /// The second half of [`open_target`].
-pub(crate) fn create_target(place: &Place, size: Option<u64>) -> Result<File> {
-    if place.replace {
-        // removing first means a link left at the target is replaced, never written through
-        match fs::remove_file(&place.path) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-    }
-    let file = OpenOptions::new().write(true).create_new(true).open(&place.path)?;
+pub(crate) fn create_target(place: Place, size: Option<u64>) -> Result<Output> {
+    let (file, staged) = if place.replace {
+        let parent = place.path.parent().ok_or_else(|| Error::UnsafePath(place.path.display().to_string()))?;
+        let (file, path) = temporary(parent)?.into_parts();
+        (file, Some(path))
+    } else {
+        let file = OpenOptions::new().write(true).create_new(true).open(&place.path)?;
+        (file, None)
+    };
     if let Some(size) = size.filter(|&s| s >= PREALLOCATE_MIN) {
         // one allocation up front keeps a big file in few extents; failure here is harmless
         let _ = file.set_len(size);
     }
-    Ok(file)
+    Ok(match staged {
+        Some(path) => Output::staged(file, size, path, place.path),
+        None => Output::created(file, size, place.path),
+    })
 }
 
 /// One entry for a listing.
@@ -202,14 +225,12 @@ pub struct Entry {
 
 /// Every volume of the set in turn, starting from `first`, calling `on_block` for each block.
 fn walk(
-    first: &Path,
+    mut vol: Volume,
     password: Option<&str>,
     mut on_block: impl FnMut(&mut Volume, Block) -> Result<()>,
 ) -> Result<u64> {
-    let mut path = first.to_path_buf();
     let mut volumes = 0;
     loop {
-        let mut vol = Volume::open_with_password(&path, password)?;
         volumes += 1;
         let mut more = vol.main.is_volume();
         let mut saw_end = false;
@@ -230,10 +251,10 @@ fn walk(
         if !more {
             return Ok(volumes);
         }
-        let Some(next) = next_volume(&path) else {
+        let Some(next) = next_volume(&vol.path) else {
             // the set says it goes on, but this name has no volume number to step
             if saw_end {
-                return Err(Error::UnnamedVolume(path));
+                return Err(Error::UnnamedVolume(vol.path));
             }
             return Ok(volumes);
         };
@@ -244,7 +265,7 @@ fn walk(
             }
             return Ok(volumes);
         }
-        path = next;
+        vol = Volume::open_with_password(&next, password)?;
     }
 }
 
@@ -321,7 +342,7 @@ fn zip_run(path: &Path, opts: &Options, password: Option<&str>, report: &mut imp
 
 fn rar_list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
-    walk(first, password, |_, block| {
+    walk(Volume::open_with_password(first, password)?, password, |_, block| {
         let Block::File(h) = block else { return Ok(()) };
         if h.split_before() {
             if let Some(last) = out.last_mut().filter(|e| e.name == h.name) {
@@ -361,7 +382,6 @@ struct PendingCipher {
 struct Pending {
     name: String,
     out: Option<Output>,
-    path: Option<PathBuf>,
     hasher: crate::crc32::Hasher,
     /// the decoder works out the CRC32 instead, and hands it over as `crc`: it does so for every compressed file
     /// whose bytes aren't gathered for a worker
@@ -388,12 +408,10 @@ struct Pending {
 }
 
 impl Pending {
-    fn new(h: &FileHeader, out: Option<File>, path: Option<PathBuf>) -> Self {
-        let size = (!h.size_unknown()).then_some(h.unpacked_size);
+    fn new(h: &FileHeader) -> Self {
         Pending {
             name: h.name.clone(),
-            out: out.map(|f| Output::new(f, size)),
-            path,
+            out: None,
             hasher: crate::crc32::Hasher::new(),
             decoder_crc: h.method != 0 && !h.encrypted,
             crc: None,
@@ -413,9 +431,7 @@ impl Pending {
     /// Creates the file at its place, if it has one and isn't created yet.
     fn open(&mut self, size: Option<u64>) -> Result<()> {
         if let Some(place) = self.place.take() {
-            let file = create_target(&place, size)?;
-            self.out = Some(Output::new(file, size));
-            self.path = Some(place.path);
+            self.out = Some(create_target(place, size)?);
         }
         Ok(())
     }
@@ -426,9 +442,6 @@ impl Pending {
         self.place = None;
         self.mem = None;
         drop(self.out.take());
-        if let Some(path) = self.path.take() {
-            let _ = fs::remove_file(path);
-        }
     }
 
     /// Decoded bytes, to the checksums and the output file.
@@ -594,13 +607,7 @@ fn check_and_finish<R: FnMut(&str)>(books: &mut Books<'_, R>, c: &Checks, mut p:
     }
     if let Some(out) = p.out.take() {
         // the last of a big file may still be on its way to the disk
-        match out.finish() {
-            Ok(file) => finish_file(&file, &c.meta),
-            Err(e) => {
-                p.discard();
-                return Err(e.into());
-            }
-        }
+        out.finish(|file| finish_file(file, &c.meta))?;
     }
     books.summary.files += 1;
     books.summary.bytes += p.bytes;
@@ -697,11 +704,28 @@ fn rar_run(first: &Path, opts: &Options, password: Option<&str>, report: impl Fn
     if opts.mode == Mode::Extract {
         fs::create_dir_all(&opts.dest)?;
     }
+    let first_volume = Volume::open_with_password(first, password)?;
+    let mut opts = opts.protecting(first)?;
+    if let Cow::Owned(opts) = &mut opts {
+        // An end header can request the next volume even if the main header omits the volume flag.
+        // Reserve existing consecutive names before any member can replace one.
+        let mut next = next_volume(first);
+        while let Some(path) = next {
+            match path.canonicalize() {
+                Ok(canonical) => {
+                    opts.protected_paths.insert(canonical);
+                    next = next_volume(&path);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => break,
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
     let threads = opts.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     // the hidden size knob is there to test decoding blocks on workers, which batching would bypass
     let threads = if opts.parallel_min.is_some() { 1 } else { threads };
     let mut r = Run {
-        opts,
+        opts: &opts,
         password: password.filter(|s| !s.is_empty()),
         summary: Summary::default(),
         pending: None,
@@ -714,7 +738,7 @@ fn rar_run(first: &Path, opts: &Options, password: Option<&str>, report: impl Fn
         queued_paths: HashSet::new(),
         dirs: Dirs::default(),
     };
-    let walked = walk(first, r.password, |vol, block| {
+    let walked = walk(first_volume, r.password, |vol, block| {
         let Block::File(h) = block else { return Ok(()) };
         r.file_block(vol, &h)
     });
@@ -845,12 +869,12 @@ impl<R: FnMut(&str)> Run<'_, R> {
     /// after it build on it.
     fn pass_over(&mut self, vol: &mut Volume, h: &FileHeader) -> Result<()> {
         if vol.main.is_solid() && h.method != 0 && !h.encrypted {
-            let mut p = Pending::new(h, None, None);
+            let mut p = Pending::new(h);
             p.passive = true;
             return self.begin_decoding(vol, h, p);
         }
         if h.split_after() {
-            let mut p = Pending::new(h, None, None);
+            let mut p = Pending::new(h);
             p.failed = true;
             self.pending = Some(p);
         }
@@ -952,7 +976,7 @@ impl<R: FnMut(&str)> Run<'_, R> {
             }
             return self.send_to_batch(vol, h, place);
         }
-        let mut p = Pending::new(h, None, None);
+        let mut p = Pending::new(h);
         p.cipher = cipher;
         p.key = (self.opts.mode == Mode::Extract).then_some(key);
         p.place = place;
@@ -1328,14 +1352,15 @@ impl<R: FnMut(&str)> Run<'_, R> {
             return Err(Error::Truncated);
         }
         // the pieces are written by position, so the writer thread hands the file over first
-        let file = match p.out.take().map(Output::finish).transpose() {
+        let file = match p.out.take().map(Output::handoff).transpose() {
             Ok(f) => f,
             Err(e) => {
                 p.discard();
                 return Err(e.into());
             }
         };
-        let part = batch::stored(vol.file(), h.data_at, h.packed_size, file.as_ref(), p.bytes, self.threads);
+        let part =
+            batch::stored(vol.file(), h.data_at, h.packed_size, file.as_ref().map(|f| &f.file), p.bytes, self.threads);
         let part = match part {
             Ok(part) => part,
             Err(e) => {
@@ -1348,13 +1373,13 @@ impl<R: FnMut(&str)> Run<'_, R> {
         p.bytes += h.packed_size;
         if let Some(mut file) = file {
             use std::io::{Seek, SeekFrom};
-            if let Err(e) = file.seek(SeekFrom::Start(p.bytes)) {
+            if let Err(e) = file.file.seek(SeekFrom::Start(p.bytes)) {
                 drop(file);
                 p.discard();
                 return Err(e.into());
             }
             let left = (!h.size_unknown()).then(|| h.unpacked_size.saturating_sub(p.bytes));
-            p.out = Some(Output::new(file, left));
+            p.out = Some(Output::resume(file, left));
         }
         if split_after {
             if h.crc32.is_some_and(|want| part.finalize() != want) {
