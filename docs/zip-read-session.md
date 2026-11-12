@@ -87,3 +87,34 @@ These costs are accepted for the additive engine API. The full Prybar
 inspect/explorer comparison must include its previous two-reader path;
 this engine result alone does not establish a caller improvement or complete
 Phase 2. Historical implementations and downstream pins remain available.
+
+## Format-aware inspection
+
+`extract::inspect`, `inspect_with_password` and `inspect_cancelable` return
+`Inspection::Zip(ReadSession)` or `Inspection::Other(Vec<Entry>)`. This lets
+callers use the snapshot for ZIP and retain their existing non-ZIP listing
+path. The password parameter applies to encrypted RAR headers.
+
+At code revision `d9a7b32c314d1bab9b5129f56faba79738745a7d`, dispatch
+captures its candidate source baseline before reading the first header.
+Ordinary and self-extracting ZIP use that same handle and baseline for the
+session. ZIP and TAR/codec headers retain priority. Unknown headers undergo
+the existing bounded RAR signature search before ZIP fallback. Once RAR is
+recognized, later errors are terminal. This intentionally differs from
+legacy listing, which can fall back to a ZIP tail after a later RAR volume
+reports `NotAnArchive`. Legacy listing itself is unchanged.
+
+`session.dispatch_bytes()` reports the actual probe charge separately from
+`metadata.parser_usage().fetched_bytes`. Both count toward the same 129 MiB
+ceiling, including overlapping reads. The exact boundary and one additional
+byte were tested. Direct session opening has zero dispatch charge and keeps
+its existing full parser budget. Non-ZIP listing errors remain unchanged;
+cancellation during those legacy calls is observed on successful return.
+
+Independent review approved the change and reran 134 distinct tests. Local
+validation passed 394 all-target test instances, five doctests, strict Clippy,
+Rust 1.87 parser/view tests and exact Git consumers. Calibrated traces showed
+one open for ordinary ZIP (1,024 probe plus 65,633 parser bytes) and one for
+self-extracting ZIP (1,049,608 probe plus 65,633 parser bytes). Genuine RAR
+still uses its existing listing reader. These trace results do not replace
+the separate caller performance comparison.

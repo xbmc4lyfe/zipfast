@@ -30,10 +30,11 @@ use crate::blake2sp::Blake2sp;
 use crate::error::{Error, Result};
 use crate::output::{Output, temporary};
 use crate::path::sanitize;
-use crate::rar5::reader::{Block, Volume};
+use crate::rar5::reader::{Block, SIGNATURE_PROBE_BYTES, Volume, signature_end};
 use crate::rar5::unpack::{Sink, Unpacker, window_for};
 use crate::rar5::{FileHeader, Redirection};
 use crate::volume::next_volume;
+use crate::zip::{InspectionSource, ReadSession, SessionResult};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -318,17 +319,22 @@ enum Format {
     Other,
 }
 
+const HEAD_PROBE_BYTES: usize = 1024;
+
 fn sniff(path: &Path) -> Result<Format> {
-    let mut head = [0u8; 1024];
+    let mut head = [0u8; HEAD_PROBE_BYTES];
     let n = crate::tar::read_full(&mut File::open(path)?, &mut head)?;
-    let head = &head[..n];
-    Ok(if crate::zip::sniff(head) {
+    Ok(classify_head(&head[..n]))
+}
+
+fn classify_head(head: &[u8]) -> Format {
+    if crate::zip::sniff(head) {
         Format::Zip
     } else if crate::stream::Codec::sniff(head).is_some() || crate::tar::sniff_tar(head) {
         Format::Tar
     } else {
         Format::Other
-    })
+    }
 }
 
 enum SelectedSource {
@@ -518,6 +524,63 @@ fn rar_selected_header(
         Ok(false)
     })?;
     header.ok_or_else(|| Error::Unsupported("entry index is out of range".into()))
+}
+
+/// Format-specific metadata returned by archive inspection.
+pub enum Inspection {
+    /// Immutable ZIP directory and the retained source for selected reads.
+    Zip(ReadSession),
+    /// The existing listing for TAR, compressed streams, or RAR.
+    Other(Vec<Entry>),
+}
+
+/// Inspects an archive and retains the ZIP source for selected reads.
+pub fn inspect(first: &Path) -> SessionResult<Inspection> {
+    inspect_with_password(first, None)
+}
+
+/// Inspects an archive, using `password` for encrypted RAR headers.
+pub fn inspect_with_password(first: &Path, password: Option<&str>) -> SessionResult<Inspection> {
+    inspect_cancelable(first, password, &Cancellation::default())
+}
+
+/// Inspects an archive with cooperative cancellation.
+///
+/// ZIP and TAR/codec head signatures take precedence. With an unknown head,
+/// inspection searches the bounded RAR signature window before trying ZIP.
+/// After recognition, errors from that format are terminal, including RAR
+/// errors from later volumes. ZIP sessions require supported Unix identity.
+///
+/// The ZIP fetch budget includes both format probes and directory parsing.
+/// The existing non-ZIP listing calls observe cancellation on successful
+/// return. For ZIP payloads, supply a password to the selected read.
+pub fn inspect_cancelable(first: &Path, password: Option<&str>, cancel: &Cancellation) -> SessionResult<Inspection> {
+    let mut source = InspectionSource::open(first, cancel)?;
+    let mut head = [0; HEAD_PROBE_BYTES];
+    let n = source.read_probe(&mut head, cancel)?;
+    let format = classify_head(&head[..n]);
+    cancel.check_io().map_err(Error::from)?;
+    let entries = match format {
+        Format::Zip => return source.into_zip(cancel).map(Inspection::Zip),
+        Format::Tar => {
+            drop(source);
+            crate::tar::list(first)?
+        }
+        Format::Other => {
+            let signature = signature_end(&source.probe_prefix(SIGNATURE_PROBE_BYTES, cancel)?);
+            cancel.check_io().map_err(Error::from)?;
+            match signature {
+                Ok(_) => {
+                    drop(source);
+                    rar_list(first, password)?
+                }
+                Err(Error::NotAnArchive) => return source.into_zip(cancel).map(Inspection::Zip),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    };
+    cancel.check_io().map_err(Error::from)?;
+    Ok(Inspection::Other(entries))
 }
 
 /// The entries of an archive, whatever its format.
