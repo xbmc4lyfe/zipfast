@@ -35,6 +35,7 @@ flate2 = "1"
 liblzma = { version = "0.4.9", features = ["parallel", "static"] }
 subtle = "2.6"
 tempfile = "3.27"
+zip-container = { version = "0.1.0", path = "crates/zip-container" }
 zstd = "0.14.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -51,5 +52,4 @@ panic = "abort"
 
 [dev-dependencies]
 flate2 = "1"
-zip-container = { path = "crates/zip-container" }
 zipview = { path = "crates/zipview" }

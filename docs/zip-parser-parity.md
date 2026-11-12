@@ -5,8 +5,8 @@ The fixtures in [zip_parity.rs](../tests/zip_parity.rs) exercise zipfast
 `ZipIndexOpener` against the same bytes. They characterize the readers at
 `914e005`. The proposed migration requirements below follow the
 [Phase 2 plan](superpowers/plans/2026-11-11-zipview-merge-and-compatibility.md).
-The table records the original observations. The current zipview
-adapter results follow it.
+The table records the original observations. The current adapter results
+follow it.
 
 The [fixture builder](../tests/common/zip_parity_fixture.rs) writes small
 little-endian records with explicit raw names, flags, extras and comments.
@@ -37,11 +37,22 @@ payload ranges and compare the returned bytes.
 | Fixture or contract | Current behavior |
 | --- | --- |
 | Embedded EOCD signature | The slice, blocking and incremental readers prefer the structurally valid EOCD with a comment ending at EOF. Trailing and clipped comments remain supported. |
-| Prefixed ZIP64 | The three zipview readers relocate the ZIP64 end record and its local offsets, including a prefixed record with extensible data. The root reader accepts the fixed prefixed record and returns `Corrupt("ZIP64 end record")` for the prefixed extensible fixture. |
+| Prefixed ZIP64 | The three zipview readers relocate the ZIP64 end record and its local offsets, including a prefixed record with extensible data. |
 | Directory limits and geometry | An impossible declaration or exhausted metadata budget returns `BadOffset`. The sparse directory-size fixture and the over-limit ZIP64 count fixture stop after the tail. Within the limits, listing retains the tolerant count and clipped central-comment behavior. |
 | Unresolved or split addressing | zipview lists the raw offset or sentinel. A local read requiring an unresolved or split address returns `BadOffset`. A full read requiring an unresolved packed size returns `Truncated` without fetching the payload. The bounded password preview still works when its local address is usable. |
-| AES extra boundaries | The public helper and entry projection use the first bounded AES extra and ignore a short or overclaimed field. The root reader still accepts the historical overclaimed-field fixture. Zipview checks the local extra for a password preview and prefers central AES parameters for a full authenticated read, with a local fallback. |
+| AES extra boundaries | The public helper and entry projection use the first bounded AES extra and ignore a short or overclaimed field. Zipview checks the local extra for a password preview and prefers central AES parameters for a full authenticated read, with a local fallback. |
 | Incremental range protocol | A nonempty supply must start at the pending offset and fit within the request. Invalid supply returns `BadOffset` and leaves progress intact. A partial request and the accumulated metadata can be cloned and continued independently. A directory outside the initial tail can require separate signature and fixed-header probes before the remaining directory ranges. |
+
+## Current zipfast adapter results
+
+| Fixture or contract | Current behavior |
+| --- | --- |
+| Prefixed ZIP64 and end framing | The root reader relocates fixed and extensible ZIP64 end records. It exposes checked physical local offsets. A ZIP64 end record whose declared length fails to reach the locator is corrupt. |
+| Central extras | The root reader skips an AES extra whose advertised body exceeds the central extra block. It uses the first complete AES extra and filters invalid strengths. The last CRC-matched Unicode path and the last valid NTFS or extended mtime win in wire order. |
+| Directory count and disk metadata | Exact counts remain mandatory, and a noncentral trailer is accepted even for zero entries. A central signature after the declared count is corrupt, including a signature with a clipped header. The central start-disk sentinel `0xffff` retains its legacy exception. Split archive declarations remain unsupported. |
+| Missing ZIP64 values | An unresolved local address is corrupt. An absent ZIP64 size extra leaves the classic sentinel visible. A present ZIP64 extra with too few required values is corrupt. |
+| Source and metadata bounds | The range driver uses the open file and shared limits, including a 128 MiB directory, 1,000,000 records, a 16 MiB pending request, and 129 MiB of cumulative source bytes. Cancelable opens read and supply chunks of at most 64 KiB. The driver preserves filesystem and cancellation errors. |
+| Local layout | Root extraction checks the complete fixed header before the signature and uses its variable lengths and the central packed size for the payload range. A short fixed header or an out-of-range payload returns `Truncated`. |
 
 ## Public metadata boundaries
 
@@ -58,5 +69,6 @@ The baseline source is available at revision `914e005` in
 `src/zip.rs`, `src/crypto.rs`, and `crates/zipview/src/{lib,index}.rs`.
 In the current adapter, [ZipReader](../crates/zipview/src/lib.rs) projects the
 shared records and [ZipIndexOpener](../crates/zipview/src/index.rs) drives
-the same parser over byte ranges. The shared records retain raw metadata
-and ranges used by the parity fixtures.
+the same parser over byte ranges. The root [Archive](../src/zip.rs) projects
+central records directly into its legacy entries. The shared raw parser
+continues to retain metadata and ranges used by the parity fixtures.
