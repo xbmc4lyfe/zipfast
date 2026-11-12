@@ -19,8 +19,9 @@ let xml = archive.read_to_string("docProps/core.xml")?;
 
 `ZipReader` needs the whole archive as one slice. For one too big to load, or
 read over a network, `ZipIndex` reads it a byte range at a time: the end of the
-archive and its central directory to open it (one read when the directory is
-small, two for most others), then only the bytes of the entries you read.
+archive and its central directory to open it, then only the bytes of the
+entries you read. The directory can fit in the first read. Otherwise the
+reader probes its start and fetches the remaining records in bounded ranges.
 
 ```rust
 use std::os::unix::fs::FileExt;
@@ -41,15 +42,16 @@ if let Some(entry) = index.by_name("release.nfo") {
 `read(offset, buf)` can be anything that fills `buf` from the archive: a file
 read by offset, HTTP range requests, pieces fetched from elsewhere. Where reads
 are asynchronous, `ZipIndexOpener` does the opening one read at a time —
-`next_read` names the bytes it needs, you `supply` them however you fetch, and
-`finish` gives the index—and `header_range`, `entry_range` and
+`next_read` names the pending range, `supply` accepts a contiguous prefix of
+that range, and `finish` gives the index. Repeated polls return the same
+range until you supply bytes. Keep read-ahead in your own buffers and drop
+the opener to cancel between reads. `header_range`, `entry_range` and
 `password_check_range` do the same for an entry, with `read_entry` and
 `password_check` finishing from the bytes.
 
-In the tests a 50 GiB archive opens with a single 65 KB read. No read is over
-16 MiB, so a directory size that lies can't make you allocate more than that at
-once, and an entry over the 256 MiB inflate limit is refused before its bytes
-are read.
+In the tests a 50 GiB archive opens with a single 65 KB read. Opening requests
+at most 16 MiB per read, and an entry over the 256 MiB inflate limit is refused
+before its bytes are read.
 
 ## Why
 
@@ -88,8 +90,10 @@ complete.
 
 ## Design
 
-The reader uses `flate2` with the `zlib-rs` backend for Deflate and
-`subtle` for constant-time WinZip AES verifier and tag comparisons.
+The reader uses `zip-container` for checked ZIP metadata parsing, `flate2`
+with the `zlib-rs` backend for Deflate, and `subtle` for constant-time WinZip
+AES verifier and tag comparisons. `zip-container` adds no third-party
+dependencies.
 
 Full WinZip AES reads through `ZipReader` and `ZipIndex` verify the
 authentication tag before decrypting. A failed check returns
@@ -114,11 +118,19 @@ portable code runs, and the tests hold both to the same reference.
   size errors instead of allocating unboundedly. A stream that inflates to a
   *different* size than declared also errors—a silently short XML document
   parses into wrong values, which is worse than no values.
-- **The declared entry count is a hint, not a promise.** It is clamped against
-  what the buffer could hold, since each central directory header needs ≥46
-  bytes.
-- **Self-extracting archives work.** A stub before the first local header shifts
-  every offset the central directory records; the shift is derived, not assumed.
+- **Listing is bounded.** The directory may yield fewer entries than declared.
+  The parser limits directory bytes to 128 MiB, records to one million, and
+  cumulative fetched metadata to 129 MiB. It also bounds retained metadata and
+  parsing work. Invalid geometry or an exhausted directory budget returns
+  `ZipReadError::BadOffset`.
+- **End records are checked before selecting the directory.** A comment that
+  ends at EOF takes priority over trailing or clipped comments. Prefix shifts
+  also apply to ZIP64, including extensible end records.
+- **Local reads require a usable address.** Split archives and unresolved
+  ZIP64 offsets can still be listed. Local access with those addresses
+  returns `ZipReadError::BadOffset` or no password check. An unresolved packed
+  size returns `ZipReadError::Truncated` on a full read, while bounded password
+  previews can still use the local header and payload prefix.
 
 ## Testing
 

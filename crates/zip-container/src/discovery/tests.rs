@@ -18,7 +18,10 @@
 
 use std::ops::Range;
 
-use crate::{DirectoryError, DirectoryLocation, EndDiscovery, LimitKind, Limits, Profile, SupplyError, discover_slice};
+use crate::{
+    DirectoryError, DirectoryLocation, DirectoryParser, EndDiscovery, LimitKind, Limits, Profile, SupplyError,
+    discover_slice,
+};
 
 const TAIL: u64 = 65_633;
 const WINDOW: u64 = 65_536;
@@ -333,6 +336,35 @@ fn zip64_recovery_handles_fixed_prefix_crossing_two_window_edges() {
                 assert!(location.buffer_usage().live_bytes <= TAIL as usize + 46);
                 assert!(location.buffer_usage().capacity_bytes <= TAIL as usize + 56);
             });
+
+            // Lockstep driving compares the pending range and cumulative work
+            // after every partial supply, including the recovery windows.
+            for step in [usize::MAX, 1, 17] {
+                let len = bytes.len() as u64;
+                let limits = Limits::default();
+                let mut raw = DirectoryParser::new(len, profile, limits).unwrap();
+                let mut projected =
+                    DirectoryParser::with_projection(len, profile, limits, |record| Ok(record.view().location()))
+                        .unwrap();
+                loop {
+                    let pending = raw.next_read();
+                    assert_eq!(projected.next_read(), pending);
+                    assert_eq!(projected.usage(), raw.usage());
+                    let Some(read) = pending.unwrap() else { break };
+                    let start = read.start as usize;
+                    let end = (read.end as usize).min(start.saturating_add(step));
+                    let part = &bytes[start..end];
+                    raw.supply(read.start, part).unwrap();
+                    projected.supply(read.start, part).unwrap();
+                }
+                let raw = raw.finish().unwrap();
+                let projected = projected.finish().unwrap();
+                assert_eq!(projected.zip64_end, raw.zip64_end);
+                assert_eq!(projected.directory_range, raw.directory_range);
+                assert_eq!(projected.prefix_shift, raw.prefix_shift);
+                assert_eq!(projected.entries, [raw.entries[0].source]);
+                assert_eq!(projected.usage, raw.usage);
+            }
         }
     }
 }
@@ -731,4 +763,27 @@ fn walk_rejects_logical_comment_end_overflow_at_a_sparse_u64_source_end() {
         assert_eq!(parser.next_read(), error);
         assert_eq!(parser.usage().owned.entries, 0);
     }
+}
+
+#[test]
+fn cloned_partial_tail_keeps_the_bounded_discovery_reservation() {
+    let bytes = classic(80_000, b"archive");
+    let mut original = EndDiscovery::new(bytes.len() as u64, Profile::Zipfast, Limits::default()).unwrap();
+    let read = original.next_read().unwrap().unwrap();
+    let split = read.start + 40 * 1024;
+    original.supply(read.start, &bytes[read.start as usize..split as usize]).unwrap();
+    let checkpoint = original.usage();
+    let mut clone = original.clone();
+    assert_eq!(clone.next_read(), Ok(Some(split..read.end)));
+    assert_eq!(clone.usage(), checkpoint);
+    for parser in [&mut clone, &mut original] {
+        parser.supply(split, &bytes[split as usize..read.end as usize]).unwrap();
+    }
+    assert_eq!(clone.usage(), original.usage());
+    assert_eq!(clone.buffer_usage().live_bytes, original.buffer_usage().live_bytes);
+    assert!(clone.buffer_usage().capacity_bytes <= original.buffer_usage().capacity_bytes);
+    let cloned = clone.finish().unwrap();
+    let original = original.finish().unwrap();
+    assert_eq!(cloned.directory_range(), original.directory_range());
+    assert_eq!(cloned.raw_comment(), original.raw_comment());
 }

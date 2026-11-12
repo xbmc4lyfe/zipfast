@@ -17,13 +17,15 @@
 // rights and limitations under the RPL.
 
 use std::{
+    cell::Cell,
     ops::Range,
     sync::atomic::{AtomicUsize, Ordering},
 };
 
 use zip_container::{
-    AesFields, Directory, DirectoryError, DirectoryParser, ExtraIter, ExtraMtime, LimitKind, Limits, OwnershipError,
-    OwnershipKind, Profile, SupplyError, discover_slice, parse_slice,
+    AesFields, CentralHeader, CentralLocation, CentralRecord, Directory, DirectoryError, DirectoryParser, ExtraIter,
+    ExtraMtime, LimitKind, Limits, OwnershipError, OwnershipKind, Profile, ReducedCentralRecord, ResolvedFields,
+    SupplyError, Usage, discover_slice, parse_slice, parse_slice_projected,
 };
 
 const PROFILES: [Profile; 2] = [Profile::Zipfast, Profile::Zipview];
@@ -84,11 +86,119 @@ fn drive(bytes: &[u8], mut parser: DirectoryParser, schedule: &[usize]) -> Resul
     parser.finish()
 }
 
+// Keep all scalars and source locations, but retain only the length of the entry comment.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct Projected {
+    header: CentralHeader,
+    source: CentralLocation,
+    resolved: ResolvedFields,
+    name: Vec<u8>,
+    comment_len: usize,
+    aes: Option<AesFields>,
+    mtime: Option<ExtraMtime>,
+    unicode_path: Option<Vec<u8>>,
+}
+
+fn project(record: ReducedCentralRecord<'_>) -> Result<Projected, DirectoryError> {
+    let view = record.view();
+    let known = record.known();
+    Ok(Projected {
+        header: view.header(),
+        source: view.location(),
+        resolved: record.resolved(),
+        name: view.raw_name().to_vec(),
+        comment_len: view.raw_comment().len(),
+        aes: known.aes,
+        mtime: known.mtime_override,
+        unicode_path: known.unicode_path.map(|path| path.path_bytes().to_vec()),
+    })
+}
+
+fn from_raw(record: &CentralRecord) -> Projected {
+    Projected {
+        header: record.header,
+        source: record.source,
+        resolved: record.resolved,
+        name: record.raw_name.to_vec(),
+        comment_len: record.raw_comment.len(),
+        aes: record.known.aes,
+        mtime: record.known.mtime_override,
+        unicode_path: record.known.unicode_path.as_deref().map(<[u8]>::to_vec),
+    }
+}
+
+type Traced<T> = (Result<Directory<T>, DirectoryError>, Vec<Range<u64>>, Usage);
+
+fn traced<T>(bytes: &[u8], mut parser: DirectoryParser<T>, schedule: &[usize]) -> Traced<T> {
+    let mut trace = Vec::new();
+    let driven = (|| {
+        while let Some(read) = parser.next_read()? {
+            let checkpoint = (parser.usage(), parser.buffer_usage());
+            assert_eq!(parser.next_read(), Ok(Some(read.clone())));
+            parser.supply(read.start, &[])?;
+            assert_eq!((parser.usage(), parser.buffer_usage()), checkpoint);
+            let start = read.start as usize;
+            let end = (read.end as usize).min(start.saturating_add(schedule[trace.len() % schedule.len()]));
+            trace.push(read.clone());
+            parser.supply(read.start, &bytes[start..end])?;
+        }
+        assert_eq!(parser.buffer_usage(), Default::default());
+        Ok(())
+    })();
+    let usage = parser.usage();
+    let finished = parser.finish();
+    if let Err(error) = driven {
+        assert_eq!(finished.err(), Some(error));
+        return (Err(error), trace, usage);
+    }
+    (finished, trace, usage)
+}
+
+fn assert_projection(raw: Result<Directory, DirectoryError>, projected: Result<Directory<Projected>, DirectoryError>) {
+    match (raw, projected) {
+        (Ok(raw), Ok(projected)) => {
+            assert_eq!(projected.entries, raw.entries.iter().map(from_raw).collect::<Vec<_>>());
+            assert_eq!(projected.archive_len, raw.archive_len);
+            assert_eq!(projected.end_record, raw.end_record);
+            assert_eq!(projected.zip64_locator, raw.zip64_locator);
+            assert_eq!(projected.zip64_end, raw.zip64_end);
+            assert_eq!(projected.declaration, raw.declaration);
+            assert_eq!(projected.directory_range, raw.directory_range);
+            assert_eq!(projected.observed_range, raw.observed_range);
+            assert_eq!(projected.logical_range, raw.logical_range);
+            assert_eq!(projected.prefix_shift, raw.prefix_shift);
+            assert_eq!(projected.comment_range, raw.comment_range);
+            assert_eq!(projected.raw_comment, raw.raw_comment);
+            assert_eq!(projected.usage, raw.usage);
+            assert_eq!(projected.local_addresses_are_single_disk(), raw.local_addresses_are_single_disk());
+        }
+        (Err(raw), Err(projected)) => assert_eq!(projected, raw),
+        (raw, projected) => panic!("projection and raw outcomes differ: {raw:?} / {projected:?}"),
+    }
+}
+
+fn assert_projected_trace(
+    bytes: &[u8],
+    profile: Profile,
+    limits: Limits,
+    schedule: &[usize],
+) -> Result<Directory, DirectoryError> {
+    let len = bytes.len() as u64;
+    let raw = DirectoryParser::new(len, profile, limits).unwrap();
+    let projected = DirectoryParser::with_projection(len, profile, limits, project).unwrap();
+    let (raw, raw_trace, raw_usage) = traced(bytes, raw, schedule);
+    let (projected, projected_trace, projected_usage) = traced(bytes, projected, schedule);
+    assert_eq!(projected_trace, raw_trace);
+    assert_eq!(projected_usage, raw_usage);
+    assert_projection(raw.clone(), projected);
+    raw
+}
+
 fn across_schedules(bytes: &[u8], profile: Profile) -> Result<Directory, DirectoryError> {
     let expected = parse_slice(bytes, profile, Limits::default());
+    assert_projection(expected.clone(), parse_slice_projected(bytes, profile, Limits::default(), project));
     for schedule in [&[usize::MAX][..], &[1], &[3, 43, 1, 2, 7, 8, 15, 39]] {
-        let ranged =
-            drive(bytes, DirectoryParser::new(bytes.len() as u64, profile, Limits::default()).unwrap(), schedule);
+        let ranged = assert_projected_trace(bytes, profile, Limits::default(), schedule);
         match (&expected, ranged) {
             (Ok(expected), Ok(mut ranged)) => {
                 assert_eq!(ranged.usage.owned, expected.usage.owned);
@@ -345,10 +455,17 @@ fn unicode_crc_override_is_lazy_once_per_name_and_keeps_work_deterministic() {
     let custom = DirectoryParser::with_name_crc32(bytes.len() as u64, Profile::Zipfast, limits, hash).unwrap();
     assert_eq!(drive(&bytes, custom, &[usize::MAX]).unwrap(), default);
     assert_eq!(CALLS.load(Ordering::Relaxed), 1);
-    let custom_view = DirectoryParser::with_name_crc32(bytes.len() as u64, Profile::Zipview, limits, hash).unwrap();
-    let view = drive(&bytes, custom_view, &[usize::MAX]).unwrap();
-    assert_eq!(view.entries[1].known.unicode_path, None);
-    assert_eq!(CALLS.load(Ordering::Relaxed), 1);
+    let custom_projected =
+        DirectoryParser::with_projection_and_name_crc32(bytes.len() as u64, Profile::Zipfast, limits, hash, project)
+            .unwrap();
+    assert_projection(Ok(default), traced(&bytes, custom_projected, &[usize::MAX]).0);
+    assert_eq!(CALLS.load(Ordering::Relaxed), 2);
+    let custom_view =
+        DirectoryParser::with_projection_and_name_crc32(bytes.len() as u64, Profile::Zipview, limits, hash, project)
+            .unwrap();
+    let view = traced(&bytes, custom_view, &[usize::MAX]).0.unwrap();
+    assert_eq!(view.entries[1].unicode_path, None);
+    assert_eq!(CALLS.load(Ordering::Relaxed), 2);
 }
 
 #[test]
@@ -367,6 +484,10 @@ fn component_budgets_carry_archive_comment_and_discovery_work_into_the_walk() {
         comment_bytes: 12,
     };
     assert_eq!(parse_slice(&bytes, Profile::Zipfast, exact).unwrap(), baseline);
+    PROJECTION_CALLS.set(0);
+    let projected = parse_slice_projected(&bytes, Profile::Zipfast, exact, counted_project).unwrap();
+    assert_projection(Ok(baseline.clone()), Ok(projected));
+    assert_eq!(PROJECTION_CALLS.get(), 1);
     for (limits, expected) in [
         (
             Limits { directory_bytes: exact.directory_bytes - 1, ..exact },
@@ -419,7 +540,25 @@ fn component_budgets_carry_archive_comment_and_discovery_work_into_the_walk() {
         assert_eq!(parser.next_read(), Err(expected));
         assert_eq!((parser.usage(), parser.buffer_usage()), stopped);
         assert_eq!(parser.finish(), Err(expected));
+        assert_eq!(assert_projected_trace(&bytes, Profile::Zipfast, limits, &[usize::MAX]), Err(expected));
+        PROJECTION_CALLS.set(0);
+        assert_eq!(parse_slice_projected(&bytes, Profile::Zipfast, limits, counted_project), Err(expected));
+        assert_eq!(PROJECTION_CALLS.get(), 0);
     }
+    let view = parse_slice(&bytes, Profile::Zipview, Limits::default()).unwrap();
+    let view_exact = Limits { work_units: view.usage.work_units, ..exact };
+    PROJECTION_CALLS.set(0);
+    assert_projection(Ok(view), parse_slice_projected(&bytes, Profile::Zipview, view_exact, counted_project));
+    assert_eq!(PROJECTION_CALLS.get(), 1);
+    let short_comment = Limits { comment_bytes: 11, ..view_exact };
+    let raw = parse_slice(&bytes, Profile::Zipview, short_comment);
+    assert!(matches!(
+        raw,
+        Err(DirectoryError::Ownership(OwnershipError::LimitExceeded { kind: OwnershipKind::CommentBytes, .. }))
+    ));
+    PROJECTION_CALLS.set(0);
+    assert_projection(raw, parse_slice_projected(&bytes, Profile::Zipview, short_comment, counted_project));
+    assert_eq!(PROJECTION_CALLS.get(), 0);
     let split = Limits { range_bytes: 1, work_units: Limits::default().work_units, ..exact };
     assert_eq!(parse_slice(&bytes, Profile::Zipfast, split).unwrap().entries, baseline.entries);
 }
@@ -431,6 +570,9 @@ fn maximum_record_is_assembled_once_with_bounded_scratch_and_transactional_suppl
     assert_eq!(cd.len(), 196_651);
     let bytes = archive(&cd, 1, &[]);
     let limits = Limits { range_bytes: 16 * 1024, ..Limits::default() };
+    for profile in PROFILES {
+        assert_projected_trace(&bytes, profile, limits, &[7]).unwrap();
+    }
     let mut parser = DirectoryParser::new(bytes.len() as u64, Profile::Zipfast, limits).unwrap();
     assert_eq!(parser.supply(0, b"X"), Err(DirectoryError::Supply(SupplyError::Unsolicited)));
     let mut peak = (0, 0);
@@ -596,6 +738,9 @@ fn first_body_request_continues_through_the_external_directory_window() {
     let discovery_reads = [tail..len, 0..4, 4..46];
 
     for profile in PROFILES {
+        for schedule in [&[usize::MAX][..], &[1], &[3, 43, 1, 2, 7, 8, 15, 39]] {
+            assert_projected_trace(&bytes, profile, Limits::default(), schedule).unwrap();
+        }
         let expected = parse_slice(&bytes, profile, Limits::default()).unwrap();
         let limits = Limits {
             fetched_bytes: len,
@@ -754,6 +899,10 @@ fn local_address_requires_in_file_start_and_preserves_view_listing() {
         } else {
             assert_eq!(view.physical_local_header_offset(0), None);
             assert_eq!(root, Err(DirectoryError::InvalidLocalOffset));
+            PROJECTION_CALLS.set(0);
+            let projected = parse_slice_projected(&bytes, Profile::Zipfast, Limits::default(), counted_project);
+            assert_eq!(projected, Err(DirectoryError::InvalidLocalOffset));
+            assert_eq!(PROJECTION_CALLS.get(), 0);
         }
     }
 }
@@ -766,4 +915,221 @@ fn incomplete_parser_can_be_finished_or_dropped_between_requests() {
     parser.supply(read.start, &bytes[..1]).unwrap();
     assert_eq!(parser.next_read().unwrap(), Some(1..read.end));
     assert_eq!(parser.finish(), Err(DirectoryError::Incomplete));
+}
+
+#[test]
+fn cloning_pending_discovery_and_walk_preserves_progress_and_counters() {
+    let records: Vec<_> = (0..2_000).flat_map(|_| record(b"dup", &[], b"file")).collect();
+    let bytes = archive(&records, 2_000, b"archive");
+    let limits = Limits { range_bytes: 16 * 1024, ..Limits::default() };
+    let expected = parse_slice(&bytes, Profile::Zipview, limits).unwrap();
+    let mut parser = DirectoryParser::new(bytes.len() as u64, Profile::Zipview, limits).unwrap();
+
+    let tail = parser.next_read().unwrap().unwrap();
+    let split = tail.start + 13;
+    parser.supply(tail.start, &bytes[tail.start as usize..split as usize]).unwrap();
+    let mut discovery_clone = parser.clone();
+    assert_eq!(discovery_clone.usage(), parser.usage());
+    assert_eq!(discovery_clone.next_read().unwrap(), Some(split..tail.end));
+
+    let mut walk_clone = None;
+    while let Some(read) = parser.next_read().unwrap() {
+        let end = read.end.min(read.start + 97);
+        parser.supply(read.start, &bytes[read.start as usize..end as usize]).unwrap();
+        if walk_clone.is_none() && parser.usage().owned.entries > 0 {
+            let mut cloned = parser.clone();
+            assert_eq!(cloned.usage(), parser.usage());
+            assert_eq!(cloned.next_read(), parser.next_read());
+            walk_clone = Some(cloned);
+        }
+    }
+
+    for mut clone in [discovery_clone, walk_clone.unwrap()] {
+        while let Some(read) = clone.next_read().unwrap() {
+            clone.supply(read.start, &bytes[read.start as usize..read.end as usize]).unwrap();
+        }
+        let clone = clone.finish().unwrap();
+        assert_eq!(clone.entries, expected.entries);
+        assert_eq!(clone.raw_comment, b"archive");
+        assert_eq!(clone.usage.owned, expected.usage.owned);
+        assert_eq!(clone.usage.fetched_bytes, expected.usage.fetched_bytes);
+    }
+    assert_eq!(parser.finish().unwrap().entries, expected.entries);
+}
+
+thread_local! {
+    static PROJECTION_CALLS: Cell<usize> = const { Cell::new(0) };
+}
+
+fn counted_project(record: ReducedCentralRecord<'_>) -> Result<Projected, DirectoryError> {
+    PROJECTION_CALLS.set(PROJECTION_CALLS.get() + 1);
+    if record.view().raw_name() == b"fail" {
+        return Err(DirectoryError::Allocation);
+    }
+    project(record)
+}
+
+#[test]
+fn projection_failure_preserves_committed_charges_and_caches_error() {
+    let cd = [record(b"first", &[], b"saved"), record(b"fail", &[], b"discard"), record(b"later", &[], b"")].concat();
+    let bytes = archive(&cd, 3, b"archive");
+    for profile in PROFILES {
+        PROJECTION_CALLS.set(0);
+        let mut parser =
+            DirectoryParser::with_projection(bytes.len() as u64, profile, Limits::default(), counted_project).unwrap();
+        let tail = parser.next_read().unwrap().unwrap();
+        parser.supply(tail.start, &bytes).unwrap();
+        assert_eq!(parser.next_read(), Err(DirectoryError::Allocation));
+        let stopped = (parser.usage(), parser.buffer_usage());
+        assert_eq!(stopped.0.owned.entries, 1);
+        assert_eq!(stopped.0.owned.name_bytes, 5);
+        assert_eq!(stopped.0.owned.comment_bytes, 12);
+        assert_eq!(stopped.1.capacity_bytes, 0);
+        for mut branch in [parser.clone(), parser] {
+            assert_eq!(branch.next_read(), Err(DirectoryError::Allocation));
+            assert_eq!(branch.supply(0, b"X"), Err(DirectoryError::Allocation));
+            assert_eq!((branch.usage(), branch.buffer_usage()), stopped);
+            assert_eq!(branch.finish(), Err(DirectoryError::Allocation));
+        }
+        assert_eq!(PROJECTION_CALLS.get(), 2);
+    }
+}
+
+#[test]
+fn projected_clones_preserve_entry_name_and_work_exhaustion() {
+    let cd = [record(b"a", &[], b"one"), record(b"bb", &[], b"two"), record(b"ccc", &[], b"three")].concat();
+    let bytes = archive(&cd, 3, b"archive");
+    for profile in PROFILES {
+        let baseline = parse_slice(&bytes, profile, Limits::default()).unwrap();
+        let default = Limits::default();
+        for (limits, expected, calls) in [
+            (Limits { entries: 2, ..default }, DirectoryError::Limit(LimitKind::Entries), 0),
+            (
+                Limits { name_bytes: 5, ..default },
+                DirectoryError::Ownership(OwnershipError::LimitExceeded {
+                    kind: OwnershipKind::NameBytes,
+                    needed: 6,
+                    limit: 5,
+                }),
+                2,
+            ),
+            (
+                Limits { work_units: baseline.usage.work_units - 1, ..default },
+                DirectoryError::Limit(LimitKind::WorkUnits),
+                2,
+            ),
+        ] {
+            PROJECTION_CALLS.set(0);
+            let make_parser =
+                || DirectoryParser::with_projection(bytes.len() as u64, profile, limits, counted_project).unwrap();
+            let mut parser = make_parser();
+            let pending = parser.next_read().unwrap().unwrap();
+            let split = pending.start + 7;
+            parser.supply(pending.start, &bytes[pending.start as usize..split as usize]).unwrap();
+            let checkpoint = parser.usage();
+            let clone = parser.clone();
+            let raw = DirectoryParser::new(bytes.len() as u64, profile, limits).unwrap();
+            let (raw, _, _) = traced(&bytes, raw, &[7, usize::MAX]);
+            assert_eq!(raw.err(), Some(expected));
+            assert_eq!(parser.usage(), checkpoint);
+            let (first, first_trace, first_usage) = traced(&bytes, parser, &[usize::MAX]);
+            assert_eq!(PROJECTION_CALLS.get(), calls);
+            assert_eq!(clone.usage(), checkpoint);
+            let (second, second_trace, second_usage) = traced(&bytes, clone, &[usize::MAX]);
+            assert_eq!(first, Err(expected));
+            assert_eq!(second, Err(expected));
+            assert_eq!(first_trace, second_trace);
+            assert_eq!(first_usage, second_usage);
+            assert_eq!(first_usage.owned.entries, calls);
+            assert_eq!(PROJECTION_CALLS.get(), calls * 2);
+        }
+    }
+}
+
+#[test]
+fn cloning_walk_scratch_preserves_tight_work_preflight() {
+    let entry = record(b"dup", &field(0x9898, b"unknown"), b"file");
+    assert_eq!(entry.len(), 64);
+    let bytes = archive(&entry.repeat(2_000), 2_000, b"end");
+    let len = bytes.len() as u64;
+    let start_second_partial = 64;
+    let end_second_partial = 112;
+    let prepare = |limits| {
+        let mut parser = DirectoryParser::new(len, Profile::Zipfast, limits).unwrap();
+        for read in [len - TAIL..len, 0..4, 4..46] {
+            assert_eq!(parser.next_read().unwrap(), Some(read.clone()));
+            parser.supply(read.start, &bytes[read.start as usize..read.end as usize]).unwrap();
+        }
+        let read = parser.next_read().unwrap().unwrap();
+        assert_eq!(read.start, 46);
+        assert!(read.end >= end_second_partial);
+        parser.supply(46, &bytes[46..47]).unwrap();
+        parser.supply(47, &bytes[47..64]).unwrap();
+        assert_eq!(parser.usage().owned.entries, 1);
+        parser
+    };
+    let supply_partial = |parser: &mut DirectoryParser| {
+        parser.supply(start_second_partial, &bytes[start_second_partial as usize..end_second_partial as usize])
+    };
+    let mut unrestricted = prepare(Limits::default());
+    supply_partial(&mut unrestricted).unwrap();
+    let limit = unrestricted.usage().work_units;
+    let mut original = prepare(Limits { work_units: limit, ..Limits::default() });
+    let mut cloned = original.clone();
+    assert_eq!(supply_partial(&mut original), Ok(()));
+    assert_eq!(supply_partial(&mut cloned), Ok(()));
+    assert_eq!(original.usage(), cloned.usage());
+    let error = Err(DirectoryError::Limit(LimitKind::WorkUnits));
+    assert_eq!(original.supply(end_second_partial, b"X"), error);
+    assert_eq!(cloned.supply(end_second_partial, b"X"), error);
+    assert_eq!(original.usage(), cloned.usage());
+}
+
+#[test]
+fn projected_clones_own_partial_records_and_completed_entries_independently() {
+    let record = record(b"dup", &field(0x9898, b"unknown"), b"file");
+    let bytes = archive(&record.repeat(2_000), 2_000, b"end");
+    let len = bytes.len() as u64;
+    let profile = Profile::Zipfast;
+    let limits = Limits::default();
+    let expected = parse_slice_projected(&bytes, profile, limits, project).unwrap();
+    let mut parser = DirectoryParser::with_projection(len, profile, limits, project).unwrap();
+    for read in [len - TAIL..len, 0..4, 4..46] {
+        assert_eq!(parser.next_read().unwrap(), Some(read.clone()));
+        parser.supply(read.start, &bytes[read.start as usize..read.end as usize]).unwrap();
+    }
+    let pending = parser.next_read().unwrap().unwrap();
+    parser.supply(46, &bytes[46..47]).unwrap();
+    let body_clone = parser.clone();
+    parser.supply(47, &bytes[47..64]).unwrap();
+    parser.supply(64, &bytes[64..69]).unwrap();
+    let fixed_clone = parser.clone();
+    parser.supply(69, &bytes[69..128]).unwrap();
+    assert_eq!(parser.usage().owned.entries, 2);
+    let before_bad_suffix = parser.usage();
+    let mut bad = parser.clone();
+    let error = DirectoryError::EntryCount { declared: 2_000, observed: 2 };
+    assert_eq!(bad.supply(128, b"Oops"), Err(error));
+    assert_eq!(bad.usage().owned, before_bad_suffix.owned);
+    assert_eq!(bad.clone().finish(), Err(error));
+    assert_eq!(bad.finish(), Err(error));
+    assert_eq!(parser.usage(), before_bad_suffix);
+    assert_eq!(parser.next_read(), Ok(Some(128..pending.end)));
+
+    for (clone, start, schedule) in [(body_clone, 47, &[97][..]), (fixed_clone, 69, &[3, 41, 500])] {
+        let (result, reads, _) = traced(&bytes, clone, schedule);
+        assert_eq!(reads[0], start..pending.end);
+        let result = result.unwrap();
+        assert_eq!(result.entries, expected.entries);
+        assert_eq!(result.raw_comment, b"end");
+        assert_eq!(result.usage.owned, expected.usage.owned);
+    }
+    while let Some(read) = parser.next_read().unwrap() {
+        parser.supply(read.start, &bytes[read.start as usize..read.end as usize]).unwrap();
+    }
+    let complete = parser.usage();
+    let mut clone = parser.clone();
+    assert_eq!(clone.supply(0, b"X"), Err(DirectoryError::Supply(SupplyError::Unsolicited)));
+    assert_eq!(clone.usage(), complete);
+    assert_eq!(clone.finish().unwrap(), parser.finish().unwrap());
 }

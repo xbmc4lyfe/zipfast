@@ -27,7 +27,9 @@ pub use metadata::{
     Zip64End, Zip64Locator,
 };
 
-pub use walk::{Directory, DirectoryParser, parse_slice};
+pub use walk::{
+    Directory, DirectoryParser, RecordProjection, ReducedCentralRecord, parse_slice, parse_slice_projected,
+};
 
 use std::{fmt, mem, ops::Range};
 
@@ -52,6 +54,7 @@ const CENTRAL_FIXED_WORK: u64 = 128;
 /// The directory range reflects its declared size. Discovery checks the first
 /// fixed header where needed and leaves verification of entries and their
 /// complete extents to the directory walker.
+#[derive(Clone)]
 pub struct DirectoryLocation {
     candidate: Candidate,
     declaration: DirectoryDeclaration,
@@ -150,6 +153,7 @@ impl fmt::Debug for DirectoryLocation {
 /// complete comment followed by trailing data, then a clipped comment in
 /// [Profile::Zipview]. Within each rank, the latest structurally plausible
 /// record wins. An embedded record with plausible geometry can win that tie.
+#[derive(Clone)]
 pub struct EndDiscovery {
     len: u64,
     profile: Profile,
@@ -322,9 +326,10 @@ impl EndDiscovery {
 
     fn append_tail(&mut self, bytes: &[u8]) -> Result<(), DirectoryError> {
         self.accounting.charge(bytes.len() as u64)?;
-        if self.tail.capacity() == 0 {
-            let total = (self.len - self.tail_start) as usize;
-            self.tail.try_reserve_exact(total).map_err(|_| DirectoryError::Allocation)?;
+        let total = (self.len - self.tail_start) as usize;
+        if self.tail.capacity() < total {
+            // A clone of a partially supplied tail has only its live bytes.
+            self.tail.try_reserve_exact(total - self.tail.len()).map_err(|_| DirectoryError::Allocation)?;
         }
         self.tail.extend_from_slice(bytes);
         Ok(())
@@ -797,14 +802,14 @@ enum Purpose {
     Recovery,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Pending {
     range: Range<u64>,
     next: u64,
     purpose: Purpose,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Candidate {
     end: EndRecord,
     locator: Option<Zip64Locator>,
@@ -840,7 +845,7 @@ impl Candidate {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct FixedProbe {
     start: u64,
     len: usize,
@@ -860,7 +865,7 @@ impl FixedProbe {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Recovery {
     end: u64,
     overlap: [u8; END64_LEN - 1],

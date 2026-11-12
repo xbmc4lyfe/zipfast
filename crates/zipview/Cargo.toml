@@ -27,6 +27,8 @@ keywords = ["zip", "archive", "read-only", "metadata", "parser"]
 categories = ["parser-implementations", "compression"]
 
 [dependencies]
+zip-container = { version = "0.1.0", path = "../zip-container" }
+
 # Inflation runs on zlib-rs, a Rust port of zlib, rather than flate2's default
 # miniz_oxide: 2.3-2.6x faster on Apple M4/M5 cores. Unlike miniz_oxide it uses
 # `unsafe` internally, for its SIMD paths. `runtime_detection` lets it pick

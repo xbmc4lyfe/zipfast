@@ -20,8 +20,8 @@ use std::{fmt, mem, ops::Range};
 
 use crate::header::{add_offset, le32};
 use crate::{
-    CentralLocation, CentralRecord, CentralView, OwnershipBudget, OwnershipUsage, ParseError, ResolvedFields,
-    UnicodePathView, central_layout,
+    CentralLocation, CentralRecord, CentralView, KnownExtrasView, OwnershipBudget, OwnershipUsage, ParseError,
+    ResolvedFields, central_layout,
 };
 
 use super::{
@@ -31,10 +31,10 @@ use super::{
 };
 
 /// Ordered central metadata and checked geometry for one archive.
-#[derive(Debug, Eq, PartialEq)]
-pub struct Directory {
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Directory<T = CentralRecord> {
     /// Central records in wire order, including duplicate names.
-    pub entries: Vec<CentralRecord>,
+    pub entries: Vec<T>,
     /// Byte length of the source used for this parse.
     pub archive_len: u64,
     /// Raw fields and source range of the selected classic end record.
@@ -62,7 +62,22 @@ pub struct Directory {
     profile: Profile,
 }
 
-impl Directory {
+impl<T> Directory<T> {
+    /// Whether the archive-level disk declarations use one address space.
+    ///
+    /// Each entry's own disk number and offset still need validation.
+    pub fn local_addresses_are_single_disk(&self) -> bool {
+        self.end_record.disk == 0
+            && self.end_record.directory_disk == 0
+            && self.end_record.disk_entries == self.end_record.entries
+            && self.zip64_locator.as_ref().is_none_or(|locator| locator.disk == 0 && locator.total_disks <= 1)
+            && self.zip64_end.as_ref().is_none_or(|record| {
+                record.disk == 0 && record.directory_disk == 0 && record.disk_entries == record.declaration.entries
+            })
+    }
+}
+
+impl Directory<CentralRecord> {
     /// Checks the physical start address of the indexed record's local header.
     ///
     /// Zipview can list split or unresolved entries without a usable address.
@@ -73,13 +88,7 @@ impl Directory {
         if self.profile == Profile::Zipview
             && (entry.resolved.unresolved.disk_start
                 || entry.resolved.disk_start != 0
-                || self.end_record.disk != 0
-                || self.end_record.directory_disk != 0
-                || self.end_record.disk_entries != self.end_record.entries
-                || self.zip64_locator.as_ref().is_some_and(|locator| locator.disk != 0 || locator.total_disks > 1)
-                || self.zip64_end.as_ref().is_some_and(|record| {
-                    record.disk != 0 || record.directory_disk != 0 || record.disk_entries != record.declaration.entries
-                }))
+                || !self.local_addresses_are_single_disk())
         {
             return None;
         }
@@ -94,28 +103,81 @@ fn physical_offset(resolved: ResolvedFields, shift: u64, archive_len: u64) -> Op
     resolved.local_header_offset.checked_add(shift).filter(|&offset| offset < archive_len)
 }
 
+/// One borrowed central record after the walk's structural and profile checks.
+pub struct ReducedCentralRecord<'a> {
+    view: CentralView<'a>,
+    resolved: ResolvedFields,
+    known: KnownExtrasView<'a>,
+}
+
+impl<'a> ReducedCentralRecord<'a> {
+    /// Original header, raw body fields and source location.
+    pub fn view(&self) -> &CentralView<'a> {
+        &self.view
+    }
+
+    /// Central values resolved according to the selected profile.
+    pub fn resolved(&self) -> ResolvedFields {
+        self.resolved
+    }
+
+    /// Known extras selected according to the profile.
+    pub fn known(&self) -> KnownExtrasView<'a> {
+        self.known
+    }
+}
+
+/// Trusted function that converts a checked, borrowed record to owned output.
+///
+/// Allocate only the returned record, report allocation failures, and avoid
+/// external side effects. The parser bounds its own work and storage. A
+/// projection controls its own allocation and work, and the parser cannot
+/// roll back its effects. The result cannot borrow the supplied input window.
+pub type RecordProjection<T> = for<'a> fn(ReducedCentralRecord<'a>) -> Result<T, DirectoryError>;
+
 /// Incrementally discovers and walks a ZIP directory over a source of known length.
 ///
 /// Requests are absolute half-open ranges. Supply a contiguous prefix of the
 /// current request, or drop the parser to cancel between requests. Complete
 /// central records are consumed directly from the borrowed input.
-#[derive(Debug)]
-pub struct DirectoryParser {
-    state: State,
+#[derive(Clone)]
+pub struct DirectoryParser<T = CentralRecord> {
+    state: State<T>,
     profile: Profile,
     name_crc32: fn(&[u8]) -> u32,
+    projection: RecordProjection<T>,
+}
+
+impl<T> fmt::Debug for DirectoryParser<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DirectoryParser")
+            .field("state", &self.state)
+            .field("profile", &self.profile)
+            .field("name_crc32", &self.name_crc32)
+            .finish()
+    }
 }
 
 // Both live variants are small and kept inline so startup needs no heap allocation.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-enum State {
+#[derive(Clone)]
+enum State<T> {
     Discovery(EndDiscovery),
-    Walk(Walk),
+    Walk(Walk<T>),
     HandoffFailure(DirectoryError, Usage),
 }
 
-impl DirectoryParser {
+impl<T> fmt::Debug for State<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Discovery(discovery) => f.debug_tuple("Discovery").field(discovery).finish(),
+            Self::Walk(walk) => f.debug_tuple("Walk").field(walk).finish(),
+            Self::HandoffFailure(error, usage) => f.debug_tuple("HandoffFailure").field(error).field(usage).finish(),
+        }
+    }
+}
+
+impl DirectoryParser<CentralRecord> {
     /// Creates a parser using the built-in IEEE CRC-32 for Unicode path extras.
     pub fn new(archive_len: u64, profile: Profile, limits: Limits) -> Result<Self, DirectoryError> {
         Self::with_name_crc32(archive_len, profile, limits, reducers::ieee_crc32)
@@ -132,7 +194,40 @@ impl DirectoryParser {
         limits: Limits,
         name_crc32: fn(&[u8]) -> u32,
     ) -> Result<Self, DirectoryError> {
-        Ok(Self { state: State::Discovery(EndDiscovery::new(archive_len, profile, limits)?), profile, name_crc32 })
+        Self::with_projection_and_name_crc32(archive_len, profile, limits, name_crc32, materialize_record)
+    }
+}
+
+impl<T> DirectoryParser<T> {
+    /// Creates a parser that owns one projected value per admitted record.
+    ///
+    /// Records become available through [`Self::finish`] after the directory
+    /// walk completes. See [`RecordProjection`] for the callback contract.
+    pub fn with_projection(
+        archive_len: u64,
+        profile: Profile,
+        limits: Limits,
+        projection: RecordProjection<T>,
+    ) -> Result<Self, DirectoryError> {
+        Self::with_projection_and_name_crc32(archive_len, profile, limits, reducers::ieee_crc32, projection)
+    }
+
+    /// Creates a projected parser using the supplied IEEE CRC-32 for raw names.
+    ///
+    /// The CRC function follows [`DirectoryParser::with_name_crc32`]'s policy.
+    pub fn with_projection_and_name_crc32(
+        archive_len: u64,
+        profile: Profile,
+        limits: Limits,
+        name_crc32: fn(&[u8]) -> u32,
+        projection: RecordProjection<T>,
+    ) -> Result<Self, DirectoryError> {
+        Ok(Self {
+            state: State::Discovery(EndDiscovery::new(archive_len, profile, limits)?),
+            profile,
+            name_crc32,
+            projection,
+        })
     }
 
     /// Progresses until the parser needs source bytes or reaches completion.
@@ -145,7 +240,7 @@ impl DirectoryParser {
             }
             let location = discovery.location.take().expect("completed discovery has a location");
             let usage = location.usage();
-            self.state = match Walk::new(location, self.profile, self.name_crc32) {
+            self.state = match Walk::new(location, self.profile, self.name_crc32, self.projection) {
                 Ok(walk) => State::Walk(walk),
                 Err(error) => State::HandoffFailure(error, usage),
             };
@@ -170,7 +265,7 @@ impl DirectoryParser {
     }
 
     /// Returns the owned directory if parsing can finish with the bytes supplied.
-    pub fn finish(mut self) -> Result<Directory, DirectoryError> {
+    pub fn finish(mut self) -> Result<Directory<T>, DirectoryError> {
         if self.next_read()?.is_some() {
             return Err(DirectoryError::Incomplete);
         }
@@ -214,7 +309,20 @@ impl DirectoryParser {
 /// # Ok::<(), zip_container::DirectoryError>(())
 /// ```
 pub fn parse_slice(bytes: &[u8], profile: Profile, limits: Limits) -> Result<Directory, DirectoryError> {
-    let mut parser = DirectoryParser::new(bytes.len() as u64, profile, limits)?;
+    parse_slice_projected(bytes, profile, limits, materialize_record)
+}
+
+/// Parses a ZIP directory from a slice, projecting each admitted central record.
+///
+/// Uses the same requests, checks and raw admission charges as [`parse_slice`].
+/// See [`RecordProjection`] for the callback contract.
+pub fn parse_slice_projected<T>(
+    bytes: &[u8],
+    profile: Profile,
+    limits: Limits,
+    projection: RecordProjection<T>,
+) -> Result<Directory<T>, DirectoryError> {
+    let mut parser = DirectoryParser::with_projection(bytes.len() as u64, profile, limits, projection)?;
     while let Some(range) = parser.next_read()? {
         parser.supply(range.start, &bytes[range.start as usize..range.end as usize])?;
     }
@@ -231,11 +339,12 @@ enum Phase {
     Failed(DirectoryError),
 }
 
-struct Walk {
-    directory: Directory,
+struct Walk<T> {
+    directory: Directory<T>,
     accounting: Accounting,
     ownership: OwnershipBudget,
     name_crc32: fn(&[u8]) -> u32,
+    projection: RecordProjection<T>,
     phase: Phase,
     next: u64,
     pending: Option<Range<u64>>,
@@ -244,11 +353,34 @@ struct Walk {
     scratch: Vec<u8>,
 }
 
-impl Walk {
+impl<T: Clone> Clone for Walk<T> {
+    fn clone(&self) -> Self {
+        // Scratch capacity decides whether the next partial supply preflights
+        // the cost of growing it. Preserve that decision across a clone.
+        let mut scratch = Vec::with_capacity(self.scratch.capacity());
+        scratch.extend_from_slice(&self.scratch);
+        Self {
+            directory: self.directory.clone(),
+            accounting: self.accounting,
+            ownership: self.ownership.clone(),
+            name_crc32: self.name_crc32,
+            projection: self.projection,
+            phase: self.phase,
+            next: self.next,
+            pending: self.pending.clone(),
+            tail_start: self.tail_start,
+            tail: self.tail.clone(),
+            scratch,
+        }
+    }
+}
+
+impl<T> Walk<T> {
     fn new(
         location: DirectoryLocation,
         profile: Profile,
         name_crc32: fn(&[u8]) -> u32,
+        projection: RecordProjection<T>,
     ) -> Result<Self, DirectoryError> {
         let archive_len = location.archive_len();
         let DirectoryLocation {
@@ -285,6 +417,7 @@ impl Walk {
             accounting,
             ownership,
             name_crc32,
+            projection,
             phase: first_header.map_or(Phase::Signature, Phase::First),
             next: start,
             pending: None,
@@ -587,7 +720,7 @@ impl Walk {
         bytes: &[u8],
     ) -> Result<(), DirectoryError> {
         let view = CentralView::from_layout(header, source, bytes);
-        self.own_record(view)?;
+        self.project_record(view)?;
         self.directory.observed_range.end = source.raw_range().end;
         self.directory.logical_range.end = source.declared_range().end;
         self.phase = Phase::Signature;
@@ -602,7 +735,7 @@ impl Walk {
         }
     }
 
-    fn own_record(&mut self, view: CentralView<'_>) -> Result<(), DirectoryError> {
+    fn project_record(&mut self, view: CentralView<'_>) -> Result<(), DirectoryError> {
         let profile = self.directory.profile;
         let (resolved, known) = reducers::reduce(&view, profile, self.name_crc32, &mut self.accounting)?;
         if profile == Profile::Zipfast {
@@ -613,14 +746,15 @@ impl Walk {
                 return Err(DirectoryError::InvalidLocalOffset);
             }
         }
-        let owned_bytes = view.raw_name().len()
-            + view.raw_comment().len()
-            + known.unicode_path.map_or(0, |path: UnicodePathView<'_>| path.path_bytes().len());
+        let charge = view.ownership_charge(known);
+        let owned_bytes = charge.name_bytes + charge.comment_bytes + charge.extra_bytes;
         self.accounting.charge(owned_bytes as u64)?;
-        let entry = view.into_owned(resolved, known, &mut self.ownership)?;
+        let next_owned = self.ownership.check(charge)?;
+        let entry = (self.projection)(ReducedCentralRecord { view, resolved, known })?;
         self.reserve_entry()?;
         self.directory.entries.push(entry);
-        self.accounting.usage.owned = self.ownership.used();
+        self.ownership.commit(next_owned);
+        self.accounting.usage.owned = next_owned;
         Ok(())
     }
 
@@ -633,6 +767,10 @@ impl Walk {
             let ceiling = self.directory.declaration.entries.min(plausible) as usize;
             let next = len.saturating_mul(2).max(4).min(ceiling);
             debug_assert!(next > len);
+            #[cfg(test)]
+            if tests::FAIL_OUTPUT_RESERVATION.replace(false) {
+                return Err(DirectoryError::Allocation);
+            }
             self.directory.entries.try_reserve_exact(next - len).map_err(|_| DirectoryError::Allocation)?;
         }
         Ok(())
@@ -673,7 +811,11 @@ impl Walk {
     }
 }
 
-impl fmt::Debug for Walk {
+fn materialize_record(record: ReducedCentralRecord<'_>) -> Result<CentralRecord, DirectoryError> {
+    Ok(record.view.materialize(record.resolved, record.known)?)
+}
+
+impl<T> fmt::Debug for Walk<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Walk")
             .field("phase", &self.phase)
@@ -681,5 +823,66 @@ impl fmt::Debug for Walk {
             .field("pending", &self.pending)
             .field("usage", &self.accounting.usage)
             .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use super::*;
+
+    thread_local! {
+        pub(super) static FAIL_OUTPUT_RESERVATION: Cell<bool> = const { Cell::new(false) };
+        static OUTPUT_DROPS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    struct Output(u8);
+
+    impl Drop for Output {
+        fn drop(&mut self) {
+            OUTPUT_DROPS.set(OUTPUT_DROPS.get() + 1);
+        }
+    }
+
+    #[test]
+    fn failed_output_reservation_drops_only_the_temporary_before_commit() {
+        let mut bytes = Vec::new();
+        for i in 0..5u8 {
+            let mut fixed = [0; CENTRAL_HEADER_LEN];
+            fixed[..4].copy_from_slice(b"PK\x01\x02");
+            fixed[28] = 1; // name length
+            bytes.extend(fixed);
+            bytes.push(i);
+        }
+        let mut end = [0; 22];
+        end[..4].copy_from_slice(b"PK\x05\x06");
+        end[8] = 5;
+        end[10] = 5;
+        end[12..16].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+        bytes.extend(end);
+
+        let mut parser =
+            DirectoryParser::with_projection(bytes.len() as u64, Profile::Zipfast, Limits::default(), |record| {
+                let id = record.view().raw_name()[0];
+                if id == 4 {
+                    FAIL_OUTPUT_RESERVATION.set(true);
+                }
+                Ok(Output(id))
+            })
+            .unwrap();
+        assert!(format!("{parser:?}").contains("Discovery"));
+        assert_eq!(parser.next_read(), Ok(Some(0..bytes.len() as u64)));
+        parser.supply(0, &bytes).unwrap();
+        let error = DirectoryError::Allocation;
+        assert_eq!(parser.next_read(), Err(error));
+        assert_eq!(OUTPUT_DROPS.get(), 1);
+        let State::Walk(walk) = &parser.state else { panic!("expected failed walk") };
+        assert_eq!(walk.directory.entries.iter().map(|entry| entry.0).collect::<Vec<_>>(), [0, 1, 2, 3]);
+        assert_eq!(walk.ownership.used(), OwnershipUsage { entries: 4, name_bytes: 4, ..OwnershipUsage::default() });
+        assert_eq!(parser.usage().owned, walk.ownership.used());
+        assert_eq!(parser.next_read(), Err(error));
+        assert_eq!(parser.finish().err(), Some(error));
+        assert_eq!(OUTPUT_DROPS.get(), 5);
     }
 }

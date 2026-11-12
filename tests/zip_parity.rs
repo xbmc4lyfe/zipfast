@@ -79,6 +79,18 @@ fn open_indexes(bytes: &[u8]) -> ([Result<ZipIndex, ZipReadError>; 2], Vec<Read>
     let mut incremental = RangeSource::new(bytes);
     let opened = open_incremental(&mut incremental);
     assert_eq!(blocking.reads, incremental.reads);
+    let mut raw_source = RangeSource::new(bytes);
+    if let Ok(mut parser) =
+        zip_container::DirectoryParser::new(bytes.len() as u64, zip_container::Profile::Zipview, Default::default())
+    {
+        while let Ok(Some(range)) = parser.next_read() {
+            let bytes = raw_source.supply(range.start, (range.end - range.start) as usize);
+            if parser.supply(range.start, bytes).is_err() {
+                break;
+            }
+        }
+    }
+    assert_eq!(blocking.reads, raw_source.reads);
     ([index, opened], blocking.reads)
 }
 
@@ -186,7 +198,7 @@ fn central_order_and_duplicate_lookup_use_central_order() {
     );
     let mut fast = open_fast(&fixture.bytes).unwrap();
     let (view, indexes, reads) = open_view(&fixture);
-    assert_eq!(reads.len(), 2, "maximum comment places the first central header outside the tail");
+    assert_eq!(reads.len(), 4, "the directory starts outside the tail and is probed before reading its body");
     assert_eq!(reads[0].offset + reads[0].length as u64, fixture.bytes.len() as u64);
     assert_eq!(reads[1].offset, fixture.central[0] as u64);
 
@@ -319,7 +331,40 @@ fn filename_decoding_and_unicode_path_extras() {
 }
 
 #[test]
-fn eocd_signature_in_comment_exposes_record_selection_disagreement() {
+fn view_decodes_entry_names_once_with_standard_replacement_and_keeps_lookup_order() {
+    let fixture = build(
+        &[
+            Member::stored(b"prefix\xe2\x82", b"incomplete"),
+            Member::stored(b"prefix\xff", b"same decoded name"),
+            Member::stored(b"", b"empty name"),
+            Member::stored(b"one\0two", b"embedded NUL"),
+            Member::stored(b"raw\xff/", b"slash"),
+            Member::stored(b"raw\xff\\", b"backslash"),
+        ],
+        &[0, 1, 2, 3, 4, 5],
+        &[],
+        b"archive",
+        false,
+    );
+    let (view, indexes, _) = open_view(&fixture);
+    assert_eq!(
+        view.entries().iter().map(ZipEntry::name).collect::<Vec<_>>(),
+        ["prefix�", "prefix�", "", "one\0two", "raw�/", "raw�\\"]
+    );
+    assert!(!view.entries()[2].is_dir());
+    assert!(view.entries()[4].is_dir());
+    assert!(view.entries()[5].is_dir());
+    assert_eq!(view.read_by_name("prefix�").unwrap(), b"incomplete");
+    assert_eq!(view.read_entry(&view.entries()[1]).unwrap(), b"same decoded name");
+    for index in indexes {
+        let mut source = RangeSource::new(&fixture.bytes);
+        let entry = index.by_name("prefix�").unwrap();
+        assert_eq!(index.fetch_entry(entry, None, |at, buf| source.read(at, buf)).unwrap(), b"incomplete");
+    }
+}
+
+#[test]
+fn eocd_signature_in_comment_keeps_the_framed_end_record() {
     let mut comment = b"start\xff".to_vec();
     comment.extend(0x06054b50u32.to_le_bytes());
     comment.extend([0; 18]); // false zero-entry EOCD, whose comment ends early
@@ -336,13 +381,8 @@ fn eocd_signature_in_comment_exposes_record_selection_disagreement() {
         assert_eq!(&*parsed.entries[0].raw_name, b"item");
         assert_eq!(parsed.raw_comment, comment);
     }
-    // Baseline: zipview picks the later, fake record and loses the real comment and entry.
-    assert!(view.is_empty());
-    assert_eq!(view.comment(), "");
-    assert_eq!(view.read_by_name("item"), Err(ZipReadError::EntryNotFound));
-    for index in indexes {
-        assert!(index.is_empty());
-    }
+    assert_eq!(view.comment(), "start�PK\x05\x06".to_owned() + &"\0".repeat(18) + "end");
+    assert_payload(&fixture, &mut fast, &view, &indexes, 0, 0, b"data");
 }
 
 #[test]
@@ -491,9 +531,8 @@ fn zip64_size_offset_and_counts_with_optional_prefix() {
     let packed = b"\x2b\x29\xcf\x07\x00"; // raw DEFLATE of "two"
     let members =
         [Member::stored(b"first", b"one"), Member { zip64: true, ..Member::deflated(b"wide", packed, b"two") }];
-    for (prefix, zip64_end) in
-        [(b"".as_slice(), true), (b"MZ synthetic prefix".as_slice(), false), (b"MZ synthetic prefix".as_slice(), true)]
-    {
+    let prefix = b"MZ synthetic prefix".as_slice();
+    for (prefix, zip64_end) in [(b"".as_slice(), true), (prefix, false), (prefix, true)] {
         let fixture = build(&members, &[0, 1], prefix, b"", zip64_end);
         let mut fast = open_fast(&fixture.bytes).unwrap();
         assert_eq!(fast.entries.len(), 2);
@@ -510,20 +549,79 @@ fn zip64_size_offset_and_counts_with_optional_prefix() {
             assert_eq!(parsed.physical_local_header_offset(1), Some(fixture.local[1] as u64));
             assert_eq!((parsed.entries[1].resolved.unpacked_size, parsed.entries[1].resolved.packed_size), (3, 5));
         }
-        if zip64_end && !prefix.is_empty() {
-            // Baseline: neither zipview path relocates the ZIP64 end record.
-            assert_eq!(ZipReader::new(&fixture.bytes).unwrap_err(), ZipReadError::BadOffset);
-            for index in open_indexes(&fixture.bytes).0 {
-                assert_eq!(index.unwrap_err(), ZipReadError::BadOffset);
-            }
-            continue;
-        }
         let (view, indexes, _) = open_view(&fixture);
         assert_eq!(view.len(), 2);
         assert_eq!(view.entries()[1].local_header_offset(), 38);
         assert_shared_metadata(&fast.entries[1], &view.entries()[1]);
         assert_payload(&fixture, &mut fast, &view, &indexes, 0, 0, b"one");
         assert_payload(&fixture, &mut fast, &view, &indexes, 1, 1, b"two");
+    }
+}
+
+#[test]
+fn prefixed_extensible_zip64_resolves_local_addresses() {
+    let prefix = b"MZ synthetic prefix";
+    let mut fixture = build(&[Member::stored(b"item", b"data")], &[0], prefix, b"", true);
+    let locator = fixture.eocd - 20;
+    let record = locator - 56;
+    fixture.bytes[record + 4..record + 12].copy_from_slice(&53u64.to_le_bytes());
+    fixture.bytes.splice(locator..locator, [0x5a; 9]);
+    fixture.eocd += 9;
+
+    assert!(matches!(open_fast(&fixture.bytes), Err(Error::Corrupt("ZIP64 end record"))));
+    let (view, indexes, _) = open_view(&fixture);
+    let parsed = shared_directory(&fixture.bytes, zip_container::Profile::Zipview);
+    assert_eq!(parsed.zip64_end.unwrap().extension, locator as u64..(locator + 9) as u64);
+    assert_eq!(view.by_index(0).unwrap().local_header_offset(), 0);
+    assert_eq!(view.read_by_name("item").unwrap(), b"data");
+    for index in indexes {
+        let entry = index.by_index(0).unwrap();
+        assert_eq!(index.header_range(entry).unwrap().start, prefix.len() as u64);
+        let mut source = RangeSource::new(&fixture.bytes);
+        assert_eq!(index.fetch_entry(entry, None, |at, buf| source.read(at, buf)).unwrap(), b"data");
+    }
+}
+
+#[test]
+fn directory_count_budget_rejects_an_over_limit_zip64_declaration() {
+    let mut fixture = build(&[Member::stored(b"item", b"data")], &[0], &[], &[], true);
+    let record = fixture.eocd - 76;
+    let count = 1_000_001u64.to_le_bytes();
+    fixture.bytes[record + 24..record + 32].copy_from_slice(&count);
+    fixture.bytes[record + 32..record + 40].copy_from_slice(&count);
+    assert_eq!(ZipReader::new(&fixture.bytes).unwrap_err(), ZipReadError::BadOffset);
+    let (indexes, reads) = open_indexes(&fixture.bytes);
+    assert_eq!(reads.len(), 1);
+    for index in indexes {
+        assert_eq!(index.unwrap_err(), ZipReadError::BadOffset);
+    }
+}
+
+#[test]
+fn short_local_header_preserves_signature_and_clipping_precedence() {
+    let mut fixture = build(&[Member::stored(b"item", b"data")], &[0], &[], b"junk", false);
+    let len = fixture.bytes.len() as u32;
+    let central = fixture.central[0];
+    for (offset, expected_range, expected) in [
+        (len - 4, Some(u64::from(len - 4)..u64::from(len)), ZipReadError::BadSignature),
+        (len - 3, Some(u64::from(len - 3)..u64::from(len)), ZipReadError::Truncated),
+        (len, Some(u64::from(len)..u64::from(len)), ZipReadError::Truncated),
+        (len + 1, None, ZipReadError::BadOffset),
+    ] {
+        fixture.bytes[central + 42..central + 46].copy_from_slice(&offset.to_le_bytes());
+        let (view, indexes, _) = open_view(&fixture);
+        assert_eq!(view.read_by_name("item"), Err(expected.clone()));
+        for index in indexes {
+            let entry = index.by_index(0).unwrap();
+            assert_eq!(index.header_range(entry).ok(), expected_range);
+            assert_eq!(
+                index.fetch_entry(entry, None, |at, buf| {
+                    buf.copy_from_slice(&fixture.bytes[at as usize..at as usize + buf.len()]);
+                    Ok::<(), ZipReadError>(())
+                }),
+                Err(expected.clone())
+            );
+        }
     }
 }
 
@@ -675,7 +773,28 @@ fn short_zip64_extra_leaves_a_sentinel_only_in_zipview() {
 }
 
 #[test]
-fn split_disk_metadata_is_rejected_by_zipfast_and_ignored_by_zipview() {
+fn unresolved_packed_size_blocks_payload_reads_but_preserves_password_preview() {
+    let payload = b"abcdefghijkl";
+    let mut fixture = build(&[Member { flags: 1, ..Member::stored(b"item", payload) }], &[0], &[], &[], false);
+    let central = fixture.central[0];
+    fixture.bytes[central + 20..central + 24].fill(0xff);
+    let (view, indexes, _) = open_view(&fixture);
+    let expected = Some(PasswordCheck::Crypto { header: *payload, check: (crc32fast::hash(payload) >> 24) as u8 });
+    assert_eq!(view.password_check(view.by_index(0).unwrap()), expected);
+    assert_eq!(view.read_by_name("item"), Err(ZipReadError::Truncated));
+    for index in indexes {
+        let entry = index.by_index(0).unwrap();
+        let mut source = RangeSource::new(&fixture.bytes);
+        assert_eq!(index.fetch_password_check(entry, |at, buf| source.read(at, buf)).unwrap(), expected);
+        assert_eq!(source.reads.len(), 2);
+        let mut source = RangeSource::new(&fixture.bytes);
+        assert_eq!(index.fetch_entry(entry, None, |at, buf| source.read(at, buf)), Err(ZipReadError::Truncated));
+        assert!(source.reads.is_empty());
+    }
+}
+
+#[test]
+fn split_disk_metadata_can_be_listed_but_cannot_address_local_data() {
     let mut fixture = build(&[Member::stored(b"item", b"data")], &[0], &[], &[], false);
     fixture.bytes[fixture.eocd + 4..fixture.eocd + 6].copy_from_slice(&1u16.to_le_bytes());
     let parsed = shared_directory(&fixture.bytes, zip_container::Profile::Zipview);
@@ -683,8 +802,36 @@ fn split_disk_metadata_is_rejected_by_zipfast_and_ignored_by_zipview() {
     assert_eq!(parsed.entries.len(), 1);
     assert_eq!(parsed.physical_local_header_offset(0), None);
     assert!(matches!(open_fast(&fixture.bytes), Err(Error::Unsupported(_))));
-    let (view, _, _) = open_view(&fixture);
-    assert_eq!(view.read_by_name("item").unwrap(), b"data");
+    let (view, indexes, _) = open_view(&fixture);
+    assert_eq!(view.by_index(0).unwrap().local_header_offset(), 0);
+    assert_eq!(view.read_by_name("item"), Err(ZipReadError::BadOffset));
+    for index in indexes {
+        let entry = index.by_index(0).unwrap();
+        assert_eq!(index.header_range(entry), Err(ZipReadError::BadOffset));
+        let mut source = RangeSource::new(&fixture.bytes);
+        assert_eq!(index.fetch_entry(entry, None, |at, buf| source.read(at, buf)), Err(ZipReadError::BadOffset));
+        assert!(source.reads.is_empty());
+        assert_eq!(index.read_entry(entry, &fixture.bytes), Err(ZipReadError::BadOffset));
+    }
+}
+
+#[test]
+fn unresolved_zip64_local_offset_is_visible_but_cannot_address_local_data() {
+    let mut fixture = build(&[Member::stored(b"item", b"data")], &[0], &[], &[], false);
+    let central = fixture.central[0];
+    fixture.bytes[central + 42..central + 46].fill(0xff);
+    let (view, indexes, _) = open_view(&fixture);
+    assert_eq!(view.by_index(0).unwrap().local_header_offset(), u64::from(u32::MAX));
+    assert_eq!(view.read_by_name("item"), Err(ZipReadError::BadOffset));
+    for index in indexes {
+        let entry = index.by_index(0).unwrap();
+        // The direct range reader must enforce address validity, even when
+        // handed bytes from a real local header without calling header_range.
+        assert_eq!(index.read_entry(entry, &fixture.bytes), Err(ZipReadError::BadOffset));
+        let mut source = RangeSource::new(&fixture.bytes);
+        assert_eq!(index.fetch_entry(entry, None, |at, buf| source.read(at, buf)), Err(ZipReadError::BadOffset));
+        assert!(source.reads.is_empty());
+    }
 }
 
 #[test]
@@ -875,6 +1022,8 @@ fn shared_directory_skips_an_overclaimed_aes_extra_that_legacy_root_accepted() {
         false,
     );
     assert_eq!(open_fast(&fixture.bytes).unwrap().entries[0].aes_info, Some((1, 2, 8)));
+    let (view, _, _) = open_view(&fixture);
+    assert_eq!(view.by_index(0).unwrap().aes_info(), None);
     for profile in [Profile::Zipfast, Profile::Zipview] {
         let parsed = shared_directory(&fixture.bytes, profile);
         assert_eq!(parsed.entries[0].known.aes, None);

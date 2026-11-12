@@ -33,6 +33,19 @@ raw archive comment, and absolute source ranges for the original records.
 `usage` includes discovery, and `buffer_usage` reports parser scratch separately
 from owned records and the caller's read buffer.
 
+Use `parse_slice_projected` or `DirectoryParser::with_projection` to own a
+different output record. The projection receives a fully checked borrowed
+record with its resolved fields and selected known extras. It returns an owned
+value and should report allocation failure and avoid external side effects.
+Entries become available through the completed directory.
+
+The same raw name, selected known-extra, and available comment bytes count
+against the metadata and work budgets for either output. In projected mode,
+`usage.owned` reports those raw admission charges. The entry limit bounds the
+number of values in the output vector. The projection controls each value's
+representation and its own variable allocation and work. Cloning a parser
+copies its progress and buffers and clones each projected value.
+
 The Zipfast profile requires the declared count and rejects another central
 signature immediately after the counted records. It permits noncentral
 directory trailers and requires complete record bodies. The Zipview profile

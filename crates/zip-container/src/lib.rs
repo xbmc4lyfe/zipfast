@@ -33,7 +33,8 @@ mod owned;
 
 pub use discovery::{
     BufferUsage, Directory, DirectoryDeclaration, DirectoryError, DirectoryLocation, DirectoryParser, EndDiscovery,
-    EndRecord, LimitKind, Limits, Profile, SupplyError, Usage, Zip64End, Zip64Locator, discover_slice, parse_slice,
+    EndRecord, LimitKind, Limits, Profile, RecordProjection, ReducedCentralRecord, SupplyError, Usage, Zip64End,
+    Zip64Locator, discover_slice, parse_slice, parse_slice_projected,
 };
 pub use error::{OwnershipError, OwnershipKind, ParseError};
 pub use extras::{

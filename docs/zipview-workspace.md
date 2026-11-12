@@ -33,7 +33,7 @@ licenses.
 ## Cargo behavior
 
 A root `cargo build`, `cargo run`, or `cargo test` selects zipfast by default.
-Use `-p zipview` to select the library or `--workspace` to select both
+Use `-p zipview` to select the library or `--workspace` to select all
 packages. The separate fuzz workspace has its own lockfile under
 `crates/zipview/fuzz`.
 
@@ -45,7 +45,8 @@ other profile defaults. A downstream Cargo root controls its own profile.
 
 A build of zipview alone enables flate2's `zlib-rs` and
 `runtime_detection` features. Its active dependency graph contains `flate2`,
-`zlib-rs`, and `subtle`. WinZip AES uses `subtle` for constant-time verifier
+`zlib-rs`, `subtle`, and the dependency-free workspace crate `zip-container`.
+WinZip AES uses `subtle` for constant-time verifier
 and authentication tag comparisons. The packaged lockfile also records
 `crc32fast` and `cfg-if`. A workspace-wide build also enables zipfast's
 flate2 defaults, adding miniz_oxide and its dependencies to the graph.
@@ -86,15 +87,16 @@ initialize the new `protected_paths` field, which accepts an empty set.
 The engine supplies its own archive and volume protections. See
 [engine behavior and limits](engine-baseline.md#safety-behavior).
 
-Cargo verified the zipview 0.1.0 package from the workspace. It includes
+At the Phase 1 gate, Cargo verified the zipview 0.1.0 package from the workspace. It includes
 the crate license, examples, and test sources. The independent fuzz workspace
 and seed corpus are available from Git. A crates.io lookup found no release for
 that version at the time of the import. Zipfast declares `publish = false`.
 
-If zipview later depends on a shared `zip-container` package, add a
-registry version alongside the local path in zipview's manifest. Package
-and verify the parser first, publish it before zipview, and verify zipview's
-packaged build resolves that registry release before publishing zipview.
+Zipview declares the `zip-container` dependency with both a version and a
+workspace path. Package and verify the parser first. Until it is published,
+verify zipview against an isolated source built from the parser's packaged
+artifact. Publishing zipview requires the parser's registry release to
+resolve from zipview's normalized manifest.
 [Cargo dependency locations](https://doc.rust-lang.org/cargo/reference/specifying-dependencies.html#multiple-locations)
 
 ## Import verification
