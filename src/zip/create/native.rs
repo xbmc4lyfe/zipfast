@@ -29,11 +29,11 @@ use super::*;
 #[path = "tests.rs"]
 mod tests;
 #[path = "transaction.rs"]
-mod transaction;
+pub(in crate::zip) mod transaction;
 #[path = "unix.rs"]
-mod unix;
+pub(in crate::zip) mod unix;
 #[path = "verify.rs"]
-mod verify;
+pub(in crate::zip) mod verify;
 
 use unix::{Parent, Stamp};
 
@@ -56,27 +56,27 @@ pub struct CreatePlan {
     variable_capacity: u64,
 }
 
-struct PlannedEntry {
-    name: Vec<u8>,
-    utf8: bool,
-    comment: Vec<u8>,
-    keys: Option<Vec<u8>>,
+pub(in crate::zip) struct PlannedEntry {
+    pub(in crate::zip) name: Vec<u8>,
+    pub(in crate::zip) utf8: bool,
+    pub(in crate::zip) comment: Vec<u8>,
+    pub(in crate::zip) keys: Option<Vec<u8>>,
     method: Method,
     modified: crate::zip::write::DosDateTime,
     extended_mtime: Option<i32>,
     permissions: crate::zip::write::Permissions,
-    source: Option<Source>,
+    pub(in crate::zip) source: Option<Source>,
 }
 
-struct Source {
-    path: PathBuf,
-    stamp: Stamp,
+pub(in crate::zip) struct Source {
+    pub(in crate::zip) path: PathBuf,
+    pub(in crate::zip) stamp: Stamp,
     // Only add_open_file retains a descriptor in the plan.
-    file: Option<File>,
+    pub(in crate::zip) file: Option<File>,
 }
 
 impl PlannedEntry {
-    fn options(&self) -> EntryOptions<'_> {
+    pub(in crate::zip) fn options(&self) -> EntryOptions<'_> {
         let name = if self.utf8 {
             EntryName::Utf8(std::str::from_utf8(&self.name).expect("validated UTF-8"))
         } else {
@@ -170,24 +170,9 @@ impl CreatePlan {
         let retained = add(self.usage.plan.retained_handles, u64::from(held))?;
         limit(retained, limits.retained_handles, CreateLimit::RetainedHandles)?;
 
-        let name = name_bytes(metadata.name);
-        let keys_len = keys.map_or(0, |keys| keys.0.len());
-        let scan = add(
-            (name.len() as u64).checked_mul(4).ok_or(CreateError::Overflow)?,
-            (metadata.comment.len() as u64).checked_mul(2).ok_or(CreateError::Overflow)?,
-        )?;
-        let path_len = source.as_ref().map_or(0, |(path, _)| path.as_os_str().len()) as u64;
-        let path_scan = path_len.checked_mul(3).ok_or(CreateError::Overflow)?;
-        work(&self.options, &mut self.usage.plan, add(add(add(scan, 2 * keys_len as u64)?, path_scan)?, 1)?)?;
-        let parts = validate_name(metadata, source.is_none())?;
-        match (self.options.collisions, keys) {
-            (CollisionPolicy::Exact, None) => {}
-            (CollisionPolicy::CallerKeys, Some(keys)) if keys.0.split(|&b| b == b'/').count() == parts => {}
-            _ => {
-                return Err(CreateError::InvalidName("collision keys do not match the plan policy or component count"));
-            }
-        }
-        let metadata_capacity = (name.len() + metadata.comment.len() + keys_len) as u64;
+        let (scan, metadata_capacity) = input_cost(metadata, keys, source.as_ref().map(|(path, _)| *path))?;
+        work(&self.options, &mut self.usage.plan, scan)?;
+        validate_input(metadata, keys, source.is_none(), self.options.collisions)?;
         let reserved = entries
             .checked_mul((size_of::<usize>() + size_of::<EntryWritten>()) as u64)
             .ok_or(CreateError::Overflow)?;
@@ -200,31 +185,8 @@ impl CreatePlan {
             .checked_sub(add(add(self.variable_capacity, metadata_capacity)?, add(fixed_min, reserved)?)?)
             .ok_or(CreateError::Limit(CreateLimit::PlanCapacity))?;
         let budget = Attempts::new(&self.options, &self.attempts);
-        let source = source
-            .map(|(path, file)| -> Result<_> {
-                let path = absolute(path, remaining, &budget)?;
-                let (file, stamp) = if let Some(file) = file {
-                    let stamp = capture(&file, &path, ordinal, &budget)?;
-                    (Some(file), stamp)
-                } else {
-                    let admission = unix::open_source(&path, &budget)?;
-                    let stamp = capture(&admission, &path, ordinal, &budget)?;
-                    drop(admission);
-                    #[cfg(test)]
-                    tests::event(tests::Event::AfterAdmissionClose, Some(&path))?;
-                    (None, stamp)
-                };
-                Ok(Source { path, stamp, file })
-            })
-            .transpose()?;
-
-        let name = copied(name)?;
-        let comment = copied(metadata.comment)?;
-        let keys = keys.map(|keys| copied(&keys.0)).transpose()?;
-        let added = name.capacity() as u64
-            + comment.capacity() as u64
-            + keys.as_ref().map_or(0, |keys| keys.capacity() as u64)
-            + source.as_ref().map_or(0, |source| source.path.capacity() as u64);
+        let entry = prepare_input(metadata, keys, source, ordinal, remaining, &budget)?;
+        let added = entry.variable_capacity();
         let variable = add(self.variable_capacity, added)?;
         let max_fixed = limits
             .plan_capacity
@@ -240,17 +202,7 @@ impl CreatePlan {
         }
         let fixed = self.entries.capacity() as u64 * entry_size;
         limit(fixed, max_fixed, CreateLimit::PlanCapacity)?;
-        self.entries.push(PlannedEntry {
-            name,
-            utf8: matches!(metadata.name, EntryName::Utf8(_)),
-            comment,
-            keys,
-            method: metadata.method,
-            modified: metadata.modified,
-            extended_mtime: metadata.extended_mtime,
-            permissions: metadata.permissions,
-            source,
-        });
+        self.entries.push(entry);
         self.variable_capacity = variable;
         self.usage.plan.entries = entries;
         self.usage.plan.retained_handles = retained;
@@ -392,7 +344,7 @@ fn absolute(path: &Path, max: u64, budget: &Attempts<'_>) -> Result<PathBuf> {
     Ok(pathbuf)
 }
 
-fn name_bytes<'a>(name: EntryName<'a>) -> &'a [u8] {
+pub(in crate::zip) fn name_bytes<'a>(name: EntryName<'a>) -> &'a [u8] {
     match name {
         EntryName::Utf8(name) => name.as_bytes(),
         EntryName::Raw(name) => name,
@@ -523,7 +475,10 @@ fn compare(a: &[u8], b: &[u8], options: &CreateOptions, usage: &mut PlanUsage) -
     Ok(a.len().cmp(&b.len()))
 }
 
-fn sort_indices(indices: &mut [usize], mut order: impl FnMut(usize, usize) -> Result<Ordering>) -> Result<()> {
+pub(in crate::zip) fn sort_indices(
+    indices: &mut [usize],
+    mut order: impl FnMut(usize, usize) -> Result<Ordering>,
+) -> Result<()> {
     fn sift(
         heap: &mut [usize],
         mut root: usize,
@@ -552,7 +507,82 @@ fn sort_indices(indices: &mut [usize], mut order: impl FnMut(usize, usize) -> Re
     Ok(())
 }
 
-fn capture(file: &File, path: &Path, id: CreateEntryId, budget: &Attempts<'_>) -> Result<Stamp> {
+pub(in crate::zip) fn input_cost(
+    metadata: EntryOptions<'_>,
+    keys: Option<&CollisionPath>,
+    path: Option<&Path>,
+) -> Result<(u64, u64)> {
+    let name = name_bytes(metadata.name).len() as u64;
+    let comment = metadata.comment.len() as u64;
+    let key = keys.map_or(0, |keys| keys.0.len()) as u64;
+    let scaled = |value: u64, scale| value.checked_mul(scale).ok_or(CreateError::Overflow);
+    let scan = add(scaled(name, 4)?, scaled(comment, 2)?)?;
+    let path_scan = scaled(path.map_or(0, |path| path.as_os_str().len()) as u64, 3)?;
+    Ok((add(add(add(scan, scaled(key, 2)?)?, path_scan)?, 1)?, add(add(name, comment)?, key)?))
+}
+
+pub(in crate::zip) fn validate_input(
+    metadata: EntryOptions<'_>,
+    keys: Option<&CollisionPath>,
+    directory: bool,
+    policy: CollisionPolicy,
+) -> Result<()> {
+    let parts = validate_name(metadata, directory)?;
+    match (policy, keys) {
+        (CollisionPolicy::Exact, None) => Ok(()),
+        (CollisionPolicy::CallerKeys, Some(keys)) if keys.0.split(|&b| b == b'/').count() == parts => Ok(()),
+        _ => Err(CreateError::InvalidName("collision keys do not match the plan policy or component count")),
+    }
+}
+
+pub(in crate::zip) fn prepare_input(
+    metadata: EntryOptions<'_>,
+    keys: Option<&CollisionPath>,
+    source: Option<(&Path, Option<File>)>,
+    ordinal: CreateEntryId,
+    remaining: u64,
+    budget: &Attempts<'_>,
+) -> Result<PlannedEntry> {
+    let source = source
+        .map(|(path, file)| -> Result<_> {
+            let path = absolute(path, remaining, budget)?;
+            let (file, stamp) = if let Some(file) = file {
+                let stamp = capture(&file, &path, ordinal, budget)?;
+                (Some(file), stamp)
+            } else {
+                let admission = unix::open_source(&path, budget)?;
+                let stamp = capture(&admission, &path, ordinal, budget)?;
+                drop(admission);
+                #[cfg(test)]
+                tests::event(tests::Event::AfterAdmissionClose, Some(&path))?;
+                (None, stamp)
+            };
+            Ok(Source { path, stamp, file })
+        })
+        .transpose()?;
+    Ok(PlannedEntry {
+        name: copied(name_bytes(metadata.name))?,
+        utf8: matches!(metadata.name, EntryName::Utf8(_)),
+        comment: copied(metadata.comment)?,
+        keys: keys.map(|keys| copied(&keys.0)).transpose()?,
+        method: metadata.method,
+        modified: metadata.modified,
+        extended_mtime: metadata.extended_mtime,
+        permissions: metadata.permissions,
+        source,
+    })
+}
+
+impl PlannedEntry {
+    pub(in crate::zip) fn variable_capacity(&self) -> u64 {
+        self.name.capacity() as u64
+            + self.comment.capacity() as u64
+            + self.keys.as_ref().map_or(0, |keys| keys.capacity() as u64)
+            + self.source.as_ref().map_or(0, |source| source.path.capacity() as u64)
+    }
+}
+
+pub(in crate::zip) fn capture(file: &File, path: &Path, id: CreateEntryId, budget: &Attempts<'_>) -> Result<Stamp> {
     let before = unix::file_stamp(file, budget)?;
     let bound = unix::path_stamp(path, budget)?;
     let after = unix::file_stamp(file, budget)?;
@@ -562,15 +592,15 @@ fn capture(file: &File, path: &Path, id: CreateEntryId, budget: &Attempts<'_>) -
     Ok(before)
 }
 
-fn add(a: u64, b: u64) -> Result<u64> {
+pub(in crate::zip) fn add(a: u64, b: u64) -> Result<u64> {
     a.checked_add(b).ok_or(CreateError::Overflow)
 }
 
-fn limit(value: u64, max: u64, kind: CreateLimit) -> Result<()> {
+pub(in crate::zip) fn limit(value: u64, max: u64, kind: CreateLimit) -> Result<()> {
     if value > max { Err(CreateError::Limit(kind)) } else { Ok(()) }
 }
 
-fn writer_limit(value: u64, max: u64, kind: crate::zip::write::Limit) -> Result<()> {
+pub(in crate::zip) fn writer_limit(value: u64, max: u64, kind: crate::zip::write::Limit) -> Result<()> {
     if value > max { Err(WriteError::Limit(kind).into()) } else { Ok(()) }
 }
 
@@ -589,7 +619,7 @@ fn work(options: &CreateOptions, usage: &mut PlanUsage, units: u64) -> Result<()
 }
 
 #[derive(Clone, Copy)]
-struct Attempts<'a> {
+pub(in crate::zip) struct Attempts<'a> {
     count: &'a Cell<u64>,
     max: u64,
     cancel: Option<&'a Cancellation>,
@@ -598,29 +628,30 @@ struct Attempts<'a> {
 
 impl<'a> Attempts<'a> {
     fn new(options: &'a CreateOptions, count: &'a Cell<u64>) -> Self {
-        Self {
-            count,
-            max: options.limits.transaction_attempts,
-            cancel: Some(&options.cancel),
-            limit: CreateLimit::TransactionAttempts,
-        }
+        Self::with_limits(&options.cancel, options.limits.transaction_attempts, count)
     }
 
-    fn finalization(count: &'a Cell<u64>) -> Self {
+    pub(in crate::zip) fn with_limits(cancel: &'a Cancellation, max: u64, count: &'a Cell<u64>) -> Self {
+        Self { count, max, cancel: Some(cancel), limit: CreateLimit::TransactionAttempts }
+    }
+
+    pub(in crate::zip) fn finalization(count: &'a Cell<u64>) -> Self {
         Self { count, max: FINALIZATION_RESERVE, cancel: None, limit: CreateLimit::FinalizationAttempts }
     }
 
-    fn charge(&self) -> Result<()> {
-        if self.cancel.is_some_and(Cancellation::is_canceled) {
-            return Err(CreateError::Canceled);
-        }
+    pub(in crate::zip) fn check_cancel(&self) -> Result<()> {
+        if self.cancel.is_some_and(Cancellation::is_canceled) { Err(CreateError::Canceled) } else { Ok(()) }
+    }
+
+    pub(in crate::zip) fn charge(&self) -> Result<()> {
+        self.check_cancel()?;
         let next = add(self.count.get(), 1)?;
         limit(next, self.max, self.limit)?;
         self.count.set(next);
         Ok(())
     }
 
-    fn run<T>(&self, mut call: impl FnMut() -> io::Result<T>) -> Result<T> {
+    pub(in crate::zip) fn run<T>(&self, mut call: impl FnMut() -> io::Result<T>) -> Result<T> {
         loop {
             self.charge()?;
             match call() {

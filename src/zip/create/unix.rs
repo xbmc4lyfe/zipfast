@@ -36,15 +36,15 @@ const LARGE_FILE: libc::c_int = libc::O_LARGEFILE;
 const LARGE_FILE: libc::c_int = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Identity(u64, u64);
+pub(in crate::zip) struct Identity(pub(in crate::zip) u64, pub(in crate::zip) u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Stamp {
-    pub(super) identity: Identity,
-    pub(super) len: u64,
+pub(in crate::zip) struct Stamp {
+    pub(in crate::zip) identity: Identity,
+    pub(in crate::zip) len: u64,
     modified: (i64, i64),
     changed: (i64, i64),
-    pub(super) mode: u16,
+    pub(in crate::zip) mode: u16,
 }
 
 impl Stamp {
@@ -61,7 +61,7 @@ impl Stamp {
         })
     }
 
-    pub(super) fn same_payload(self, other: Self) -> bool {
+    pub(in crate::zip) fn same_payload(self, other: Self) -> bool {
         self.identity == other.identity && self.len == other.len && self.modified == other.modified
     }
 
@@ -81,7 +81,7 @@ impl Stamp {
     }
 }
 
-pub(super) enum NameState {
+pub(in crate::zip) enum NameState {
     Regular(Stamp),
     Other,
 }
@@ -90,7 +90,7 @@ fn identity(meta: &Metadata) -> Identity {
     Identity(meta.dev(), meta.ino())
 }
 
-pub(super) fn open_source(path: &Path, budget: &Attempts<'_>) -> Result<File> {
+pub(in crate::zip) fn open_source(path: &Path, budget: &Attempts<'_>) -> Result<File> {
     let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC | LARGE_FILE;
     let cpath = c_path(path)?;
     budget.run(|| {
@@ -101,24 +101,32 @@ pub(super) fn open_source(path: &Path, budget: &Attempts<'_>) -> Result<File> {
     })
 }
 
-pub(super) fn file_stamp(file: &File, budget: &Attempts<'_>) -> Result<Stamp> {
+pub(in crate::zip) fn file_stamp(file: &File, budget: &Attempts<'_>) -> Result<Stamp> {
     Stamp::regular(&budget.run(|| file.metadata())?)
 }
 
-pub(super) fn path_stamp(path: &Path, budget: &Attempts<'_>) -> Result<Stamp> {
+pub(in crate::zip) fn path_stamp(path: &Path, budget: &Attempts<'_>) -> Result<Stamp> {
     Stamp::regular(&budget.run(|| fs::symlink_metadata(path))?)
 }
 
-pub(super) struct Parent {
-    pub(super) destination: PathBuf,
+pub(in crate::zip) struct Parent {
+    pub(in crate::zip) destination: PathBuf,
     pub(super) real_path: PathBuf,
-    pub(super) leaf: CString,
-    pub(super) file: File,
-    pub(super) identity: Identity,
+    pub(in crate::zip) leaf: CString,
+    pub(in crate::zip) file: File,
+    pub(in crate::zip) identity: Identity,
 }
 
 impl Parent {
     pub(super) fn open(destination: &Path, budget: &Attempts<'_>, max: u64) -> Result<Self> {
+        let parent = Self::bind(destination, budget, max)?;
+        if parent.lookup(&parent.leaf, budget)?.is_some() {
+            return Err(CreateError::Conflict);
+        }
+        Ok(parent)
+    }
+
+    pub(in crate::zip) fn bind(destination: &Path, budget: &Attempts<'_>, max: u64) -> Result<Self> {
         let raw = destination.as_os_str().as_bytes();
         limit(raw.len() as u64, max, CreateLimit::PlanCapacity)?;
         let final_component = raw.rsplit(|&b| b == b'/').next().unwrap_or_default();
@@ -148,19 +156,26 @@ impl Parent {
         if !budget.run(|| filesystem(&parent.file))?.eligible() {
             return Err(CreateError::UnsupportedFilesystem);
         }
-        if parent.lookup(&parent.leaf, budget)?.is_some() {
-            return Err(CreateError::Conflict);
-        }
         Ok(parent)
     }
 
-    pub(super) fn capacity(&self) -> u64 {
+    pub(in crate::zip) fn open_existing_regular(&self, budget: &Attempts<'_>) -> Result<(File, Stamp)> {
+        let flags = libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC | LARGE_FILE;
+        let file = budget.run(|| {
+            // The descriptor and the validated single component remain live.
+            opened(unsafe { libc::openat(self.file.as_raw_fd(), self.leaf.as_ptr(), flags) })
+        })?;
+        let stamp = file_stamp(&file, budget)?;
+        Ok((file, stamp))
+    }
+
+    pub(in crate::zip) fn capacity(&self) -> u64 {
         self.destination.capacity() as u64
             + self.real_path.capacity() as u64
             + self.leaf.as_bytes_with_nul().len() as u64
     }
 
-    pub(super) fn check(&self, budget: &Attempts<'_>) -> Result<()> {
+    pub(in crate::zip) fn check(&self, budget: &Attempts<'_>) -> Result<()> {
         let path = self.destination.parent().ok_or(CreateError::InvalidDestination)?;
         let observed = budget.run(|| fs::metadata(path))?;
         let real = budget.run(|| fs::symlink_metadata(&self.real_path))?;
@@ -174,7 +189,7 @@ impl Parent {
         Ok(())
     }
 
-    pub(super) fn lookup(&self, leaf: &CStr, budget: &Attempts<'_>) -> Result<Option<NameState>> {
+    pub(in crate::zip) fn lookup(&self, leaf: &CStr, budget: &Attempts<'_>) -> Result<Option<NameState>> {
         budget.run(|| {
             let mut meta = MaybeUninit::<NativeStat>::uninit();
             // The descriptor and C string remain live. fstatat initializes
@@ -270,14 +285,14 @@ const STAGE_PREFIX_WITH_TILDE: &str = ".zipfast-~";
 const STAGE_PREFIX_WITHOUT_TILDE: &str = ".zipfast-@";
 const STAGE_NAME_LEN: usize = STAGE_PREFIX_WITH_TILDE.len() + RANDOM_LEN + 1;
 
-pub(super) struct Stage {
-    pub(super) file: File,
+pub(in crate::zip) struct Stage {
+    pub(in crate::zip) file: File,
     path: tempfile::TempPath,
     name: [u8; STAGE_NAME_LEN],
 }
 
 impl Stage {
-    pub(super) fn create(parent: &Parent, budget: &Attempts<'_>, stage_attempts: &mut u64) -> Result<Self> {
+    pub(in crate::zip) fn create(parent: &Parent, budget: &Attempts<'_>, stage_attempts: &mut u64) -> Result<Self> {
         parent.check(budget)?;
         let mut terminal = None;
         // ASCII tilde presence survives case folding and canonical
@@ -335,29 +350,29 @@ impl Stage {
         Ok(Self { file, path, name })
     }
 
-    pub(super) fn name(&self) -> &CStr {
+    pub(in crate::zip) fn name(&self) -> &CStr {
         CStr::from_bytes_with_nul(&self.name).expect("checked generated stage name")
     }
 
     #[cfg(test)]
-    pub(super) fn path(&self) -> &Path {
+    pub(in crate::zip) fn path(&self) -> &Path {
         self.path.as_ref()
     }
 
-    pub(super) fn into_path(self) -> PathBuf {
+    pub(in crate::zip) fn into_path(self) -> PathBuf {
         // On Unix keep has no I/O side effects. Cleanup was disabled
         // before creating the path, including on this error branch.
         self.path.keep().unwrap_or_else(|error| error.path.to_path_buf())
     }
 }
 
-pub(super) enum PublishError {
+pub(in crate::zip) enum PublishError {
     Definite(CreateError),
     Uncertain(CreateError),
 }
 
 impl PublishError {
-    pub(super) fn into_cause(self) -> CreateError {
+    pub(in crate::zip) fn into_cause(self) -> CreateError {
         match self {
             Self::Definite(error) | Self::Uncertain(error) => error,
         }
@@ -408,6 +423,22 @@ impl Parent {
         if status == 0 { Ok(()) } else { Err(PublishError::from_syscall(io::Error::last_os_error())) }
     }
 
+    pub(in crate::zip) fn publish_replace(
+        &self,
+        stage: &CStr,
+        budget: &Attempts<'_>,
+    ) -> std::result::Result<(), PublishError> {
+        budget.charge().map_err(PublishError::Definite)?;
+        #[cfg(test)]
+        crate::zip::rewrite::test_event(crate::zip::rewrite::Event::NativePublish, None)
+            .map_err(PublishError::from_syscall)?;
+        let fd = self.file.as_raw_fd();
+        // Both names are single components in the same held directory.
+        // This replacement is performed once. Its result is never retried.
+        let status = unsafe { libc::renameat(fd, stage.as_ptr(), fd, self.leaf.as_ptr()) };
+        if status == 0 { Ok(()) } else { Err(PublishError::from_syscall(io::Error::last_os_error())) }
+    }
+
     pub(super) fn unlink(&self, stage: &CStr, budget: &Attempts<'_>) -> Result<()> {
         budget.charge()?;
         #[cfg(test)]
@@ -418,7 +449,7 @@ impl Parent {
     }
 }
 
-pub(super) fn chmod(file: &File, permissions: u16, budget: &Attempts<'_>) -> Result<()> {
+pub(in crate::zip) fn chmod(file: &File, permissions: u16, budget: &Attempts<'_>) -> Result<()> {
     budget.run(|| {
         #[cfg(test)]
         super::tests::event_io(super::tests::Event::Chmod, None)?;
@@ -429,7 +460,7 @@ pub(super) fn chmod(file: &File, permissions: u16, budget: &Attempts<'_>) -> Res
     })
 }
 
-pub(super) fn sync_stage(file: &File, budget: &Attempts<'_>) -> Result<()> {
+pub(in crate::zip) fn sync_stage(file: &File, budget: &Attempts<'_>) -> Result<()> {
     budget.run(|| {
         #[cfg(test)]
         super::tests::event_io(super::tests::Event::FileSync, None)?;
@@ -439,7 +470,7 @@ pub(super) fn sync_stage(file: &File, budget: &Attempts<'_>) -> Result<()> {
     })
 }
 
-pub(super) fn sync_directory(file: &File, budget: &Attempts<'_>) -> Result<()> {
+pub(in crate::zip) fn sync_directory(file: &File, budget: &Attempts<'_>) -> Result<()> {
     budget.run(|| {
         #[cfg(test)]
         super::tests::event_io(super::tests::Event::DirectorySync, None)?;
