@@ -870,3 +870,109 @@ fn anchored_zip64_preserves_validation_and_budgets() {
     corrupt[76] ^= 1;
     assert_eq!(parse_anchored(&corrupt, anchor, Limits::default(), 1).unwrap_err(), DirectoryError::MalformedZip64,);
 }
+
+#[test]
+fn discovery_scratch_limit_counts_inline_tail_and_fragmented_recovery() {
+    let bytes = extended(100_000, 180_000, 46, true);
+    let inline = 56 + 55;
+    let tail = TAIL as usize;
+    let window = WINDOW as usize;
+    let limit_error = DirectoryError::Limit(LimitKind::ScratchBytes);
+    for profile in PROFILES {
+        assert_eq!(
+            EndDiscovery::new_with_scratch_limit(bytes.len() as u64, profile, Limits::default(), inline - 1)
+                .unwrap_err(),
+            limit_error,
+        );
+        for (cap, fragmented, succeeds) in [
+            (tail + inline - 1, false, false),
+            (tail + inline, false, true),
+            (tail + inline + window - 1, true, false),
+            (tail + inline + window, true, true),
+        ] {
+            let mut discovery =
+                EndDiscovery::new_with_scratch_limit(bytes.len() as u64, profile, Limits::default(), cap).unwrap();
+            let mut saw_recovery = false;
+            while let Some(range) = discovery.next_read().unwrap() {
+                let is_recovery = range.end - range.start == WINDOW;
+                saw_recovery |= is_recovery;
+                let start = range.start as usize;
+                let end = if is_recovery && fragmented { start + 1 } else { range.end as usize };
+                let mut cloned = (is_recovery && fragmented).then(|| discovery.clone());
+                let result = discovery.supply(range.start, &bytes[start..end]);
+                assert!(discovery.buffer_usage().capacity_bytes <= cap);
+                if let Some(cloned) = &mut cloned {
+                    assert_eq!(cloned.supply(range.start, &bytes[start..end]), result);
+                    assert!(cloned.buffer_usage().capacity_bytes <= cap);
+                }
+                if let Err(error) = result {
+                    assert!(!succeeds);
+                    assert_eq!(error, limit_error);
+                    assert_eq!(discovery.next_read(), Err(limit_error));
+                    assert_eq!(discovery.clone().next_read(), Err(limit_error));
+                    break;
+                }
+            }
+            assert_eq!(saw_recovery, cap >= tail + inline);
+            if succeeds {
+                assert_eq!(discovery.finish().unwrap().directory_range(), 100_000..100_046);
+            } else {
+                assert_eq!(discovery.finish().unwrap_err(), limit_error);
+            }
+        }
+    }
+}
+
+#[test]
+fn anchored_scratch_limit_precedes_fragmented_body_reservation_even_for_corrupted_lengths() {
+    let name = usize::from(u16::MAX);
+    let body = 2 * name;
+    let central_at = 30;
+    let eocd = central_at + 46 + body;
+    let required = TAIL as usize + body;
+    for corrupt in [false, true] {
+        let mut bytes = vec![0xA5; central_at];
+        let mut header = central();
+        set16(&mut header, 28, u16::MAX);
+        set16(&mut header, 30, u16::from(corrupt));
+        set16(&mut header, 32, u16::MAX - u16::from(corrupt));
+        bytes.extend(header);
+        bytes.resize(eocd, b'a');
+        bytes.extend(end(1, (46 + body) as u32, central_at as u32, 0));
+
+        for (cap, admitted_body) in [(required - 1, false), (required, true)] {
+            if corrupt && admitted_body {
+                continue;
+            }
+            let mut parser =
+                DirectoryParser::at_eocd_with_scratch_limit(bytes.len() as u64, eocd as u64, Limits::default(), cap)
+                    .unwrap();
+            let mut saw_full_reservation = false;
+            while let Some(range) = parser.next_read().unwrap() {
+                let start = range.start as usize;
+                let end = (start + 64 * 1024).min(range.end as usize);
+                let mut cloned = (start == central_at + 46).then(|| parser.clone());
+                let result = parser.supply(range.start, &bytes[start..end]);
+                if let Some(cloned) = &mut cloned {
+                    assert_eq!(cloned.supply(range.start, &bytes[start..end]), result);
+                    assert!(cloned.buffer_usage().capacity_bytes <= cap);
+                }
+                let scratch = parser.buffer_usage().capacity_bytes;
+                assert!(scratch <= cap, "scratch capacity {scratch} exceeds {cap}");
+                saw_full_reservation |= scratch == required;
+                if let Err(error) = result {
+                    assert_eq!(error, DirectoryError::Limit(LimitKind::ScratchBytes));
+                    assert_eq!(parser.next_read(), Err(error));
+                    assert_eq!(parser.clone().next_read(), Err(error));
+                    break;
+                }
+            }
+            assert_eq!(saw_full_reservation, admitted_body);
+            if admitted_body {
+                assert_eq!(parser.finish().unwrap().entries[0].raw_name.len(), name);
+            } else {
+                assert_eq!(parser.finish().unwrap_err(), DirectoryError::Limit(LimitKind::ScratchBytes));
+            }
+        }
+    }
+}

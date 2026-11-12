@@ -116,6 +116,8 @@ pub enum LimitKind {
     ExtraBytes,
     /// Owned raw archive and entry comments.
     CommentBytes,
+    /// Requested parser scratch storage, including retained inline buffers.
+    ScratchBytes,
 }
 
 /// Invalid source supply, which leaves parser progress and counters intact.
