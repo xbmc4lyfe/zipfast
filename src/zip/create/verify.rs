@@ -1,0 +1,602 @@
+// Copyright (C) 2026 xbmc4lyfe
+// SPDX-License-Identifier: RPL-1.5
+//
+// Unless explicitly acquired and licensed from Licensor under another license,
+// the contents of this file are subject to the Reciprocal Public License
+// ("RPL") Version 1.5, or subsequent versions as allowed by the RPL, and You
+// may not copy or use this file in either source code or executable form,
+// except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS"
+// basis, WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR
+// HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
+// ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
+// rights and limitations under the RPL.
+
+#[cfg(test)]
+#[path = "verify/tests.rs"]
+mod tests;
+
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
+
+use flate2::{Decompress, FlushDecompress, Status};
+use zip_container::{
+    CentralRecord, Directory, DirectoryDeclaration, DirectoryError, DirectoryParser, EndDiscovery, EndRecord,
+    ExtraIter, LOCAL_HEADER_LEN, LocalHeader, Profile, Zip64End, Zip64Locator, local_layout,
+};
+
+use crate::crc32::Hasher;
+use crate::zip::{FLAG_UTF8, HOST_UNIX, METHOD_DEFLATE, METHOD_STORED, S_IFDIR};
+
+use super::{
+    Attempts, CreateError, CreateLimit, CreateOptions, PlannedEntry, Result, Stamp, VerificationUsage, add, limit, unix,
+};
+use crate::zip::write::{EntryWritten, Method, WriteSummary};
+
+const BUFFER: usize = 64 << 10;
+pub(super) const DISCOVERY_TAIL_BYTES: u64 = 22 + u16::MAX as u64 + 56 + 20;
+const MAX_EXTRA: usize = 37;
+const SIZE_SENTINEL: u64 = u32::MAX as u64;
+
+#[derive(Debug)]
+pub(super) struct VerifiedCreation {
+    pub(super) stamp: Stamp,
+}
+
+pub(super) fn verify_created(
+    file: &mut File,
+    entries: &[PlannedEntry],
+    receipts: &[EntryWritten],
+    options: &CreateOptions,
+    summary: WriteSummary,
+    attempts: &Attempts<'_>,
+    usage: &mut VerificationUsage,
+) -> Result<VerifiedCreation> {
+    let stamp = unix::file_stamp(file, attempts)?;
+    ensure(
+        stamp.len == summary.usage.archive_extent
+            && entries.len() == receipts.len()
+            && entries.len() as u64 == summary.usage.entries,
+        "wrong created archive length or receipt count",
+    )?;
+    let mut reader = Reader { file, options, attempts, usage };
+    let mut input = [0; BUFFER];
+    // Drop each default discovery's buffers and raw comment before
+    // materializing the strict directory. Keep only its checked geometry.
+    let ordinary = [
+        reader.discover(stamp.len, Profile::Zipfast, &mut input)?,
+        reader.discover(stamp.len, Profile::Zipview, &mut input)?,
+    ];
+    let directory = reader.read_directory(stamp.len, entries, &mut input)?;
+    check_directory(&directory, receipts, summary, &options.archive_comment)?;
+    for (profile, observed) in [Profile::Zipfast, Profile::Zipview].into_iter().zip(ordinary) {
+        if !observed.agrees(&directory) {
+            return Err(CreateError::AmbiguousDirectory { profile });
+        }
+    }
+    reader.usage.metadata_bytes = options.archive_comment.len() as u64;
+
+    let mut local_at = 0;
+    let mut central_at = directory.directory_range.start;
+    let mut wide_entry = false;
+    for (ordinal, ((central, expected), receipt)) in directory.entries.iter().zip(entries).zip(receipts).enumerate() {
+        ensure(
+            receipt.ordinal == ordinal as u64
+                && receipt.local_offset == local_at
+                && central.source.raw_range().start == central_at
+                && central.source.raw_range() == central.source.declared_range(),
+            "entry order, offset or extent differs from the plan",
+        )?;
+        let metadata = u64::from(central.header.name_len)
+            + u64::from(central.header.comment_len)
+            + u64::from(central.header.extra_len);
+        reader.usage.metadata_bytes = add(reader.usage.metadata_bytes, metadata)?;
+        limit(reader.usage.metadata_bytes, options.limits.verification_metadata, CreateLimit::VerificationMetadata)?;
+        let framing = Framing::new(expected, receipt)?;
+        wide_entry |= framing.version == 45;
+        let record = Member { central, expected, receipt, framing };
+        record.check_central(&mut reader)?;
+        let payload_end = record.check_local(&mut reader, directory.directory_range.start, &mut input)?;
+        if expected.source.is_some() {
+            reader.verify_payload(receipt, &mut input)?;
+            reader.usage.payloads += 1;
+        }
+        local_at = payload_end;
+        central_at = central.source.raw_range().end;
+        reader.usage.entries += 1;
+    }
+    let expected_wide = wide_entry
+        || receipts.len() >= u16::MAX as usize
+        || directory.declaration.size >= SIZE_SENTINEL
+        || directory.declaration.offset >= SIZE_SENTINEL;
+    ensure(
+        local_at == directory.directory_range.start
+            && central_at == directory.directory_range.end
+            && summary.zip64 == expected_wide,
+        "gap in local or central records or wrong ZIP64 end policy",
+    )?;
+    if unix::file_stamp(reader.file, reader.attempts)? != stamp {
+        return Err(CreateError::StageChanged);
+    }
+    Ok(VerifiedCreation { stamp })
+}
+
+fn check_directory(
+    directory: &Directory,
+    receipts: &[EntryWritten],
+    summary: WriteSummary,
+    expected_comment: &[u8],
+) -> Result<()> {
+    let end = &directory.end_record;
+    let declared = directory.declaration;
+    let central = &directory.directory_range;
+    ensure(
+        directory.prefix_shift == 0
+            && directory.entries.len() == receipts.len()
+            && declared.entries == receipts.len() as u64
+            && declared.size == summary.usage.central_bytes
+            && declared.offset == summary.central_offset
+            && central.start == declared.offset
+            && central.end == add(declared.offset, declared.size)?
+            && directory.observed_range == *central
+            && directory.logical_range == *central
+            && end.disk == 0
+            && end.directory_disk == 0
+            && end.comment_len as usize == expected_comment.len()
+            && directory.raw_comment == expected_comment
+            && directory.comment_range.start == end.source.end
+            && directory.comment_range.end == directory.archive_len,
+        "wrong central directory, end record or archive comment",
+    )?;
+    if summary.zip64 {
+        let wide = directory.zip64_end.as_ref().ok_or(CreateError::Verification("missing ZIP64 end"))?;
+        let locator = directory.zip64_locator.as_ref().ok_or(CreateError::Verification("missing ZIP64 locator"))?;
+        ensure(
+            end.entries == u16::MAX
+                && end.disk_entries == u16::MAX
+                && end.size == u32::MAX
+                && end.offset == u32::MAX
+                && wide.source.start == central.end
+                && wide.source.end == locator.source.start
+                && locator.source.end == end.source.start
+                && wide.body_size == 44
+                && wide.extension.is_empty()
+                && wide.version_made_by == (u16::from(HOST_UNIX) << 8 | 45)
+                && wide.version_needed == 45
+                && wide.disk == 0
+                && wide.directory_disk == 0
+                && wide.disk_entries == declared.entries
+                && wide.declaration == declared
+                && locator.disk == 0
+                && locator.total_disks == 1
+                && locator.record_offset == wide.source.start,
+            "wrong ZIP64 end framing",
+        )
+    } else {
+        ensure(
+            directory.zip64_end.is_none()
+                && directory.zip64_locator.is_none()
+                && end.source.start == central.end
+                && u64::from(end.entries) == declared.entries
+                && u64::from(end.disk_entries) == declared.entries
+                && u64::from(end.size) == declared.size
+                && u64::from(end.offset) == declared.offset,
+            "wrong classic end framing",
+        )
+    }
+}
+
+struct Geometry {
+    end: EndRecord,
+    zip64_end: Option<Zip64End>,
+    locator: Option<Zip64Locator>,
+    declaration: DirectoryDeclaration,
+    directory: std::ops::Range<u64>,
+    prefix_shift: u64,
+    comment: std::ops::Range<u64>,
+}
+
+impl Geometry {
+    fn agrees(&self, strict: &Directory) -> bool {
+        self.end == strict.end_record
+            && self.zip64_end == strict.zip64_end
+            && self.locator == strict.zip64_locator
+            && self.declaration == strict.declaration
+            && self.directory == strict.directory_range
+            && self.prefix_shift == 0
+            && self.comment == strict.comment_range
+    }
+}
+
+struct Framing {
+    method: u16,
+    version: u16,
+    flags: u16,
+    dos: (u16, u16),
+    attributes: u32,
+    wide_sizes: bool,
+    wide_offset: bool,
+}
+
+impl Framing {
+    fn new(entry: &PlannedEntry, receipt: &EntryWritten) -> Result<Self> {
+        let decoded = entry.source.as_ref().map_or(0, |source| source.stamp.len);
+        let expected_method = if decoded == 0 { Method::Stored } else { entry.method };
+        ensure(
+            receipt.decoded_size == decoded
+                && receipt.method == expected_method
+                && (decoded != 0 || (receipt.crc32 == 0 && receipt.packed_size == 0)),
+            "writer receipt differs from the expected source framing",
+        )?;
+        let method = match receipt.method {
+            Method::Stored => {
+                ensure(receipt.packed_size == decoded, "Stored payload sizes differ")?;
+                METHOD_STORED
+            }
+            Method::Deflate(_) => METHOD_DEFLATE,
+        };
+        let wide_sizes = method == METHOD_DEFLATE || decoded >= SIZE_SENTINEL;
+        let wide_offset = receipt.local_offset >= SIZE_SENTINEL;
+        let (kind, dos_attributes) = if entry.source.is_some() { (0o100000, 0) } else { (S_IFDIR, 0x10) };
+        Ok(Self {
+            method,
+            version: if wide_sizes || wide_offset { 45 } else { 20 },
+            flags: if entry.utf8 { FLAG_UTF8 } else { 0 },
+            dos: entry.modified.wire_fields(),
+            attributes: ((kind | u32::from(entry.permissions.bits())) << 16) | dos_attributes,
+            wide_sizes,
+            wide_offset,
+        })
+    }
+
+    fn size_field(&self, size: u64) -> u32 {
+        if self.wide_sizes { u32::MAX } else { size as u32 }
+    }
+
+    fn valid_flags(&self, flags: u16) -> bool {
+        // Bit 1/2 may indicate a Deflate level hint. All other flags are
+        // forbidden except the EFS bit selected by the plan.
+        let hints = if self.method == METHOD_DEFLATE { 0b110 } else { 0 };
+        flags & !hints == self.flags
+    }
+}
+
+struct Member<'a> {
+    central: &'a CentralRecord,
+    expected: &'a PlannedEntry,
+    receipt: &'a EntryWritten,
+    framing: Framing,
+}
+
+impl Member<'_> {
+    fn check_central(&self, reader: &mut Reader<'_, '_>) -> Result<()> {
+        let header = self.central.header;
+        let resolved = self.central.resolved;
+        let expected = self.expected;
+        let receipt = self.receipt;
+        let framing = &self.framing;
+        ensure(
+            self.central.raw_name.as_ref() == expected.name
+                && self.central.raw_comment.as_ref() == expected.comment
+                && header.name_len as usize == expected.name.len()
+                && header.comment_len as usize == expected.comment.len()
+                && framing.valid_flags(header.flags)
+                && header.method == framing.method
+                && (header.mod_time, header.mod_date) == framing.dos
+                && header.version_needed == framing.version
+                && header.version_made_by == (u16::from(HOST_UNIX) << 8 | framing.version)
+                && header.crc32 == receipt.crc32
+                && header.packed_size == framing.size_field(receipt.packed_size)
+                && header.unpacked_size == framing.size_field(receipt.decoded_size)
+                && header.local_header_offset
+                    == if framing.wide_offset { u32::MAX } else { receipt.local_offset as u32 }
+                && header.disk_start == 0
+                && header.internal_attributes == 0
+                && header.external_attributes == framing.attributes
+                && resolved.unresolved == zip_container::Zip64Fields::default()
+                && resolved.packed_size == receipt.packed_size
+                && resolved.unpacked_size == receipt.decoded_size
+                && resolved.local_header_offset == receipt.local_offset
+                && resolved.disk_start == 0,
+            "central header or metadata differs from the plan and receipt",
+        )?;
+        let extra_at = self.central.source.extra_range().start;
+        if header.extra_len != 0 {
+            reader.seek(extra_at)?;
+        }
+        self.check_extras(reader, header.extra_len, extra_at, framing.wide_offset)
+    }
+
+    fn check_local(&self, reader: &mut Reader<'_, '_>, central_at: u64, buffer: &mut [u8]) -> Result<u64> {
+        let receipt = self.receipt;
+        let framing = &self.framing;
+        let offset = receipt.local_offset;
+        ensure(add(offset, LOCAL_HEADER_LEN as u64)? <= central_at, "local header overlaps the directory")?;
+        reader.seek(offset)?;
+        let mut fixed = [0; LOCAL_HEADER_LEN];
+        reader.read_exact(&mut fixed)?;
+        let local = LocalHeader::parse(&fixed).map_err(|error| CreateError::Directory(error.into()))?;
+        let layout = local_layout(local, offset, central_at).map_err(|error| CreateError::Directory(error.into()))?;
+        ensure(
+            local.version_needed == framing.version
+                && local.flags == self.central.header.flags
+                && local.method == framing.method
+                && (local.mod_time, local.mod_date) == framing.dos
+                && local.crc32 == receipt.crc32
+                && local.packed_size == framing.size_field(receipt.packed_size)
+                && local.unpacked_size == framing.size_field(receipt.decoded_size)
+                && local.name_len as usize == self.expected.name.len(),
+            "local header differs from the central header",
+        )?;
+        let payload = layout
+            .payload_range(receipt.packed_size, central_at)
+            .map_err(|error| CreateError::Directory(error.into()))?;
+        let name = &mut buffer[..self.expected.name.len()];
+        reader.read_exact(name)?;
+        ensure(name == self.expected.name, "local name differs from the central name")?;
+        self.check_extras(reader, local.extra_len, layout.extra_range().start, false)?;
+        Ok(payload.end)
+    }
+
+    fn check_extras(&self, reader: &mut Reader<'_, '_>, len: u16, at: u64, offset: bool) -> Result<()> {
+        let mut data = [0; MAX_EXTRA];
+        let data = data.get_mut(..usize::from(len)).ok_or(CreateError::Verification("unexpected extra fields"))?;
+        reader.read_exact(data)?;
+        let mut fields = ExtraIter::new(data, at).map_err(|error| CreateError::Directory(error.into()))?;
+        if self.framing.wide_sizes || offset {
+            let field = fields
+                .next()
+                .transpose()
+                .map_err(|error| CreateError::Directory(error.into()))?
+                .ok_or(CreateError::Verification("missing ZIP64 extra"))?;
+            let mut body = field.body;
+            ensure(field.id == 1, "unexpected ZIP64 extra ID")?;
+            if self.framing.wide_sizes {
+                expect_qword(&mut body, self.receipt.decoded_size)?;
+                expect_qword(&mut body, self.receipt.packed_size)?;
+            }
+            if offset {
+                expect_qword(&mut body, self.receipt.local_offset)?;
+            }
+            ensure(body.is_empty(), "unexpected ZIP64 extra bytes")?;
+        }
+        if let Some(mtime) = self.expected.extended_mtime {
+            let field = fields
+                .next()
+                .transpose()
+                .map_err(|error| CreateError::Directory(error.into()))?
+                .ok_or(CreateError::Verification("missing modification-time extra"))?;
+            ensure(
+                field.id == 0x5455
+                    && field.body.len() == 5
+                    && field.body[0] == 1
+                    && field.body[1..] == mtime.to_le_bytes(),
+                "wrong modification-time extra",
+            )?;
+        }
+        ensure(fields.next().is_none(), "unexpected or duplicate extra field")
+    }
+}
+
+fn expect_qword(bytes: &mut &[u8], expected: u64) -> Result<()> {
+    let (field, rest) = bytes.split_at_checked(8).ok_or(CreateError::Verification("short ZIP64 extra"))?;
+    *bytes = rest;
+    ensure(field == expected.to_le_bytes(), "wrong ZIP64 extra value")
+}
+
+struct Reader<'a, 'b> {
+    file: &'a mut File,
+    options: &'a CreateOptions,
+    attempts: &'a Attempts<'b>,
+    usage: &'a mut VerificationUsage,
+}
+
+impl Reader<'_, '_> {
+    fn seek(&mut self, at: u64) -> Result<()> {
+        let actual = self.attempts.run(|| {
+            #[cfg(test)]
+            super::tests::event_io(super::tests::Event::VerifySeek, None)?;
+            self.file.seek(SeekFrom::Start(at))
+        })?;
+        ensure(actual == at, "stage seek reached the wrong offset")
+    }
+
+    fn read_exact(&mut self, mut bytes: &mut [u8]) -> Result<()> {
+        let maximum = self.options.limits.verification_read_bytes;
+        limit(add(self.usage.read_bytes, bytes.len() as u64)?, maximum, CreateLimit::VerificationReadBytes)?;
+        while !bytes.is_empty() {
+            let count = self.attempts.run(|| {
+                #[cfg(test)]
+                super::tests::event_io(super::tests::Event::VerifyRead, None)?;
+                self.file.read(bytes)
+            })?;
+            if count == 0 {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+            }
+            self.usage.read_bytes = add(self.usage.read_bytes, count as u64)?;
+            bytes = &mut bytes[count..];
+        }
+        Ok(())
+    }
+
+    fn read_directory(&mut self, len: u64, entries: &[PlannedEntry], buffer: &mut [u8]) -> Result<Directory> {
+        let options = self.options;
+        let mut limits = self.parser_budget()?;
+        limits.entries = limits.entries.min(options.limits.directory_entries()).min(entries.len() as u64);
+        // Only the exact expected raw name and comment totals may be owned.
+        // The admitted extra types use scalar projections, with no owned
+        // variable-length Unicode path or other variable-length summary.
+        let mut names = 0;
+        let mut comments = options.archive_comment.len() as u64;
+        for entry in entries {
+            if options.cancel.is_canceled() {
+                return Err(CreateError::Canceled);
+            }
+            names = add(names, entry.name.len() as u64)?;
+            comments = add(comments, entry.comment.len() as u64)?;
+        }
+        limits.name_bytes = limits.name_bytes.min(names);
+        limits.comment_bytes = limits.comment_bytes.min(comments);
+        limits.extra_bytes = 0;
+        let eocd = len
+            .checked_sub(22 + options.archive_comment.len() as u64)
+            .ok_or(CreateError::Verification("archive is too short for the expected end and comment"))?;
+        let mut parser = DirectoryParser::at_eocd(len, eocd, limits).map_err(CreateError::Directory)?;
+        let mut at = None;
+        loop {
+            self.check_parser(&parser)?;
+            let request = parser.next_read();
+            self.check_parser(&parser)?;
+            let Some(range) = request.map_err(CreateError::Directory)? else { break };
+            let size = (range.end - range.start).min(buffer.len() as u64) as usize;
+            ensure(size != 0 && range.end <= len, "parser requested invalid stage range")?;
+            if at != Some(range.start) {
+                self.seek(range.start)?;
+            }
+            self.read_exact(&mut buffer[..size])?;
+            at = Some(range.start + size as u64);
+            let supplied = parser.supply(range.start, &buffer[..size]);
+            self.check_parser(&parser)?;
+            supplied.map_err(CreateError::Directory)?;
+        }
+        let directory = parser.finish().map_err(CreateError::Directory)?;
+        self.usage.record_capacity = directory.entries.capacity() as u64 * size_of::<CentralRecord>() as u64;
+        limit(self.usage.record_capacity, options.limits.verification_records, CreateLimit::VerificationRecords)?;
+        Ok(directory)
+    }
+
+    fn parser_budget(&self) -> Result<zip_container::Limits> {
+        let mut limits = self.options.limits.directory;
+        limits.fetched_bytes =
+            limits.fetched_bytes.checked_sub(self.usage.discovery_bytes).ok_or(CreateError::Overflow)?;
+        limits.work_units = limits.work_units.checked_sub(self.usage.discovery_work).ok_or(CreateError::Overflow)?;
+        Ok(limits)
+    }
+
+    fn discover(&mut self, len: u64, profile: Profile, buffer: &mut [u8]) -> Result<Geometry> {
+        let mut limits = self.parser_budget()?;
+        limits.comment_bytes = limits.comment_bytes.min(self.options.archive_comment.len() as u64);
+        let baseline_bytes = self.usage.discovery_bytes;
+        let baseline_work = self.usage.discovery_work;
+        let ambiguity = || CreateError::AmbiguousDirectory { profile };
+        let classify = |error| match error {
+            DirectoryError::Limit(_) | DirectoryError::Allocation => CreateError::Directory(error),
+            _ => ambiguity(),
+        };
+        let mut discovery = EndDiscovery::new(len, profile, limits).map_err(classify)?;
+        loop {
+            if self.options.cancel.is_canceled() {
+                return Err(CreateError::Canceled);
+            }
+            let request = discovery.next_read();
+            let usage = discovery.usage();
+            self.usage.discovery_bytes = add(baseline_bytes, usage.fetched_bytes)?;
+            self.usage.discovery_work = add(baseline_work, usage.work_units)?;
+            self.scratch(discovery.buffer_usage().capacity_bytes)?;
+            let Some(range) = request.map_err(classify)? else { break };
+            let size = (range.end - range.start).min(buffer.len() as u64) as usize;
+            ensure(size != 0 && range.end <= len, "discovery requested invalid stage range")?;
+            self.seek(range.start)?;
+            self.read_exact(&mut buffer[..size])?;
+            let supplied = discovery.supply(range.start, &buffer[..size]);
+            let usage = discovery.usage();
+            self.usage.discovery_bytes = add(baseline_bytes, usage.fetched_bytes)?;
+            self.usage.discovery_work = add(baseline_work, usage.work_units)?;
+            self.scratch(discovery.buffer_usage().capacity_bytes)?;
+            supplied.map_err(classify)?;
+        }
+        let located = discovery.finish().map_err(classify)?;
+        if located.raw_comment() != self.options.archive_comment {
+            return Err(ambiguity());
+        }
+        Ok(Geometry {
+            end: located.end_record().clone(),
+            zip64_end: located.zip64_end().cloned(),
+            locator: located.zip64_locator().cloned(),
+            declaration: located.declaration(),
+            directory: located.directory_range(),
+            prefix_shift: located.prefix_shift(),
+            comment: located.comment_range(),
+        })
+    }
+
+    fn check_parser(&mut self, parser: &DirectoryParser) -> Result<()> {
+        if self.options.cancel.is_canceled() {
+            return Err(CreateError::Canceled);
+        }
+        self.usage.directory = parser.usage();
+        self.scratch(parser.buffer_usage().capacity_bytes)
+    }
+
+    fn scratch(&mut self, bytes: usize) -> Result<()> {
+        let scratch = bytes as u64;
+        self.usage.scratch_capacity = self.usage.scratch_capacity.max(scratch);
+        limit(scratch, self.options.limits.verification_scratch, CreateLimit::VerificationScratch)
+    }
+
+    fn verify_payload(&mut self, receipt: &EntryWritten, buffer: &mut [u8]) -> Result<()> {
+        let mut remaining = receipt.packed_size;
+        let mut decoded = 0;
+        let mut crc = Hasher::new();
+        if receipt.method == Method::Stored {
+            while remaining != 0 {
+                let len = remaining.min(buffer.len() as u64) as usize;
+                self.read_exact(&mut buffer[..len])?;
+                self.decoded(&mut crc, &mut decoded, receipt, &buffer[..len])?;
+                remaining -= len as u64;
+            }
+        } else {
+            let mut inflate = Decompress::new(false);
+            let mut output = [0; BUFFER];
+            let mut current = 0..0;
+            loop {
+                if current.is_empty() && remaining != 0 {
+                    let len = remaining.min(buffer.len() as u64) as usize;
+                    self.read_exact(&mut buffer[..len])?;
+                    remaining -= len as u64;
+                    current = 0..len;
+                }
+                self.attempts.charge()?;
+                let (before_in, before_out) = (inflate.total_in(), inflate.total_out());
+                let status = inflate
+                    .decompress(&buffer[current.clone()], &mut output, FlushDecompress::None)
+                    .map_err(|_| CreateError::Verification("invalid raw Deflate payload"))?;
+                let used = codec_delta(inflate.total_in(), before_in, current.len())?;
+                let made = codec_delta(inflate.total_out(), before_out, output.len())?;
+                current.start += used;
+                self.decoded(&mut crc, &mut decoded, receipt, &output[..made])?;
+                if status == Status::StreamEnd {
+                    ensure(current.is_empty() && remaining == 0, "trailing bytes in packed Deflate range")?;
+                    break;
+                }
+                ensure(used != 0 || made != 0, "truncated or stalled raw Deflate payload")?;
+            }
+        }
+        ensure(decoded == receipt.decoded_size && crc.finalize() == receipt.crc32, "decoded length or CRC differs")
+    }
+
+    fn decoded(&mut self, crc: &mut Hasher, member: &mut u64, receipt: &EntryWritten, bytes: &[u8]) -> Result<()> {
+        *member = add(*member, bytes.len() as u64)?;
+        let aggregate = add(self.usage.decoded_bytes, bytes.len() as u64)?;
+        limit(*member, self.options.limits.verification_entry_bytes, CreateLimit::VerificationEntryBytes)?;
+        limit(aggregate, self.options.limits.verification_decoded_bytes, CreateLimit::VerificationDecodedBytes)?;
+        ensure(*member <= receipt.decoded_size, "payload exceeds the declared decoded length")?;
+        self.usage.decoded_bytes = aggregate;
+        crc.update(bytes);
+        Ok(())
+    }
+}
+
+fn codec_delta(total: u64, previous: u64, maximum: usize) -> Result<usize> {
+    total
+        .checked_sub(previous)
+        .filter(|&delta| delta <= maximum as u64)
+        .map(|delta| delta as usize)
+        .ok_or(CreateError::Verification("invalid decoder progress counters"))
+}
+
+fn ensure(condition: bool, reason: &'static str) -> Result<()> {
+    if condition { Ok(()) } else { Err(CreateError::Verification(reason)) }
+}
