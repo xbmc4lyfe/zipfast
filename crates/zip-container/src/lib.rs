@@ -25,11 +25,16 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+mod discovery;
 mod error;
 mod extras;
 mod header;
 mod owned;
 
+pub use discovery::{
+    BufferUsage, DirectoryDeclaration, DirectoryError, DirectoryLocation, EndDiscovery, EndRecord, LimitKind, Limits,
+    Profile, SupplyError, Usage, Zip64End, Zip64Locator, discover_slice,
+};
 pub use error::{OwnershipError, OwnershipKind, ParseError};
 pub use extras::{
     AesFields, AesView, ExtendedMtimeView, Extra, ExtraIter, NtfsMtimeView, UnicodePathView, Zip64FieldIter,
