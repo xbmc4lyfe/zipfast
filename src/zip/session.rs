@@ -324,7 +324,13 @@ pub struct Metadata {
 }
 
 impl Metadata {
-    fn from_directory(mut envelope: Directory, cancel: &Cancellation) -> Result<Self> {
+    fn from_directory(envelope: Directory, cancel: &Cancellation) -> Result<Self> {
+        Self::from_directory_accounted(envelope, cancel).map(|(metadata, _, _)| metadata)
+    }
+
+    pub(super) const RECORD_BYTES: usize = std::mem::size_of::<CanonicalEntry>();
+
+    pub(super) fn from_directory_accounted(mut envelope: Directory, cancel: &Cancellation) -> Result<(Self, u64, u64)> {
         let mut entries = Vec::new();
         entries.try_reserve_exact(envelope.entries.len()).map_err(|_| directory_error(DirectoryError::Allocation))?;
         let mut decoded_names = DecodedNameBudget(DECODED_NAME_BYTES);
@@ -334,7 +340,9 @@ impl Metadata {
                 CanonicalEntry::from_record(record, |len| decoded_names.charge(len)).map_err(directory_error)?;
             entries.push(entry);
         }
-        Ok(Self { identity: Arc::new(SessionIdentity { _private: 0 }), envelope, entries })
+        let capacity = entries.capacity() as u64 * Self::RECORD_BYTES as u64;
+        let decoded = (DECODED_NAME_BYTES - decoded_names.0) as u64;
+        Ok((Self { identity: Arc::new(SessionIdentity { _private: 0 }), envelope, entries }, capacity, decoded))
     }
 
     /// Number of central records, including duplicates.
@@ -352,7 +360,7 @@ impl Metadata {
         (ordinal < self.len()).then(|| EntryId { identity: Arc::clone(&self.identity), ordinal })
     }
 
-    fn ordinal(&self, id: &EntryId) -> SessionResult<usize> {
+    pub(super) fn ordinal(&self, id: &EntryId) -> SessionResult<usize> {
         if !Arc::ptr_eq(&id.identity, &self.identity) || id.ordinal >= self.len() {
             return Err(SessionError::ForeignEntryId);
         }
@@ -369,7 +377,7 @@ impl Metadata {
         self.entries.iter().map(|entry| EntryMetadata { entry, prefix_shift: self.prefix_shift() })
     }
 
-    fn view(&self, ordinal: usize) -> EntryMetadata<'_> {
+    pub(super) fn view(&self, ordinal: usize) -> EntryMetadata<'_> {
         EntryMetadata { entry: &self.entries[ordinal], prefix_shift: self.prefix_shift() }
     }
 

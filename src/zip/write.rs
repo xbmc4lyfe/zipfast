@@ -61,6 +61,8 @@ use crate::zip::{FLAG_UTF8, S_IFDIR};
 
 use records::{End, Member, Width};
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) mod raw;
 mod records;
 mod stream;
 pub use stream::ZipStreamWriter;
@@ -616,6 +618,32 @@ fn prepare_member(
         external: ((type_bits | u32::from(options.permissions.0)) << 16) | dos_attributes,
         mtime: options.extended_mtime,
         local_at,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) struct ExactMemberGeometry {
+    pub(super) local_bytes: u64,
+    pub(super) central_bytes: u64,
+    pub(super) patch_bytes: u64,
+    pub(super) wide: bool,
+    pub(super) deflate: bool,
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) fn exact_member_geometry(
+    options: EntryOptions<'_>,
+    size: u64,
+    directory: bool,
+    offset: u64,
+) -> Result<ExactMemberGeometry, WriteError> {
+    let member = prepare_member(options, InputLength::Exact(size), directory, offset)?;
+    Ok(ExactMemberGeometry {
+        local_bytes: member.local_len(),
+        central_bytes: member.central_len(),
+        patch_bytes: if size == 0 { 0 } else { member.patch_len() },
+        wide: member.width.is_wide(),
+        deflate: matches!(member.method, Method::Deflate(_)),
     })
 }
 

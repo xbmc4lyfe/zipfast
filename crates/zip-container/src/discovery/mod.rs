@@ -164,6 +164,7 @@ pub struct EndDiscovery {
     tail: Vec<u8>,
     tail_start: u64,
     end_offset: Option<u64>,
+    retain_comment: bool,
     rank: Rank,
     cursor: usize,
     rejected: Option<DirectoryError>,
@@ -176,7 +177,7 @@ pub struct EndDiscovery {
 impl EndDiscovery {
     /// Creates discovery state without fetching or allocating source buffers.
     pub fn new(archive_len: u64, profile: Profile, limits: Limits) -> Result<Self, DirectoryError> {
-        Self::with_end_offset(archive_len, profile, limits, None, usize::MAX)
+        Self::with_end_offset(archive_len, profile, limits, None, usize::MAX, true)
     }
 
     /// Creates discovery with a ceiling on requested scratch byte capacity.
@@ -191,7 +192,7 @@ impl EndDiscovery {
         limits: Limits,
         scratch_bytes: usize,
     ) -> Result<Self, DirectoryError> {
-        Self::with_end_offset(archive_len, profile, limits, None, scratch_bytes)
+        Self::with_end_offset(archive_len, profile, limits, None, scratch_bytes, true)
     }
 
     fn with_end_offset(
@@ -200,6 +201,7 @@ impl EndDiscovery {
         limits: Limits,
         end_offset: Option<u64>,
         scratch_bytes: usize,
+        retain_comment: bool,
     ) -> Result<Self, DirectoryError> {
         if let Some(offset) = end_offset {
             let comment_len = offset.checked_add(END_LEN as u64).and_then(|end| archive_len.checked_sub(end));
@@ -222,6 +224,7 @@ impl EndDiscovery {
             tail: Vec::new(),
             tail_start,
             end_offset,
+            retain_comment,
             rank: Rank::Exact,
             cursor: 0,
             rejected: None,
@@ -763,7 +766,7 @@ impl EndDiscovery {
         let comment = self.candidate().comment.clone();
         let start = (comment.start - self.tail_start) as usize;
         let end = (comment.end - self.tail_start) as usize;
-        let comment = self.accounting.own_comment(&self.tail[start..end])?;
+        let comment = self.accounting.archive_comment(&self.tail[start..end], self.retain_comment)?;
         let first_probe =
             (first_header.is_some() && directory.start < self.tail_start).then(|| mem::take(&mut self.probe));
         let shift = directory.start - declaration.offset;
@@ -992,14 +995,16 @@ impl Accounting {
         check_remaining(0, declaration.entries, self.limits.entries, LimitKind::Entries)
     }
 
-    fn own_comment(&mut self, bytes: &[u8]) -> Result<Vec<u8>, DirectoryError> {
+    fn archive_comment(&mut self, bytes: &[u8], retain: bool) -> Result<Vec<u8>, DirectoryError> {
         if bytes.len() > self.ownership_limits.comment_bytes - self.usage.owned.comment_bytes {
             return Err(DirectoryError::Limit(LimitKind::CommentBytes));
         }
         self.charge(bytes.len() as u64)?;
         let mut comment = Vec::new();
-        comment.try_reserve_exact(bytes.len()).map_err(|_| DirectoryError::Allocation)?;
-        comment.extend_from_slice(bytes);
+        if retain {
+            comment.try_reserve_exact(bytes.len()).map_err(|_| DirectoryError::Allocation)?;
+            comment.extend_from_slice(bytes);
+        }
         self.usage.owned.comment_bytes += bytes.len();
         Ok(comment)
     }
