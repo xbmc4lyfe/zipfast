@@ -18,28 +18,18 @@
 
 //! Archives that are not in memory, read a byte range at a time.
 //!
-//! [`ZipIndexOpener`] follows the same steps as [`ZipReader::new`], but asks
+//! [`ZipIndexOpener`] follows the same steps as [`crate::ZipReader::new`], but asks
 //! for each piece of the archive it needs instead of indexing a slice. The
 //! tests hold the two to the same entries, comment and errors on every
 //! fixture, every truncation of one and every single-byte corruption.
 
 use super::{
-    CENTRAL_HEADER_LEN, CENTRAL_HEADER_SIG, EOCD_LEN, EOCD_SIG, LOCAL_HEADER_LEN, LOCAL_HEADER_SIG,
-    MAX_EOCD_SEARCH, MAX_INFLATED_SIZE, PasswordCheck, Result, ZIP64_EOCD_SIG, ZIP64_LOCATOR_SIG,
-    ZipEntry, ZipReadError, ZipReader, local_password_check, read_local_entry, u16_at, u32_at,
-    u64_at,
+    Listing, MAX_INFLATED_SIZE, PasswordCheck, Result, ZipEntry, ZipReadError, directory_error,
+    local_password_check, parse_error, parse_local_header, read_local_entry,
 };
 use std::borrow::Cow;
 use std::ops::Range;
-
-/// The ZIP64 end record (56 bytes) and its locator (20) sit just before the
-/// end record, so the first read takes them along with the longest comment.
-const TAIL_LEN: u64 = MAX_EOCD_SEARCH as u64 + 56 + 20;
-
-/// The most of the central directory asked for in one read. A bigger
-/// directory (roughly 150,000 entries and up) takes more reads, and a size
-/// field that lies can't make a caller allocate more than this at once.
-const DIRECTORY_READ: u64 = 16 * 1024 * 1024;
+use zip_container::{DirectoryParser, LOCAL_HEADER_LEN, Limits, Profile, local_layout};
 
 /// The longest span [`ZipIndex::entry_range`] asks for: the largest entry
 /// [`MAX_INFLATED_SIZE`] lets through, stored or deflated, with its headers.
@@ -52,9 +42,9 @@ const PASSWORD_CHECK_LEN: u64 = 16 + 2;
 /// The directory of a ZIP archive that isn't in memory: a file too big to
 /// load, or one read over a network a range at a time.
 ///
-/// Opening reads the end of the archive and its central directory (two reads
-/// for most archives, one when the directory is small), and reading an entry
-/// fetches only that entry's bytes. Nothing else of the archive is read or
+/// Opening reads the end of the archive and, when the directory lies outside
+/// that range, probes and fetches its records. Reading an entry fetches only
+/// that entry's bytes. Nothing else of the archive is read or
 /// held. [`ZipIndex::open`] and [`ZipIndex::fetch_entry`] take a blocking
 /// `read(offset, buf)`; [`ZipIndexOpener`], [`ZipIndex::entry_range`] and
 /// [`ZipIndex::read_entry`] do the same work one read at a time, for callers
@@ -83,9 +73,7 @@ const PASSWORD_CHECK_LEN: u64 = 16 + 2;
 #[derive(Debug, Clone)]
 pub struct ZipIndex {
     len: u64,
-    entries: Vec<ZipEntry>,
-    comment: Vec<u8>,
-    offset_shift: u64,
+    listing: Listing,
 }
 
 /// Opens a [`ZipIndex`] one read at a time.
@@ -94,8 +82,9 @@ pub struct ZipIndex {
 /// the archive however suits (asynchronously, say) and hand them to
 /// [`supply`](Self::supply); then [`finish`](Self::finish) gives the index.
 /// Each read asks for bytes not yet supplied. The central directory is parsed
-/// once, as its pieces arrive, and bytes already parsed are dropped, so a big
-/// directory isn't held twice.
+/// once, as its pieces arrive, and processed input buffers are released.
+/// Supply a contiguous prefix of the current request and keep any read-ahead
+/// in your own buffers. Drop the opener to cancel between reads.
 ///
 /// ```
 /// use zipview::ZipIndexOpener;
@@ -114,329 +103,51 @@ pub struct ZipIndex {
 #[derive(Debug, Clone)]
 pub struct ZipIndexOpener {
     len: u64,
-    /// Supplied pieces of the archive, at their offsets.
-    held: Vec<(u64, Vec<u8>)>,
-    /// The walk over the central directory, once its start is known.
-    walk: Option<Walk>,
+    parser: Result<DirectoryParser>,
 }
-
-/// Where the walk over the central directory has got to, kept between reads
-/// so each header is parsed once.
-#[derive(Debug, Clone)]
-struct Walk {
-    comment: Vec<u8>,
-    offset_shift: u64,
-    eocd: u64,
-    /// Headers still to read, as the end record counts them.
-    remaining: u64,
-    cursor: u64,
-    entries: Vec<ZipEntry>,
-}
-
-/// Why a step stopped: bytes it needs, or a reason the archive can't open.
-enum Halt {
-    Read(Range<u64>),
-    Fail(ZipReadError),
-}
-
-impl From<ZipReadError> for Halt {
-    fn from(e: ZipReadError) -> Self {
-        Self::Fail(e)
-    }
-}
-
-type Step<T> = std::result::Result<T, Halt>;
 
 impl ZipIndexOpener {
     /// Starts opening an archive of `archive_len` bytes.
     pub fn new(archive_len: u64) -> Self {
         Self {
             len: archive_len,
-            held: Vec::new(),
-            walk: None,
+            parser: DirectoryParser::new(archive_len, Profile::Zipview, Limits::default())
+                .map_err(directory_error),
         }
     }
 
-    /// The bytes to read next, or `None` once everything is in. `Err` when
-    /// the archive can't be opened, with the error [`ZipReader::new`] gives
-    /// for it.
+    /// The pending read, or `None` once everything is in. Repeated calls
+    /// return the same range until more bytes are supplied. Archive errors
+    /// match those from [`crate::ZipReader::new`].
     pub fn next_read(&mut self) -> Result<Option<Range<u64>>> {
-        let mut walk = match self.walk.take() {
-            Some(walk) => walk,
-            None => match self.locate() {
-                Ok(walk) => walk,
-                Err(Halt::Read(range)) => return Ok(Some(range)),
-                Err(Halt::Fail(e)) => return Err(e),
-            },
-        };
-        let step = self.walk(&mut walk);
-        let cursor = walk.cursor;
-        self.walk = Some(walk);
-        match step {
-            Ok(()) => {
-                self.held = Vec::new();
-                Ok(None)
-            }
-            Err(Halt::Read(range)) => {
-                self.forget_before(cursor);
-                Ok(Some(range))
-            }
-            Err(Halt::Fail(e)) => Err(e),
-        }
+        self.parser
+            .as_mut()
+            .map_err(|error| error.clone())?
+            .next_read()
+            .map_err(directory_error)
     }
 
-    /// Hands over `bytes`, read from the archive at `offset`. `BadOffset`
-    /// when they would run past its end.
+    /// Supplies a contiguous prefix of the range from [`next_read`](Self::next_read).
+    ///
+    /// An empty in-bounds supply has no effect. A nonempty supply without a
+    /// pending request, at the wrong offset, or beyond the request returns
+    /// [`ZipReadError::BadOffset`] and leaves the opener's progress intact.
     pub fn supply(&mut self, offset: u64, bytes: &[u8]) -> Result<()> {
-        if offset
-            .checked_add(bytes.len() as u64)
-            .is_none_or(|end| end > self.len)
-        {
-            return Err(ZipReadError::BadOffset);
+        match &mut self.parser {
+            Ok(parser) => parser.supply(offset, bytes).map_err(directory_error),
+            Err(_) if offset > self.len || !bytes.is_empty() => Err(ZipReadError::BadOffset),
+            Err(_) => Ok(()),
         }
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        // A read that continues a piece extends it, so the directory stays
-        // one slice however many reads it takes.
-        match self
-            .held
-            .iter_mut()
-            .find(|(start, piece)| start + piece.len() as u64 == offset)
-        {
-            Some((_, piece)) => piece.extend_from_slice(bytes),
-            None => self.held.push((offset, bytes.to_vec())),
-        }
-        Ok(())
     }
 
     /// The index, once [`next_read`](Self::next_read) has nothing more to
     /// ask for. `Truncated` if it still needs bytes.
-    pub fn finish(mut self) -> Result<ZipIndex> {
-        if self.next_read()?.is_some() {
-            return Err(ZipReadError::Truncated);
-        }
-        let walk = self.walk.ok_or(ZipReadError::Truncated)?;
+    pub fn finish(self) -> Result<ZipIndex> {
+        let directory = self.parser?.finish().map_err(directory_error)?;
         Ok(ZipIndex {
             len: self.len,
-            entries: walk.entries,
-            comment: walk.comment,
-            offset_shift: walk.offset_shift,
+            listing: Listing::from_directory(directory),
         })
-    }
-
-    /// Drops supplied bytes before `cursor`: the walk never reads behind it.
-    fn forget_before(&mut self, cursor: u64) {
-        self.held.retain_mut(|(start, piece)| {
-            let end = *start + piece.len() as u64;
-            if end <= cursor {
-                return false;
-            }
-            if *start < cursor {
-                piece.drain(..(cursor - *start) as usize);
-                *start = cursor;
-            }
-            true
-        });
-    }
-
-    /// `n` bytes at `at`, if one supplied piece holds them all.
-    fn held(&self, at: u64, n: u64) -> Option<&[u8]> {
-        let end = at.checked_add(n)?;
-        self.held.iter().find_map(|(start, piece)| {
-            let from = usize::try_from(at.checked_sub(*start)?).ok()?;
-            let to = usize::try_from(end - start).ok()?;
-            piece.get(from..to)
-        })
-    }
-
-    /// `n` bytes at `at`, or a read of those not yet supplied.
-    fn need(&self, at: u64, n: u64) -> Step<&[u8]> {
-        self.held(at, n)
-            .ok_or_else(|| Halt::Read(self.unheld(at, at + n)..at + n))
-    }
-
-    /// Where a read for `at..end` starts: past the end of a supplied piece
-    /// that covers its beginning, so a caller who supplied part of a read is
-    /// asked for the rest rather than all of it again.
-    fn unheld(&self, at: u64, end: u64) -> u64 {
-        self.held
-            .iter()
-            .filter(|(start, _)| *start <= at)
-            .map(|(start, piece)| start + piece.len() as u64)
-            .filter(|&piece_end| piece_end > at && piece_end < end)
-            .max()
-            .unwrap_or(at)
-    }
-
-    /// Follows [`ZipReader::new`] over the supplied pieces as far as where
-    /// the central directory starts.
-    fn locate(&self) -> Step<Walk> {
-        let len = self.len;
-        if len < EOCD_LEN as u64 {
-            return Err(ZipReadError::NotAZip.into());
-        }
-        let tail_start = len.saturating_sub(TAIL_LEN);
-        let tail = self.need(tail_start, len - tail_start)?;
-        let at = |off: u64| (off - tail_start) as usize;
-
-        // The last end record within reach of the end, as `find_eocd`.
-        let search_start = len.saturating_sub(MAX_EOCD_SEARCH as u64);
-        let eocd = (search_start..=len - EOCD_LEN as u64)
-            .rev()
-            .find(|&off| u32_at(tail, at(off)) == Ok(EOCD_SIG))
-            .ok_or(ZipReadError::NotAZip)?;
-
-        let mut entry_count = u64::from(u16_at(tail, at(eocd) + 10)?);
-        let mut cd_size = u64::from(u32_at(tail, at(eocd) + 12)?);
-        let mut cd_offset = u64::from(u32_at(tail, at(eocd) + 16)?);
-        let comment_len = u64::from(u16_at(tail, at(eocd) + 20)?);
-        let comment_start = eocd + EOCD_LEN as u64;
-        let comment_end = (comment_start + comment_len).min(len);
-        let comment = tail[at(comment_start)..at(comment_end)].to_vec();
-
-        if entry_count == u64::from(u16::MAX)
-            || cd_offset == u64::from(u32::MAX)
-            || cd_size == u64::from(u32::MAX)
-        {
-            if let Some((z64_entries, z64_size, z64_offset)) = self.zip64(eocd, tail, tail_start)? {
-                entry_count = z64_entries;
-                cd_size = z64_size;
-                cd_offset = z64_offset;
-            }
-        }
-
-        let (cd_start, offset_shift) = self.locate_central_directory(eocd, cd_size, cd_offset)?;
-        Ok(Walk {
-            comment,
-            offset_shift,
-            eocd,
-            remaining: entry_count,
-            cursor: cd_start,
-            entries: Vec::new(),
-        })
-    }
-
-    /// Parses central headers from where `walk` left off, as
-    /// [`ZipReader::new`]'s loop does, until the count runs out, a header
-    /// signature is missing, or the next header isn't supplied yet.
-    fn walk(&self, walk: &mut Walk) -> Step<()> {
-        let eocd = walk.eocd;
-        while walk.remaining > 0 {
-            if u32_at(self.need_directory(walk.cursor, 4, eocd)?, 0)? != CENTRAL_HEADER_SIG {
-                walk.remaining = 0;
-                break;
-            }
-            let fixed = self.need_directory(walk.cursor, CENTRAL_HEADER_LEN as u64, eocd)?;
-            let name_len = u64::from(u16_at(fixed, 28)?);
-            let extra_len = u64::from(u16_at(fixed, 30)?);
-            let header = CENTRAL_HEADER_LEN as u64 + name_len + extra_len;
-            let bytes = self.need_directory(walk.cursor, header, eocd)?;
-            let (entry, next) = ZipReader::parse_central_entry(bytes, 0)?;
-            walk.entries.push(entry);
-            walk.cursor = walk
-                .cursor
-                .checked_add(next as u64)
-                .ok_or(ZipReadError::Truncated)?;
-            walk.remaining -= 1;
-        }
-        Ok(())
-    }
-
-    /// As `ZipReader::read_zip64`: the ZIP64 counts, or `None` on any
-    /// inconsistency.
-    fn zip64(&self, eocd: u64, tail: &[u8], tail_start: u64) -> Step<Option<(u64, u64, u64)>> {
-        // The locator's 20 bytes end at the end record, inside the tail.
-        let Some(locator) = eocd.checked_sub(20) else {
-            return Ok(None);
-        };
-        let at = (locator - tail_start) as usize;
-        if u32_at(tail, at) != Ok(ZIP64_LOCATOR_SIG) {
-            return Ok(None);
-        }
-        let Ok(record) = u64_at(tail, at + 8) else {
-            return Ok(None);
-        };
-        if record.checked_add(56).is_none_or(|end| end > self.len) {
-            return Ok(None);
-        }
-        let bytes = self.need(record, 56)?;
-        if u32_at(bytes, 0)? != ZIP64_EOCD_SIG {
-            return Ok(None);
-        }
-        Ok(Some((
-            u64_at(bytes, 32)?,
-            u64_at(bytes, 40)?,
-            u64_at(bytes, 48)?,
-        )))
-    }
-
-    /// As `ZipReader::locate_central_directory`: where the directory starts
-    /// and how far a self-extracting stub shifts the archive's offsets.
-    fn locate_central_directory(
-        &self,
-        eocd: u64,
-        cd_size: u64,
-        cd_offset: u64,
-    ) -> Step<(u64, u64)> {
-        if cd_offset <= self.len
-            && self.signature_at(cd_offset, cd_size, eocd)? == Some(CENTRAL_HEADER_SIG)
-        {
-            return Ok((cd_offset, 0));
-        }
-        if let Some(computed) = eocd.checked_sub(cd_size) {
-            if computed <= self.len
-                && self.signature_at(computed, cd_size, eocd)? == Some(CENTRAL_HEADER_SIG)
-            {
-                return Ok((computed, computed.saturating_sub(cd_offset)));
-            }
-        }
-        if cd_offset > self.len {
-            return Err(ZipReadError::BadOffset.into());
-        }
-        Ok((cd_offset, 0))
-    }
-
-    /// The four bytes at `at`, `None` past the end. When they aren't held,
-    /// asks for the directory that would start there, which is what the
-    /// next steps read if they turn out to be a central header.
-    fn signature_at(&self, at: u64, cd_size: u64, eocd: u64) -> Step<Option<u32>> {
-        if at.checked_add(4).is_none_or(|end| end > self.len) {
-            return Ok(None);
-        }
-        match self.held(at, 4) {
-            Some(bytes) => Ok(Some(u32_at(bytes, 0)?)),
-            None => {
-                // The declared size, though not past the end record the
-                // directory comes before, nor more than one read's worth.
-                let want = cd_size
-                    .min(eocd.saturating_sub(at))
-                    .max(CENTRAL_HEADER_LEN as u64)
-                    .min(DIRECTORY_READ);
-                let end = at.saturating_add(want).min(self.len);
-                Err(Halt::Read(self.unheld(at, end)..end))
-            }
-        }
-    }
-
-    /// `n` bytes of the central directory at `at`. `Truncated` past the end
-    /// of the archive, as in memory; otherwise, when they aren't held, a read
-    /// that continues the piece `at` is in.
-    fn need_directory(&self, at: u64, n: u64, eocd: u64) -> Step<&[u8]> {
-        let end = at
-            .checked_add(n)
-            .filter(|&end| end <= self.len)
-            .ok_or(ZipReadError::Truncated)?;
-        if let Some(bytes) = self.held(at, n) {
-            return Ok(bytes);
-        }
-        let from = self.unheld(at, end);
-        // Up to the end record in reads of at most DIRECTORY_READ, or a
-        // little past it for a directory whose size field undersells it.
-        let chunk = eocd.saturating_sub(from).clamp(64 * 1024, DIRECTORY_READ);
-        Err(Halt::Read(
-            from..end.max(from.saturating_add(chunk)).min(self.len),
-        ))
     }
 }
 
@@ -453,9 +164,9 @@ impl ZipIndex {
     ) -> std::result::Result<Self, E> {
         let mut opener = ZipIndexOpener::new(archive_len);
         while let Some(range) = opener.next_read()? {
-            let mut buf = vec![0; (range.end - range.start) as usize];
-            read(range.start, &mut buf)?;
-            opener.supply(range.start, &buf)?;
+            let start = range.start;
+            let buf = read_range(range, &mut read, ZipReadError::BadOffset)?;
+            opener.supply(start, &buf)?;
         }
         Ok(opener.finish()?)
     }
@@ -468,32 +179,32 @@ impl ZipIndex {
     /// Number of entries parsed. May be fewer than the archive declared when
     /// its central directory is damaged.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.listing.entries.len()
     }
 
     /// True when no entries parsed.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.listing.entries.is_empty()
     }
 
     /// The archive comment, lossily decoded.
     pub fn comment(&self) -> Cow<'_, str> {
-        String::from_utf8_lossy(&self.comment)
+        String::from_utf8_lossy(&self.listing.comment)
     }
 
     /// All parsed entries, in central-directory order.
     pub fn entries(&self) -> &[ZipEntry] {
-        &self.entries
+        &self.listing.entries
     }
 
     /// The entry at `index` in central-directory order.
     pub fn by_index(&self, index: usize) -> Option<&ZipEntry> {
-        self.entries.get(index)
+        self.listing.entries.get(index)
     }
 
     /// The first entry whose name matches exactly.
     pub fn by_name(&self, name: &str) -> Option<&ZipEntry> {
-        self.entries.iter().find(|e| e.name == name)
+        self.listing.entries.iter().find(|e| e.name == name)
     }
 
     /// Whether an entry with this exact name exists.
@@ -506,10 +217,7 @@ impl ZipIndex {
     /// [`entry_range`](Self::entry_range) or
     /// [`password_check_range`](Self::password_check_range).
     pub fn header_range(&self, entry: &ZipEntry) -> Result<Range<u64>> {
-        let start = entry.local_header_offset.saturating_add(self.offset_shift);
-        if start > self.len {
-            return Err(ZipReadError::BadOffset);
-        }
+        let start = self.listing.local_start(entry, self.len)?;
         Ok(start..start.saturating_add(LOCAL_HEADER_LEN as u64).min(self.len))
     }
 
@@ -519,15 +227,17 @@ impl ZipIndex {
     ///
     /// `EntryTooLarge` for an entry too big to read, before anything else.
     pub fn entry_range(&self, entry: &ZipEntry, header: &[u8]) -> Result<Range<u64>> {
-        if entry.uncompressed_size > MAX_INFLATED_SIZE {
-            return Err(ZipReadError::EntryTooLarge(entry.uncompressed_size));
-        }
-        let start = self.header_range(entry)?.start;
-        let data_start = local_data_start(header)?;
-        let end = start
-            .checked_add(data_start)
-            .and_then(|v| v.checked_add(entry.compressed_size))
-            .ok_or(ZipReadError::BadOffset)?
+        entry.check_inflated_size()?;
+        let start = self.listing.local_start(entry, self.len)?;
+        let packed_size = entry.checked_packed_size()?;
+        // The preview clips to EOF, including when the local variable
+        // fields or payload extend past it. A full read checks the bounds.
+        let layout =
+            local_layout(parse_local_header(header)?, start, u64::MAX).map_err(parse_error)?;
+        let end = layout
+            .payload_range(packed_size, u64::MAX)
+            .map_err(parse_error)?
+            .end
             .min(self.len);
         // A compressed size no entry within the limit could have.
         if end - start > MAX_ENTRY_SPAN {
@@ -545,11 +255,12 @@ impl ZipIndex {
         if !entry.is_encrypted() {
             return None;
         }
-        let start = self.header_range(entry).ok()?.start;
-        let data_start = local_data_start(header).ok()?;
-        let end = start
-            .checked_add(data_start)?
-            .checked_add(PASSWORD_CHECK_LEN)?
+        let start = self.listing.local_start(entry, self.len).ok()?;
+        let layout = local_layout(parse_local_header(header).ok()?, start, u64::MAX).ok()?;
+        let end = layout
+            .payload_range(PASSWORD_CHECK_LEN, u64::MAX)
+            .ok()?
+            .end
             .min(self.len);
         Some(start..end)
     }
@@ -569,9 +280,8 @@ impl ZipIndex {
         bytes: &[u8],
         password: Option<&str>,
     ) -> Result<Vec<u8>> {
-        if entry.uncompressed_size > MAX_INFLATED_SIZE {
-            return Err(ZipReadError::EntryTooLarge(entry.uncompressed_size));
-        }
+        entry.check_inflated_size()?;
+        self.listing.local_start(entry, self.len)?;
         read_local_entry(bytes, 0, entry, password)
     }
 
@@ -581,7 +291,8 @@ impl ZipIndex {
         if !entry.is_encrypted() {
             return None;
         }
-        local_password_check(bytes, 0, entry)
+        self.listing.local_start(entry, self.len).ok()?;
+        local_password_check(bytes, entry)
     }
 
     /// Reads and decompresses `entry` with a blocking `read(offset, buf)`
@@ -593,11 +304,10 @@ impl ZipIndex {
         password: Option<&str>,
         mut read: impl FnMut(u64, &mut [u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<Vec<u8>, E> {
-        if entry.uncompressed_size > MAX_INFLATED_SIZE {
-            return Err(ZipReadError::EntryTooLarge(entry.uncompressed_size).into());
-        }
-        let too_large = ZipReadError::EntryTooLarge(entry.compressed_size);
-        let header = read_range(self.header_range(entry)?, &mut read, too_large.clone())?;
+        entry.check_inflated_size()?;
+        let header_range = self.header_range(entry)?;
+        let too_large = ZipReadError::EntryTooLarge(entry.checked_packed_size()?);
+        let header = read_range(header_range, &mut read, too_large.clone())?;
         let range = self.entry_range(entry, &header)?;
         let bytes = read_range(range, &mut read, too_large)?;
         Ok(self.read_entry_with_password(entry, &bytes, password)?)
@@ -642,18 +352,6 @@ fn read_range<E: From<ZipReadError>>(
     Ok(buf)
 }
 
-/// Where an entry's data starts, from the start of its local header, given
-/// the header's fixed 30 bytes; the same checks, in the same order, as
-/// reading it in memory.
-fn local_data_start(header: &[u8]) -> Result<u64> {
-    if u32_at(header, 0)? != LOCAL_HEADER_SIG {
-        return Err(ZipReadError::BadSignature);
-    }
-    let name_len = u64::from(u16_at(header, 26)?);
-    let extra_len = u64::from(u16_at(header, 28)?);
-    Ok(LOCAL_HEADER_LEN as u64 + name_len + extra_len)
-}
-
 impl From<ZipReadError> for std::io::Error {
     fn from(e: ZipReadError) -> Self {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
@@ -663,6 +361,7 @@ impl From<ZipReadError> for std::io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{CENTRAL_HEADER_SIG, EOCD_SIG, LOCAL_HEADER_SIG, ZipReader};
 
     /// An archive of `n` empty stored entries named by `name`.
     fn archive(n: usize, name: impl Fn(usize) -> String) -> Vec<u8> {
@@ -707,14 +406,14 @@ mod tests {
         let (mut reads, mut parsed) = (0, 0);
         while let Some(range) = opener.next_read().expect("next read") {
             reads += 1;
-            if let Some(walk) = &opener.walk {
-                assert!(walk.entries.len() >= parsed);
-                parsed = walk.entries.len();
-                // What's held is the tail and less than one header of the
-                // directory: the rest is parsed and dropped.
-                let held: u64 = opener.held.iter().map(|(_, p)| p.len() as u64).sum();
-                assert!(held <= TAIL_LEN + 1024, "{held} bytes held");
-            }
+            let parser = opener.parser.as_ref().unwrap();
+            let entries = parser.usage().owned.entries;
+            assert!(entries >= parsed);
+            parsed = entries;
+            // The tail and one partial record are sufficient, even while a
+            // range much larger than either is being supplied in pieces.
+            let held = parser.buffer_usage().live_bytes;
+            assert!(held < 67_000, "{held} bytes held");
             let end = range.end.min(range.start + 65_536);
             let bytes = &data[range.start as usize..end as usize];
             opener.supply(range.start, bytes).expect("supply");

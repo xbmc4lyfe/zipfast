@@ -5,8 +5,8 @@ The fixtures in [zip_parity.rs](../tests/zip_parity.rs) exercise zipfast
 `ZipIndexOpener` against the same bytes. They characterize the readers at
 `914e005`. The proposed migration requirements below follow the
 [Phase 2 plan](superpowers/plans/2026-11-11-zipview-merge-and-compatibility.md).
-Tests that currently pin a disagreement will need new expectations when
-the corresponding behavior change is implemented.
+The table records the original observations. The current zipview
+adapter results follow it.
 
 The [fixture builder](../tests/common/zip_parity_fixture.rs) writes small
 little-endian records with explicit raw names, flags, extras and comments.
@@ -32,6 +32,17 @@ payload ranges and compare the returned bytes.
 | Data descriptor and conflicting local fields | All readers use the local name and extra lengths to locate the compressed payload. Central name, flags, method, sizes and CRC remain the indexed metadata. Changing the local name, flags, method, CRC and sizes leaves the selected bytes intact. The range ends before the descriptor. | Use the bounded local layout for the physical payload start and the central packed size for the span. Preserve both records and their fields. Keep data descriptors outside the payload range, and keep integrity policy with each decoder. [APPNOTE §§4.3.7–4.3.9 and §4.3.12](https://pkware.cachefly.net/webdocs/APPNOTE/APPNOTE-6.3.8.TXT) |
 | Bad directory count, truncated fields and split metadata | zipfast rejects low/high counts. zipview returns the declared subset or stops at the first non-central signature. All reject an overlong central name and a local extra extending beyond EOF at payload read. zipfast rejects an overlong central comment and zipview skips the declared length. With a short ZIP64 extra, zipfast rejects the entry and zipview lists it with the packed-size sentinel and rejects payload read. zipfast rejects a nonzero EOCD disk number and zipview lists the entry. | Bound all reads and record extents and distinguish complete records from unavailable fields. Preserve zipfast's strict extraction behavior and zipview's established listing recovery via explicit policy, with the same outcomes for slice and range under the same policy. Treat unfilled ZIP64 sentinels as unresolved for payload reads. Split archives remain unsupported by zipfast. [APPNOTE §§4.3.12–4.3.16 and §4.5.3](https://pkware.cachefly.net/webdocs/APPNOTE/APPNOTE-6.3.8.TXT) |
 
+## Current zipview adapter results
+
+| Fixture or contract | Current behavior |
+| --- | --- |
+| Embedded EOCD signature | The slice, blocking and incremental readers prefer the structurally valid EOCD with a comment ending at EOF. Trailing and clipped comments remain supported. |
+| Prefixed ZIP64 | The three zipview readers relocate the ZIP64 end record and its local offsets, including a prefixed record with extensible data. The root reader accepts the fixed prefixed record and returns `Corrupt("ZIP64 end record")` for the prefixed extensible fixture. |
+| Directory limits and geometry | An impossible declaration or exhausted metadata budget returns `BadOffset`. The sparse directory-size fixture and the over-limit ZIP64 count fixture stop after the tail. Within the limits, listing retains the tolerant count and clipped central-comment behavior. |
+| Unresolved or split addressing | zipview lists the raw offset or sentinel. A local read requiring an unresolved or split address returns `BadOffset`. A full read requiring an unresolved packed size returns `Truncated` without fetching the payload. The bounded password preview still works when its local address is usable. |
+| AES extra boundaries | The public helper and entry projection use the first bounded AES extra and ignore a short or overclaimed field. The root reader still accepts the historical overclaimed-field fixture. Zipview checks the local extra for a password preview and prefers central AES parameters for a full authenticated read, with a local fallback. |
+| Incremental range protocol | A nonempty supply must start at the pending offset and fit within the request. Invalid supply returns `BadOffset` and leaves progress intact. A partial request and the accumulated metadata can be cloned and continued independently. A directory outside the initial tail can require separate signature and fixed-header probes before the remaining directory ranges. |
+
 ## Public metadata boundaries
 
 Neither reader exposes raw entry names, raw entry comments, or unknown
@@ -43,32 +54,9 @@ through `unix_mode()`. zipview has no link accessor, and zipfast has no
 public local payload-offset accessor. The fixtures retain the bytes and
 expected positions for future direct checks of shared records.
 
-At the baseline, the source locations below account for the observations.
-
-- zipfast resolves EOCD candidates, ZIP64, directory size and counts in
-  [Archive::open_cancelable](../src/zip.rs#L150). It projects DOS, NTFS,
-  extended timestamps and Unicode extras in
-  [parse_central](../src/zip.rs#L532) and
-  [decode_name](../src/zip.rs#L637).
-- zipview chooses the last EOCD signature in
-  [find_eocd](../crates/zipview/src/lib.rs#L511) and
-  [the ranged locator](../crates/zipview/src/index.rs#L274). Its slice and
-  ranged ZIP64 readers follow the stored offset in
-  [read_zip64](../crates/zipview/src/lib.rs#L529) and
-  [ZipIndexOpener::zip64](../crates/zipview/src/index.rs#L348).
-- zipview uses the count as a loop bound in
-  [ZipReader::new](../crates/zipview/src/lib.rs#L431) and
-  [ZipIndexOpener::walk](../crates/zipview/src/index.rs#L323). The
-  [central parser](../crates/zipview/src/lib.rs#L593) checks the name and
-  extra slices, but advances over the comment using its declared length.
-- The classification differences are in the
-  [zipfast entry methods](../src/zip.rs#L91) and
-  [zipview entry methods](../crates/zipview/src/lib.rs#L340).
-  zipfast's [AES extra parser](../src/crypto.rs#L1052) returns vendor
-  version, while zipview's [AES extra parser](../crates/zipview/src/lib.rs#L1008)
-  returns strength and method.
-- zipview's [password probe](../crates/zipview/src/lib.rs#L799) passes
-  the local extra bytes to its verifier helper. Its
-  [full read](../crates/zipview/src/lib.rs#L825) tries the central AES
-  fields first. zipfast's [payload read](../src/zip.rs#L300) uses central
-  AES fields and the vendor version when applying CRC policy.
+The baseline source is available at revision `914e005` in
+`src/zip.rs`, `src/crypto.rs`, and `crates/zipview/src/{lib,index}.rs`.
+In the current adapter, [ZipReader](../crates/zipview/src/lib.rs) projects the
+shared records and [ZipIndexOpener](../crates/zipview/src/index.rs) drives
+the same parser over byte ranges. The shared records retain raw metadata
+and ranges used by the parity fixtures.

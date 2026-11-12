@@ -115,7 +115,7 @@ pub struct OwnershipUsage {
 }
 
 /// Cumulative limits and usage for converting borrowed central records.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct OwnershipBudget {
     limits: OwnershipUsage,
     used: OwnershipUsage,

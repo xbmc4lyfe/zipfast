@@ -62,9 +62,8 @@
 //!
 //! # Hardening
 //!
-//! Every field is read through bounds-checked helpers, so a truncated or
-//! hostile archive yields `Err`, never a panic or an out-of-bounds read.
-//! Parsing has no `unsafe`. The only `unsafe` in the crate is in `accel`,
+//! The shared ZIP parser checks directory and local record bounds and caps
+//! directory metadata. Parsing has no `unsafe`. The only `unsafe` in this crate is in `accel`,
 //! which runs the processor's own AES, SHA-1 and CRC-32 instructions where it has them, checked
 //! for at run time, with the portable code as the fallback. Inflation is done
 //! by `flate2` on its `zlib-rs` backend, which also uses `unsafe`, for speed.
@@ -78,14 +77,11 @@
 //!   allocation. A stream that inflates to a *different* size than declared is
 //!   also an error: a silently short XML document parses into wrong values,
 //!   which is worse than no values.
-//! - The entry count from the end-of-central-directory record is a hint, not a
-//!   promise. It is clamped against what the buffer could actually hold, since
-//!   each central directory entry needs at least 46 bytes.
-//! - Self-extracting archives are handled. A stub before the first local
-//!   header shifts every offset the central directory records, and the shift
-//!   is derived rather than assumed. Getting this wrong reads zero entries
-//!   *silently*, which is how it was caught -- by differential testing against
-//!   the `zip` crate, not by any amount of reading the code.
+//! - Listing may stop before the declared count. Directory declarations and
+//!   retained metadata must fit the parser's finite budgets.
+//! - Self-extracting archives can shift the stored offsets of both classic
+//!   and ZIP64 records. Listing preserves recorded entry offsets, while local
+//!   reads use checked, relocated addresses from a single disk.
 //!
 //! # Example
 //!
@@ -134,28 +130,17 @@ pub use index::{ZipIndex, ZipIndexOpener};
 use std::borrow::Cow;
 use subtle::ConstantTimeEq;
 
-/// Local file header signature, `PK\x03\x04`.
+use zip_container::{
+    AesFields, AesView, CentralRecord, Directory, DirectoryError, ExtraIter, Limits, LocalHeader,
+    ParseError, Profile, Zip64Fields, Zip64Value, Zip64View, local_layout, parse_slice,
+};
+
+#[cfg(test)]
 const LOCAL_HEADER_SIG: u32 = 0x0403_4b50;
-/// Central directory file header signature, `PK\x01\x02`.
+#[cfg(test)]
 const CENTRAL_HEADER_SIG: u32 = 0x0201_4b50;
-/// End of central directory signature, `PK\x05\x06`.
+#[cfg(test)]
 const EOCD_SIG: u32 = 0x0605_4b50;
-/// ZIP64 end of central directory record signature, `PK\x06\x06`.
-const ZIP64_EOCD_SIG: u32 = 0x0606_4b50;
-/// ZIP64 end of central directory locator signature, `PK\x06\x07`.
-const ZIP64_LOCATOR_SIG: u32 = 0x0706_4b50;
-
-/// Fixed size of a central directory file header, before the variable-length
-/// name, extra and comment fields.
-const CENTRAL_HEADER_LEN: usize = 46;
-/// Fixed size of a local file header, before name and extra.
-const LOCAL_HEADER_LEN: usize = 30;
-/// Fixed size of an end-of-central-directory record, before its comment.
-const EOCD_LEN: usize = 22;
-
-/// The EOCD comment field is a `u16` length, so the record can start at most
-/// this far from the end of the file.
-const MAX_EOCD_SEARCH: usize = EOCD_LEN + u16::MAX as usize;
 
 /// Ceiling on a single entry's inflated size, independent of what the archive
 /// claims. Callers here read small XML and plist members; anything larger is not
@@ -173,7 +158,7 @@ pub enum ZipReadError {
     Truncated,
     /// A signature was not what the format requires at that offset.
     BadSignature,
-    /// An offset or length in the archive does not address the buffer.
+    /// An invalid source range, directory geometry, or directory budget.
     BadOffset,
     /// No entry with the requested name exists.
     EntryNotFound,
@@ -181,7 +166,7 @@ pub enum ZipReadError {
     UnsupportedCompression(u16),
     /// Decompression failed, or produced a different size than declared.
     DecompressionFailed,
-    /// The entry's declared size exceeds [`MAX_INFLATED_SIZE`].
+    /// The entry exceeds the inflated-size or ranged-read limit.
     EntryTooLarge(u64),
     /// The entry is encrypted and no password was provided.
     Encrypted,
@@ -276,6 +261,8 @@ pub struct ZipEntry {
     flags: u16,
     last_modified: Option<DosDateTime>,
     aes_info: Option<(u8, u16)>,
+    local_address_resolved: bool,
+    packed_size_resolved: bool,
 }
 
 impl ZipEntry {
@@ -383,326 +370,160 @@ impl ZipEntry {
 #[derive(Debug, Clone)]
 pub struct ZipReader<'a> {
     data: &'a [u8],
+    listing: Listing,
+}
+
+#[derive(Debug, Clone)]
+struct Listing {
     entries: Vec<ZipEntry>,
     comment: Vec<u8>,
-    /// Bytes of non-ZIP prefix (a self-extracting stub) that every offset in
-    /// the central directory is implicitly relative to. Zero for ordinary
-    /// archives. See `locate_central_directory`.
     offset_shift: u64,
+    single_disk: bool,
 }
 
-/// Reads a little-endian `u16` at `off`, or `Truncated`.
-fn u16_at(data: &[u8], off: usize) -> Result<u16> {
-    data.get(off..off + 2)
-        .map(|b| u16::from_le_bytes([b[0], b[1]]))
-        .ok_or(ZipReadError::Truncated)
-}
-
-/// Reads a little-endian `u32` at `off`, or `Truncated`.
-fn u32_at(data: &[u8], off: usize) -> Result<u32> {
-    data.get(off..off + 4)
-        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .ok_or(ZipReadError::Truncated)
-}
-
-/// Reads a little-endian `u64` at `off`, or `Truncated`.
-fn u64_at(data: &[u8], off: usize) -> Result<u64> {
-    data.get(off..off + 8)
-        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))
-        .ok_or(ZipReadError::Truncated)
-}
-
-/// Converts a `u64` from the archive into a buffer index, rejecting anything
-/// that cannot address `data`. This is the only place archive-supplied offsets
-/// become indices, so every such conversion is checked.
-fn offset_to_index(value: u64, data: &[u8]) -> Result<usize> {
-    let idx = usize::try_from(value).map_err(|_| ZipReadError::BadOffset)?;
-    if idx > data.len() {
-        return Err(ZipReadError::BadOffset);
+impl Listing {
+    fn from_directory(directory: Directory) -> Self {
+        let single_disk = directory.local_addresses_are_single_disk();
+        let mut entries: Vec<_> = directory
+            .entries
+            .into_iter()
+            .map(ZipEntry::from_record)
+            .collect();
+        // Collection can reuse the parser's larger record allocation.
+        entries.shrink_to_fit();
+        Self {
+            entries,
+            comment: directory.raw_comment,
+            offset_shift: directory.prefix_shift,
+            single_disk,
+        }
     }
-    Ok(idx)
+
+    fn local_start(&self, entry: &ZipEntry, archive_len: u64) -> Result<u64> {
+        if !self.single_disk || !entry.local_address_resolved {
+            return Err(ZipReadError::BadOffset);
+        }
+        entry
+            .local_header_offset
+            .checked_add(self.offset_shift)
+            .filter(|&start| start <= archive_len)
+            .ok_or(ZipReadError::BadOffset)
+    }
+}
+
+impl ZipEntry {
+    fn from_record(record: CentralRecord) -> Self {
+        let CentralRecord {
+            header,
+            resolved,
+            raw_name,
+            known,
+            ..
+        } = record;
+        // A valid name takes ownership of the parser's allocation. Invalid
+        // UTF-8 gets one owned lossy projection for repeated lookups.
+        let name = String::from_utf8(raw_name.into_vec())
+            .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned());
+        Self {
+            name,
+            compression: header.method,
+            crc32: header.crc32,
+            compressed_size: resolved.packed_size,
+            uncompressed_size: resolved.unpacked_size,
+            local_header_offset: resolved.local_header_offset,
+            external_attributes: header.external_attributes,
+            version_made_by: header.version_made_by,
+            flags: header.flags,
+            last_modified: DosDateTime::from_parts(header.mod_date, header.mod_time),
+            aes_info: known.aes.and_then(project_aes),
+            local_address_resolved: !resolved.unresolved.local_header_offset
+                && !resolved.unresolved.disk_start
+                && resolved.disk_start == 0,
+            packed_size_resolved: !resolved.unresolved.packed_size,
+        }
+    }
+
+    fn check_inflated_size(&self) -> Result<()> {
+        if self.uncompressed_size > MAX_INFLATED_SIZE {
+            return Err(ZipReadError::EntryTooLarge(self.uncompressed_size));
+        }
+        Ok(())
+    }
+
+    fn checked_packed_size(&self) -> Result<u64> {
+        if !self.packed_size_resolved {
+            return Err(ZipReadError::Truncated);
+        }
+        Ok(self.compressed_size)
+    }
+}
+
+fn directory_error(error: DirectoryError) -> ZipReadError {
+    match error {
+        DirectoryError::NotZip => ZipReadError::NotAZip,
+        DirectoryError::Incomplete | DirectoryError::EntryCount { .. } => ZipReadError::Truncated,
+        DirectoryError::Parse(error) => parse_error(error),
+        DirectoryError::MalformedEnd
+        | DirectoryError::MalformedZip64
+        | DirectoryError::InvalidLocalOffset
+        | DirectoryError::UnsupportedDisk
+        | DirectoryError::Limit(_)
+        | DirectoryError::Allocation
+        | DirectoryError::Supply(_)
+        | DirectoryError::Ownership(_) => ZipReadError::BadOffset,
+    }
+}
+
+fn parse_error(error: ParseError) -> ZipReadError {
+    match error {
+        ParseError::OffsetOverflow => ZipReadError::BadOffset,
+        ParseError::BadSignature { .. } => ZipReadError::BadSignature,
+        ParseError::Truncated { .. }
+        | ParseError::TruncatedExtraHeader { .. }
+        | ParseError::TruncatedExtraBody { .. }
+        | ParseError::ExtraBodyTooLong { .. } => ZipReadError::Truncated,
+    }
 }
 
 impl<'a> ZipReader<'a> {
     /// Parses the central directory of `data`.
     ///
-    /// Reads no entry payloads, so the cost is proportional to the number of
-    /// entries rather than the size of the archive.
+    /// Reads no entry payloads. Directory geometry and metadata budgets
+    /// are checked before allocating based on archive declarations.
     pub fn new(data: &'a [u8]) -> Result<Self> {
-        let eocd = Self::find_eocd(data).ok_or(ZipReadError::NotAZip)?;
-
-        let mut entry_count = u16_at(data, eocd + 10)? as u64;
-        let mut cd_size = u32_at(data, eocd + 12)? as u64;
-        let mut cd_offset = u32_at(data, eocd + 16)? as u64;
-
-        let comment_len = u16_at(data, eocd + 20)? as usize;
-        let comment_start = eocd + EOCD_LEN;
-        // A comment length longer than the remaining bytes is a malformed
-        // archive rather than a fatal one: take what is actually there.
-        let comment_end = comment_start.saturating_add(comment_len).min(data.len());
-        let comment = data
-            .get(comment_start..comment_end)
-            .unwrap_or_default()
-            .to_vec();
-
-        // ZIP64 only when the 32-bit fields are saturated, which is the signal
-        // the format uses. Looking for the ZIP64 records unconditionally would
-        // misread a plain archive whose bytes happen to contain the signature.
-        if entry_count == u16::MAX as u64
-            || cd_offset == u32::MAX as u64
-            || cd_size == u32::MAX as u64
-        {
-            if let Some((z64_entries, z64_size, z64_offset)) = Self::read_zip64(data, eocd) {
-                entry_count = z64_entries;
-                cd_size = z64_size;
-                cd_offset = z64_offset;
-            }
-        }
-
-        // A self-extracting archive carries an executable stub before the first
-        // local header, so every offset the central directory records is
-        // relative to where the ZIP data starts rather than to the file. The
-        // declared offset then points into the stub.
-        //
-        // The central directory always ends at the EOCD, so `eocd - cd_size`
-        // is its true position; the difference from the declared offset is the
-        // prefix length, and the same shift applies to every local header
-        // offset. Trusting the declared offset instead reads zero entries,
-        // which is how this was caught -- by the differential test against the
-        // `zip` crate, on a stub-prefixed archive.
-        let (cd_start, offset_shift) =
-            Self::locate_central_directory(data, eocd, cd_size, cd_offset)?;
-
-        let mut cursor = cd_start;
-
-        // The declared count is a hint. Each central directory header occupies
-        // at least CENTRAL_HEADER_LEN bytes, so an archive claiming more
-        // entries than could fit is lying and would otherwise have us
-        // preallocate on its word.
-        let max_possible = data.len().saturating_sub(cursor) / CENTRAL_HEADER_LEN;
-        let capacity = (entry_count as usize).min(max_possible);
-        let mut entries = Vec::with_capacity(capacity);
-
-        for _ in 0..entry_count {
-            if u32_at(data, cursor)? != CENTRAL_HEADER_SIG {
-                // A short central directory is common in damaged archives.
-                // Stop and keep what parsed rather than discarding all of it;
-                // the entries already read are individually well-formed.
-                break;
-            }
-            let (entry, next) = Self::parse_central_entry(data, cursor)?;
-            entries.push(entry);
-            cursor = next;
-        }
-
+        let directory =
+            parse_slice(data, Profile::Zipview, Limits::default()).map_err(directory_error)?;
         Ok(Self {
             data,
-            entries,
-            comment,
-            offset_shift,
+            listing: Listing::from_directory(directory),
         })
-    }
-
-    /// Scans backwards for the end-of-central-directory signature.
-    ///
-    /// Backwards because the record sits at the end, and an archive may carry a
-    /// self-extracting stub or trailing junk; the *last* valid-looking record
-    /// is the operative one.
-    fn find_eocd(data: &[u8]) -> Option<usize> {
-        if data.len() < EOCD_LEN {
-            return None;
-        }
-        let search_start = data.len().saturating_sub(MAX_EOCD_SEARCH);
-        let last_possible = data.len() - EOCD_LEN;
-        for off in (search_start..=last_possible).rev() {
-            if u32_at(data, off).ok()? == EOCD_SIG {
-                return Some(off);
-            }
-        }
-        None
-    }
-
-    /// Follows the ZIP64 locator that precedes the EOCD to the ZIP64 EOCD
-    /// record. Returns `None` on any inconsistency, leaving the 32-bit values
-    /// in force, since a partially-understood ZIP64 archive should degrade to
-    /// what the classic record says rather than guess.
-    fn read_zip64(data: &[u8], eocd: usize) -> Option<(u64, u64, u64)> {
-        // The locator is a fixed 20 bytes immediately before the EOCD.
-        let locator = eocd.checked_sub(20)?;
-        if u32_at(data, locator).ok()? != ZIP64_LOCATOR_SIG {
-            return None;
-        }
-        let z64_eocd = offset_to_index(u64_at(data, locator + 8).ok()?, data).ok()?;
-        if u32_at(data, z64_eocd).ok()? != ZIP64_EOCD_SIG {
-            return None;
-        }
-        let entries = u64_at(data, z64_eocd + 32).ok()?;
-        let cd_size = u64_at(data, z64_eocd + 40).ok()?;
-        let cd_offset = u64_at(data, z64_eocd + 48).ok()?;
-        Some((entries, cd_size, cd_offset))
-    }
-
-    /// Resolves where the central directory really begins, and by how much
-    /// the archive's internal offsets are shifted.
-    ///
-    /// Returns `(index of first central header, shift)`. The shift is added to
-    /// each entry's local header offset when reading its payload.
-    ///
-    /// Order matters: the declared offset is tried first, so an ordinary
-    /// archive is unaffected and cannot be mis-shifted by a coincidence. Only
-    /// when that does not hold a central header is the `eocd - cd_size`
-    /// position consulted.
-    fn locate_central_directory(
-        data: &[u8],
-        eocd: usize,
-        cd_size: u64,
-        cd_offset: u64,
-    ) -> Result<(usize, u64)> {
-        // Ordinary archive: the declared offset addresses a central header.
-        if let Ok(idx) = offset_to_index(cd_offset, data) {
-            if u32_at(data, idx) == Ok(CENTRAL_HEADER_SIG) {
-                return Ok((idx, 0));
-            }
-        }
-
-        // Prefixed archive: the directory ends at the EOCD, so back up by its
-        // size. The shift is how far the real position is past the declared.
-        let computed = (eocd as u64).checked_sub(cd_size);
-        if let Some(computed) = computed {
-            if let Ok(idx) = offset_to_index(computed, data) {
-                if u32_at(data, idx) == Ok(CENTRAL_HEADER_SIG) {
-                    let shift = computed.saturating_sub(cd_offset);
-                    return Ok((idx, shift));
-                }
-            }
-        }
-
-        // Neither position holds a central header. An archive with zero
-        // entries legitimately has no central header at all, so accept the
-        // declared offset and let the (empty) entry loop confirm it.
-        Ok((offset_to_index(cd_offset, data)?, 0))
-    }
-
-    /// Parses one central directory header at `off`, returning it and the
-    /// offset of the next header.
-    ///
-    /// Always inlined: with [`ZipIndex`] calling it too, the compiler stops
-    /// inlining it into [`ZipReader::new`]'s loop, which opens a 20,000-entry
-    /// directory about 10% slower.
-    #[inline(always)]
-    fn parse_central_entry(data: &[u8], off: usize) -> Result<(ZipEntry, usize)> {
-        let version_made_by = u16_at(data, off + 4)?;
-        let flags = u16_at(data, off + 8)?;
-        let compression = u16_at(data, off + 10)?;
-        let mod_time = u16_at(data, off + 12)?;
-        let mod_date = u16_at(data, off + 14)?;
-        let crc32 = u32_at(data, off + 16)?;
-        let mut compressed_size = u32_at(data, off + 20)? as u64;
-        let mut uncompressed_size = u32_at(data, off + 24)? as u64;
-        let name_len = u16_at(data, off + 28)? as usize;
-        let extra_len = u16_at(data, off + 30)? as usize;
-        let comment_len = u16_at(data, off + 32)? as usize;
-        let external_attributes = u32_at(data, off + 38)?;
-        let mut local_header_offset = u32_at(data, off + 42)? as u64;
-
-        let name_start = off + CENTRAL_HEADER_LEN;
-        let name_bytes = data
-            .get(name_start..name_start + name_len)
-            .ok_or(ZipReadError::Truncated)?;
-
-        // Flag bit 11 promises UTF-8. Without it the name is officially CP437,
-        // but in practice it is usually UTF-8 anyway, so decode as UTF-8 and
-        // fall back to lossy rather than mis-transcoding. Entry names are used
-        // for lookup and reporting, never as filesystem paths.
-        let name = match std::str::from_utf8(name_bytes) {
-            Ok(s) => s.to_string(),
-            Err(_) => String::from_utf8_lossy(name_bytes).into_owned(),
-        };
-
-        let extra_start = name_start + name_len;
-        let extra = data
-            .get(extra_start..extra_start + extra_len)
-            .ok_or(ZipReadError::Truncated)?;
-
-        // ZIP64 extended information (header id 0x0001) replaces whichever
-        // 32-bit fields are saturated, in a fixed order, each present only if
-        // its 32-bit counterpart was 0xFFFFFFFF.
-        if compressed_size == u32::MAX as u64
-            || uncompressed_size == u32::MAX as u64
-            || local_header_offset == u32::MAX as u64
-        {
-            if let Some(z64) = find_extra_field(extra, 0x0001) {
-                let mut p = 0usize;
-                if uncompressed_size == u32::MAX as u64 {
-                    if let Ok(v) = u64_at(z64, p) {
-                        uncompressed_size = v;
-                        p += 8;
-                    }
-                }
-                if compressed_size == u32::MAX as u64 {
-                    if let Ok(v) = u64_at(z64, p) {
-                        compressed_size = v;
-                        p += 8;
-                    }
-                }
-                if local_header_offset == u32::MAX as u64 {
-                    if let Ok(v) = u64_at(z64, p) {
-                        local_header_offset = v;
-                    }
-                }
-            }
-        }
-
-        let aes_info = aes_extra(extra);
-
-        let next = extra_start
-            .checked_add(extra_len)
-            .and_then(|v| v.checked_add(comment_len))
-            .ok_or(ZipReadError::Truncated)?;
-
-        Ok((
-            ZipEntry {
-                name,
-                compression,
-                crc32,
-                compressed_size,
-                uncompressed_size,
-                local_header_offset,
-                external_attributes,
-                version_made_by,
-                flags,
-                last_modified: DosDateTime::from_parts(mod_date, mod_time),
-                aes_info,
-            },
-            next,
-        ))
     }
 
     /// Number of entries parsed. May be fewer than the archive declared when
     /// its central directory is damaged.
     pub fn len(&self) -> usize {
-        self.entries.len()
+        self.listing.entries.len()
     }
 
     /// True when no entries parsed.
     pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
+        self.listing.entries.is_empty()
     }
 
     /// The archive comment, lossily decoded. Comments are free text with no
     /// declared encoding.
     pub fn comment(&self) -> Cow<'_, str> {
-        String::from_utf8_lossy(&self.comment)
+        String::from_utf8_lossy(&self.listing.comment)
     }
 
     /// All parsed entries, in central-directory order.
     pub fn entries(&self) -> &[ZipEntry] {
-        &self.entries
+        &self.listing.entries
     }
 
     /// The entry at `index` in central-directory order.
     pub fn by_index(&self, index: usize) -> Option<&ZipEntry> {
-        self.entries.get(index)
+        self.listing.entries.get(index)
     }
 
     /// The first entry whose name matches exactly.
@@ -710,7 +531,7 @@ impl<'a> ZipReader<'a> {
     /// Exact comparison, not path resolution: ZIP permits duplicate names,
     /// and resolving them would be a guess.
     pub fn by_name(&self, name: &str) -> Option<&ZipEntry> {
-        self.entries.iter().find(|e| e.name == name)
+        self.listing.entries.iter().find(|e| e.name == name)
     }
 
     /// Whether an entry with this exact name exists.
@@ -757,12 +578,11 @@ impl<'a> ZipReader<'a> {
         if !entry.is_encrypted() {
             return None;
         }
-        let local = offset_to_index(
-            entry.local_header_offset.saturating_add(self.offset_shift),
-            self.data,
-        )
-        .ok()?;
-        local_password_check(self.data, local, entry)
+        let start = self
+            .listing
+            .local_start(entry, self.data.len() as u64)
+            .ok()?;
+        local_password_check(&self.data[start as usize..], entry)
     }
 
     /// Decompresses one entry's payload.
@@ -780,80 +600,60 @@ impl<'a> ZipReader<'a> {
         entry: &ZipEntry,
         password: Option<&str>,
     ) -> Result<Vec<u8>> {
-        if entry.uncompressed_size > MAX_INFLATED_SIZE {
-            return Err(ZipReadError::EntryTooLarge(entry.uncompressed_size));
-        }
-
-        let local = offset_to_index(
-            entry.local_header_offset.saturating_add(self.offset_shift),
-            self.data,
-        )?;
-        read_local_entry(self.data, local, entry, password)
+        entry.check_inflated_size()?;
+        let start = self.listing.local_start(entry, self.data.len() as u64)?;
+        read_local_entry(self.data, start, entry, password)
     }
 }
 
-/// The [`PasswordCheck`] of encrypted `entry`, whose local header starts at
-/// `local` in `data`. Shared by [`ZipReader`], where `data` is the whole
-/// archive, and [`ZipIndex`], where it is the bytes read from the local
-/// header on.
-fn local_password_check(data: &[u8], local: usize, entry: &ZipEntry) -> Option<PasswordCheck> {
-    if u32_at(data, local).ok()? != LOCAL_HEADER_SIG {
-        return None;
+/// Parses the fixed header with the legacy signature-first error precedence.
+fn parse_local_header(bytes: &[u8]) -> Result<LocalHeader> {
+    match LocalHeader::parse(bytes) {
+        Err(ParseError::Truncated { .. })
+            if bytes.get(..4).is_some_and(|sig| sig != b"PK\x03\x04") =>
+        {
+            Err(ZipReadError::BadSignature)
+        }
+        result => result.map_err(parse_error),
     }
-    let local_name_len = u16_at(data, local + 26).ok()? as usize;
-    let local_extra_len = u16_at(data, local + 28).ok()? as usize;
-    let extra_start = local
-        .checked_add(LOCAL_HEADER_LEN)?
-        .checked_add(local_name_len)?;
-    let data_start = extra_start.checked_add(local_extra_len)?;
-    let local_extra = data.get(extra_start..data_start)?;
-    let entry_slice = data.get(local..)?;
+}
+
+/// The [`PasswordCheck`] for encrypted `entry`, with `data` beginning at its
+/// local header. The check uses the local extra and the available prefix.
+fn local_password_check(data: &[u8], entry: &ZipEntry) -> Option<PasswordCheck> {
+    let header = parse_local_header(data).ok()?;
+    let layout = local_layout(header, 0, data.len() as u64).ok()?;
+    let extra = layout.extra_range();
+    let data_start = extra.end as usize;
     password_check_at(
-        entry_slice,
+        data,
         usize::from(entry.flags),
         usize::from(entry.compression),
-        local_extra,
-        data_start - local,
+        &data[extra.start as usize..data_start],
+        data_start,
     )
 }
 
-/// Decrypts and decompresses `entry`, whose local header starts at `local`
-/// in `data` (see [`local_password_check`] for what `data` is). Sizes come
-/// from the central directory, never the local header: a streamed entry
-/// stores zeros there and writes the real values to a data descriptor after
+/// Decrypts and decompresses `entry` starting at `start` in `data`.
+/// The central sizes remain authoritative even when a data descriptor follows
 /// the payload.
 fn read_local_entry(
     data: &[u8],
-    local: usize,
+    start: u64,
     entry: &ZipEntry,
     password: Option<&str>,
 ) -> Result<Vec<u8>> {
-    if u32_at(data, local)? != LOCAL_HEADER_SIG {
-        return Err(ZipReadError::BadSignature);
-    }
-    // Only the variable-length counts are taken from the local header; the
-    // payload begins after them.
-    let local_name_len = u16_at(data, local + 26)? as usize;
-    let local_extra_len = u16_at(data, local + 28)? as usize;
-
-    let extra_start = local
-        .checked_add(LOCAL_HEADER_LEN)
-        .and_then(|v| v.checked_add(local_name_len))
-        .ok_or(ZipReadError::BadOffset)?;
-    let data_start = extra_start
-        .checked_add(local_extra_len)
-        .ok_or(ZipReadError::BadOffset)?;
-    let local_extra = data
-        .get(extra_start..data_start)
-        .ok_or(ZipReadError::Truncated)?;
-
-    let compressed_len =
-        usize::try_from(entry.compressed_size).map_err(|_| ZipReadError::BadOffset)?;
-    let data_end = data_start
-        .checked_add(compressed_len)
-        .ok_or(ZipReadError::BadOffset)?;
+    let compressed_len = entry.checked_packed_size()?;
+    let header = parse_local_header(&data[start as usize..])?;
+    let layout = local_layout(header, start, data.len() as u64).map_err(parse_error)?;
+    let extra = layout.extra_range();
+    let local_extra = &data[extra.start as usize..extra.end as usize];
+    // Keep full reads within this platform's address space before checking EOF.
+    let payload = layout
+        .payload_range(compressed_len, usize::MAX as u64)
+        .map_err(|_| ZipReadError::BadOffset)?;
     let payload = data
-        .get(data_start..data_end)
+        .get(payload.start as usize..payload.end as usize)
         .ok_or(ZipReadError::Truncated)?;
 
     let (decrypted_buf, method);
@@ -871,7 +671,7 @@ fn read_local_entry(
             method = actual_method;
         } else {
             let check = if entry.flags & 0x0008 != 0 {
-                *data.get(local + 11).ok_or(ZipReadError::Truncated)?
+                (header.mod_time >> 8) as u8
             } else {
                 (entry.crc32 >> 24) as u8
             };
@@ -986,33 +786,34 @@ impl PasswordCheck {
 /// Parses the ZIP64 extended information extra field (`0x0001`) for saturated 32-bit sizes.
 /// Returns `(uncompressed_size, compressed_size)`.
 pub fn zip64_sizes(extra: &[u8], uncompressed: u32, compressed: u32) -> (u64, u64) {
-    let (mut unp, mut packed) = (u64::from(uncompressed), u64::from(compressed));
-    if let Some(z64) = find_extra_field(extra, 0x0001) {
-        let mut at = 0usize;
-        if uncompressed == u32::MAX {
-            if let Ok(v) = u64_at(z64, at) {
-                unp = v;
-            }
-            at += 8;
-        }
-        if compressed == u32::MAX {
-            if let Ok(v) = u64_at(z64, at) {
-                packed = v;
+    let (mut unpacked, mut packed) = (u64::from(uncompressed), u64::from(compressed));
+    if let Some(body) = find_extra_field(extra, 0x0001) {
+        let requested = Zip64Fields {
+            unpacked_size: uncompressed == u32::MAX,
+            packed_size: compressed == u32::MAX,
+            ..Zip64Fields::default()
+        };
+        for field in Zip64View::new(body).fields(requested) {
+            match field {
+                Ok(Zip64Value::UnpackedSize(value)) => unpacked = value,
+                Ok(Zip64Value::PackedSize(value)) => packed = value,
+                Ok(_) | Err(_) => break,
             }
         }
     }
-    (unp, packed)
+    (unpacked, packed)
 }
 
 /// Parses WinZip AES extra field `0x9901`, returning `(strength, actual_method)`.
 pub fn aes_extra(extra: &[u8]) -> Option<(u8, u16)> {
     let body = find_extra_field(extra, 0x9901)?;
-    if body.len() < 7 {
-        return None;
-    }
-    let strength = body.get(4).copied().filter(|s| (1..=3).contains(s))?;
-    let method = u16::from_le_bytes([*body.get(5)?, *body.get(6)?]);
-    Some((strength, method))
+    project_aes(AesView::parse(body).ok()?.fields())
+}
+
+fn project_aes(fields: AesFields) -> Option<(u8, u16)> {
+    (1..=3)
+        .contains(&fields.strength)
+        .then_some((fields.strength, fields.method))
 }
 
 /// Extracts a [`PasswordCheck`] from a local entry slice starting at its `PK\x03\x04` signature.
@@ -1640,19 +1441,11 @@ fn ctr_xor<const NR: usize>(rk: &[u32; 60], data: &mut [u8]) {
 /// The block is a sequence of `(u16 id, u16 len, len bytes)`. A malformed
 /// length terminates the walk rather than running past the block.
 fn find_extra_field(extra: &[u8], want_id: u16) -> Option<&[u8]> {
-    let mut off = 0usize;
-    while off + 4 <= extra.len() {
-        let id = u16::from_le_bytes([extra[off], extra[off + 1]]);
-        let len = u16::from_le_bytes([extra[off + 2], extra[off + 3]]) as usize;
-        let body_start = off + 4;
-        let body_end = body_start.checked_add(len)?;
-        if body_end > extra.len() {
-            return None;
+    for field in ExtraIter::new(extra, 0).ok()? {
+        let field = field.ok()?;
+        if field.id == want_id {
+            return Some(field.body);
         }
-        if id == want_id {
-            return Some(&extra[body_start..body_end]);
-        }
-        off = body_end;
     }
     None
 }
@@ -1876,7 +1669,7 @@ mod tests {
     #[test]
     fn absurd_entry_count_does_not_preallocate() {
         let mut zip = stored_archive("a.txt", b"x");
-        let eocd = ZipReader::find_eocd(&zip).expect("eocd");
+        let eocd = zip.len() - 22;
         // Claim 65534 entries in an archive that holds one.
         zip[eocd + 10..eocd + 12].copy_from_slice(&65534u16.to_le_bytes());
         // Must stop at the first non-signature rather than trusting the count.

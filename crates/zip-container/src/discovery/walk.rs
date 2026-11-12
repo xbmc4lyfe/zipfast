@@ -31,7 +31,7 @@ use super::{
 };
 
 /// Ordered central metadata and checked geometry for one archive.
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Directory {
     /// Central records in wire order, including duplicate names.
     pub entries: Vec<CentralRecord>,
@@ -63,6 +63,19 @@ pub struct Directory {
 }
 
 impl Directory {
+    /// Whether the archive-level disk declarations use one address space.
+    ///
+    /// Each entry's own disk number and offset still need validation.
+    pub fn local_addresses_are_single_disk(&self) -> bool {
+        self.end_record.disk == 0
+            && self.end_record.directory_disk == 0
+            && self.end_record.disk_entries == self.end_record.entries
+            && self.zip64_locator.as_ref().is_none_or(|locator| locator.disk == 0 && locator.total_disks <= 1)
+            && self.zip64_end.as_ref().is_none_or(|record| {
+                record.disk == 0 && record.directory_disk == 0 && record.disk_entries == record.declaration.entries
+            })
+    }
+
     /// Checks the physical start address of the indexed record's local header.
     ///
     /// Zipview can list split or unresolved entries without a usable address.
@@ -73,13 +86,7 @@ impl Directory {
         if self.profile == Profile::Zipview
             && (entry.resolved.unresolved.disk_start
                 || entry.resolved.disk_start != 0
-                || self.end_record.disk != 0
-                || self.end_record.directory_disk != 0
-                || self.end_record.disk_entries != self.end_record.entries
-                || self.zip64_locator.as_ref().is_some_and(|locator| locator.disk != 0 || locator.total_disks > 1)
-                || self.zip64_end.as_ref().is_some_and(|record| {
-                    record.disk != 0 || record.directory_disk != 0 || record.disk_entries != record.declaration.entries
-                }))
+                || !self.local_addresses_are_single_disk())
         {
             return None;
         }
@@ -99,7 +106,7 @@ fn physical_offset(resolved: ResolvedFields, shift: u64, archive_len: u64) -> Op
 /// Requests are absolute half-open ranges. Supply a contiguous prefix of the
 /// current request, or drop the parser to cancel between requests. Complete
 /// central records are consumed directly from the borrowed input.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct DirectoryParser {
     state: State,
     profile: Profile,
@@ -108,7 +115,7 @@ pub struct DirectoryParser {
 
 // Both live variants are small and kept inline so startup needs no heap allocation.
 #[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum State {
     Discovery(EndDiscovery),
     Walk(Walk),
@@ -231,6 +238,7 @@ enum Phase {
     Failed(DirectoryError),
 }
 
+#[derive(Clone)]
 struct Walk {
     directory: Directory,
     accounting: Accounting,

@@ -767,3 +767,43 @@ fn incomplete_parser_can_be_finished_or_dropped_between_requests() {
     assert_eq!(parser.next_read().unwrap(), Some(1..read.end));
     assert_eq!(parser.finish(), Err(DirectoryError::Incomplete));
 }
+
+#[test]
+fn cloning_pending_discovery_and_walk_preserves_progress_and_counters() {
+    let records: Vec<_> = (0..2_000).flat_map(|_| record(b"dup", &[], b"file")).collect();
+    let bytes = archive(&records, 2_000, b"archive");
+    let limits = Limits { range_bytes: 16 * 1024, ..Limits::default() };
+    let expected = parse_slice(&bytes, Profile::Zipview, limits).unwrap();
+    let mut parser = DirectoryParser::new(bytes.len() as u64, Profile::Zipview, limits).unwrap();
+
+    let tail = parser.next_read().unwrap().unwrap();
+    let split = tail.start + 13;
+    parser.supply(tail.start, &bytes[tail.start as usize..split as usize]).unwrap();
+    let mut discovery_clone = parser.clone();
+    assert_eq!(discovery_clone.usage(), parser.usage());
+    assert_eq!(discovery_clone.next_read().unwrap(), Some(split..tail.end));
+
+    let mut walk_clone = None;
+    while let Some(read) = parser.next_read().unwrap() {
+        let end = read.end.min(read.start + 97);
+        parser.supply(read.start, &bytes[read.start as usize..end as usize]).unwrap();
+        if walk_clone.is_none() && parser.usage().owned.entries > 0 {
+            let mut cloned = parser.clone();
+            assert_eq!(cloned.usage(), parser.usage());
+            assert_eq!(cloned.next_read(), parser.next_read());
+            walk_clone = Some(cloned);
+        }
+    }
+
+    for mut clone in [discovery_clone, walk_clone.unwrap()] {
+        while let Some(read) = clone.next_read().unwrap() {
+            clone.supply(read.start, &bytes[read.start as usize..read.end as usize]).unwrap();
+        }
+        let clone = clone.finish().unwrap();
+        assert_eq!(clone.entries, expected.entries);
+        assert_eq!(clone.raw_comment, b"archive");
+        assert_eq!(clone.usage.owned, expected.usage.owned);
+        assert_eq!(clone.usage.fetched_bytes, expected.usage.fetched_bytes);
+    }
+    assert_eq!(parser.finish().unwrap().entries, expected.entries);
+}

@@ -701,6 +701,78 @@ fn aes_full_reads_accept_authentic_entries() {
 }
 
 #[test]
+fn aes_full_reads_use_central_parameters_then_local_fallback() {
+    let (strength, payload, plaintext) = AES_FIXTURES[2];
+    let archive = build(
+        &[Entry::stored("entry.txt", plaintext).encrypted(Crypt::Aes { strength, payload })],
+        "",
+    );
+    let eocd = archive.len() - 22;
+    let central = u32::from_le_bytes(archive[eocd + 16..eocd + 20].try_into().unwrap()) as usize;
+    let local_extra = 30 + "entry.txt".len();
+    let central_extra = central + 46 + "entry.txt".len();
+    for use_fallback in [false, true] {
+        let mut data = archive.clone();
+        let expected = if use_fallback {
+            // An overclaimed body must be ignored even if its AES prefix fits.
+            data[central_extra + 2..central_extra + 4].copy_from_slice(&20u16.to_le_bytes());
+            None
+        } else {
+            data[local_extra + 8] = 1;
+            Some((3, 0))
+        };
+        let view = ZipReader::new(&data).unwrap();
+        let source = Source::new(&data);
+        let index = ZipIndex::open(data.len() as u64, source.read()).unwrap();
+        let entry = index.by_index(0).unwrap();
+        assert_eq!(entry.aes_info(), expected);
+        assert_eq!(view.by_index(0).unwrap().aes_info(), expected);
+        assert_eq!(
+            index
+                .fetch_entry(entry, Some(AES_PASSWORD), source.read())
+                .unwrap(),
+            plaintext
+        );
+        assert_eq!(
+            view.read_by_name_with_password("entry.txt", Some(AES_PASSWORD))
+                .unwrap(),
+            plaintext
+        );
+    }
+}
+
+#[test]
+fn public_extra_helpers_use_the_first_bounded_field_and_zip64_sentinel_order() {
+    use zipview::{aes_extra, zip64_sizes};
+
+    let aes = [1, 0x99, 7, 0, 9, 0, b'?', b'!', 2, 8, 0];
+    assert_eq!(aes_extra(&aes), Some((2, 8)));
+    assert_eq!(aes_extra(&[&[1, 0x99, 0, 0][..], &aes].concat()), None);
+    assert_eq!(aes_extra(&[&[1, 0x99, 20, 0][..], &aes].concat()), None);
+    assert_eq!(
+        aes_extra(&[&[0xff, 0xff, 0xff, 0xff][..], &aes].concat()),
+        None
+    );
+    let mut invalid_strength = aes;
+    invalid_strength[8] = 4;
+    assert_eq!(aes_extra(&[&invalid_strength[..], &aes].concat()), None);
+
+    let first = [1, 0, 8, 0, 42, 0, 0, 0, 0, 0, 0, 0];
+    let both = [
+        1, 0, 16, 0, 42, 0, 0, 0, 0, 0, 0, 0, 21, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let sentinel = u64::from(u32::MAX);
+    assert_eq!(zip64_sizes(&both, u32::MAX, u32::MAX), (42, 21));
+    assert_eq!(zip64_sizes(&both, 12, u32::MAX), (12, 42));
+    assert_eq!(zip64_sizes(&first, u32::MAX, u32::MAX), (42, sentinel));
+    assert_eq!(
+        zip64_sizes(&[&first[..], &both].concat(), u32::MAX, u32::MAX),
+        (42, sentinel)
+    );
+    assert_eq!(zip64_sizes(&both[..11], u32::MAX, 7), (sentinel, 7));
+}
+
+#[test]
 fn aes_full_reads_reject_ciphertext_tampering() {
     for (strength, payload, plaintext) in AES_FIXTURES {
         let mut damaged = payload.to_vec();
@@ -856,7 +928,7 @@ fn ranged_reads_match_in_memory_on_every_truncation_and_corruption() {
 }
 
 #[test]
-fn opening_takes_one_read_for_a_small_directory_and_two_for_a_big_one() {
+fn opening_reuses_the_tail_and_probes_the_external_directory() {
     let small = plain_archive();
     let source = Source::new(&small);
     let index = ZipIndex::open(small.len() as u64, source.read()).expect("open");
@@ -876,7 +948,7 @@ fn opening_takes_one_read_for_a_small_directory_and_two_for_a_big_one() {
     let big = build(&entries, "");
     let source = Source::new(&big);
     let index = ZipIndex::open(big.len() as u64, source.read()).expect("open");
-    assert_eq!(source.read_count(), 2);
+    assert_eq!(source.read_count(), 4);
     assert_eq!(index.len(), 3000);
     assert_same(&big, &[None]);
 }
@@ -1088,7 +1160,7 @@ fn a_fifty_gigabyte_archive_opens_with_one_small_read() {
 }
 
 #[test]
-fn a_lying_directory_size_is_read_at_most_sixteen_mebibytes_at_a_time() {
+fn a_lying_directory_size_is_rejected_before_fetching_directory_bytes() {
     // A 60 GB archive of zeros but for an end record claiming a 4 GiB
     // directory at offset 0, where no central header is.
     let len = 60_000_000_000u64;
@@ -1105,9 +1177,63 @@ fn a_lying_directory_size_is_read_at_most_sixteen_mebibytes_at_a_time() {
         pieces: vec![(len - eocd.len() as u64, eocd)],
         reads: RefCell::new(Vec::new()),
     };
-    let index = ZipIndex::open(len, archive.read()).expect("open");
-    assert!(index.is_empty());
-    let reads = archive.reads.borrow().clone();
-    assert!(reads.len() <= 3, "{reads:?}");
-    assert!(reads.iter().all(|&(_, n)| n <= 16 << 20), "{reads:?}");
+    assert_eq!(
+        ZipIndex::open(len, archive.read()).unwrap_err(),
+        ZipReadError::BadOffset
+    );
+    let reads = archive.reads.borrow();
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert!(reads[0].1 < 70_000);
+}
+
+#[test]
+fn the_opener_rejects_unsolicited_out_of_order_and_overlong_supply() {
+    let data = build(&[Entry::stored("file", b"data")], "");
+    let mut opener = ZipIndexOpener::new(data.len() as u64);
+    assert_eq!(opener.supply(0, &data[..1]), Err(ZipReadError::BadOffset));
+    let read = opener.next_read().unwrap().unwrap();
+    assert_eq!(
+        opener.supply(read.start + 1, &data[1..2]),
+        Err(ZipReadError::BadOffset)
+    );
+    assert_eq!(opener.next_read().unwrap(), Some(read.clone()));
+    opener.supply(read.start, &data[..2]).unwrap();
+
+    let mut cloned = opener.clone();
+    for active in [&mut opener, &mut cloned] {
+        assert_eq!(active.next_read().unwrap(), Some(read.start + 2..read.end));
+        assert_eq!(
+            active.supply(read.start, &data[..2]),
+            Err(ZipReadError::BadOffset)
+        );
+        active.supply(read.start + 2, &data[2..]).unwrap();
+        assert_eq!(active.next_read().unwrap(), None);
+        assert_eq!(
+            active.supply(read.start, &data[..2]),
+            Err(ZipReadError::BadOffset)
+        );
+        assert_eq!(active.supply(read.end, &[]), Ok(()));
+        assert_eq!(active.next_read().unwrap(), None);
+    }
+    assert_eq!(opener.finish().unwrap().entries()[0].name(), "file");
+    assert_eq!(cloned.finish().unwrap().entries()[0].name(), "file");
+
+    let prefix = vec![b'p'; 70_000];
+    let mut prefixed = prefix;
+    prefixed.extend_from_slice(&data);
+    let mut opener = ZipIndexOpener::new(prefixed.len() as u64);
+    let tail = opener.next_read().unwrap().unwrap();
+    opener
+        .supply(tail.start, &prefixed[tail.start as usize..])
+        .unwrap();
+    let probe = opener.next_read().unwrap().unwrap();
+    assert!(probe.end < tail.start);
+    assert_eq!(
+        opener.supply(
+            probe.start,
+            &prefixed[probe.start as usize..=probe.end as usize]
+        ),
+        Err(ZipReadError::BadOffset)
+    );
+    assert_eq!(opener.next_read().unwrap(), Some(probe));
 }

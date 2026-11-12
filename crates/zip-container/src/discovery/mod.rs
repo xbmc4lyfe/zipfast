@@ -52,6 +52,7 @@ const CENTRAL_FIXED_WORK: u64 = 128;
 /// The directory range reflects its declared size. Discovery checks the first
 /// fixed header where needed and leaves verification of entries and their
 /// complete extents to the directory walker.
+#[derive(Clone)]
 pub struct DirectoryLocation {
     candidate: Candidate,
     declaration: DirectoryDeclaration,
@@ -150,6 +151,7 @@ impl fmt::Debug for DirectoryLocation {
 /// complete comment followed by trailing data, then a clipped comment in
 /// [Profile::Zipview]. Within each rank, the latest structurally plausible
 /// record wins. An embedded record with plausible geometry can win that tie.
+#[derive(Clone)]
 pub struct EndDiscovery {
     len: u64,
     profile: Profile,
@@ -797,14 +799,14 @@ enum Purpose {
     Recovery,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Pending {
     range: Range<u64>,
     next: u64,
     purpose: Purpose,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Candidate {
     end: EndRecord,
     locator: Option<Zip64Locator>,
@@ -840,7 +842,7 @@ impl Candidate {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct FixedProbe {
     start: u64,
     len: usize,
@@ -860,7 +862,7 @@ impl FixedProbe {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Recovery {
     end: u64,
     overlap: [u8; END64_LEN - 1],
