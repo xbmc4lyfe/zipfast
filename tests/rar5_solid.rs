@@ -280,3 +280,59 @@ fn a_stored_file_among_queued_ones_reports_after_them() {
     }
     assert_eq!(seen[0], seen[1]);
 }
+
+#[test]
+fn refused_solid_predecessor_cannot_leave_stale_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let arc = dir.path().join("solid.rar");
+    let start = testenc::block(&[Op::Lit(b'A'), Op::Lit(b'A'), Op::Lit(b'A')], true, true);
+    let dependent = testenc::block(&[Op::Match(3, 3)], true, true);
+    for (algorithm, extra, reason) in [
+        (1, vec![], "RAR 7 compression is not supported yet"),
+        (
+            0,
+            vec![36, 1, 0, 0, 4].into_iter().chain([0x53; 16]).chain([0x49; 16]).collect(),
+            "encrypted (password required)",
+        ),
+    ] {
+        let specs = [
+            (FileSpec { method: 3, size: Some(3), ..FileSpec::new("start", &start) }, crc32fast::hash(b"AAA")),
+            (FileSpec { method: 3, extra, size: Some(3), solid: true, ..FileSpec::new("refused", &start) }, 0),
+            (
+                FileSpec { method: 3, size: Some(3), solid: true, ..FileSpec::new("dependent", &dependent) },
+                crc32fast::hash(b"AAA"),
+            ),
+            (FileSpec { method: 3, size: Some(3), ..FileSpec::new("restart", &start) }, crc32fast::hash(b"AAA")),
+        ];
+        let mut archive = SIG.to_vec();
+        archive.extend(main_block_flags(false, None, true));
+        for (spec, crc) in &specs {
+            if algorithm == 1 && spec.name == "refused" {
+                let mut fields = vec![4, 3, 0x20];
+                fields.extend(crc.to_le_bytes());
+                vint((3 << 7) | 0x40 | 1, &mut fields);
+                fields.extend([0, 7]);
+                fields.extend(b"refused");
+                archive.extend(block(2, 0, &fields, &[], spec.data, true));
+            } else {
+                archive.extend(file_block(spec, spec.data, *crc, false, false));
+            }
+        }
+        archive.extend(end_block(false));
+        fs::write(&arc, archive).unwrap();
+        for threads in [1, 4] {
+            let out = dir.path().join(format!("out-{algorithm}-{threads}"));
+            let (summary, lines) = run(&arc, &opts(&out, threads));
+            assert_eq!(
+                lines,
+                [
+                    format!("refused: {reason}"),
+                    "dependent: needs the files before it in this solid archive, which weren't decoded".to_owned(),
+                ]
+            );
+            assert_eq!(summary.files, 2);
+            assert!(!out.join("dependent").exists());
+            assert_eq!(fs::read(out.join("restart")).unwrap(), b"AAA");
+        }
+    }
+}

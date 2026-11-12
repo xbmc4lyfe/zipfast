@@ -1385,7 +1385,10 @@ impl<R: FnMut(&str)> Run<'_, R> {
     }
 
     fn pass_over_with_cipher(&mut self, vol: &mut Volume, h: &FileHeader, cipher: Option<PendingCipher>) -> Result<()> {
-        if vol.main.is_solid() && h.method != 0 && (!h.encrypted || cipher.is_some()) {
+        if h.method != 0 && (h.algorithm != 0 || (h.encrypted && cipher.is_none())) {
+            self.drain()?;
+            self.stream = None;
+        } else if vol.main.is_solid() && h.method != 0 {
             let mut p = Pending::new(h);
             p.passive = true;
             p.cipher = cipher;
