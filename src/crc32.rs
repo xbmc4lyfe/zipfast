@@ -1,3 +1,19 @@
+// Copyright (C) 2026 xbmc4lyfe
+// SPDX-License-Identifier: RPL-1.5
+//
+// Unless explicitly acquired and licensed from Licensor under another license,
+// the contents of this file are subject to the Reciprocal Public License
+// ("RPL") Version 1.5, or subsequent versions as allowed by the RPL, and You
+// may not copy or use this file in either source code or executable form,
+// except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS"
+// basis, WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR
+// HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
+// ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
+// rights and limitations under the RPL.
+
 //! CRC-32 (IEEE 802.3, reflected), as RAR, ZIP and gzip store it.
 //!
 //! On 64-bit ARM, input of a few hundred bytes or more is folded with carry-less multiplies (PMULL): eight 16-byte
@@ -104,17 +120,15 @@ mod fold {
     #[target_feature(enable = "aes")]
     #[inline]
     unsafe fn carry(acc: uint8x16_t, k: (u64, u64), next: uint8x16_t) -> uint8x16_t {
-        // SAFETY: as the caller promises
-        unsafe {
-            let halves = vreinterpretq_u64_u8(acc);
-            let a = vreinterpretq_u8_p128(vmull_p64(vgetq_lane_u64(halves, 0), k.0));
-            let b = vreinterpretq_u8_p128(vmull_p64(vgetq_lane_u64(halves, 1), k.1));
-            #[cfg(target_feature = "sha3")]
-            let sum = veor3q_u8(a, b, next);
-            #[cfg(not(target_feature = "sha3"))]
-            let sum = veorq_u8(veorq_u8(a, b), next);
-            sum
-        }
+        let halves = vreinterpretq_u64_u8(acc);
+        let a = vreinterpretq_u8_p128(vmull_p64(vgetq_lane_u64(halves, 0), k.0));
+        let b = vreinterpretq_u8_p128(vmull_p64(vgetq_lane_u64(halves, 1), k.1));
+        #[cfg(target_feature = "sha3")]
+        // SAFETY: This build requires SHA3 support.
+        let sum = unsafe { veor3q_u8(a, b, next) };
+        #[cfg(not(target_feature = "sha3"))]
+        let sum = veorq_u8(veorq_u8(a, b), next);
+        sum
     }
 
     /// Chained CRC instructions over `bytes`, from the raw (inverted) register `c`.

@@ -161,6 +161,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "zipview"
+version = "0.1.0"
+dependencies = [
+ "flate2",
+]
+
+[[package]]
 name = "zlib-rs"
 version = "0.6.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
