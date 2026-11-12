@@ -110,3 +110,40 @@ space for its archive; full independent extraction needs space for another
 large member. Reference source pins and the Linux build are recorded in
 [the workspace verification](zipview-workspace.md) and
 [Prybar's checked reference builder](https://github.com/xbmc4lyfe/prybar/blob/ab44daa52e1065d81a77fc171703d343606baf92/scripts/build-compatibility-references.sh).
+
+## Forward-only ZIP writer
+
+Use [ZipStreamWriter](../src/zip/write/stream.rs) for an owned or borrowed
+sink that implements only Write, such as a pipe or a file opened for
+sequential output. Construction validates options without calling the
+sink. The caller supplies a fresh logical stream at offset zero. For a
+file, truncate it and position it at zero before passing it to the
+writer. All recorded offsets and the reported extent are relative to the
+first byte emitted by the writer.
+
+The forward writer uses the same metadata, input-length rules and resource
+limits. Nonempty files set general-purpose bit 3 and put a signed data
+descriptor immediately after the packed payload. The descriptor contains
+the CRC32 and final sizes. Known Stored lengths below the ZIP32 size
+sentinel use a 16-byte descriptor. Unknown Stored lengths, larger Stored
+lengths and nonempty Deflate use ZIP64 local size placeholders and a
+24-byte descriptor. A ZIP64 local-header offset alone keeps the 16-byte
+descriptor for an otherwise narrow member. Empty files and explicit
+directories use Stored with no descriptor. Unknown inputs reserve the
+prospective wide header, descriptor and tail before the first read, even
+when they turn out empty.
+
+The physical extent and cumulative output counters include descriptors
+and are equal for a forward stream. The packed byte count excludes
+descriptors. A member contributes to the central directory after its
+descriptor and the following cancellation check succeed.
+
+Preflight failures leave earlier members usable. An admitted failure,
+including an error on the first read, poisons the writer. Already accepted
+bytes remain on the sink. Use a borrowed sink to retain access after an
+error, for example to discard an incomplete file. Dropping the writer
+performs no ZIP finalization. Call finish to write the central directory,
+end records and archive comment. It returns Finished after the sink
+flushes and cancellation is checked again. A transport may have accepted
+bytes before a late failure, so use the successful result to determine
+whether the archive was finalized.
