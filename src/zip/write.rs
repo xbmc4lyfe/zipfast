@@ -144,6 +144,11 @@ pub enum EntryName<'a> {
 pub struct Permissions(u16);
 
 impl Permissions {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn bits(self) -> u16 {
+        self.0
+    }
+
     /// Validates a Unix permission mode in 0o000..=0o777.
     pub fn new(mode: u16) -> Result<Self, WriteError> {
         if mode > 0o777 {
@@ -164,6 +169,11 @@ impl DeflateLevel {
 }
 
 impl DosDateTime {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(super) fn wire_fields(self) -> (u16, u16) {
+        (self.time, self.date)
+    }
+
     /// Validates a Gregorian date in 1980 through 2107 and a civil time.
     /// Odd seconds round down to the previous two-second tick. The writer
     /// applies no timezone conversion.
@@ -338,10 +348,15 @@ impl<W: Write + Seek> ZipWriter<W> {
     /// On error, an owned sink is dropped. Pass a mutable reference to keep
     /// access to the sink if the probe or subsequent writing fails.
     pub fn new(sink: W, options: WriterOptions<'_>) -> Result<Self, WriteError> {
-        let comment_len = metadata_len(options.comment, "archive comment exceeds 65,535 bytes")?;
+        Self::new_accounted(sink, options).map_err(|(error, _)| error)
+    }
+
+    pub(super) fn new_accounted(sink: W, options: WriterOptions<'_>) -> Result<Self, (WriteError, WriteUsage)> {
+        let before_io = |error| (error, WriteUsage::default());
+        let comment_len = metadata_len(options.comment, "archive comment exceeds 65,535 bytes").map_err(before_io)?;
         let max_buffer = isize::MAX as u64;
-        bound(options.limits.central_bytes, max_buffer, Limit::CentralBytes)?;
-        bound(options.limits.metadata_capacity, max_buffer, Limit::MetadataCapacity)?;
+        bound(options.limits.central_bytes, max_buffer, Limit::CentralBytes).map_err(before_io)?;
+        bound(options.limits.metadata_capacity, max_buffer, Limit::MetadataCapacity).map_err(before_io)?;
 
         let mut writer = Self {
             output: Output::new(sink, options.limits, options.cancel),
@@ -351,20 +366,29 @@ impl<W: Write + Seek> ZipWriter<W> {
             wide_member: false,
             failed: None,
         };
-        writer.output.check_tail(End::new(0, 0, 0, false, comment_len), 0)?;
-        bound(u64::from(comment_len), options.limits.metadata_capacity, Limit::MetadataCapacity)?;
-        writer.comment.try_reserve_exact(usize::from(comment_len)).map_err(WriteError::Allocation)?;
-        bound(writer.comment.capacity() as u64, options.limits.metadata_capacity, Limit::MetadataCapacity)?;
-        writer.comment.extend_from_slice(options.comment);
+        match writer.initialize(options.comment) {
+            Ok(()) => Ok(writer),
+            Err(error) => Err((error, writer.usage())),
+        }
+    }
 
-        let output = &mut writer.output;
+    fn initialize(&mut self, comment: &[u8]) -> Result<(), WriteError> {
+        let comment_len = self.comment_len;
+        let metadata_capacity = self.output.work.limits.metadata_capacity;
+        self.output.check_tail(End::new(0, 0, 0, false, comment_len), 0)?;
+        bound(u64::from(comment_len), metadata_capacity, Limit::MetadataCapacity)?;
+        self.comment.try_reserve_exact(usize::from(comment_len)).map_err(WriteError::Allocation)?;
+        bound(self.comment.capacity() as u64, metadata_capacity, Limit::MetadataCapacity)?;
+        self.comment.extend_from_slice(comment);
+
+        let output = &mut self.output;
         let position = output.seek(SeekFrom::Current(0), IoStage::SinkPosition)?;
         let extent = output.seek(SeekFrom::End(0), IoStage::SinkExtent)?;
         output.seek_to(position, IoStage::SinkRestore)?;
         if position != 0 || extent != 0 {
             return Err(WriteError::NonEmptySink { position, extent });
         }
-        Ok(writer)
+        Ok(())
     }
 
     /// Streams a regular file. Exact lengths require a one-byte EOF probe,
@@ -404,7 +428,18 @@ impl<W: Write + Seek> ZipWriter<W> {
     /// Writes the directory and end records, then flushes. On success the
     /// returned sink is positioned at the end of the archive. Discard the
     /// partial archive on error, even if all bytes were written before flush.
-    pub fn finish(mut self) -> Result<Finished<W>, WriteError> {
+    pub fn finish(self) -> Result<Finished<W>, WriteError> {
+        self.finish_accounted().map_err(|(error, _)| error)
+    }
+
+    pub(super) fn finish_accounted(mut self) -> Result<Finished<W>, (WriteError, WriteUsage)> {
+        match self.finish_records() {
+            Ok(summary) => Ok(Finished { sink: self.output.sink, summary }),
+            Err(error) => Err((error, self.usage())),
+        }
+    }
+
+    fn finish_records(&mut self) -> Result<WriteSummary, WriteError> {
         self.check_failed()?;
         let usage = self.usage();
         let central_offset = self.output.position;
@@ -418,8 +453,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         self.output.write(&self.comment, IoStage::EndRecord)?;
         self.output.flush()?;
         self.output.work.check_canceled()?;
-        let summary = WriteSummary { usage: self.usage(), central_offset, zip64: end.is_wide() };
-        Ok(Finished { sink: self.output.sink, summary })
+        Ok(WriteSummary { usage: self.usage(), central_offset, zip64: end.is_wide() })
     }
 
     fn check_failed(&self) -> Result<(), WriteError> {

@@ -36,6 +36,7 @@ use crate::path::sanitize;
 use crate::rar5::Redirection;
 use crate::stream::{LZMA_MEMORY_LIMIT, zstd_decoder};
 
+pub mod create;
 mod session;
 pub mod write;
 
