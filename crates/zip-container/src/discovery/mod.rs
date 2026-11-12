@@ -42,6 +42,7 @@ const LOCATOR_LEN: usize = 20;
 const END_SEARCH: usize = END_LEN + u16::MAX as usize;
 const TAIL_LEN: usize = END_SEARCH + END64_LEN + LOCATOR_LEN;
 const SEARCH_WINDOW: u64 = 64 * 1024;
+const DISCOVERY_INLINE_SCRATCH: usize = END64_LEN + (END64_LEN - 1);
 const END_SIG: u32 = 0x0605_4b50;
 const END64_SIG: [u8; 4] = *b"PK\x06\x06";
 const LOCATOR_SIG: u32 = 0x0706_4b50;
@@ -175,7 +176,22 @@ pub struct EndDiscovery {
 impl EndDiscovery {
     /// Creates discovery state without fetching or allocating source buffers.
     pub fn new(archive_len: u64, profile: Profile, limits: Limits) -> Result<Self, DirectoryError> {
-        Self::with_end_offset(archive_len, profile, limits, None)
+        Self::with_end_offset(archive_len, profile, limits, None, usize::MAX)
+    }
+
+    /// Creates discovery with a ceiling on requested scratch byte capacity.
+    ///
+    /// The ceiling includes inline discovery buffers, the retained tail, and
+    /// fragmented recovery storage. It excludes allocator overhead, caller
+    /// buffers, and owned output. Exhaustion returns [`LimitKind::ScratchBytes`]
+    /// before reserving scratch.
+    pub fn new_with_scratch_limit(
+        archive_len: u64,
+        profile: Profile,
+        limits: Limits,
+        scratch_bytes: usize,
+    ) -> Result<Self, DirectoryError> {
+        Self::with_end_offset(archive_len, profile, limits, None, scratch_bytes)
     }
 
     fn with_end_offset(
@@ -183,6 +199,7 @@ impl EndDiscovery {
         profile: Profile,
         limits: Limits,
         end_offset: Option<u64>,
+        scratch_bytes: usize,
     ) -> Result<Self, DirectoryError> {
         if let Some(offset) = end_offset {
             let comment_len = offset.checked_add(END_LEN as u64).and_then(|end| archive_len.checked_sub(end));
@@ -194,10 +211,12 @@ impl EndDiscovery {
             return Err(DirectoryError::NotZip);
         }
         let tail_start = archive_len.saturating_sub(TAIL_LEN as u64);
+        let accounting = Accounting::new(limits, scratch_bytes)?;
+        accounting.check_scratch(&[DISCOVERY_INLINE_SCRATCH])?;
         Ok(Self {
             len: archive_len,
             profile,
-            accounting: Accounting::new(limits)?,
+            accounting,
             stage: Stage::Tail,
             pending: None,
             tail: Vec::new(),
@@ -348,6 +367,7 @@ impl EndDiscovery {
         let total = (self.len - self.tail_start) as usize;
         if self.tail.capacity() < total {
             // A clone of a partially supplied tail has only its live bytes.
+            self.accounting.check_scratch(&[DISCOVERY_INLINE_SCRATCH, self.recovery.partial.capacity(), total])?;
             self.tail.try_reserve_exact(total - self.tail.len()).map_err(|_| DirectoryError::Allocation)?;
         }
         self.tail.extend_from_slice(bytes);
@@ -552,6 +572,7 @@ impl EndDiscovery {
 
         let total = (range.end - range.start) as usize;
         if self.recovery.partial.capacity() < total {
+            self.accounting.check_scratch(&[DISCOVERY_INLINE_SCRATCH, self.tail.capacity(), total])?;
             self.recovery
                 .partial
                 .try_reserve_exact(total - self.recovery.partial.len())
@@ -927,12 +948,13 @@ fn framed_zip64(bytes: &[u8], start: u64, locator: u64) -> Option<Zip64End> {
 #[derive(Clone, Copy, Debug)]
 struct Accounting {
     limits: Limits,
+    scratch_bytes: usize,
     ownership_limits: OwnershipUsage,
     usage: Usage,
 }
 
 impl Accounting {
-    fn new(limits: Limits) -> Result<Self, DirectoryError> {
+    fn new(limits: Limits, scratch_bytes: usize) -> Result<Self, DirectoryError> {
         let capacity = |value, kind| usize::try_from(value).map_err(|_| DirectoryError::Limit(kind));
         let ownership_limits = OwnershipUsage {
             entries: capacity(limits.entries, LimitKind::Entries)?,
@@ -940,7 +962,15 @@ impl Accounting {
             extra_bytes: capacity(limits.extra_bytes, LimitKind::ExtraBytes)?,
             comment_bytes: capacity(limits.comment_bytes, LimitKind::CommentBytes)?,
         };
-        Ok(Self { limits, ownership_limits, usage: Usage::default() })
+        Ok(Self { limits, scratch_bytes, ownership_limits, usage: Usage::default() })
+    }
+
+    fn check_scratch(&self, capacities: &[usize]) -> Result<(), DirectoryError> {
+        capacities
+            .iter()
+            .try_fold(self.scratch_bytes, |remaining, &capacity| remaining.checked_sub(capacity))
+            .map(|_| ())
+            .ok_or(DirectoryError::Limit(LimitKind::ScratchBytes))
     }
 
     fn check_fetched(&self, additional: u64) -> Result<(), DirectoryError> {
