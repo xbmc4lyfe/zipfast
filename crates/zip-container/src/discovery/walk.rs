@@ -188,9 +188,30 @@ impl DirectoryParser<CentralRecord> {
     /// must end at `archive_len`. The normal ZIP64 and directory validation
     /// still apply, and an invalid anchor cannot select a different end record.
     pub fn at_eocd(archive_len: u64, end_offset: u64, limits: Limits) -> Result<Self, DirectoryError> {
+        Self::at_eocd_with_scratch_limit(archive_len, end_offset, limits, usize::MAX)
+    }
+
+    /// Creates an anchored strict parser with a ceiling on requested scratch
+    /// byte capacity, including discovery and partial central records.
+    ///
+    /// This is independent of the limits on owned raw metadata and excludes
+    /// allocator overhead, caller buffers, and owned output. Exhaustion
+    /// returns [`LimitKind::ScratchBytes`] before reserving scratch.
+    pub fn at_eocd_with_scratch_limit(
+        archive_len: u64,
+        end_offset: u64,
+        limits: Limits,
+        scratch_bytes: usize,
+    ) -> Result<Self, DirectoryError> {
         let profile = Profile::Zipfast;
         Ok(Self {
-            state: State::Discovery(EndDiscovery::with_end_offset(archive_len, profile, limits, Some(end_offset))?),
+            state: State::Discovery(EndDiscovery::with_end_offset(
+                archive_len,
+                profile,
+                limits,
+                Some(end_offset),
+                scratch_bytes,
+            )?),
             profile,
             name_crc32: reducers::ieee_crc32,
             projection: materialize_record,
@@ -473,7 +494,7 @@ impl<T> Walk<T> {
         let result = self.accounting.charge(size);
         self.cache_failure(result)?;
         self.accounting.usage.fetched_bytes += size;
-        let result = self.consume_window(bytes, false);
+        let result = self.consume_window(bytes, None);
         self.cache_failure(result)?;
         self.pending = (end < pending_end && !matches!(self.phase, Phase::Done)).then_some(end..pending_end);
         Ok(())
@@ -501,12 +522,12 @@ impl<T> Walk<T> {
             };
             let missing = (need - self.scratch.len()) as u64;
             if missing == 0 {
-                self.consume_window(&[], false)?;
+                self.consume_window(&[], None)?;
             } else if self.next >= self.tail_start {
                 let from = (self.next - self.tail_start) as usize;
                 let to = (self.available_end() - self.tail_start) as usize;
                 let tail = mem::take(&mut self.tail);
-                self.consume_window(&tail[from..to], true)?;
+                self.consume_window(&tail[from..to], Some(tail.capacity()))?;
             } else {
                 self.request(missing)?;
                 return Ok(());
@@ -543,7 +564,10 @@ impl<T> Walk<T> {
         Ok(())
     }
 
-    fn consume_window(&mut self, mut bytes: &[u8], cached: bool) -> Result<(), DirectoryError> {
+    fn consume_window(&mut self, mut bytes: &[u8], cached_tail_capacity: Option<usize>) -> Result<(), DirectoryError> {
+        let cached = cached_tail_capacity.is_some();
+        // A cached window temporarily owns the tail outside of self.
+        let tail_capacity = cached_tail_capacity.unwrap_or_else(|| self.tail.capacity());
         while let Some(need) = self.required_part()? {
             if self.scratch.is_empty() && bytes.len() >= need {
                 if matches!(self.phase, Phase::Signature) && bytes.len() >= CENTRAL_HEADER_LEN {
@@ -565,6 +589,7 @@ impl<T> Walk<T> {
                 let driver_bytes = if cached { missing } else { missing - take };
                 let charge = (take + if cached { take } else { 0 }) as u64;
                 if need > self.scratch.capacity() {
+                    self.accounting.check_scratch(&[tail_capacity, need])?;
                     self.accounting.check_work((missing + driver_bytes) as u64 + self.minimum_part_work())?;
                     self.accounting.charge(charge)?;
                     self.scratch.try_reserve_exact(missing).map_err(|_| DirectoryError::Allocation)?;
