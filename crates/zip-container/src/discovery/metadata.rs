@@ -78,6 +78,8 @@ pub struct Usage {
     pub fetched_bytes: u64,
     /// Deterministic units charged before scans, checks and copies.
     pub work_units: u64,
+    /// Furthest requested or logically traversed directory extent in bytes.
+    pub directory_bytes: u64,
     /// Successfully owned metadata, including the archive comment.
     pub owned: OwnershipUsage,
 }
@@ -134,6 +136,16 @@ pub enum DirectoryError {
     MalformedEnd,
     /// ZIP64 framing, declarations, or directory geometry are invalid.
     MalformedZip64,
+    /// The strict walk encountered a central signature beyond the declared count
+    /// or stopped at a noncentral signature before reaching it.
+    EntryCount {
+        /// Effective entry declaration.
+        declared: u64,
+        /// Complete entries, plus an immediately following excess signature when present.
+        observed: u64,
+    },
+    /// A required local header address could not be resolved inside the archive.
+    InvalidLocalOffset,
     /// The selected profile disallows the archive's disk declarations.
     UnsupportedDisk,
     /// A configured component budget was exhausted or unrepresentable.
@@ -156,6 +168,10 @@ impl fmt::Display for DirectoryError {
             Self::NotZip => f.write_str("ZIP end record not found"),
             Self::MalformedEnd => f.write_str("invalid ZIP end record geometry"),
             Self::MalformedZip64 => f.write_str("invalid ZIP64 end record geometry"),
+            Self::EntryCount { declared, observed } => {
+                write!(f, "invalid ZIP directory count (declared {declared}, observed {observed})")
+            }
+            Self::InvalidLocalOffset => f.write_str("invalid ZIP local header offset"),
             Self::UnsupportedDisk => f.write_str("unsupported split ZIP directory"),
             Self::Limit(kind) => write!(f, "ZIP directory limit exceeded: {kind:?}"),
             Self::Allocation => f.write_str("cannot reserve ZIP directory buffer"),

@@ -51,4 +51,5 @@ panic = "abort"
 
 [dev-dependencies]
 flate2 = "1"
+zip-container = { path = "crates/zip-container" }
 zipview = { path = "crates/zipview" }

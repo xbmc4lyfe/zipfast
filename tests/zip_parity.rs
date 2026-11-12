@@ -209,6 +209,17 @@ fn central_order_and_duplicate_lookup_use_central_order() {
         assert_view_entry(actual, expected);
     }
 
+    for profile in [zip_container::Profile::Zipfast, zip_container::Profile::Zipview] {
+        let parsed = shared_directory(&fixture.bytes, profile);
+        assert_eq!(parsed.raw_comment.len(), usize::from(u16::MAX));
+        assert_eq!(
+            parsed.entries.iter().map(|entry| &*entry.raw_name).collect::<Vec<_>>(),
+            [b"same".as_slice(), b"middle", b"same"]
+        );
+        assert_eq!(parsed.physical_local_header_offset(0), Some(fixture.local[2] as u64));
+        assert_eq!(parsed.physical_local_header_offset(2), Some(fixture.local[0] as u64));
+    }
+
     assert_eq!(view.comment().len(), usize::from(u16::MAX));
     assert!(view.comment().bytes().all(|b| b == b'c'));
     assert_eq!(fast.entries.len(), 3);
@@ -319,6 +330,12 @@ fn eocd_signature_in_comment_exposes_record_selection_disagreement() {
     let mut fast = open_fast(&fixture.bytes).unwrap();
     assert_eq!(read_fast(&mut fast, 0).unwrap(), b"data");
     let (view, indexes, _) = open_view(&fixture);
+    for profile in [zip_container::Profile::Zipfast, zip_container::Profile::Zipview] {
+        let parsed = shared_directory(&fixture.bytes, profile);
+        assert_eq!(parsed.entries.len(), 1);
+        assert_eq!(&*parsed.entries[0].raw_name, b"item");
+        assert_eq!(parsed.raw_comment, comment);
+    }
     // Baseline: zipview picks the later, fake record and loses the real comment and entry.
     assert!(view.is_empty());
     assert_eq!(view.comment(), "");
@@ -486,6 +503,13 @@ fn zip64_size_offset_and_counts_with_optional_prefix() {
         assert_eq!(&fixture.bytes[fixture.payload[1].clone()], packed);
         assert_eq!(fast.entries[1].local_at, fixture.local[1] as u64);
         assert_eq!(read_fast(&mut fast, 1).unwrap(), b"two");
+        for profile in [zip_container::Profile::Zipfast, zip_container::Profile::Zipview] {
+            let parsed = shared_directory(&fixture.bytes, profile);
+            assert_eq!(parsed.entries.len(), 2);
+            assert_eq!(parsed.prefix_shift, prefix.len() as u64);
+            assert_eq!(parsed.physical_local_header_offset(1), Some(fixture.local[1] as u64));
+            assert_eq!((parsed.entries[1].resolved.unpacked_size, parsed.entries[1].resolved.packed_size), (3, 5));
+        }
         if zip64_end && !prefix.is_empty() {
             // Baseline: neither zipview path relocates the ZIP64 end record.
             assert_eq!(ZipReader::new(&fixture.bytes).unwrap_err(), ZipReadError::BadOffset);
@@ -654,6 +678,10 @@ fn short_zip64_extra_leaves_a_sentinel_only_in_zipview() {
 fn split_disk_metadata_is_rejected_by_zipfast_and_ignored_by_zipview() {
     let mut fixture = build(&[Member::stored(b"item", b"data")], &[0], &[], &[], false);
     fixture.bytes[fixture.eocd + 4..fixture.eocd + 6].copy_from_slice(&1u16.to_le_bytes());
+    let parsed = shared_directory(&fixture.bytes, zip_container::Profile::Zipview);
+    assert_eq!(parsed.end_record.disk, 1);
+    assert_eq!(parsed.entries.len(), 1);
+    assert_eq!(parsed.physical_local_header_offset(0), None);
     assert!(matches!(open_fast(&fixture.bytes), Err(Error::Unsupported(_))));
     let (view, _, _) = open_view(&fixture);
     assert_eq!(view.read_by_name("item").unwrap(), b"data");
@@ -710,5 +738,146 @@ fn encryption_classification_preserves_raw_flags_and_aes_extra() {
         assert_shared_metadata(f, v);
         assert_eq!((f.flags, f.method, f.aes_info), (flags, method, aes));
         assert_eq!((f.encrypted(), v.is_encrypted()), (fast_encrypted, view_encrypted));
+    }
+}
+
+fn shared_directory(bytes: &[u8], profile: zip_container::Profile) -> zip_container::Directory {
+    use zip_container::{DirectoryParser, Limits, parse_slice};
+
+    let limits = Limits::default();
+    let slice = parse_slice(bytes, profile, limits).unwrap();
+    for chunks in [&[usize::MAX][..], &[1], &[3, 27, 16, 1, 4, 7, 13, 2]] {
+        let mut parser = DirectoryParser::new(bytes.len() as u64, profile, limits).unwrap();
+        let mut chunk = 0;
+        while let Some(range) = parser.next_read().unwrap() {
+            let start = range.start as usize;
+            let end = (range.end as usize).min(start.saturating_add(chunks[chunk % chunks.len()]));
+            parser.supply(range.start, &bytes[start..end]).unwrap();
+            chunk += 1;
+        }
+        let mut ranged = parser.finish().unwrap();
+        assert_eq!(ranged.usage.owned, slice.usage.owned);
+        ranged.usage = slice.usage;
+        assert_eq!(ranged, slice);
+    }
+    slice
+}
+
+#[test]
+fn shared_directory_retains_raw_generated_fixture_metadata() {
+    use zip_container::{AesFields, ExtraIter, ExtraMtime, LocalHeader, Profile, local_layout};
+
+    let prefix = b"MZ synthetic prefix";
+    let local_extra = extra(0xfedc, b"local only");
+    let opaque = extra(0xfedc, b"central only");
+    let aes = extra(0x9901, &[2, 0, b'A', b'E', 3, 8, 0]);
+    let timestamp = extra(0x5455, &[1, 0xfe, 0xff, 0xff, 0xff]);
+    let raw_name = b"same\x82";
+    let mut unicode = vec![1];
+    unicode.extend(crc32fast::hash(raw_name).to_le_bytes());
+    unicode.extend(b"override\xff");
+    let extras = [opaque.as_slice(), &aes, &timestamp, &extra(0x7075, &unicode)].concat();
+    let packed = b"\x2b\x29\xcf\x07\x00";
+    let members = [
+        Member::stored(raw_name, b"stored payload"),
+        Member {
+            zip64: true,
+            flags: 0x801,
+            method: 99,
+            made_by: 0x033f,
+            external: 0x1234_5678,
+            dos_time: 0x7182,
+            dos_date: 0x3421,
+            local_name: Some(b"separate local"),
+            local_extra: &local_extra,
+            central_extra: &extras,
+            comment: b"entry\xffcomment",
+            ..Member::deflated(raw_name, packed, b"two")
+        },
+    ];
+    let fixture = build(&members, &[1, 0], prefix, b"archive\xff", true);
+    let expected_name = fixture.central[0] + 46;
+    let expected_extra = expected_name + raw_name.len();
+    let expected_comment = expected_extra + extras.len() + 28;
+    let anchor = fixture.eocd - 20 - 56;
+    for profile in [Profile::Zipfast, Profile::Zipview] {
+        let parsed = shared_directory(&fixture.bytes, profile);
+        assert_eq!(parsed.archive_len, fixture.bytes.len() as u64);
+        assert_eq!(parsed.prefix_shift, prefix.len() as u64);
+        assert_eq!(parsed.directory_range, fixture.central[0] as u64..anchor as u64);
+        assert_eq!(parsed.observed_range, parsed.directory_range);
+        assert_eq!(parsed.logical_range, parsed.directory_range);
+        assert_eq!(parsed.declaration.entries, 2);
+        assert_eq!(parsed.declaration.size, (anchor - fixture.central[0]) as u64);
+        assert_eq!(parsed.declaration.offset, (fixture.central[0] - prefix.len()) as u64);
+        assert_eq!(parsed.end_record.entries, u16::MAX);
+        assert_eq!(parsed.zip64_end.as_ref().unwrap().source, anchor as u64..(anchor + 56) as u64);
+        assert_eq!(parsed.zip64_locator.as_ref().unwrap().record_offset, (anchor - prefix.len()) as u64);
+        assert_eq!(parsed.raw_comment, b"archive\xff");
+        assert_eq!(range_bytes(&fixture.bytes, parsed.comment_range.clone()), b"archive\xff");
+        let first = &parsed.entries[0];
+        assert_eq!(&*first.raw_name, raw_name);
+        assert_eq!(&*parsed.entries[1].raw_name, raw_name);
+        assert_eq!(&*first.raw_comment, b"entry\xffcomment");
+        assert_eq!(first.source.raw_range(), fixture.central[0] as u64..fixture.central[1] as u64);
+        assert_eq!(first.source.name_range(), expected_name as u64..expected_extra as u64);
+        assert_eq!(first.source.extra_range(), expected_extra as u64..expected_comment as u64);
+        assert_eq!(first.source.comment_range(), expected_comment as u64..fixture.central[1] as u64);
+        assert_eq!(first.header.version_made_by, 0x033f);
+        assert_eq!(first.header.version_needed, 45);
+        assert_eq!(first.header.flags, 0x801);
+        assert_eq!(first.header.method, 99);
+        assert_eq!(first.header.mod_time, 0x7182);
+        assert_eq!(first.header.mod_date, 0x3421);
+        assert_eq!(first.header.crc32, crc32fast::hash(b"two"));
+        assert_eq!(first.header.packed_size, u32::MAX);
+        assert_eq!(first.header.unpacked_size, u32::MAX);
+        assert_eq!(first.header.name_len, raw_name.len() as u16);
+        assert_eq!(first.header.extra_len, (extras.len() + 28) as u16);
+        assert_eq!(first.header.comment_len, 13);
+        assert_eq!(first.header.disk_start, 0);
+        assert_eq!(first.header.internal_attributes, 0);
+        assert_eq!(first.header.external_attributes, 0x1234_5678);
+        assert_eq!(first.header.local_header_offset, u32::MAX);
+        assert_eq!((first.resolved.unpacked_size, first.resolved.packed_size), (3, 5));
+        assert_eq!(first.resolved.local_header_offset, (fixture.local[1] - prefix.len()) as u64);
+        assert_eq!(parsed.physical_local_header_offset(0), Some(fixture.local[1] as u64));
+        assert_eq!(parsed.physical_local_header_offset(1), Some(fixture.local[0] as u64));
+        assert_eq!(first.known.aes, Some(AesFields { vendor_version: 2, vendor_id: *b"AE", strength: 3, method: 8 }));
+        assert_eq!(first.known.mtime_override, Some(ExtraMtime::UnixSeconds(-2)));
+        assert_eq!(first.known.unicode_path.as_deref(), (profile == Profile::Zipfast).then_some(&b"override\xff"[..]));
+        let extra_range = first.source.extra_range();
+        let mut extra = ExtraIter::new(range_bytes(&fixture.bytes, extra_range.clone()), extra_range.start).unwrap();
+        assert_eq!(extra.next().unwrap().unwrap().body, b"central only");
+        let local = parsed.physical_local_header_offset(0).unwrap();
+        let header = LocalHeader::parse(&fixture.bytes[local as usize..]).unwrap();
+        let layout = local_layout(header, local, parsed.archive_len).unwrap();
+        assert_eq!(range_bytes(&fixture.bytes, layout.name_range()), b"separate local");
+        assert!(range_bytes(&fixture.bytes, layout.extra_range()).starts_with(&local_extra));
+        assert_eq!(
+            range_bytes(&fixture.bytes, layout.payload_range(first.resolved.packed_size, parsed.archive_len).unwrap()),
+            packed
+        );
+    }
+}
+
+#[test]
+fn shared_directory_skips_an_overclaimed_aes_extra_that_legacy_root_accepted() {
+    use zip_container::Profile;
+
+    let mut aes = extra(0x9901, &[2, 0, b'A', b'E', 1, 8, 0]);
+    aes[2..4].copy_from_slice(&20u16.to_le_bytes());
+    let fixture = build(
+        &[Member { flags: 1, method: 99, central_extra: &aes, ..Member::stored(b"file", b"") }],
+        &[0],
+        &[],
+        &[],
+        false,
+    );
+    assert_eq!(open_fast(&fixture.bytes).unwrap().entries[0].aes_info, Some((1, 2, 8)));
+    for profile in [Profile::Zipfast, Profile::Zipview] {
+        let parsed = shared_directory(&fixture.bytes, profile);
+        assert_eq!(parsed.entries[0].known.aes, None);
+        assert_eq!(range_bytes(&fixture.bytes, parsed.entries[0].source.extra_range()), aes);
     }
 }

@@ -17,13 +17,17 @@
 // rights and limitations under the RPL.
 
 mod metadata;
+mod reducers;
 #[cfg(test)]
 mod tests;
+mod walk;
 
 pub use metadata::{
     BufferUsage, DirectoryDeclaration, DirectoryError, EndRecord, LimitKind, Limits, Profile, SupplyError, Usage,
     Zip64End, Zip64Locator,
 };
+
+pub use walk::{Directory, DirectoryParser, parse_slice};
 
 use std::{fmt, mem, ops::Range};
 
@@ -627,7 +631,7 @@ impl EndDiscovery {
         }
 
         self.accounting.check_directory(declaration)?;
-        let empty = declaration.size == 0 && declaration.entries == 0;
+        let empty = declaration.entries == 0;
         let start = if self.stage == Stage::Declared && !empty {
             declaration.offset
         } else {
