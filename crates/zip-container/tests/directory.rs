@@ -587,6 +587,131 @@ fn incremental_output_reservation_is_capped_by_declared_and_plausible_counts() {
 }
 
 #[test]
+fn first_body_request_continues_through_the_external_directory_window() {
+    let entry = record(b"dup", &field(0x9898, b"unknown"), b"file");
+    assert_eq!(entry.len(), 64);
+    let bytes = archive(&entry.repeat(2_000), 2_000, b"end");
+    let len = bytes.len() as u64;
+    let tail = len - TAIL;
+    let discovery_reads = [tail..len, 0..4, 4..46];
+
+    for profile in PROFILES {
+        let expected = parse_slice(&bytes, profile, Limits::default()).unwrap();
+        let limits = Limits {
+            fetched_bytes: len,
+            range_bytes: TAIL,
+            work_units: expected.usage.work_units,
+            directory_bytes: 128_000,
+            entries: 2_000,
+            name_bytes: 6_000,
+            extra_bytes: 0,
+            comment_bytes: 8_003,
+        };
+        let mut parser = DirectoryParser::new(len, profile, limits).unwrap();
+        for read in &discovery_reads {
+            assert_eq!(parser.next_read().unwrap().as_ref(), Some(read));
+            parser.supply(read.start, &bytes[read.start as usize..read.end as usize]).unwrap();
+        }
+        assert_eq!(parser.next_read().unwrap(), Some(46..tail));
+        let before = parser.usage();
+        assert_eq!(parser.next_read().unwrap(), Some(46..tail));
+        assert_eq!(parser.usage(), before);
+        assert_eq!(before.directory_bytes, tail);
+
+        // Supply the first body and a complete following record. The next
+        // poll can be cancelled and does not charge work for the window suffix.
+        parser.supply(46, &bytes[46..128]).unwrap();
+        let checkpoint = parser.usage();
+        assert_eq!(checkpoint.fetched_bytes, before.fetched_bytes + 82);
+        assert_eq!(checkpoint.work_units, before.work_units + 82 + 128 + 2 * (16 + 3 + 4));
+        assert_eq!(checkpoint.owned.entries, 2);
+        assert_eq!(checkpoint.owned.name_bytes, 6);
+        assert_eq!(checkpoint.owned.extra_bytes, 0);
+        assert_eq!(checkpoint.owned.comment_bytes, 11);
+        assert_eq!(parser.next_read().unwrap(), Some(128..tail));
+        assert_eq!(parser.usage(), checkpoint);
+        parser.supply(128, &bytes[128..tail as usize]).unwrap();
+        assert_eq!(parser.next_read().unwrap(), None);
+        let result = parser.finish().unwrap();
+        assert_eq!(result, expected);
+        assert_eq!(result.usage.fetched_bytes, len);
+        assert_eq!(result.entries[1].source.extra_range(), 113..124);
+        assert_eq!(&*result.entries[1].raw_name, b"dup");
+        assert_eq!(&*result.entries[1].raw_comment, b"file");
+
+        let fragment_limits = Limits { work_units: Limits::default().work_units, ..limits };
+        let fragmented =
+            drive(&bytes, DirectoryParser::new(len, profile, fragment_limits).unwrap(), &[3, 43, 1, 2, 7, 8, 15, 39])
+                .unwrap();
+        assert_eq!(fragmented.entries, expected.entries);
+        assert_eq!(fragmented.usage.owned, expected.usage.owned);
+        assert_eq!(fragmented.usage.fetched_bytes, len);
+        assert!(fragmented.usage.work_units > expected.usage.work_units);
+
+        let discovery = discover_slice(&bytes, profile, limits).unwrap();
+        let limited = Limits { work_units: discovery.usage().work_units + 115, ..limits };
+        let mut parser = DirectoryParser::new(len, profile, limited).unwrap();
+        for read in &discovery_reads {
+            assert_eq!(parser.next_read().unwrap().as_ref(), Some(read));
+            parser.supply(read.start, &bytes[read.start as usize..read.end as usize]).unwrap();
+        }
+        // Preflight holds back the first name and comment's ownership work.
+        assert_eq!(parser.next_read().unwrap(), Some(46..154));
+        assert_eq!(parser.usage().work_units, discovery.usage().work_units);
+        assert_eq!(parser.finish(), Err(DirectoryError::Incomplete));
+    }
+}
+
+#[test]
+fn contiguous_and_split_headers_fail_ownership_before_the_body() {
+    let first = record(b"first", &[], &[]);
+    let mut cd = first.clone();
+    cd.extend(record(&vec![b'n'; usize::from(u16::MAX)], &[], &vec![b'c'; usize::from(u16::MAX)]));
+    let bytes = archive(&cd, 2, &[]);
+    let len = bytes.len() as u64;
+    let tail = len - TAIL;
+    let body = first.len() as u64 + 46;
+    let limits = Limits { name_bytes: 5, ..Limits::default() };
+
+    for profile in PROFILES {
+        let mut failures = Vec::new();
+        for cuts in [&[46, body][..], &[46, first.len() as u64, first.len() as u64 + 4, body]] {
+            let mut parser = DirectoryParser::new(len, profile, limits).unwrap();
+            for read in [tail..len, 0..4, 4..46] {
+                assert_eq!(parser.next_read().unwrap(), Some(read.clone()));
+                parser.supply(read.start, &bytes[read.start as usize..read.end as usize]).unwrap();
+            }
+            assert_eq!(parser.next_read().unwrap(), Some(46..tail));
+            let discovery = parser.usage();
+            for (index, cut) in cuts.windows(2).enumerate() {
+                let (start, end) = (cut[0], cut[1]);
+                assert_eq!(parser.next_read().unwrap(), Some(start..tail));
+                let result = parser.supply(start, &bytes[start as usize..end as usize]);
+                if index < cuts.len() - 2 {
+                    assert_eq!(result, Ok(()));
+                } else {
+                    let error = DirectoryError::Ownership(OwnershipError::LimitExceeded {
+                        kind: OwnershipKind::NameBytes,
+                        needed: 5 + usize::from(u16::MAX),
+                        limit: 5,
+                    });
+                    assert_eq!(result, Err(error));
+                    assert_eq!(parser.next_read(), Err(error));
+                    assert_eq!(parser.buffer_usage().capacity_bytes, 0);
+                    let usage = parser.usage();
+                    assert_eq!(usage.fetched_bytes, discovery.fetched_bytes + body - 46);
+                    assert_eq!(usage.work_units, discovery.work_units + body - 46 + 5 + 128);
+                    assert_eq!(usage.owned.entries, 1);
+                    assert_eq!(usage.owned.name_bytes, 5);
+                    failures.push(usage);
+                }
+            }
+        }
+        assert_eq!(failures[0], failures[1]);
+    }
+}
+
+#[test]
 fn strict_trailer_reads_only_the_next_signature_outside_the_cached_tail() {
     for count in [0, 1] {
         let mut cd = if count == 0 { vec![] } else { record(b"file", &[], &[]) };

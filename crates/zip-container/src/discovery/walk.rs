@@ -399,13 +399,14 @@ impl Walk {
     fn consume_window(&mut self, mut bytes: &[u8], cached: bool) -> Result<(), DirectoryError> {
         while let Some(need) = self.required_part()? {
             if self.scratch.is_empty() && bytes.len() >= need {
-                let (part, remainder) = bytes.split_at(need);
-                if cached {
-                    self.accounting.charge(need as u64)?;
+                if matches!(self.phase, Phase::Signature) && bytes.len() >= CENTRAL_HEADER_LEN {
+                    bytes = self.consume_contiguous_record(bytes, cached)?;
+                } else {
+                    let (part, remainder) = bytes.split_at(need);
+                    self.advance_borrowed(need, cached)?;
+                    self.consume_part(part)?;
+                    bytes = remainder;
                 }
-                self.next += need as u64;
-                self.consume_part(part)?;
-                bytes = remainder;
             } else {
                 let missing = need - self.scratch.len();
                 let take = missing.min(bytes.len());
@@ -440,6 +441,37 @@ impl Walk {
         Ok(())
     }
 
+    // Keep the checked fixed header and layout local when the record is
+    // borrowed. Store them in the phase only when a later supply is needed.
+    fn consume_contiguous_record<'a>(&mut self, bytes: &'a [u8], cached: bool) -> Result<&'a [u8], DirectoryError> {
+        let (fixed, remainder) = bytes.split_at(CENTRAL_HEADER_LEN);
+        self.advance_borrowed(4, cached)?;
+        if !self.check_signature(&fixed[..4])? {
+            self.complete();
+            return Ok(&[]);
+        }
+        self.advance_borrowed(CENTRAL_HEADER_LEN - 4, cached)?;
+        let header = self.decode_fixed(&fixed[4..])?;
+        let source = self.check_body(header)?;
+        let need = self.body_len(source);
+        if remainder.len() < need {
+            self.phase = Phase::Body { header, source };
+            return Ok(remainder);
+        }
+        let (body, remainder) = remainder.split_at(need);
+        self.advance_borrowed(need, cached)?;
+        self.consume_body(header, source, body)?;
+        Ok(remainder)
+    }
+
+    fn advance_borrowed(&mut self, len: usize, cached: bool) -> Result<(), DirectoryError> {
+        if cached {
+            self.accounting.charge(len as u64)?;
+        }
+        self.next += len as u64;
+        Ok(())
+    }
+
     // Each input part has a fixed target length once its phase begins. Progress
     // through a partial part uses only its current length and these scalars.
     fn required_part(&mut self) -> Result<Option<usize>, DirectoryError> {
@@ -464,7 +496,7 @@ impl Walk {
                 4
             }
             Phase::Fixed => CENTRAL_HEADER_LEN - 4,
-            Phase::Body { source, .. } => (source.raw_range().end - start) as usize - CENTRAL_HEADER_LEN,
+            Phase::Body { source, .. } => self.body_len(source),
             Phase::Done => return Ok(None),
             Phase::Failed(error) => return Err(error),
             Phase::First(_) => unreachable!("first header is supplied by discovery"),
@@ -473,47 +505,59 @@ impl Walk {
     }
 
     fn consume_part(&mut self, bytes: &[u8]) -> Result<(), DirectoryError> {
-        let start = self.directory.logical_range.end;
         match self.phase {
             Phase::Signature => {
-                let central = le32(bytes, 0) == CENTRAL_SIG;
-                let reached = self.directory.entries.len() as u64 == self.directory.declaration.entries;
-                if self.directory.profile == Profile::Zipfast && central == reached {
-                    return Err(self.count_error(central));
-                }
-                if central {
-                    let available = self.available_end() - start;
-                    if available < CENTRAL_HEADER_LEN as u64 {
-                        return Err(ParseError::Truncated {
-                            offset: start,
-                            needed: CENTRAL_HEADER_LEN as u64,
-                            available,
-                        }
-                        .into());
-                    }
-                    self.charge_extent(start + CENTRAL_HEADER_LEN as u64)?;
+                if self.check_signature(bytes)? {
                     self.phase = Phase::Fixed;
                 } else {
                     self.complete();
                 }
             }
             Phase::Fixed => {
-                self.accounting.charge(CENTRAL_FIXED_WORK)?;
-                self.start_body(CentralHeader::decode_fields(bytes))?;
+                let header = self.decode_fixed(bytes)?;
+                self.start_body(header)?;
             }
-            Phase::Body { header, source } => {
-                let view = CentralView::from_layout(header, source, bytes);
-                self.own_record(view)?;
-                self.directory.observed_range.end = source.raw_range().end;
-                self.directory.logical_range.end = source.declared_range().end;
-                self.phase = Phase::Signature;
-            }
+            Phase::Body { header, source } => self.consume_body(header, source, bytes)?,
             _ => unreachable!("only walk input phases consume bytes"),
         }
         Ok(())
     }
 
+    fn check_signature(&mut self, bytes: &[u8]) -> Result<bool, DirectoryError> {
+        let central = le32(bytes, 0) == CENTRAL_SIG;
+        let reached = self.directory.entries.len() as u64 == self.directory.declaration.entries;
+        if self.directory.profile == Profile::Zipfast && central == reached {
+            return Err(self.count_error(central));
+        }
+        if central {
+            let start = self.directory.logical_range.end;
+            let available = self.available_end() - start;
+            if available < CENTRAL_HEADER_LEN as u64 {
+                return Err(
+                    ParseError::Truncated { offset: start, needed: CENTRAL_HEADER_LEN as u64, available }.into()
+                );
+            }
+            self.charge_extent(start + CENTRAL_HEADER_LEN as u64)?;
+        }
+        Ok(central)
+    }
+
+    fn decode_fixed(&mut self, bytes: &[u8]) -> Result<CentralHeader, DirectoryError> {
+        self.accounting.charge(CENTRAL_FIXED_WORK)?;
+        Ok(CentralHeader::decode_fields(bytes))
+    }
+
+    fn body_len(&self, source: CentralLocation) -> usize {
+        (source.raw_range().end - self.directory.logical_range.end) as usize - CENTRAL_HEADER_LEN
+    }
+
     fn start_body(&mut self, header: CentralHeader) -> Result<(), DirectoryError> {
+        let source = self.check_body(header)?;
+        self.phase = Phase::Body { header, source };
+        Ok(())
+    }
+
+    fn check_body(&mut self, header: CentralHeader) -> Result<CentralLocation, DirectoryError> {
         let start = self.directory.logical_range.end;
         let bound = self.available_end();
         let source = central_layout(header, start, bound)?;
@@ -533,7 +577,20 @@ impl Walk {
             comment_bytes: usize::from(source.available_comment_len()),
             extra_bytes: 0,
         })?;
-        self.phase = Phase::Body { header, source };
+        Ok(source)
+    }
+
+    fn consume_body(
+        &mut self,
+        header: CentralHeader,
+        source: CentralLocation,
+        bytes: &[u8],
+    ) -> Result<(), DirectoryError> {
+        let view = CentralView::from_layout(header, source, bytes);
+        self.own_record(view)?;
+        self.directory.observed_range.end = source.raw_range().end;
+        self.directory.logical_range.end = source.declared_range().end;
+        self.phase = Phase::Signature;
         Ok(())
     }
 
