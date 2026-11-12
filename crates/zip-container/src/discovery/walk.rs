@@ -183,6 +183,20 @@ impl DirectoryParser<CentralRecord> {
         Self::with_name_crc32(archive_len, profile, limits, reducers::ieee_crc32)
     }
 
+    /// Creates a strict parser that considers only the classic end record at
+    /// `end_offset`, an absolute byte offset. That record's complete comment
+    /// must end at `archive_len`. The normal ZIP64 and directory validation
+    /// still apply, and an invalid anchor cannot select a different end record.
+    pub fn at_eocd(archive_len: u64, end_offset: u64, limits: Limits) -> Result<Self, DirectoryError> {
+        let profile = Profile::Zipfast;
+        Ok(Self {
+            state: State::Discovery(EndDiscovery::with_end_offset(archive_len, profile, limits, Some(end_offset))?),
+            profile,
+            name_crc32: reducers::ieee_crc32,
+            projection: materialize_record,
+        })
+    }
+
     /// Creates a parser using the supplied IEEE CRC-32 function for raw names.
     ///
     /// The function is used at most once per raw name with an eligible Unicode

@@ -19,8 +19,8 @@
 use std::ops::Range;
 
 use crate::{
-    DirectoryError, DirectoryLocation, DirectoryParser, EndDiscovery, LimitKind, Limits, Profile, SupplyError,
-    discover_slice,
+    Directory, DirectoryError, DirectoryLocation, DirectoryParser, EndDiscovery, LimitKind, Limits, Profile,
+    SupplyError, discover_slice, parse_slice,
 };
 
 const TAIL: u64 = 65_633;
@@ -786,4 +786,87 @@ fn cloned_partial_tail_keeps_the_bounded_discovery_reservation() {
     let original = original.finish().unwrap();
     assert_eq!(cloned.directory_range(), original.directory_range());
     assert_eq!(cloned.raw_comment(), original.raw_comment());
+}
+
+fn parse_anchored(bytes: &[u8], offset: u64, limits: Limits, fragment: usize) -> Result<Directory, DirectoryError> {
+    let mut parser = DirectoryParser::at_eocd(bytes.len() as u64, offset, limits)?;
+    while let Some(range) = parser.next_read()? {
+        assert_eq!(parser.next_read()?, Some(range.clone()));
+        let start = range.start as usize;
+        let end = (range.end as usize).min(start + fragment);
+        parser.supply(range.start, &bytes[start..end])?;
+    }
+    parser.finish()
+}
+
+#[test]
+fn anchored_directory_keeps_the_real_eocd_and_full_binary_comment() {
+    let mut comment = vec![0xA5; u16::MAX as usize];
+    let fake = end(0, 0, 0, 0);
+    let fake_at = comment.len() - fake.len();
+    comment[fake_at..].copy_from_slice(&fake);
+    let bytes = classic(30, &comment);
+    let actual_at = 30 + 46;
+    let default = parse_slice(&bytes, Profile::Zipfast, Limits::default()).unwrap();
+    assert_eq!(default.end_record.source.start, (bytes.len() - fake.len()) as u64);
+    assert!(default.entries.is_empty());
+
+    let baseline = parse_anchored(&bytes, actual_at, Limits::default(), usize::MAX / 2).unwrap();
+    assert_eq!(baseline.end_record.source.start, actual_at);
+    assert_eq!(baseline.raw_comment, comment);
+    assert_eq!(baseline.entries.len(), 1);
+    for fragment in [1, 17, 64 * 1024] {
+        let parsed = parse_anchored(&bytes, actual_at, Limits::default(), fragment).unwrap();
+        assert_eq!(parsed, baseline);
+    }
+}
+
+#[test]
+fn invalid_eocd_anchor_never_uses_a_valid_neighbor() {
+    let bytes = classic(30, b"binary\0comment");
+    for anchor in [0, 75, 77, bytes.len() as u64, u64::MAX] {
+        assert_eq!(parse_anchored(&bytes, anchor, Limits::default(), 17).unwrap_err(), DirectoryError::MalformedEnd,);
+    }
+    let mut malformed = bytes.clone();
+    malformed.extend(end(1, 1024, 0, 0));
+    let real_comment_len = (malformed.len() - (76 + 22)) as u16;
+    set16(&mut malformed, 76 + 20, real_comment_len);
+    assert_eq!(
+        parse_anchored(&malformed, bytes.len() as u64, Limits::default(), 1).unwrap_err(),
+        DirectoryError::MalformedEnd,
+    );
+    let mut inexact = bytes;
+    inexact.push(0);
+    assert_eq!(parse_anchored(&inexact, 76, Limits::default(), 17).unwrap_err(), DirectoryError::MalformedEnd,);
+}
+
+#[test]
+fn anchored_zip64_preserves_validation_and_budgets() {
+    let bytes = extended(30, 0, 76, true);
+    let anchor = (bytes.len() - 22) as u64;
+    let baseline = parse_anchored(&bytes, anchor, Limits::default(), 1).unwrap();
+    assert_eq!(baseline.directory_range, 30..76);
+    assert_eq!(baseline.zip64_locator.as_ref().unwrap().record_offset, 76);
+    assert_eq!(baseline.zip64_end.as_ref().unwrap().source, 76..132);
+    let limits = Limits {
+        directory_bytes: 46,
+        entries: 1,
+        fetched_bytes: baseline.usage.fetched_bytes,
+        work_units: baseline.usage.work_units,
+        range_bytes: 1,
+        ..Limits::default()
+    };
+    assert_eq!(parse_anchored(&bytes, anchor, limits, 1).unwrap(), baseline);
+    for (limits, error) in [
+        (Limits { fetched_bytes: limits.fetched_bytes - 1, ..limits }, LimitKind::FetchedBytes),
+        (Limits { work_units: limits.work_units - 1, ..limits }, LimitKind::WorkUnits),
+        (Limits { directory_bytes: limits.directory_bytes - 1, ..limits }, LimitKind::DirectoryBytes),
+        (Limits { entries: 0, ..limits }, LimitKind::Entries),
+        (Limits { range_bytes: 0, ..limits }, LimitKind::RangeBytes),
+    ] {
+        assert_eq!(parse_anchored(&bytes, anchor, limits, 1).unwrap_err(), DirectoryError::Limit(error));
+    }
+    let mut corrupt = bytes;
+    corrupt[76] ^= 1;
+    assert_eq!(parse_anchored(&corrupt, anchor, Limits::default(), 1).unwrap_err(), DirectoryError::MalformedZip64,);
 }
