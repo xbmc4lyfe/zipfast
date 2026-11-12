@@ -17,7 +17,7 @@
 //! Typed RAR outcomes from format-generated archives.
 mod common;
 
-use std::{fs, path::Path, sync::Arc};
+use std::{fs, path::Path};
 
 use common::*;
 use zipfast::error::{IoOperation, RarFailure, RarIntegrityReason, RarPasswordEvidence, RarUnsupported};
@@ -111,8 +111,11 @@ fn empty_archive_has_no_match_and_foreign_input_is_an_error() {
     assert!(error.entry.is_none());
 }
 
+#[cfg(unix)]
 #[test]
 fn fatal_target_failure_owns_the_io_error_and_entry_event() {
+    use std::sync::Arc;
+
     let dir = tempfile::tempdir().unwrap();
     let archive = dir.path().join("target.rar");
     let original = common::archive(&[FileSpec::new("good", b"good"), FileSpec::new(&"a".repeat(300), b"too long")]);
@@ -317,6 +320,7 @@ fn compressed_size_failures_report_expected_and_actual_counts() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn archive_failure_stays_primary_when_a_worker_fails_during_cleanup() {
     let dir = tempfile::tempdir().unwrap();

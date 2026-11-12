@@ -680,6 +680,7 @@ impl Volume {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn volume_metadata_retains_the_original_io_error() {
         let path = Path::new("volume");
@@ -733,6 +734,7 @@ mod tests {
         assert!(matches!(fault.into_legacy(), Error::Truncated));
     }
 
+    #[cfg(unix)]
     #[test]
     fn data_read_distinguishes_synthetic_eof_from_sink_failure() {
         let dir = tempfile::tempdir().unwrap();
