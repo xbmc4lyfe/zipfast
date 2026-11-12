@@ -79,6 +79,18 @@ fn open_indexes(bytes: &[u8]) -> ([Result<ZipIndex, ZipReadError>; 2], Vec<Read>
     let mut incremental = RangeSource::new(bytes);
     let opened = open_incremental(&mut incremental);
     assert_eq!(blocking.reads, incremental.reads);
+    let mut raw_source = RangeSource::new(bytes);
+    if let Ok(mut parser) =
+        zip_container::DirectoryParser::new(bytes.len() as u64, zip_container::Profile::Zipview, Default::default())
+    {
+        while let Ok(Some(range)) = parser.next_read() {
+            let bytes = raw_source.supply(range.start, (range.end - range.start) as usize);
+            if parser.supply(range.start, bytes).is_err() {
+                break;
+            }
+        }
+    }
+    assert_eq!(blocking.reads, raw_source.reads);
     ([index, opened], blocking.reads)
 }
 
@@ -316,6 +328,39 @@ fn filename_decoding_and_unicode_path_extras() {
     assert_eq!(&fixture.bytes[name_at..name_at + legacy.len()], legacy);
     let comment_at = name_at + legacy.len() + valid.len();
     assert_eq!(&fixture.bytes[comment_at..fixture.central[5]], b"entry\xffcomment");
+}
+
+#[test]
+fn view_decodes_entry_names_once_with_standard_replacement_and_keeps_lookup_order() {
+    let fixture = build(
+        &[
+            Member::stored(b"prefix\xe2\x82", b"incomplete"),
+            Member::stored(b"prefix\xff", b"same decoded name"),
+            Member::stored(b"", b"empty name"),
+            Member::stored(b"one\0two", b"embedded NUL"),
+            Member::stored(b"raw\xff/", b"slash"),
+            Member::stored(b"raw\xff\\", b"backslash"),
+        ],
+        &[0, 1, 2, 3, 4, 5],
+        &[],
+        b"archive",
+        false,
+    );
+    let (view, indexes, _) = open_view(&fixture);
+    assert_eq!(
+        view.entries().iter().map(ZipEntry::name).collect::<Vec<_>>(),
+        ["prefix�", "prefix�", "", "one\0two", "raw�/", "raw�\\"]
+    );
+    assert!(!view.entries()[2].is_dir());
+    assert!(view.entries()[4].is_dir());
+    assert!(view.entries()[5].is_dir());
+    assert_eq!(view.read_by_name("prefix�").unwrap(), b"incomplete");
+    assert_eq!(view.read_entry(&view.entries()[1]).unwrap(), b"same decoded name");
+    for index in indexes {
+        let mut source = RangeSource::new(&fixture.bytes);
+        let entry = index.by_name("prefix�").unwrap();
+        assert_eq!(index.fetch_entry(entry, None, |at, buf| source.read(at, buf)).unwrap(), b"incomplete");
+    }
 }
 
 #[test]

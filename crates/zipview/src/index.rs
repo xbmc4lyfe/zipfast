@@ -103,7 +103,7 @@ pub struct ZipIndex {
 #[derive(Debug, Clone)]
 pub struct ZipIndexOpener {
     len: u64,
-    parser: Result<DirectoryParser>,
+    parser: Result<DirectoryParser<ZipEntry>>,
 }
 
 impl ZipIndexOpener {
@@ -111,8 +111,13 @@ impl ZipIndexOpener {
     pub fn new(archive_len: u64) -> Self {
         Self {
             len: archive_len,
-            parser: DirectoryParser::new(archive_len, Profile::Zipview, Limits::default())
-                .map_err(directory_error),
+            parser: DirectoryParser::with_projection(
+                archive_len,
+                Profile::Zipview,
+                Limits::default(),
+                ZipEntry::from_reduced_record,
+            )
+            .map_err(directory_error),
         }
     }
 

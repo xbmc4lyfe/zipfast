@@ -138,6 +138,11 @@ impl OwnershipBudget {
         Ok(budget)
     }
 
+    // The caller commits a checked total after all related allocations succeed.
+    pub(crate) fn commit(&mut self, checked: OwnershipUsage) {
+        self.used = checked;
+    }
+
     pub(crate) fn check(&self, charge: OwnershipUsage) -> Result<OwnershipUsage, OwnershipError> {
         let used = self.used;
         let limits = self.limits;
@@ -186,21 +191,34 @@ impl<'a> CentralView<'a> {
         known: KnownExtrasView<'a>,
         budget: &mut OwnershipBudget,
     ) -> Result<CentralRecord, OwnershipError> {
-        let path = known.unicode_path.map(UnicodePathView::path_bytes);
-        let next = budget.check(OwnershipUsage {
+        let next = budget.check(self.ownership_charge(known))?;
+        let record = self.materialize(resolved, known)?;
+        budget.commit(next);
+        Ok(record)
+    }
+
+    pub(crate) fn ownership_charge(&self, known: KnownExtrasView<'a>) -> OwnershipUsage {
+        OwnershipUsage {
             entries: 1,
             name_bytes: self.raw_name().len(),
-            extra_bytes: path.map_or(0, <[u8]>::len),
+            extra_bytes: known.unicode_path.map_or(0, |path| path.path_bytes().len()),
             comment_bytes: self.raw_comment().len(),
-        })?;
+        }
+    }
 
+    pub(crate) fn materialize(
+        self,
+        resolved: ResolvedFields,
+        known: KnownExtrasView<'a>,
+    ) -> Result<CentralRecord, OwnershipError> {
+        let path = known.unicode_path.map(UnicodePathView::path_bytes);
         let name = reserve(OwnershipKind::NameBytes, self.raw_name().len())?;
         let comment = reserve(OwnershipKind::CommentBytes, self.raw_comment().len())?;
         let path = path
             .map(|bytes| reserve(OwnershipKind::ExtraBytes, bytes.len()).map(|buffer| (buffer, bytes)))
             .transpose()?;
 
-        let record = CentralRecord {
+        Ok(CentralRecord {
             header: self.header(),
             resolved,
             source: self.location(),
@@ -211,9 +229,7 @@ impl<'a> CentralView<'a> {
                 mtime_override: known.mtime_override,
                 unicode_path: path.map(|(buffer, bytes)| copy_to_box(buffer, bytes)),
             },
-        };
-        budget.used = next;
-        Ok(record)
+        })
     }
 }
 

@@ -31,8 +31,9 @@ pub enum Profile {
 
 /// Independent component limits for directory parsing.
 ///
-/// These limits bound input, work and metadata ownership. Peak process memory
-/// also includes parser scratch, allocator overhead, and caller buffers.
+/// These limits bound input, work and raw metadata admission. Peak process
+/// memory also includes parser scratch, allocator overhead, and caller buffers.
+/// Projected records can have different allocation sizes from raw records.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Limits {
     /// Declared and visited directory bytes.
@@ -45,11 +46,11 @@ pub struct Limits {
     pub range_bytes: u64,
     /// Maximum work units charged to discovery and parsing.
     pub work_units: u64,
-    /// Owned raw entry name bytes.
+    /// Raw entry name bytes, including when projection expands a decoded name.
     pub name_bytes: u64,
-    /// Owned variable-length known-extra bytes.
+    /// Selected variable-length known-extra bytes, even if a projection discards them.
     pub extra_bytes: u64,
-    /// Owned raw archive and entry comment bytes together.
+    /// Raw archive and available entry comment bytes, even if a projection discards entry comments.
     pub comment_bytes: u64,
 }
 
@@ -80,7 +81,10 @@ pub struct Usage {
     pub work_units: u64,
     /// Furthest requested or logically traversed directory extent in bytes.
     pub directory_bytes: u64,
-    /// Successfully owned metadata, including the archive comment.
+    /// Successfully admitted raw metadata, including the owned archive comment.
+    ///
+    /// For the default output this counts owned metadata. For projected output
+    /// it records the equivalent raw charge and can differ from allocation.
     pub owned: OwnershipUsage,
 }
 

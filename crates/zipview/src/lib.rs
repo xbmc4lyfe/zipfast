@@ -131,8 +131,9 @@ use std::borrow::Cow;
 use subtle::ConstantTimeEq;
 
 use zip_container::{
-    AesFields, AesView, CentralRecord, Directory, DirectoryError, ExtraIter, Limits, LocalHeader,
-    ParseError, Profile, Zip64Fields, Zip64Value, Zip64View, local_layout, parse_slice,
+    AesFields, AesView, Directory, DirectoryError, ExtraIter, Limits, LocalHeader, ParseError,
+    Profile, ReducedCentralRecord, Zip64Fields, Zip64Value, Zip64View, local_layout,
+    parse_slice_projected,
 };
 
 #[cfg(test)]
@@ -382,17 +383,10 @@ struct Listing {
 }
 
 impl Listing {
-    fn from_directory(directory: Directory) -> Self {
+    fn from_directory(directory: Directory<ZipEntry>) -> Self {
         let single_disk = directory.local_addresses_are_single_disk();
-        let mut entries: Vec<_> = directory
-            .entries
-            .into_iter()
-            .map(ZipEntry::from_record)
-            .collect();
-        // Collection can reuse the parser's larger record allocation.
-        entries.shrink_to_fit();
         Self {
-            entries,
+            entries: directory.entries,
             comment: directory.raw_comment,
             offset_shift: directory.prefix_shift,
             single_disk,
@@ -412,20 +406,13 @@ impl Listing {
 }
 
 impl ZipEntry {
-    fn from_record(record: CentralRecord) -> Self {
-        let CentralRecord {
-            header,
-            resolved,
-            raw_name,
-            known,
-            ..
-        } = record;
-        // A valid name takes ownership of the parser's allocation. Invalid
-        // UTF-8 gets one owned lossy projection for repeated lookups.
-        let name = String::from_utf8(raw_name.into_vec())
-            .unwrap_or_else(|invalid| String::from_utf8_lossy(invalid.as_bytes()).into_owned());
-        Self {
-            name,
+    fn from_reduced_record(
+        record: ReducedCentralRecord<'_>,
+    ) -> std::result::Result<Self, DirectoryError> {
+        let header = record.view().header();
+        let resolved = record.resolved();
+        Ok(Self {
+            name: decode_name(record.view().raw_name())?,
             compression: header.method,
             crc32: header.crc32,
             compressed_size: resolved.packed_size,
@@ -435,12 +422,12 @@ impl ZipEntry {
             version_made_by: header.version_made_by,
             flags: header.flags,
             last_modified: DosDateTime::from_parts(header.mod_date, header.mod_time),
-            aes_info: known.aes.and_then(project_aes),
+            aes_info: record.known().aes.and_then(project_aes),
             local_address_resolved: !resolved.unresolved.local_header_offset
                 && !resolved.unresolved.disk_start
                 && resolved.disk_start == 0,
             packed_size_resolved: !resolved.unresolved.packed_size,
-        }
+        })
     }
 
     fn check_inflated_size(&self) -> Result<()> {
@@ -456,6 +443,42 @@ impl ZipEntry {
         }
         Ok(self.compressed_size)
     }
+}
+
+// Retain one decoded name. Invalid UTF-8 can expand to three bytes per raw
+// byte; the directory's name budget continues to charge the raw byte count.
+fn decode_name(raw: &[u8]) -> std::result::Result<String, DirectoryError> {
+    let mut name = String::new();
+    if let Ok(valid) = std::str::from_utf8(raw) {
+        name.try_reserve_exact(valid.len())
+            .map_err(|_| DirectoryError::Allocation)?;
+        name.push_str(valid);
+        return Ok(name);
+    }
+
+    // Utf8Chunks identifies the same malformed sequences as from_utf8_lossy,
+    // including an incomplete final sequence. Reserve the exact decoded length.
+    let decoded_len = raw
+        .utf8_chunks()
+        .try_fold(0usize, |len, chunk| {
+            let replacement = if chunk.invalid().is_empty() {
+                0
+            } else {
+                '\u{fffd}'.len_utf8()
+            };
+            len.checked_add(chunk.valid().len())?
+                .checked_add(replacement)
+        })
+        .ok_or(DirectoryError::Allocation)?;
+    name.try_reserve_exact(decoded_len)
+        .map_err(|_| DirectoryError::Allocation)?;
+    for chunk in raw.utf8_chunks() {
+        name.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            name.push('\u{fffd}');
+        }
+    }
+    Ok(name)
 }
 
 fn directory_error(error: DirectoryError) -> ZipReadError {
@@ -489,10 +512,17 @@ impl<'a> ZipReader<'a> {
     /// Parses the central directory of `data`.
     ///
     /// Reads no entry payloads. Directory geometry and metadata budgets
-    /// are checked before allocating based on archive declarations.
+    /// are checked before allocating based on archive declarations. Name
+    /// budgets count raw bytes. A name decoded with UTF-8 replacement can
+    /// occupy up to three times its raw length.
     pub fn new(data: &'a [u8]) -> Result<Self> {
-        let directory =
-            parse_slice(data, Profile::Zipview, Limits::default()).map_err(directory_error)?;
+        let directory = parse_slice_projected(
+            data,
+            Profile::Zipview,
+            Limits::default(),
+            ZipEntry::from_reduced_record,
+        )
+        .map_err(directory_error)?;
         Ok(Self {
             data,
             listing: Listing::from_directory(directory),
@@ -1489,6 +1519,34 @@ fn inflate(payload: &[u8], declared_size: u64) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fallible_name_decoding_uses_standard_lossy_boundaries() {
+        let mut name = *b"valid-xxx-\0end";
+        for first in 0..=u8::MAX {
+            for second in 0..=u8::MAX {
+                name[6..9].copy_from_slice(&[first, second, 0x80]);
+                assert_eq!(decode_name(&name).unwrap(), String::from_utf8_lossy(&name));
+                assert_eq!(
+                    decode_name(&[first, second]).unwrap(),
+                    String::from_utf8_lossy(&[first, second])
+                );
+            }
+        }
+        for name in [
+            b"".as_slice(),
+            b"plain",
+            "café/字".as_bytes(),
+            b"\xf0\x9f\x92",
+            b"\xed\xa0\x80\xef\xbf\xbf",
+            b"x\xe2\x82\xf0\x9f\x92",
+        ] {
+            assert_eq!(decode_name(name).unwrap(), String::from_utf8_lossy(name));
+        }
+        let expanded = decode_name(&[0xff; 205]).unwrap();
+        assert_eq!(expanded, "\u{fffd}".repeat(205));
+        assert_eq!(expanded.len(), 615);
+    }
 
     /// Builds a single-entry Stored archive by hand. The richer builder in
     /// `tests/writer.rs` covers Deflate and timestamps; this local one keeps
