@@ -17,7 +17,8 @@ local standalone checkout at `/Users/allen/git.xbmc4lyfe/zipview`, whose
 `origin/main` was the recorded parent.
 [Standalone upstream](https://github.com/xbmc4lyfe/zipview/tree/2c3d73a06b29987cea1510e903e437a482076745)
 
-The import copied the committed tree with `git archive`. It preserves the
+At import commit `c0830e592e4cd008baba6a046621694ee2d3d7d8`, the
+committed tree was copied with `git archive`. That commit preserves the
 library and test source, examples, fuzz target, seed generator, all 11
 curated seeds, and the crate's RPL notices byte for byte. The standalone
 workflow moved to `.github/workflows/ci.yml` and now runs at workspace
@@ -56,25 +57,34 @@ unification.
 
 ## Git dependencies and packaging
 
-Once the import commit is available on the zipfast remote, pin its full
+Once the reviewed engine revision is available on the zipfast remote, pin its full
 revision. Cargo finds each package by name within the repository.
 
 ```toml
 [dependencies]
-zipfast = { git = "https://github.com/xbmc4lyfe/zipfast", rev = "<import commit>" }
-zipview = { git = "https://github.com/xbmc4lyfe/zipfast", rev = "<import commit>" }
+zipfast = { git = "https://github.com/xbmc4lyfe/zipfast", rev = "<full engine revision>" }
+zipview = { git = "https://github.com/xbmc4lyfe/zipfast", rev = "<full engine revision>" }
 ```
 
-Set `IMPORT_REV` to the full import revision to install the binary.
+Set `ENGINE_REV` to the full engine revision to install the binary.
 
 ```sh
-cargo install --git https://github.com/xbmc4lyfe/zipfast --rev "$IMPORT_REV" --locked --bin zipfast zipfast
+cargo install --git https://github.com/xbmc4lyfe/zipfast --rev "$ENGINE_REV" --locked --bin zipfast zipfast
 ```
 
 Record the full remote revision and resolved
 `Cargo.lock` when updating a downstream consumer. Validate the new pin
 against its caller tests before retiring the standalone source. Preserve
 the previous pin for rollback.
+
+At the reviewed revision, zipview retains the same public slice and range
+APIs and the same Deflate backend. Full WinZip AES reads verify the payload
+tag, while header password checks and prefix previews remain provisional.
+Zipfast retains its default command, root package, and skip-existing
+extraction default. Callers constructing `zipfast::extract::Options` must
+initialize the new `protected_paths` field, which accepts an empty set.
+The engine supplies its own archive and volume protections. See
+[engine behavior and limits](engine-baseline.md#safety-behavior).
 
 Cargo verified the zipview 0.1.0 package from the workspace. It includes
 the crate license, examples, and test sources. The independent fuzz workspace
@@ -156,8 +166,30 @@ identical output. Standalone and workspace `zipfast` binaries built with
 and test summaries on the stored, deflated, and Unicode seeds after
 normalizing the elapsed time and throughput in test output.
 
-Workspace formatting passed. The separate fuzz formatting command
+Workspace formatting passed at import. The separate fuzz formatting command
 `cargo fmt --manifest-path crates/zipview/fuzz/Cargo.toml -- --check` reports
 one line wrap in the original fuzz target on Rust 1.99.1. The standalone
-snapshot produces the same diff, and the imported target retains its bytes.
-The workflow passed actionlint 1.7.7. GitHub-hosted runs are pending.
+snapshot produces the same diff. Commit `5cd2502` wraps that line after the
+byte-preserving import. The workflow passed actionlint 1.7.7.
+
+## Phase 1 verification
+
+The reviewed code revision is `14e68d5196304656c76062b7f7c435f7c21e9a5c`.
+The results below cover that revision. The final documentation edit restores
+the spaces in two zipview README example strings.
+
+| Check | Observed result |
+| --- | --- |
+| Workspace formatting, strict Clippy, locked all-target tests and doctests | Passed on native macOS arm64 and Debian Bookworm arm64 in Docker with Rust 1.99.1. macOS passed 246 tests and three doctests. Linux passed 244 tests and three doctests. |
+| Zipview on Rust 1.87.0 | `cargo +1.87.0 test -p zipview --locked` passed 41 tests and three doctests on both platforms. |
+| Examples and default package | Both packages' examples compiled on both platforms. Zipview's seed checker accepted all 11 curated seeds on macOS. A root `cargo build --locked` selected zipfast, and `cargo run --locked -- t <seed>` succeeded on both platforms. |
+| Clean Git consumers | Independent zipview and zipfast consumers built and ran from a bare local Git mirror on both platforms. The installed root CLI verified the same seed. The zipview-only feature trees matched the workspace package after aligning flate2 to 1.1.10 and removing the package source path. |
+| Prybar callers | A temporary archive of Prybar `d3b8aa3` built with both Git dependencies pinned to the reviewed engine revision. Its original checkout, vendored snapshots, and recorded pins stay in place. This was a local research build. |
+| Zipview packaging | `cargo package -p zipview --locked` verified 15 files. The extracted package passed 41 tests and three doctests on Rust 1.87.0. |
+| Independent fuzz workspace | Formatting and locked compilation passed. A seeded nightly smoke run completed 560,438 executions in 121 seconds. |
+| Dependency audits | Both lockfiles passed with cargo-audit 0.23.0 and RustSec revision `fd6f39814c4d3c359fdbe223d0280dec4933f78f`. |
+
+GitHub-hosted runs and remote Git consumer verification are pending.
+Review the combined distribution terms and run the downstream caller
+checks before changing Prybar's pins or retiring the standalone repository.
+[Licensing and downstream inventory](engine-baseline.md)

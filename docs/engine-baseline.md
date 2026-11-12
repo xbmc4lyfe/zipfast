@@ -44,6 +44,13 @@ release remains open.
 [FSF license list](https://www.gnu.org/licenses/license-list.html#RPL) ·
 [FSF RPL 1.3 record](https://directory.fsf.org/wiki/License:ReciprocalPLv1.3)
 
+The new direct dependencies declare BSD-3-Clause for `subtle` 2.6.1 and
+MIT or Apache-2.0 for `tempfile` 3.27.0. The new lockfile entries for
+`rustix` and `linux-raw-sys` also list Apache-2.0 with the LLVM exception
+as an alternative. The remaining new transitive entries declare MIT or
+Apache-2.0. Existing dependencies and the native XZ and Zstandard sources
+retain their own terms and notices.
+
 ## Engine callers
 
 Paths in this section are relative to the named repository at its baseline
@@ -65,26 +72,61 @@ member decoding.
 
 ## Vendor reconciliation
 
-The first two rows record changes already committed in the workspace.
-The remaining rows describe vendor behavior and pending acceptance work.
+The following changes are present in the reviewed Phase 1 engine revision,
+`14e68d5196304656c76062b7f7c435f7c21e9a5c`.
 
 | Area | Status and scope |
 | --- | --- |
-| WinZip AES | `bfdf2bf622f913b8a333a29f179693f59e59416b` authenticates complete payloads in zipfast. The full read checks length and the 10-byte HMAC-SHA1 tag before returning plaintext. A prefix read remains provisional. The historical zipview API is unchanged by this commit. |
+| WinZip AES | `bfdf2bf` ports full authentication to zipfast. `1d8609b` extends full authentication to zipview's slice and range readers. Both check packed length and the 10-byte HMAC-SHA1 tag before decryption. Password checks and prefix previews remain provisional. |
 | AArch64 CRC | `ea51228e932066e6958852a60cdfdf92977f0f1d` applies the vendor's equivalent narrowing of the intrinsic unsafe scope. |
-| Selected reads | Reconcile cancellable, indexed ZIP, RAR5, and TAR reads with provisional sink delivery. Preserve RAR solid and split history, enforce cumulative packed and decoded budgets and the 256 MiB selected RAR window cap, and account for compressed TAR wrapper input and output. |
-| Input preservation | The vendor accepts caller-supplied canonical input paths. Cover the archive and relevant RAR volumes at engine entry points, including calls from the standalone CLI and paths reached through directory aliases. |
-| Staged publication | The vendor carries temporary-file ownership through serial and parallel verification. Compressed TAR defers publication until the stream drains, then publishes per member. Preserve existing outputs on prepublication failures and document the per-member publication boundary. |
-| Encrypted RAR5 | The vendor verifies keyed BLAKE2sp and separates compressed blocks from final cipher padding. Check stored padding bounds and handling of a final-volume BLAKE2sp record when CRC also exists. Require independent encrypted RAR fixtures for acceptance. |
-| Listing limits | The vendor bounds ZIP central directories to 128 MiB and one million entries. It caps RAR and TAR listing names at 64 MiB across one million entries and uses an 8 GiB compressed-stream TAR listing budget. |
-| Decoder limits | The vendor caps encrypted ZIP packed data at 128 MiB, LZMA and XZ memory at 256 MiB, and Zstandard window log at 27. These are individual resource limits. |
-| Volume names | The vendor checks numeric increments and decimal width arithmetic and validates old-style volume suffix letters. |
+| Selected reads | `14e68d5` adds cancellable, indexed ZIP, RAR5, and TAR reads with provisional sink delivery. The engine preserves RAR solid history and split-member state, enforces cumulative packed and decoded budgets and a 256 MiB selected RAR window cap, and counts compressed TAR wrapper input and output through verification. |
+| Input preservation | `cefdc28` makes the engine reserve the archive and discoverable consecutive RAR volume names automatically, including at direct format entry points and through directory aliases. Caller-supplied `Options::protected_paths` adds protections. The standalone CLI inherits automatic protection. |
+| Staged publication | `cefdc28` keeps temporary-file ownership in output handles through serial and parallel verification. Compressed TAR waits for outer stream verification before publishing members in archive order. |
+| Encrypted RAR5 | `ac74b2e` ports keyed BLAKE2sp and compressed block framing, bounds cipher padding, and rejects a late BLAKE2sp record when hash state is unavailable. Split members honor each volume header's checksum mode. `14e68d5` carries the same checks into selected reads and retains encrypted solid history when bulk extraction skips an output. |
+| Listing limits | `8644202` caps ZIP central directories at 128 MiB and one million entries, and verifies the exact record count. `14e68d5` caps RAR and TAR listing metadata at one million entries and 64 MiB of names, and compressed TAR listing at 8 GiB each for packed and decoded data. |
+| Decoder limits | `8644202` caps encrypted ZIP packed data at 128 MiB, LZMA and XZ memory at 256 MiB, and Zstandard window log at 27. ZIP shares decoder limits across its encrypted and unencrypted paths. |
+| Volume names | `8644202` checks numeric increments and decimal width arithmetic and validates old-style volume suffix letters. |
 
 The standalone base already provides RAR5 keyed CRC, short-write
 optimization, and ZIP codec and encryption plumbing. The zipview import
 already includes its upstream range reader. Prybar-specific argument
 parsing, terminal UI, display policy, and metadata matching stay with
 Prybar.
+
+The implementation ports and regression additions in the table were
+AI-assisted. The root AES, archive limits, staging, RAR5 verification, and
+selected-read changes use Prybar's recorded vendor snapshot as their
+starting point. The imported zipview code comes from the recorded RPL
+snapshot, and its later AES verification and regression additions are local
+work. AES test vectors were reproduced independently with Python PBKDF2 and
+HMAC and OpenSSL AES. The added RAR5 regression fixtures are generated in
+tests from format records and locally constructed payloads.
+
+## Safety behavior
+
+Selected reads use zero-based listing indices and stream provisional bytes
+to the caller. Callers must wait for a successful return before publishing.
+Cancellation is cooperative at parser and decoder checkpoints. Archive
+identity across separate opens is deferred to Phase 2.
+
+The engine refuses an output that resolves to its own archive name or a
+reserved RAR volume. An existing consecutive name can be reserved even if
+the archive terminates earlier. Replacing a separate hard-link name leaves
+the input inode and bytes intact. A same-filesystem rename publishes each
+staged replacement after verification. Compressed TAR stages payloads and
+archive-supplied directory metadata until the outer wrapper verifies, then
+publishes per member. A later publication failure can leave earlier members
+in place. Staging uses available disk space and can change the staging
+directory's modification time. Path checks can race a concurrent directory
+replacement. Crash durability depends on the filesystem.
+
+Encrypted RAR5 rejects alignment padding beyond 15 bytes when the plaintext
+or final compression block defines the boundary, partial final cipher
+blocks, and unverifiable final-only BLAKE2sp metadata even with a matching
+CRC. Full WinZip AES reads reject damaged ciphertext or tags. In the
+zipview release microbenchmark on an Apple M4, authenticating a prebuilt
+1 MiB AES-256 payload increased median time from 195.416 µs to 1,817.979 µs
+(9.30×). The test measured the payload helper and excluded parsing and I/O.
 
 ## Compatibility references
 
@@ -105,6 +147,22 @@ The encrypted RAR5 smoke fixture, `rar5-psw.rar`, comes from rarfile revision
 Reference binaries cross-read Deflate ZIP and gzip, extracted from a ZIP64
 archive with 65,536 small entries, and agreed on both encrypted RAR5 member
 payloads. These smoke tests exercised only the reference binaries.
+
+Phase 1 interoperability checks used the pinned 7-Zip to produce and test
+Stored and Deflate WinZip AES-256 archives. Zipfast's CLI and selected reader
+and zipview's slice and range readers reproduced the original bytes. Pinned
+UnRAR and 7-Zip also validated format-generated and RARLAB writer fixtures.
+The reviewed zipfast CLI verified and extracted the writer archives, and
+four split and solid selected reads reproduced the writer inputs. Two
+members of the pinned rarfile archive matched fresh UnRAR output.
+
+Reference binaries and externally sourced archives were used in local
+scratch and carry their original terms. The UnRAR sources and the affected
+7-Zip RAR decoder files carry UnRAR restrictions. The RARLAB 7.23 trial
+writer and the archives it generated were kept for private evaluation
+pending redistribution review. The upstream rarfile fixture was fetched by
+revision and checksum for comparison. The new regression tests use
+locally generated fixtures.
 
 Prybar's Ubuntu workflow builds tools with
 `scripts/build-compatibility-references.sh`, builds the CLI with

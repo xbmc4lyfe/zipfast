@@ -658,3 +658,145 @@ fn a_prepublication_filesystem_error_leaves_compressed_tar_outputs_untouched() {
     assert_eq!(fs::read_dir(&out).unwrap().count(), 2);
     fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn reads_selected_tar_members_and_bounds_compressed_streams() {
+    let dir = tmp("selected");
+    let mut builder = Tar::default();
+    let tar = builder.file("same.txt", b"first").file("same.txt", b"second").end();
+    let mut broken = gzip(&tar);
+    let trailer = broken.len() - 8;
+    broken[trailer] ^= 1;
+    for (name, data) in [("sample.tar", tar.clone()), ("sample.tgz", gzip(&tar)), ("broken.tgz", broken)] {
+        let path = dir.join(name);
+        fs::write(&path, data).unwrap();
+        let mut bytes = Vec::new();
+        let result = extract::SelectedEntry::open(&path, 1, None, 16 << 10).and_then(|entry| {
+            assert_eq!(entry.name(), "same.txt");
+            entry.read(None, |chunk| {
+                bytes.extend_from_slice(chunk);
+                Ok(())
+            })
+        });
+        if name == "broken.tgz" {
+            assert!(result.is_err());
+        } else {
+            result.unwrap();
+            assert_eq!(bytes, b"second");
+        }
+    }
+    let path = dir.join("standalone.gz");
+    fs::write(&path, gzip(&vec![b'x'; 4096])).unwrap();
+    let mut bytes = Vec::new();
+    let result = extract::SelectedEntry::open(&path, 0, None, 1024).and_then(|entry| {
+        entry.read(None, |chunk| {
+            bytes.extend_from_slice(chunk);
+            Ok(())
+        })
+    });
+    assert!(result.is_err());
+    assert!(bytes.len() <= 1024);
+}
+
+#[test]
+fn selected_compressed_tar_drains_past_the_payload_to_verify_the_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tail.tar.gz");
+    let tar = Tar::default().file("selected", b"payload").end();
+    let mut packed = gzip(&tar);
+    packed.extend(gzip(&[0; 512]));
+    let limit = (tar.len() + 512) as u64;
+    for (max_bytes, damage) in [(limit, false), (limit - 1, false), (limit, true)] {
+        let mut archive = packed.clone();
+        if damage {
+            let trailer = archive.len() - 8;
+            archive[trailer] ^= 1;
+        }
+        fs::write(&path, archive).unwrap();
+        let entry = extract::SelectedEntry::open(&path, 0, None, max_bytes).unwrap();
+        assert_eq!(entry.unix_mode(), Some(0o640));
+        assert_eq!(entry.modified(), Some((981_173_106, 0)));
+        let mut output = Vec::new();
+        let result = entry.read(None, |chunk| {
+            output.extend_from_slice(chunk);
+            Ok(())
+        });
+        assert_eq!(output, b"payload");
+        assert_eq!(result.is_ok(), max_bytes == limit && !damage, "{result:?}");
+        if damage {
+            assert!(extract::list(&path).is_err());
+        }
+    }
+}
+
+#[test]
+fn selected_compressed_tar_cancellation_stops_the_final_drain() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cancel.tar.gz");
+    let tar = Tar::default().file("selected", b"payload").end();
+    fs::write(&path, gzip(&tar)).unwrap();
+    let cancel = extract::Cancellation::default();
+    let entry = extract::SelectedEntry::open_cancelable(&path, 0, None, 4096, cancel.clone()).unwrap();
+    let error = entry
+        .read(None, |bytes| {
+            assert_eq!(bytes, b"payload");
+            cancel.cancel();
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(matches!(error, zipfast::Error::Io(error) if error.kind() == std::io::ErrorKind::ConnectionAborted));
+}
+
+#[test]
+fn selected_compressed_tar_counts_packed_bytes_while_draining() {
+    use std::fs::OpenOptions;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("growing.tar.gz");
+    let tar = Tar::default().file("selected", b"payload").end();
+    let initial = gzip(&tar);
+    let trailing = gzip(&data(4096, 321));
+    let limit = (tar.len() + 4096) as u64;
+    // Empty gzip members use packed bytes without increasing decoded bytes.
+    let empty = gzip(b"");
+    let count = (limit as usize - initial.len() - trailing.len()) / empty.len() + 1;
+    fs::write(&path, initial).unwrap();
+    let entry = extract::SelectedEntry::open(&path, 0, None, limit).unwrap();
+    let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+    file.write_all(&trailing).unwrap();
+    for _ in 0..count {
+        file.write_all(&empty).unwrap();
+    }
+    let error = entry.read(None, |_| Ok(())).unwrap_err();
+    assert!(matches!(error, zipfast::Error::Unsupported(message) if message.contains("input byte limit")));
+}
+
+#[cfg(unix)]
+#[test]
+fn rejects_compressed_tar_listing_above_eight_gib_before_decoding() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("oversize.tar.gz");
+    let mut file = fs::File::create(&path).unwrap();
+    file.write_all(&[0x1f, 0x8b, 8]).unwrap();
+    file.set_len((8 << 30) + 1).unwrap();
+    let error = extract::list(&path).unwrap_err();
+    assert!(matches!(error, zipfast::Error::Unsupported(message) if message.contains("input byte limit")));
+}
+
+#[test]
+fn selected_tar_preserves_fractional_times_before_the_epoch() {
+    use std::time::{Duration, UNIX_EPOCH};
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("timestamps.tar");
+    let tar = Tar::default().pax(&[("mtime", "-1.25")], "f", b"x").end();
+    fs::write(&path, tar).unwrap();
+    let entry = extract::SelectedEntry::open(&path, 0, None, 1).unwrap();
+    let (seconds, nanos) = entry.modified().unwrap();
+    let expected = UNIX_EPOCH - Duration::from_millis(1250);
+    assert_eq!(extract::archive_time(seconds, nanos), Some(expected));
+    let output = dir.path().join("out");
+    let summary = extract::run(&path, &opts(Mode::Extract, &output), |_| {}).unwrap();
+    assert!(summary.errors.is_empty(), "{:?}", summary.errors);
+    assert_eq!(fs::metadata(output.join("f")).unwrap().modified().unwrap(), expected);
+}

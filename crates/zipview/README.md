@@ -9,7 +9,7 @@ by the caller.
 let archive = zipview::ZipReader::new(bytes)?;
 
 for entry in archive.entries() {
-    println!("{}—{} bytes, {}", entry.name(), entry.size(), entry.compression_name());
+    println!("{} — {} bytes, {}", entry.name(), entry.size(), entry.compression_name());
 }
 
 let xml = archive.read_to_string("docProps/core.xml")?;
@@ -30,7 +30,7 @@ let read = |offset: u64, buf: &mut [u8]| file.read_exact_at(buf, offset);
 let index = zipview::ZipIndex::open(file.metadata()?.len(), read)?;
 
 for entry in index.entries() {
-    println!("{}—{} bytes", entry.name(), entry.size());
+    println!("{} — {} bytes", entry.name(), entry.size());
 }
 if let Some(entry) = index.by_name("release.nfo") {
     let nfo = index.fetch_entry(entry, None, read)?; // two reads: header, entry

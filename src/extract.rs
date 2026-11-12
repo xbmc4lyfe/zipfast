@@ -21,6 +21,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::batch::{self, Batch, Done, Job, Outcome};
@@ -223,18 +225,51 @@ pub struct Entry {
     pub link: Option<Redirection>,
 }
 
+#[derive(Default)]
+pub(crate) struct ListingBudget {
+    entries: usize,
+    name_bytes: usize,
+}
+
+impl ListingBudget {
+    pub(crate) fn record(&mut self, name: &str) -> Result<()> {
+        self.entries += 1;
+        self.name_bytes += name.len();
+        if self.entries > 1_000_000 || self.name_bytes > 64 << 20 {
+            return Err(Error::Unsupported("archive listing exceeds the entry or name byte limit".into()));
+        }
+        Ok(())
+    }
+}
+
 /// Every volume of the set in turn, starting from `first`, calling `on_block` for each block.
 fn walk(
-    mut vol: Volume,
+    vol: Volume,
     password: Option<&str>,
     mut on_block: impl FnMut(&mut Volume, Block) -> Result<()>,
+) -> Result<u64> {
+    walk_until(vol, password, None, |vol, block| {
+        on_block(vol, block)?;
+        Ok(false)
+    })
+}
+
+fn walk_until(
+    mut vol: Volume,
+    password: Option<&str>,
+    cancel: Option<&Cancellation>,
+    mut on_block: impl FnMut(&mut Volume, Block) -> Result<bool>,
 ) -> Result<u64> {
     let mut volumes = 0;
     loop {
         volumes += 1;
         let mut more = vol.main.is_volume();
         let mut saw_end = false;
-        while let Some(block) = vol.next_block()? {
+        loop {
+            if let Some(cancel) = cancel {
+                cancel.check_io()?;
+            }
+            let Some(block) = vol.next_block()? else { break };
             match block {
                 Block::End { more_volumes } => {
                     more = more_volumes;
@@ -242,7 +277,11 @@ fn walk(
                     break;
                 }
                 Block::Crypt => return Err(Error::Encrypted),
-                b => on_block(&mut vol, b)?,
+                b => {
+                    if on_block(&mut vol, b)? {
+                        return Ok(volumes);
+                    }
+                }
             }
         }
         if !saw_end && !vol.main.is_volume() {
@@ -290,6 +329,195 @@ fn sniff(path: &Path) -> Result<Format> {
     } else {
         Format::Other
     })
+}
+
+enum SelectedSource {
+    Zip(crate::zip::Archive),
+    Tar(Box<crate::tar::Selected>),
+    Rar { path: PathBuf, chain_start: usize },
+}
+
+const RAR_SELECTED_WINDOW_LIMIT: u64 = 256 << 20;
+
+/// A shared cancellation signal for selected reads.
+#[derive(Clone, Default)]
+pub struct Cancellation(Arc<AtomicBool>);
+
+impl Cancellation {
+    /// Requests that the decoder stop at its next cancellation check.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    /// Reports whether the caller requested cancellation.
+    pub fn is_canceled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn check_io(&self) -> std::io::Result<()> {
+        if self.is_canceled() {
+            return Err(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "operation canceled"));
+        }
+        Ok(())
+    }
+}
+
+/// A regular file selected by its index in the archive listing.
+pub struct SelectedEntry {
+    source: SelectedSource,
+    index: usize,
+    limit: u64,
+    name: String,
+    windows_names: bool,
+    meta: Meta,
+    cancel: Cancellation,
+}
+
+impl SelectedEntry {
+    /// Opens a zero-based listing entry. The limit applies independently to
+    /// packed and decoded bytes. It includes the entire compressed TAR stream
+    /// or any solid RAR members required to decode the selection.
+    pub fn open(path: &Path, index: usize, password: Option<&str>, limit: u64) -> Result<Self> {
+        Self::open_cancelable(path, index, password, limit, Cancellation::default())
+    }
+
+    /// Opens an entry and checks the signal while scanning and decoding it.
+    pub fn open_cancelable(
+        path: &Path,
+        index: usize,
+        password: Option<&str>,
+        limit: u64,
+        cancel: Cancellation,
+    ) -> Result<Self> {
+        cancel.check_io()?;
+        match sniff(path)? {
+            Format::Tar => {
+                let selected = crate::tar::Selected::open(path, index, limit, cancel.clone())?;
+                return Ok(Self {
+                    name: selected.name.clone(),
+                    meta: selected.meta,
+                    windows_names: false,
+                    index,
+                    limit,
+                    source: SelectedSource::Tar(Box::new(selected)),
+                    cancel,
+                });
+            }
+            Format::Other => match rar_selected_header(path, index, password, &cancel) {
+                Ok((header, chain_start)) => {
+                    if header.is_dir() || header.redirection.is_some() {
+                        return Err(Error::Unsupported("the selected RAR5 entry is not a regular file".into()));
+                    }
+                    if header.packed_size > limit || (!header.size_unknown() && header.unpacked_size > limit) {
+                        return Err(Error::Unsupported("the selected RAR5 entry exceeds the byte limit".into()));
+                    }
+                    return Ok(Self {
+                        meta: Meta::from(&header),
+                        windows_names: !header.is_unix(),
+                        name: header.name,
+                        index,
+                        limit,
+                        source: SelectedSource::Rar { path: path.to_path_buf(), chain_start },
+                        cancel,
+                    });
+                }
+                Err(Error::NotAnArchive) => {}
+                Err(error) => return Err(error),
+            },
+            Format::Zip => {}
+        }
+        let archive = crate::zip::Archive::open_cancelable(path, Some(&cancel))?;
+        let entry = archive.selected_entry(index, limit)?;
+        Ok(Self {
+            name: entry.name.clone(),
+            windows_names: entry.host != 3,
+            meta: Meta { mtime: entry.mtime, nanos: entry.nanos, mode: entry.unix_mode() },
+            index,
+            limit,
+            source: SelectedSource::Zip(archive),
+            cancel,
+        })
+    }
+
+    /// Returns the name stored in the archive.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns a path checked for traversal and absolute components.
+    pub fn relative_path(&self) -> Result<PathBuf> {
+        if matches!(self.source, SelectedSource::Rar { .. }) && self.name.contains('\u{FFFE}') {
+            return Err(Error::Unsupported("the selected name contains bytes that are not UTF-8".into()));
+        }
+        sanitize(&self.name, self.windows_names)
+    }
+
+    /// Returns Unix permission bits if the archive stores them.
+    pub fn unix_mode(&self) -> Option<u32> {
+        self.meta.mode
+    }
+
+    /// Returns the modification time as Unix seconds and nanoseconds.
+    pub fn modified(&self) -> Option<(i64, u32)> {
+        self.meta.mtime.map(|seconds| (seconds, self.meta.nanos))
+    }
+
+    /// Decodes the selected file into the sink. Data is provisional until
+    /// all available integrity checks pass and this function returns success.
+    pub fn read(self, password: Option<&str>, mut sink: impl FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        self.cancel.check_io()?;
+        let mut checked_sink = |chunk: &[u8]| {
+            self.cancel.check_io()?;
+            sink(chunk)
+        };
+        match self.source {
+            SelectedSource::Zip(mut archive) => {
+                archive.read_at_cancelable(self.index, password, self.limit, Some(&self.cancel), &mut checked_sink)
+            }
+            SelectedSource::Tar(selected) => selected.read(&mut checked_sink),
+            SelectedSource::Rar { path, chain_start } => {
+                let selection = RarSelection {
+                    sink: &mut checked_sink,
+                    emit: false,
+                    packed_left: self.limit,
+                    decoded_left: self.limit,
+                    cancel: &self.cancel,
+                };
+                rar_read_at(&path, chain_start, self.index, &self.name, password, selection)
+            }
+        }?;
+        self.cancel.check_io()?;
+        Ok(())
+    }
+}
+
+fn rar_selected_header(
+    path: &Path,
+    index: usize,
+    password: Option<&str>,
+    cancel: &Cancellation,
+) -> Result<(FileHeader, usize)> {
+    let mut current = 0;
+    let mut chain_start = None;
+    let mut header = None;
+    let volume = Volume::open_with_password(path, password)?;
+    walk_until(volume, password, Some(cancel), |_, block| {
+        if let Block::File(file) = block
+            && !file.split_before()
+        {
+            if file.method != 0 && !file.solid && !file.is_dir() && file.redirection.is_none() {
+                chain_start = Some(current);
+            }
+            if current == index {
+                let first = if file.solid && file.method != 0 { chain_start.unwrap_or(current) } else { current };
+                header = Some((file, first));
+                return Ok(true);
+            }
+            current += 1;
+        }
+        Ok(false)
+    })?;
+    header.ok_or_else(|| Error::Unsupported("entry index is out of range".into()))
 }
 
 /// The entries of an archive, whatever its format.
@@ -342,17 +570,19 @@ fn zip_run(path: &Path, opts: &Options, password: Option<&str>, report: &mut imp
 
 fn rar_list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
+    let mut budget = ListingBudget::default();
     walk(Volume::open_with_password(first, password)?, password, |_, block| {
         let Block::File(h) = block else { return Ok(()) };
         if h.split_before() {
             if let Some(last) = out.last_mut().filter(|e| e.name == h.name) {
-                last.packed += h.packed_size;
+                last.packed = last.packed.checked_add(h.packed_size).ok_or(Error::Corrupt("split packed size"))?;
                 if !h.split_after() {
                     last.crc32 = h.crc32;
                 }
             }
             return Ok(());
         }
+        budget.record(&h.name)?;
         out.push(Entry {
             name: h.name.clone(),
             size: h.unpacked_size,
@@ -546,6 +776,45 @@ impl Sink for Pending {
 
     fn crc(&mut self, crc: u32) {
         self.crc = Some(crc);
+    }
+}
+
+struct RarSelection<'a> {
+    sink: &'a mut dyn FnMut(&[u8]) -> Result<()>,
+    emit: bool,
+    packed_left: u64,
+    decoded_left: u64,
+    cancel: &'a Cancellation,
+}
+
+struct SelectedSink<'p, 's> {
+    pending: &'p mut Pending,
+    selection: &'p mut RarSelection<'s>,
+}
+
+impl Sink for SelectedSink<'_, '_> {
+    fn put(&mut self, chunk: &[u8]) -> Result<()> {
+        self.selection.cancel.check_io()?;
+        let before = self.pending.bytes;
+        self.pending.take(chunk)?;
+        let count = self.pending.bytes - before;
+        self.selection.decoded_left = self
+            .selection
+            .decoded_left
+            .checked_sub(count)
+            .ok_or_else(|| Error::Unsupported("RAR5 decoding exceeds the decoded byte limit".into()))?;
+        if self.selection.emit && count > 0 {
+            (self.selection.sink)(&chunk[..count as usize])?;
+        }
+        Ok(())
+    }
+
+    fn wants_crc(&self) -> bool {
+        self.pending.wants_crc()
+    }
+
+    fn crc(&mut self, crc: u32) {
+        self.pending.crc(crc);
     }
 }
 
@@ -743,6 +1012,7 @@ struct Run<'a, R: FnMut(&str)> {
     queued_paths: HashSet<String>,
     /// folders under the destination made (or found) so far
     dirs: Dirs,
+    selection: Option<RarSelection<'a>>,
 }
 
 /// A file finished on another thread, counted and reported as if done here.
@@ -787,20 +1057,7 @@ fn rar_run(first: &Path, opts: &Options, password: Option<&str>, report: impl Fn
     let threads = opts.threads.unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     // the hidden size knob is there to test decoding blocks on workers, which batching would bypass
     let threads = if opts.parallel_min.is_some() { 1 } else { threads };
-    let mut r = Run {
-        opts: &opts,
-        password: password.filter(|s| !s.is_empty()),
-        summary: Summary::default(),
-        pending: None,
-        stream: None,
-        report,
-        threads,
-        batch: None,
-        batch_paths: HashSet::new(),
-        queued: VecDeque::new(),
-        queued_paths: HashSet::new(),
-        dirs: Dirs::default(),
-    };
+    let mut r = Run::new(&opts, password, report, threads);
     let walked = walk(first_volume, r.password, |vol, block| {
         let Block::File(h) = block else { return Ok(()) };
         r.file_block(vol, &h)
@@ -829,6 +1086,90 @@ fn rar_run(first: &Path, opts: &Options, password: Option<&str>, report: impl Fn
     }
     finish_dirs(&mut r.summary);
     Ok(r.summary)
+}
+
+fn rar_read_at(
+    first: &Path,
+    chain_start: usize,
+    index: usize,
+    name: &str,
+    password: Option<&str>,
+    selection: RarSelection<'_>,
+) -> Result<()> {
+    let opts = Options {
+        mode: Mode::Test,
+        dest: PathBuf::new(),
+        overwrite: Overwrite::Skip,
+        flatten: false,
+        threads: Some(1),
+        protected_paths: Default::default(),
+        parallel_min: None,
+    };
+    let cancel = selection.cancel;
+    let mut run = Run::new(&opts, password, |_: &str| {}, 1);
+    run.selection = Some(RarSelection { sink: &mut *selection.sink, ..selection });
+    let mut next = 0;
+    let mut selected = false;
+    let mut prerequisite = false;
+    let mut complete = false;
+    let volume = Volume::open_with_password(first, run.password)?;
+    walk_until(volume, run.password, Some(cancel), |volume, block| {
+        let Block::File(header) = block else { return Ok(false) };
+        if !header.split_before() {
+            if run.pending.is_some() {
+                return Err(Error::Truncated);
+            }
+            selected = next == index;
+            prerequisite = (chain_start..index).contains(&next)
+                && header.method != 0
+                && !header.is_dir()
+                && header.redirection.is_none();
+            next += 1;
+            if selected && (header.name != name || header.is_dir() || header.redirection.is_some()) {
+                return Err(Error::Corrupt("RAR5 entry changed since it was selected"));
+            }
+        }
+        if !selected && !prerequisite {
+            return Ok(false);
+        }
+        if header.split_before() && run.pending.is_none() {
+            return Err(Error::Truncated);
+        }
+        if let Some(selection) = &mut run.selection {
+            selection.emit = selected;
+        }
+        let before = run.summary.files;
+        run.file_block(volume, &header)?;
+        if let Some(error) = run.summary.errors.first() {
+            return Err(Error::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error.clone())));
+        }
+        complete = selected && !header.split_after() && run.summary.files > before && run.pending.is_none();
+        Ok(complete)
+    })?;
+    if !complete {
+        return Err(Error::Truncated);
+    }
+    Ok(())
+}
+
+impl<'a, R: FnMut(&str)> Run<'a, R> {
+    fn new(opts: &'a Options, password: Option<&'a str>, report: R, threads: usize) -> Self {
+        Self {
+            opts,
+            password: password.filter(|s| !s.is_empty()),
+            summary: Summary::default(),
+            pending: None,
+            stream: None,
+            report,
+            threads,
+            batch: None,
+            batch_paths: HashSet::new(),
+            queued: VecDeque::new(),
+            queued_paths: HashSet::new(),
+            dirs: Dirs::default(),
+            selection: None,
+        }
+    }
 }
 
 impl<R: FnMut(&str)> Run<'_, R> {
@@ -931,9 +1272,14 @@ impl<R: FnMut(&str)> Run<'_, R> {
     /// Reads past a file this run won't write. In a solid archive its data is still decoded, since the files
     /// after it build on it.
     fn pass_over(&mut self, vol: &mut Volume, h: &FileHeader) -> Result<()> {
-        if vol.main.is_solid() && h.method != 0 && !h.encrypted {
+        self.pass_over_with_cipher(vol, h, None)
+    }
+
+    fn pass_over_with_cipher(&mut self, vol: &mut Volume, h: &FileHeader, cipher: Option<PendingCipher>) -> Result<()> {
+        if vol.main.is_solid() && h.method != 0 && (!h.encrypted || cipher.is_some()) {
             let mut p = Pending::new(h);
             p.passive = true;
+            p.cipher = cipher;
             return self.begin_decoding(vol, h, p);
         }
         if h.split_after() {
@@ -954,11 +1300,15 @@ impl<R: FnMut(&str)> Run<'_, R> {
             self.summary.skipped += 1;
             return self.pass_over(vol, h);
         }
-        let rel = match sanitize(&h.name, !h.is_unix()) {
-            Ok(rel) => rel,
-            Err(e) => {
-                self.fail_in_order(&h.name, &e.to_string())?;
-                return self.pass_over(vol, h);
+        let rel = if self.selection.is_some() {
+            PathBuf::new()
+        } else {
+            match sanitize(&h.name, !h.is_unix()) {
+                Ok(rel) => rel,
+                Err(e) => {
+                    self.fail_in_order(&h.name, &e.to_string())?;
+                    return self.pass_over(vol, h);
+                }
             }
         };
         // U+FFFE marks a Unix name holding bytes that aren't UTF-8, mapped into private-use characters
@@ -1032,11 +1382,11 @@ impl<R: FnMut(&str)> Run<'_, R> {
                     self.drain()?;
                     (self.report)(&format!("{}: exists, skipped", h.name));
                     self.summary.skipped += 1;
-                    return self.pass_over(vol, h);
+                    return self.pass_over_with_cipher(vol, h, cipher);
                 }
                 Checked::Blocked(why) => {
                     self.fail_in_order(&h.name, why)?;
-                    return self.pass_over(vol, h);
+                    return self.pass_over_with_cipher(vol, h, cipher);
                 }
             }
         } else {
@@ -1106,6 +1456,9 @@ impl<R: FnMut(&str)> Run<'_, R> {
                 }
             } else {
                 match window_for(h.dictionary, size, solid_archive) {
+                    Ok(window) if self.selection.is_some() && window.size > RAR_SELECTED_WINDOW_LIMIT => {
+                        return Err(Error::Unsupported("RAR5 window exceeds the 256 MiB limit".into()));
+                    }
                     Ok(window) => match self.stream.as_mut().filter(|u| u.fits(window)) {
                         Some(u) => {
                             u.restart(window, size);
@@ -1312,6 +1665,13 @@ impl<R: FnMut(&str)> Run<'_, R> {
             }
             return Ok(());
         }
+        if let Some(selection) = &mut self.selection {
+            selection.cancel.check_io()?;
+            selection.packed_left = selection
+                .packed_left
+                .checked_sub(h.packed_size)
+                .ok_or_else(|| Error::Unsupported("RAR5 decoding exceeds the packed byte limit".into()))?;
+        }
         // a part's checksums cover only its own packed bytes
         let mut part = crate::crc32::Hasher::new();
         let mut part_blake = h.blake2sp.filter(|_| split_after).map(|_| Blake2sp::new());
@@ -1330,6 +1690,9 @@ impl<R: FnMut(&str)> Run<'_, R> {
         // The decoder needs the pending member as a sink while the framing state is borrowed.
         let mut blocks = p.cipher.as_mut().and_then(|cipher| cipher.blocks.take());
         let read = vol.read_data_shared(h.data_at, h.packed_size, |piece, range| {
+            if let Some(selection) = &self.selection {
+                selection.cancel.check_io()?;
+            }
             let chunk = &piece.bytes()[range.clone()];
             if split_after {
                 part.update(chunk);
@@ -1353,12 +1716,26 @@ impl<R: FnMut(&str)> Run<'_, R> {
                     aes.decrypt_cbc_in_place(iv, &mut dec_buf);
                     &dec_buf
                 };
+                let mut selected_sink;
+                let sink: &mut dyn Sink = match self.selection.as_mut() {
+                    Some(selection) => {
+                        selected_sink = SelectedSink { pending: &mut p, selection };
+                        &mut selected_sink
+                    }
+                    None => &mut p,
+                };
                 match stream.as_mut() {
                     Some(decoder) => blocks
                         .as_mut()
                         .ok_or(Error::Corrupt("missing encrypted block state"))?
-                        .feed(to_feed, decoder, &mut p),
-                    None => p.take(to_feed),
+                        .feed(to_feed, decoder, sink),
+                    None => sink.put(to_feed),
+                }
+            } else if let Some(selection) = &mut self.selection {
+                let mut sink = SelectedSink { pending: &mut p, selection };
+                match stream.as_mut() {
+                    Some(u) => u.feed_shared(piece, range, &mut sink),
+                    None => sink.put(chunk),
                 }
             } else {
                 match stream.as_mut() {
@@ -1379,12 +1756,19 @@ impl<R: FnMut(&str)> Run<'_, R> {
                     None => Ok(()),
                 };
                 padding.and_then(|()| match stream.as_mut() {
-                    Some(u) => u.finish(&mut p),
+                    Some(u) => match self.selection.as_mut() {
+                        Some(selection) => u.finish(&mut SelectedSink { pending: &mut p, selection }),
+                        None => u.finish(&mut p),
+                    },
                     None => Ok(()),
                 })
             }
             Ok(()) => Ok(()),
-            Err(e @ (Error::Corrupt(_) | Error::Unsupported(_))) if p.compressed || p.encrypted => Err(e),
+            Err(e @ (Error::Corrupt(_) | Error::Unsupported(_)))
+                if self.selection.is_none() && (p.compressed || p.encrypted) =>
+            {
+                Err(e)
+            }
             Err(e) => {
                 p.discard();
                 return Err(e);
@@ -1392,6 +1776,9 @@ impl<R: FnMut(&str)> Run<'_, R> {
         };
         if let Err(e) = decoded {
             p.discard();
+            if self.selection.is_some() {
+                return Err(e);
+            }
             if !p.passive {
                 self.fail_in_order(&p.name, &e.to_string())?;
             }
@@ -1525,16 +1912,16 @@ pub(crate) fn finish_file(out: &File, h: &Meta) {
 }
 
 fn set_time(out: &File, h: &Meta) {
-    if let Some(secs) = h.mtime {
-        let at = if secs >= 0 {
-            UNIX_EPOCH.checked_add(Duration::new(secs as u64, h.nanos))
-        } else {
-            UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))
-        };
-        if let Some(at) = at.filter(|t| *t != SystemTime::UNIX_EPOCH || secs == 0) {
-            let _ = out.set_modified(at);
-        }
+    if let Some(at) = h.mtime.and_then(|seconds| archive_time(seconds, h.nanos)) {
+        let _ = out.set_modified(at);
     }
+}
+
+/// Converts an archive timestamp with a nonnegative fraction of a second.
+pub fn archive_time(seconds: i64, nanos: u32) -> Option<SystemTime> {
+    let elapsed = Duration::from_secs(seconds.unsigned_abs());
+    let base = if seconds < 0 { UNIX_EPOCH.checked_sub(elapsed) } else { UNIX_EPOCH.checked_add(elapsed) }?;
+    base.checked_add(Duration::from_nanos(u64::from(nanos)))
 }
 
 impl Dirs {
@@ -1684,5 +2071,24 @@ mod tests {
             assert!(!dirs.note(Path::new("d/K")), "after {odd:?}");
             assert!(!dirs.note(Path::new("x/y")), "after {odd:?}");
         }
+    }
+
+    #[test]
+    fn listing_budget_accepts_exactly_one_million_names() {
+        let mut budget = ListingBudget::default();
+        for _ in 0..1_000_000 {
+            budget.record("name").unwrap();
+        }
+        assert!(matches!(budget.record("name"), Err(Error::Unsupported(_))));
+    }
+
+    #[test]
+    fn listing_budget_accepts_exactly_sixty_four_mib_of_names() {
+        let mut budget = ListingBudget::default();
+        let name = "a".repeat(1 << 20);
+        for _ in 0..64 {
+            budget.record(&name).unwrap();
+        }
+        assert!(matches!(budget.record("a"), Err(Error::Unsupported(_))));
     }
 }

@@ -24,8 +24,8 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::extract::{
-    Checked, Entry, Meta, Mode, Options, Overwrite, Place, Summary, check_target, create_target, finish_dirs,
-    finish_file, make_dirs,
+    Cancellation, Checked, Entry, ListingBudget, Meta, Mode, Options, Overwrite, Place, Summary, check_target,
+    create_target, finish_dirs, finish_file, make_dirs,
 };
 use crate::output::{Output, replace, temporary};
 use crate::path::sanitize;
@@ -37,6 +37,7 @@ const BLOCK: usize = 512;
 const BUF: usize = 4 << 20;
 /// The longest name, link target or pax record set taken from an extension record.
 const MAX_EXT: u64 = 1 << 20;
+const COMPRESSED_LIST_LIMIT: u64 = 8 << 30;
 /// The most zero bytes an empty archive is taken to be: GNU tar pads one to 10 KiB, other writers to whole
 /// records of up to this much.
 const EMPTY_MAX: usize = 1 << 20;
@@ -113,28 +114,50 @@ fn name_of(bytes: &[u8]) -> String {
 /// Where the archive's bytes come from: the file itself, which can be skipped through, or a compressed stream,
 /// which has to be read.
 enum Source {
-    Plain { r: BufReader<File>, len: u64, pos: u64 },
+    Plain { r: BufReader<File>, len: u64, pos: u64, cancel: Option<Cancellation> },
     Packed(Box<dyn Read>, Codec),
 }
 
 impl Source {
-    fn open(path: &Path, threads: usize) -> Result<Source> {
+    fn open(path: &Path, threads: usize, limit: Option<u64>, cancel: Option<Cancellation>) -> Result<Source> {
         let mut file = File::open(path)?;
         let mut head = [0u8; 6];
         let n = read_full(&mut file, &mut head)?;
         file.rewind()?;
         let len = file.metadata()?.len();
-        let r = BufReader::with_capacity(1 << 20, file);
-        Ok(match Codec::sniff(&head[..n]) {
-            Some(codec) => Source::Packed(codec.open(r, threads).map_err(read_error)?, codec),
-            None => Source::Plain { r, len, pos: 0 },
-        })
+        let Some(codec) = Codec::sniff(&head[..n]) else {
+            return Ok(Source::Plain { r: BufReader::with_capacity(1 << 20, file), len, pos: 0, cancel });
+        };
+        let Some(limit) = limit else {
+            let reader = BufReader::with_capacity(1 << 20, file);
+            return Ok(Source::Packed(codec.open(reader, threads).map_err(read_error)?, codec));
+        };
+        if len > limit {
+            return Err(Error::Unsupported("compressed stream exceeds the input byte limit".into()));
+        }
+        let packed = Limited {
+            inner: file,
+            remaining: limit,
+            cancel: cancel.clone(),
+            message: "compressed stream exceeds the input byte limit",
+        };
+        let decoder = codec.open_reader(BufReader::with_capacity(1 << 20, packed), threads).map_err(read_error)?;
+        let decoded = Limited {
+            inner: decoder,
+            remaining: limit,
+            cancel,
+            message: "compressed stream exceeds the decoded byte limit",
+        };
+        Ok(Source::Packed(Box::new(decoded), codec))
     }
 
     /// Fills `buf` unless the stream ends first; returns how much was read.
     fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         let n = match self {
-            Source::Plain { r, pos, .. } => {
+            Source::Plain { r, pos, cancel, .. } => {
+                if let Some(cancel) = cancel {
+                    cancel.check_io()?;
+                }
                 let n = read_full(r, buf).map_err(read_error)?;
                 *pos += n as u64;
                 n
@@ -147,7 +170,10 @@ impl Source {
     /// Passes over `n` bytes, which must all be there.
     fn skip(&mut self, n: u64, buf: &mut [u8]) -> Result<()> {
         match self {
-            Source::Plain { r, len, pos } => {
+            Source::Plain { r, len, pos, cancel } => {
+                if let Some(cancel) = cancel {
+                    cancel.check_io()?;
+                }
                 if *len - *pos < n {
                     return Err(Error::Truncated);
                 }
@@ -178,6 +204,34 @@ impl Source {
     }
 }
 
+struct Limited<R> {
+    inner: R,
+    remaining: u64,
+    cancel: Option<Cancellation>,
+    message: &'static str,
+}
+
+impl<R: Read> Read for Limited<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if let Some(cancel) = &self.cancel {
+            cancel.check_io()?;
+        }
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            return match self.inner.read(&mut [0])? {
+                0 => Ok(0),
+                _ => Err(io::Error::new(io::ErrorKind::FileTooLarge, self.message)),
+            };
+        }
+        let len = self.remaining.min(buf.len() as u64) as usize;
+        let count = self.inner.read(&mut buf[..len])?;
+        self.remaining -= count as u64;
+        Ok(count)
+    }
+}
+
 pub(crate) fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut n = 0;
     while n < buf.len() {
@@ -195,6 +249,8 @@ pub(crate) fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> 
 /// disk itself counts as damage.
 fn read_error(e: io::Error) -> Error {
     match e.kind() {
+        io::ErrorKind::ConnectionAborted => Error::Io(e),
+        io::ErrorKind::FileTooLarge if e.raw_os_error().is_none() => Error::Unsupported(e.to_string()),
         io::ErrorKind::UnexpectedEof => Error::Truncated,
         io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound | io::ErrorKind::Interrupted => Error::Io(e),
         _ if e.raw_os_error().is_some() => Error::Io(e),
@@ -347,7 +403,16 @@ struct Reader {
 
 impl Reader {
     fn open(path: &Path, threads: usize) -> Result<Reader> {
-        let mut src = Source::open(path, threads)?;
+        Self::open_with_limit(path, threads, None, None)
+    }
+
+    fn open_with_limit(
+        path: &Path,
+        threads: usize,
+        limit: Option<u64>,
+        cancel: Option<Cancellation>,
+    ) -> Result<Reader> {
+        let mut src = Source::open(path, threads, limit, cancel)?;
         let mut first = vec![0u8; BLOCK];
         let n = src.read(&mut first)?;
         first.truncate(n);
@@ -539,6 +604,57 @@ impl Reader {
     }
 }
 
+pub(crate) struct Selected {
+    reader: Reader,
+    pub name: String,
+    size: Option<u64>,
+    pub meta: Meta,
+}
+
+impl Selected {
+    pub(crate) fn open(path: &Path, index: usize, limit: u64, cancel: Cancellation) -> Result<Self> {
+        let mut reader = Reader::open_with_limit(path, 1, Some(limit), Some(cancel))?;
+        if matches!(reader.content, Content::Single) {
+            let codec = reader.src.codec().ok_or(Error::NotAnArchive)?;
+            if index == 0 {
+                return Ok(Self { name: single_name(codec, path), reader, size: None, meta: Meta::default() });
+            }
+        } else {
+            let mut current = 0;
+            while let Some(member) = reader.next()? {
+                if member.kind == Kind::Other(b'V') {
+                    continue;
+                }
+                if current == index {
+                    if member.kind != Kind::File {
+                        return Err(Error::Unsupported("the selected tar member is not a regular file".into()));
+                    }
+                    if member.size > limit {
+                        return Err(Error::Unsupported("the selected member exceeds the byte limit".into()));
+                    }
+                    let meta = member.meta();
+                    return Ok(Self { reader, name: member.name, size: Some(member.size), meta });
+                }
+                current += 1;
+            }
+        }
+        Err(Error::Unsupported("entry index is out of range".into()))
+    }
+
+    pub(crate) fn read(mut self, sink: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        let mut buf = vec![0; BUF];
+        if let Some(size) = self.size {
+            self.reader.read_data(size, &mut buf, sink)?;
+            if self.reader.src.codec().is_some() {
+                self.reader.drain(&mut buf)?;
+            }
+        } else {
+            self.reader.read_single(&mut buf, sink)?;
+        }
+        Ok(())
+    }
+}
+
 fn padding(size: u64) -> u64 {
     (BLOCK as u64 - size % BLOCK as u64) % BLOCK as u64
 }
@@ -576,7 +692,7 @@ fn single_fallback(codec: Codec, path: &Path, clean: &dyn Fn(&str) -> Option<Str
 /// The archive's members. A lone compressed file is decoded to find its size: the gzip trailer holds only the
 /// last member's size, and only below 4 GiB, and other formats may not record it at all.
 pub fn list(path: &Path) -> Result<Vec<Entry>> {
-    let mut reader = Reader::open(path, 1)?;
+    let mut reader = Reader::open_with_limit(path, 1, Some(COMPRESSED_LIST_LIMIT), None)?;
     if let (Content::Single, Some(codec)) = (&reader.content, reader.src.codec()) {
         let gzip = codec == Codec::Gzip;
         let packed = std::fs::metadata(path)?.len();
@@ -596,10 +712,16 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
         }]);
     }
     let mut out = Vec::new();
+    let mut budget = ListingBudget::default();
     while let Some(m) = reader.next()? {
         if m.kind != Kind::Other(b'V') {
+            budget.record(&m.name)?;
             out.push(m.entry());
         }
+    }
+    if reader.src.codec().is_some() {
+        let mut buffer = vec![0; BUF];
+        reader.drain(&mut buffer)?;
     }
     Ok(out)
 }
@@ -654,6 +776,7 @@ enum StagedMember {
 #[derive(Default)]
 struct StagedTar {
     members: Vec<StagedMember>,
+    budget: ListingBudget,
 }
 
 impl StagedTar {
@@ -843,6 +966,7 @@ fn run_tar(
             Kind::Dir => {
                 if opts.mode == Mode::Extract && !opts.flatten {
                     if let Some(staged) = &mut staged {
+                        staged.budget.record(&m.name)?;
                         staged.members.push(StagedMember::Directory(rel, m.meta()));
                         continue;
                     }
@@ -870,6 +994,7 @@ fn run_tar(
             {
                 continue;
             }
+            staged.budget.record(&m.name)?;
             let (file, temporary) = temporary(&parent)?.into_parts();
             let output = Output::new(file, Some(m.size));
             match copy_out(Some(output), &m.meta(), |sink| reader.read_data(m.size, buf, sink))? {

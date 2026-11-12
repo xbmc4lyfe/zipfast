@@ -119,32 +119,35 @@ additional gzip options, and RAR decoder expansion follow in their own PRs.
 
 ## Phase 1. Import zipview and reconcile the engine baseline
 
-- [ ] Capture locked test results for both standalone checkouts. Record
+- [x] Capture locked test results for both standalone checkouts. Record
   downstream call sites for public zipview APIs and the zipfast CLI.
-- [ ] Add a workspace to the root `Cargo.toml`. Keep the root `zipfast`
+- [x] Add a workspace to the root `Cargo.toml`. Keep the root `zipfast`
   package and import zipview under `crates/zipview/` at the recorded RPL revision.
   Preserve import provenance and keep its source notices, tests, examples,
   fuzz targets, and seed corpus.
   Exclude the fuzz package from the main workspace if it retains its own
   lockfile and toolchain. Port applicable CI jobs to the repository root.
-- [ ] Reconcile the unified lockfile and effective Cargo profiles. Run the
+- [x] Reconcile the unified lockfile and effective Cargo profiles. Run the
   old standalone build and workspace build on equivalent inputs. Check
   examples, fuzz target compilation, public API imports, and dependency
   features when building zipview alone and with zipfast. Use
   `cargo +1.87.0 test -p zipview --locked` and
   `cargo tree -p zipview -e features`. Compare the resolved dependency
   tree with a clean consumer using zipview alone.
-- [ ] Inventory the differences in Prybar's vendored zipfast. Port behavior
+- [x] Inventory the differences in Prybar's vendored zipfast. Port behavior
   and tests together in small changes, including selected reads, archive
   input protection, staged output, WinZip AES authentication, encrypted RAR
   verification, listing budgets, and decoder limits. Record any local
   changes that are CLI-specific or superseded upstream.
-- [ ] Document new source locations for direct Git dependencies. Build a
+- [x] Document new source locations for direct Git dependencies. Build a
   clean consumer for each package and plan a downstream pin update before
   retiring the standalone zipview repository. Check the current publishing
   path before introducing a shared path dependency. If zipview is packaged
   for a registry, provide a publishable versioned parser dependency and
   validate packaging in dependency order.
+
+[Phase 1 verification](../../zipview-workspace.md#phase-1-verification) ·
+[Vendor reconciliation and downstream inventory](../../engine-baseline.md)
 
 ## Phase 2. Use one ZIP container parser
 
