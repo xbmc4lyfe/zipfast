@@ -991,26 +991,50 @@ pub fn aes_derive(password: &[u8], salt: &[u8], key_len: usize) -> Option<Vec<u8
     Some(derived)
 }
 
-/// Decrypts a WinZip AES (method 99) entry starting at `data` (`salt + verifier + ciphertext [+ 10-byte auth]`).
+/// Decrypts WinZip AES (method 99) data starting with the salt and password verifier.
+///
+/// With `Some(packed)`, `data` must contain exactly `packed` bytes, including
+/// the 10-byte authentication tag. The ciphertext is authenticated before decryption.
+/// With `None`, the bytes after the verifier are treated as a ciphertext prefix
+/// for preview and decrypted without authentication.
 pub fn decrypt_winzip_aes(password: &str, strength: u8, data: &[u8], full_packed: Option<u64>) -> Option<Vec<u8>> {
+    use subtle::ConstantTimeEq;
+
+    const TAG_LEN: usize = 10;
+
     if !(1..=3).contains(&strength) {
         return None;
     }
     let salt_len = usize::from(strength) * 4 + 4;
     let key_len = (usize::from(strength) + 1) * 8;
+    let ct_end = if let Some(packed) = full_packed {
+        if usize::try_from(packed).ok()? != data.len() {
+            return None;
+        }
+        data.len().checked_sub(TAG_LEN)?
+    } else {
+        data.len()
+    };
     let salt = data.get(..salt_len)?;
     let verifier = data.get(salt_len..salt_len + 2)?;
+    let ct = data.get(salt_len + 2..ct_end)?;
     let derived = aes_derive(password.as_bytes(), salt, key_len)?;
-    if derived.get(key_len * 2..key_len * 2 + 2) != Some(verifier) {
+    if !bool::from(derived.get(key_len * 2..)?.ct_eq(verifier)) {
         return None;
     }
-    let key = derived.get(..key_len)?;
-    let ct_end = match full_packed.and_then(|p| usize::try_from(p).ok()) {
-        Some(p) if p >= salt_len + 12 => data.len().min(p - 10),
-        _ => data.len(),
-    };
-    let ct = data.get(salt_len + 2..ct_end)?;
-    decrypt_winzip_ctr(key, ct)
+    if full_packed.is_some() {
+        let mut ipad = [0x36; 64];
+        let mut opad = [0x5c; 64];
+        for (i, byte) in derived[key_len..key_len * 2].iter().enumerate() {
+            ipad[i] ^= byte;
+            opad[i] ^= byte;
+        }
+        let expected = hmac_sha1(&ipad, &opad, ct);
+        if !bool::from(expected[..TAG_LEN].ct_eq(&data[ct_end..])) {
+            return None;
+        }
+    }
+    decrypt_winzip_ctr(&derived[..key_len], ct)
 }
 
 /// Parses WinZip AES extra field `0x9901`: `(strength, actual_method)`.
@@ -1039,6 +1063,89 @@ pub fn aes_extra_info(extra: &[u8]) -> Option<(u8, u16, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The AES-128 fixture comes from Prybar d3b8aa32a7c7214919b9c973588a9aa97a6a0e88.
+    // Python hashlib and hmac and OpenSSL AES-ECB generated the fixtures independently.
+    const AES_PASSWORD: &str = "prybar-fixture";
+    const AES_FIXTURES: [(u8, &[u8], &[u8]); 3] = [
+        (
+            1,
+            &[
+                49, 50, 51, 52, 53, 54, 55, 56, 153, 191, 197, 64, 79, 101, 103, 92, 73, 178, 222, 207, 22, 192, 51,
+                16, 127, 189, 76, 25, 140,
+            ],
+            b"hello pry",
+        ),
+        (
+            2,
+            &[
+                49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 60, 136, 41, 180, 105, 28, 77, 228, 120, 155, 112, 7,
+                174, 93, 111, 242, 148, 11, 66, 182, 93, 138, 189, 164, 33, 206, 162, 187, 170, 49, 127, 137, 243, 7,
+                22, 15, 144, 85, 84, 98, 174, 19, 58, 225, 89, 169, 188, 217,
+            ],
+            b"WinZip AES fixture across CTR blocks",
+        ),
+        (
+            3,
+            &[
+                49, 50, 51, 52, 53, 54, 55, 56, 57, 97, 98, 99, 100, 101, 102, 103, 55, 108, 59, 75, 78, 18, 73, 213,
+                62, 53, 134, 241, 128, 148, 158, 57, 34, 200, 88, 19, 73, 163, 62, 13, 7, 115, 194, 62, 70, 21, 220,
+                88, 175, 19, 146, 81, 98, 148, 247, 157, 137, 199, 148, 224, 5, 28, 238, 88,
+            ],
+            b"WinZip AES fixture across CTR blocks",
+        ),
+    ];
+
+    #[test]
+    fn authenticates_full_winzip_aes_payload() {
+        for (strength, data, plaintext) in AES_FIXTURES {
+            let packed = Some(data.len() as u64);
+            assert_eq!(decrypt_winzip_aes(AES_PASSWORD, strength, data, packed).as_deref(), Some(plaintext));
+            assert!(decrypt_winzip_aes("wrong password", strength, data, packed).is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_winzip_aes_ciphertext_tampering() {
+        for (strength, data, plaintext) in AES_FIXTURES {
+            let mut damaged = data.to_vec();
+            damaged[data.len() - 10 - plaintext.len()] ^= 1;
+            assert!(decrypt_winzip_aes(AES_PASSWORD, strength, &damaged, Some(data.len() as u64)).is_none());
+        }
+    }
+
+    #[test]
+    fn rejects_winzip_aes_tag_tampering() {
+        for (strength, data, _) in AES_FIXTURES {
+            let mut damaged = data.to_vec();
+            damaged[data.len() - 1] ^= 1;
+            assert!(decrypt_winzip_aes(AES_PASSWORD, strength, &damaged, Some(data.len() as u64)).is_none());
+        }
+    }
+
+    #[test]
+    fn requires_exact_winzip_aes_packed_size() {
+        for (strength, data, plaintext) in AES_FIXTURES {
+            let packed = data.len() as u64;
+            assert!(decrypt_winzip_aes(AES_PASSWORD, strength, &data[..data.len() - 1], Some(packed)).is_none());
+            assert!(decrypt_winzip_aes(AES_PASSWORD, strength, data, Some(packed - 1)).is_none());
+
+            let short = &data[..data.len() - 10 - plaintext.len() + 9];
+            assert!(decrypt_winzip_aes(AES_PASSWORD, strength, short, Some(short.len() as u64)).is_none());
+        }
+    }
+
+    #[test]
+    fn previews_winzip_aes_ciphertext_prefix_without_tag() {
+        for (strength, data, plaintext) in AES_FIXTURES {
+            let end = data.len() - 10 - plaintext.len() + 4;
+            assert_eq!(
+                decrypt_winzip_aes(AES_PASSWORD, strength, &data[..end], None).as_deref(),
+                Some(&plaintext[..4])
+            );
+            assert!(decrypt_winzip_aes("wrong password", strength, &data[..end], None).is_none());
+        }
+    }
 
     #[test]
     fn fips_197_and_cbc_round_trip() {
