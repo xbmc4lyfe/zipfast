@@ -18,6 +18,10 @@
 #[path = "verify/tests.rs"]
 mod tests;
 
+#[cfg(test)]
+#[path = "verify/aes_tests.rs"]
+mod aes_tests;
+
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 
@@ -28,18 +32,18 @@ use zip_container::{
 };
 
 use crate::crc32::Hasher;
-use crate::crypto::ZipCrypto;
+use crate::crypto::{WinZipAesEncryptor, ZipCrypto};
 use crate::zip::{FLAG_DESCRIPTOR, FLAG_ENCRYPTED, FLAG_UTF8, HOST_UNIX, METHOD_DEFLATE, METHOD_STORED, S_IFDIR};
 
 use super::{
     Attempts, CreateError, CreateLimit, CreateLimits, CreateOptions, PlannedEntry, Result, Stamp, VerificationUsage,
     add, limit, unix,
 };
-use crate::zip::write::{EntryWritten, InputLength, Method, WriteSummary};
+use crate::zip::write::{AesStrength, AesVariant, EntryWritten, InputLength, Method, WinZipAesRequest, WriteSummary};
 
 const BUFFER: usize = 64 << 10;
 pub(in crate::zip) const DISCOVERY_TAIL_BYTES: u64 = 22 + u16::MAX as u64 + 56 + 20;
-const MAX_EXTRA: usize = 37;
+const MAX_EXTRA: usize = 48;
 const ZIPCRYPTO_HEADER: u64 = 12;
 const SIZE_SENTINEL: u64 = u32::MAX as u64;
 
@@ -54,6 +58,55 @@ pub(super) struct ZipCryptoExpectation<'a> {
     pub(super) length: InputLength,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct AesExpectation<'a> {
+    pub(super) request: &'a WinZipAesRequest<'a>,
+    pub(super) length: InputLength,
+    pub(super) plaintext_crc32: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum EncryptionExpectation<'a> {
+    ZipCrypto(ZipCryptoExpectation<'a>),
+    Aes(AesExpectation<'a>),
+}
+
+impl<'a> From<ZipCryptoExpectation<'a>> for EncryptionExpectation<'a> {
+    fn from(value: ZipCryptoExpectation<'a>) -> Self {
+        Self::ZipCrypto(value)
+    }
+}
+
+impl<'a> From<AesExpectation<'a>> for EncryptionExpectation<'a> {
+    fn from(value: AesExpectation<'a>) -> Self {
+        Self::Aes(value)
+    }
+}
+
+impl EncryptionExpectation<'_> {
+    fn length(self) -> InputLength {
+        match self {
+            Self::ZipCrypto(mode) => mode.length,
+            Self::Aes(mode) => mode.length,
+        }
+    }
+    fn aes(self) -> Option<(AesStrength, AesVariant)> {
+        match self {
+            Self::ZipCrypto(_) => None,
+            Self::Aes(mode) => {
+                let (_, strength, variant) = mode.request.parameters();
+                Some((strength, variant))
+            }
+        }
+    }
+    fn overhead(self) -> u64 {
+        match self {
+            Self::ZipCrypto(_) => ZIPCRYPTO_HEADER,
+            Self::Aes(_) => self.aes().expect("AES mode").0.overhead(),
+        }
+    }
+}
+
 pub(super) fn verify_created<'a>(
     file: &mut File,
     members: (&[PlannedEntry], &[EntryWritten]),
@@ -61,7 +114,7 @@ pub(super) fn verify_created<'a>(
     summary: WriteSummary,
     attempts: &Attempts<'_>,
     usage: &mut VerificationUsage,
-    mut encryption: impl FnMut(usize) -> Option<ZipCryptoExpectation<'a>>,
+    mut encryption: impl FnMut(usize) -> Option<EncryptionExpectation<'a>>,
 ) -> Result<VerifiedCreation> {
     let (entries, receipts) = members;
     let stamp = unix::file_stamp(file, attempts)?;
@@ -243,6 +296,8 @@ impl Geometry {
 
 struct Framing {
     method: u16,
+    outer_method: u16,
+    aes: Option<(AesStrength, AesVariant)>,
     version: u16,
     flags: u16,
     dos: (u16, u16),
@@ -253,21 +308,34 @@ struct Framing {
 }
 
 impl Framing {
-    fn new(entry: &PlannedEntry, receipt: &EntryWritten, encryption: Option<ZipCryptoExpectation<'_>>) -> Result<Self> {
+    fn new(
+        entry: &PlannedEntry,
+        receipt: &EntryWritten,
+        encryption: Option<EncryptionExpectation<'_>>,
+    ) -> Result<Self> {
         let source = entry.payload_source();
         let decoded = source.map_or(0, |source| source.stamp.len);
         if let Some(encryption) = encryption {
             ensure(source.is_some(), "a directory cannot have encrypted framing")?;
-            if let InputLength::Exact(size) = encryption.length {
+            if let InputLength::Exact(size) = encryption.length() {
                 ensure(size == decoded, "encrypted writer length differs from the source")?;
             }
         }
-        let overhead = if encryption.is_some() { ZIPCRYPTO_HEADER } else { 0 };
+        let overhead = encryption.map_or(0, EncryptionExpectation::overhead);
+        let aes = encryption.and_then(EncryptionExpectation::aes);
+        let plaintext_crc32 = match encryption {
+            Some(EncryptionExpectation::Aes(mode)) => mode.plaintext_crc32,
+            _ => receipt.crc32,
+        };
+        ensure(
+            receipt.crc32 == aes.map_or(plaintext_crc32, |(_, variant)| variant.wire_crc(plaintext_crc32)),
+            "wire CRC differs from the encryption policy",
+        )?;
         let expected_method = if decoded == 0 { Method::Stored } else { entry.method };
         ensure(
             receipt.decoded_size == decoded
                 && receipt.method == expected_method
-                && (decoded != 0 || (receipt.crc32 == 0 && receipt.packed_size == overhead))
+                && (decoded != 0 || (plaintext_crc32 == 0 && receipt.packed_size == overhead))
                 && receipt.packed_size >= overhead,
             "writer receipt differs from the expected source framing",
         )?;
@@ -280,11 +348,13 @@ impl Framing {
         };
         let wide_sizes = method == METHOD_DEFLATE
             || receipt.packed_size >= SIZE_SENTINEL
-            || (decoded != 0 && encryption.is_some_and(|mode| mode.length == InputLength::Unknown));
+            || (decoded != 0 && encryption.is_some_and(|mode| mode.length() == InputLength::Unknown));
         let wide_offset = receipt.local_offset >= SIZE_SENTINEL;
         let (kind, dos_attributes) = if entry.payload_source().is_some() { (0o100000, 0) } else { (S_IFDIR, 0x10) };
         Ok(Self {
             method,
+            outer_method: if aes.is_some() { 99 } else { method },
+            aes,
             version: if wide_sizes || wide_offset { 45 } else { 20 },
             flags: (if entry.utf8 { FLAG_UTF8 } else { 0 })
                 | (if encryption.is_some() { FLAG_DESCRIPTOR | FLAG_ENCRYPTED } else { 0 }),
@@ -328,7 +398,7 @@ impl Member<'_> {
                 && header.name_len as usize == expected.name.len()
                 && header.comment_len as usize == expected.comment.len()
                 && framing.valid_flags(header.flags)
-                && header.method == framing.method
+                && header.method == framing.outer_method
                 && (header.mod_time, header.mod_date) == framing.dos
                 && header.version_needed == framing.version
                 && header.version_made_by == (u16::from(HOST_UNIX) << 8 | framing.version)
@@ -370,7 +440,7 @@ impl Member<'_> {
         ensure(
             local.version_needed == framing.version
                 && local.flags == self.central.header.flags
-                && local.method == framing.method
+                && local.method == framing.outer_method
                 && (local.mod_time, local.mod_date) == framing.dos
                 && local.crc32 == local_crc
                 && local.packed_size == framing.size_field(local_packed)
@@ -425,6 +495,19 @@ impl Member<'_> {
                     && field.body[1..] == mtime.to_le_bytes(),
                 "wrong modification-time extra",
             )?;
+        }
+        if let Some((strength, variant)) = self.framing.aes {
+            let field = fields
+                .next()
+                .transpose()
+                .map_err(|error| CreateError::Directory(error.into()))?
+                .ok_or(CreateError::Verification("missing AES extra"))?;
+            let mut expected = [0; 7];
+            expected[..2].copy_from_slice(&variant.wire().to_le_bytes());
+            expected[2..4].copy_from_slice(b"AE");
+            expected[4] = strength.wire();
+            expected[5..].copy_from_slice(&self.framing.method.to_le_bytes());
+            ensure(field.id == 0x9901 && field.body == expected, "AES extra differs from the request")?;
         }
         ensure(fields.next().is_none(), "unexpected or duplicate extra field")
     }
@@ -490,7 +573,7 @@ impl<'a, 'b> Reader<'a, 'b> {
         receipt: &EntryWritten,
         boundary: u64,
         buffer: &mut [u8],
-        encryption: Option<ZipCryptoExpectation<'_>>,
+        encryption: Option<EncryptionExpectation<'_>>,
     ) -> Result<bool> {
         let framing = Framing::new(expected, receipt, encryption)?;
         let record = Member { central, expected, receipt, framing };
@@ -500,8 +583,11 @@ impl<'a, 'b> Reader<'a, 'b> {
         let descriptor_len = if encryption.is_some() { if wide { 24 } else { 16 } } else { 0 };
         ensure(add(payload_end, descriptor_len)? == boundary, "new entry leaves a gap or overlaps the next record")?;
         if expected.payload_source().is_some() {
-            let password_check = encryption.map(|mode| (mode.password, (record.framing.dos.0 >> 8) as u8));
-            self.verify_payload((*receipt).into(), buffer, password_check)?;
+            let mut payload = Payload::from(*receipt);
+            if let Some(EncryptionExpectation::Aes(mode)) = encryption {
+                payload.crc32 = mode.plaintext_crc32;
+            }
+            self.verify_payload(payload, buffer, encryption, (record.framing.dos.0 >> 8) as u8)?;
             if encryption.is_some() {
                 let mut descriptor = [0; 24];
                 let descriptor = &mut descriptor[..descriptor_len as usize];
@@ -524,7 +610,7 @@ impl<'a, 'b> Reader<'a, 'b> {
 
     pub(in crate::zip) fn check_payload(&mut self, at: u64, payload: Payload, buffer: &mut [u8]) -> Result<()> {
         self.seek(at)?;
-        self.verify_payload(payload, buffer, None)?;
+        self.verify_payload(payload, buffer, None, 0)?;
         self.usage.payloads += 1;
         Ok(())
     }
@@ -545,7 +631,11 @@ impl<'a, 'b> Reader<'a, 'b> {
             let count = self.attempts.run(|| {
                 #[cfg(test)]
                 super::tests::event_io(super::tests::Event::VerifyRead, None)?;
-                self.file.read(bytes)
+                #[cfg(test)]
+                let size = bytes.len().min(super::tests::verify_read_cap());
+                #[cfg(not(test))]
+                let size = bytes.len();
+                self.file.read(&mut bytes[..size])
             })?;
             if count == 0 {
                 return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
@@ -668,18 +758,36 @@ impl<'a, 'b> Reader<'a, 'b> {
         &mut self,
         receipt: Payload,
         buffer: &mut [u8],
-        password_check: Option<(&str, u8)>,
+        encryption: Option<EncryptionExpectation<'_>>,
+        password_check: u8,
     ) -> Result<()> {
         let mut remaining = receipt.packed_size;
-        let mut cipher = if let Some((password, check)) = password_check {
+        let mut cipher = if let Some(EncryptionExpectation::ZipCrypto(mode)) = encryption {
             remaining =
                 remaining.checked_sub(ZIPCRYPTO_HEADER).ok_or(CreateError::Verification("short ZipCrypto header"))?;
             let mut header = [0; ZIPCRYPTO_HEADER as usize];
             self.read_exact(&mut header)?;
-            let mut cipher = ZipCrypto::new(password);
+            let mut cipher = ZipCrypto::new(mode.password);
             cipher.decrypt(&mut header);
-            ensure(header[11] == check, "ZipCrypto password hint differs")?;
-            Some(cipher)
+            ensure(header[11] == password_check, "ZipCrypto password hint differs")?;
+            Some(PayloadCipher::ZipCrypto(cipher))
+        } else if let Some(EncryptionExpectation::Aes(mode)) = encryption {
+            let (password, strength, _) = mode.request.parameters();
+            remaining =
+                remaining.checked_sub(strength.overhead()).ok_or(CreateError::Verification("short AES payload"))?;
+            let mut header = [0; 18];
+            let salt_len = strength.salt_bytes();
+            self.read_exact(&mut header[..salt_len + 2])?;
+            self.attempts.check_cancel()?;
+            let cipher = WinZipAesEncryptor::new(password.as_bytes(), &header[..salt_len], strength.key_bytes())
+                .ok_or(CreateError::Verification("invalid AES parameters"))?;
+            self.attempts.check_cancel()?;
+            use subtle::ConstantTimeEq;
+            ensure(
+                bool::from(cipher.verifier().ct_eq(&header[salt_len..salt_len + 2])),
+                "AES password verifier differs",
+            )?;
+            Some(PayloadCipher::Aes(cipher))
         } else {
             None
         };
@@ -720,13 +828,24 @@ impl<'a, 'b> Reader<'a, 'b> {
                 ensure(used != 0 || made != 0, "truncated or stalled raw Deflate payload")?;
             }
         }
+        if let Some(PayloadCipher::Aes(cipher)) = cipher {
+            let mut tag = [0; 10];
+            self.read_exact(&mut tag)?;
+            use subtle::ConstantTimeEq;
+            ensure(bool::from(cipher.tag().ct_eq(&tag)), "AES authentication tag differs")?;
+        }
         ensure(decoded == receipt.decoded_size && crc.finalize() == receipt.crc32, "decoded length or CRC differs")
     }
 
-    fn read_packed(&mut self, buffer: &mut [u8], cipher: &mut Option<ZipCrypto>) -> Result<()> {
+    fn read_packed(&mut self, buffer: &mut [u8], cipher: &mut Option<PayloadCipher>) -> Result<()> {
         self.read_exact(buffer)?;
         if let Some(cipher) = cipher {
-            cipher.decrypt(buffer);
+            match cipher {
+                PayloadCipher::ZipCrypto(cipher) => cipher.decrypt(buffer),
+                PayloadCipher::Aes(cipher) => {
+                    cipher.decrypt(buffer).ok_or(CreateError::Overflow)?;
+                }
+            }
         }
         Ok(())
     }
@@ -741,6 +860,12 @@ impl<'a, 'b> Reader<'a, 'b> {
         crc.update(bytes);
         Ok(())
     }
+}
+
+#[allow(clippy::large_enum_variant, reason = "fixed-size cipher state stays on the stack without an allocation")]
+enum PayloadCipher {
+    ZipCrypto(ZipCrypto),
+    Aes(WinZipAesEncryptor),
 }
 
 fn parser_error(error: DirectoryError) -> CreateError {
