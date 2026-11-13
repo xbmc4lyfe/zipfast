@@ -202,7 +202,7 @@ impl CreatePlan {
             |ordinal| {
                 let password = password?;
                 let source = self.entries[ordinal].payload_source()?;
-                Some(verify::ZipCryptoExpectation { password, length: InputLength::Exact(source.stamp.len) })
+                Some(verify::ZipCryptoExpectation { password, length: InputLength::Exact(source.stamp.len) }.into())
             },
         )
         .at(CreateStage::Verify)?;

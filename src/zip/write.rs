@@ -149,24 +149,24 @@ pub enum AesStrength {
 }
 
 impl AesStrength {
-    fn key_bytes(self) -> usize {
+    pub(in crate::zip) fn key_bytes(self) -> usize {
         match self {
             Self::Aes128 => 16,
             Self::Aes192 => 24,
             Self::Aes256 => 32,
         }
     }
-    fn salt_bytes(self) -> usize {
+    pub(in crate::zip) fn salt_bytes(self) -> usize {
         self.key_bytes() / 2
     }
-    fn wire(self) -> u8 {
+    pub(in crate::zip) fn wire(self) -> u8 {
         match self {
             Self::Aes128 => 1,
             Self::Aes192 => 2,
             Self::Aes256 => 3,
         }
     }
-    fn overhead(self) -> u64 {
+    pub(in crate::zip) fn overhead(self) -> u64 {
         self.salt_bytes() as u64 + 12
     }
 }
@@ -179,13 +179,13 @@ pub enum AesVariant {
 }
 
 impl AesVariant {
-    fn wire(self) -> u16 {
+    pub(in crate::zip) fn wire(self) -> u16 {
         match self {
             Self::Ae1 => 1,
             Self::Ae2 => 2,
         }
     }
-    fn wire_crc(self, plaintext: u32) -> u32 {
+    pub(in crate::zip) fn wire_crc(self, plaintext: u32) -> u32 {
         match self {
             Self::Ae1 => plaintext,
             Self::Ae2 => 0,
@@ -207,6 +207,10 @@ impl<'a> WinZipAesRequest<'a> {
             return Err(WriteError::InvalidMetadata("AES password must be 1 to 65,535 UTF-8 bytes without NUL"));
         }
         Ok(Self { password, strength, variant })
+    }
+
+    pub(in crate::zip) fn parameters(&self) -> (&'a str, AesStrength, AesVariant) {
+        (self.password, self.strength, self.variant)
     }
 }
 

@@ -1154,6 +1154,16 @@ impl WinZipAesEncryptor {
 
     pub(crate) fn encrypt(&mut self, bytes: &mut [u8]) -> Option<()> {
         self.hmac.inner.total_len.checked_add(bytes.len() as u64)?.checked_mul(8)?;
+        self.xor(bytes)?;
+        self.hmac.update(bytes)
+    }
+
+    pub(crate) fn decrypt(&mut self, bytes: &mut [u8]) -> Option<()> {
+        self.hmac.update(bytes)?;
+        self.xor(bytes)
+    }
+
+    fn xor(&mut self, bytes: &mut [u8]) -> Option<()> {
         for byte in bytes.iter_mut() {
             if self.used == self.stream.len() {
                 let mut carry = true;
@@ -1174,7 +1184,7 @@ impl WinZipAesEncryptor {
             *byte ^= self.stream[self.used];
             self.used += 1;
         }
-        self.hmac.update(bytes)
+        Some(())
     }
 
     pub(crate) fn tag(&self) -> [u8; 10] {
@@ -1368,6 +1378,24 @@ mod tests {
             }
             assert_eq!(bytes, &expected[salt_len + 2..expected.len() - 10]);
             assert_eq!(cipher.tag(), expected[expected.len() - 10..]);
+        }
+    }
+
+    #[test]
+    fn incremental_winzip_aes_decrypts_and_authenticates_original_vectors() {
+        for (strength, expected, plaintext) in AES_FIXTURES {
+            let key_len = (usize::from(strength) + 1) * 8;
+            let salt_len = key_len / 2;
+            for chunk in [1, 15, 16, 17, 63, 64, 65, 65536] {
+                let mut cipher =
+                    WinZipAesEncryptor::new(AES_PASSWORD.as_bytes(), &expected[..salt_len], key_len).unwrap();
+                let mut bytes = expected[salt_len + 2..expected.len() - 10].to_vec();
+                for block in bytes.chunks_mut(chunk) {
+                    cipher.decrypt(block).unwrap();
+                }
+                assert_eq!(bytes, plaintext);
+                assert_eq!(cipher.tag(), expected[expected.len() - 10..]);
+            }
         }
     }
 
