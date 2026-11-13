@@ -286,17 +286,31 @@ impl Drop for Extraction<'_> {
             if self.inspect_parents(parent).is_err() {
                 continue;
             }
-            let Ok(dir) = OpenOptions::new()
+            match OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
                 .open(&entry.path)
-            else {
-                continue;
-            };
-            if dir.metadata().is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == entry.identity) {
-                finish_file(&dir, &entry.meta);
+            {
+                Ok(dir) if dir.metadata().is_ok_and(|meta| (meta.dev(), meta.ino()) == entry.identity) => {
+                    finish_file(&dir, &entry.meta);
+                }
+                Err(error) if error.kind() == io::ErrorKind::PermissionDenied => restore_unreadable_mode(entry),
+                _ => {}
             }
         }
+    }
+}
+
+fn restore_unreadable_mode(entry: &DirectoryOutput) {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let Some(mode) = entry.meta.mode else { return };
+    let Ok(path) = CString::new(entry.path.as_os_str().as_bytes()) else { return };
+    if fs::symlink_metadata(&entry.path).is_ok_and(|meta| meta.is_dir() && (meta.dev(), meta.ino()) == entry.identity) {
+        // The controlled namespace keeps the checked directory bound
+        // between these calls. Refuse symlinks in the chmod call as well.
+        unsafe { libc::fchmodat(libc::AT_FDCWD, path.as_ptr(), (mode & 0o777) as _, libc::AT_SYMLINK_NOFOLLOW) };
     }
 }
 

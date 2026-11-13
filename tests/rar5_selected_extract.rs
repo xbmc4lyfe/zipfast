@@ -101,6 +101,25 @@ fn selected_extraction_orders_duplicates_preserves_metadata_and_refuses_unsafe_p
 }
 
 #[test]
+fn restores_mode_of_an_owned_unreadable_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.rar");
+    let member = FileSpec { dir: true, unix_mode: Some(0o750), ..FileSpec::new("folder", b"") };
+    fs::write(&path, archive(&[member])).unwrap();
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    let dest = dir.path().join("out");
+    let folder = dest.join("folder");
+    fs::create_dir_all(&folder).unwrap();
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o0)).unwrap();
+    let summary = session
+        .extract_selected(&selected, &options(&dest, Overwrite::Always), RarDecodeLimits::default(), |_| {})
+        .unwrap();
+    assert_eq!((summary.dirs, summary.failed), (1, 0));
+    assert_eq!(fs::metadata(&folder).unwrap().permissions().mode() & 0o777, 0o750);
+}
+
+#[test]
 fn last_selected_directory_record_sets_permissions() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("archive.rar");
