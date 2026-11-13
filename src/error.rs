@@ -98,7 +98,7 @@ pub enum RarScope {
 }
 
 /// Checks and framing violations found while reading a RAR archive.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum RarIntegrityReason {
     HeaderCrc,
@@ -134,7 +134,7 @@ pub enum RarIntegrityReason {
     },
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum RarUnsupported {
     ArchiveVersion(u8),
@@ -146,7 +146,7 @@ pub enum RarUnsupported {
     Decoder(String),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[non_exhaustive]
 pub enum RarResource {
     KdfExponent,
@@ -161,6 +161,8 @@ pub enum RarResource {
     CatalogueBlocks,
     CatalogueReadBytes,
     CatalogueAllocation,
+    SelectedPackedBytes,
+    SelectedDecodedBytes,
 }
 
 #[derive(Debug)]
@@ -211,6 +213,7 @@ pub enum RarFailure {
     MissingVolume { path: PathBuf },
     UnnamedVolume { path: PathBuf },
     SourceChanged { path: PathBuf },
+    ForeignSelection,
     Canceled,
     NotRar,
     Internal(RarInternal),
@@ -243,6 +246,7 @@ impl fmt::Display for RarFailure {
             Self::MissingVolume { path } => write!(f, "missing volume {}", path.display()),
             Self::UnnamedVolume { path } => write!(f, "cannot determine the next volume after {}", path.display()),
             Self::SourceChanged { path } => write!(f, "RAR source changed: {}", path.display()),
+            Self::ForeignSelection => f.write_str("RAR selection belongs to a different session"),
             Self::Canceled => f.write_str("RAR operation canceled"),
             Self::NotRar => f.write_str("not a RAR archive"),
             Self::Internal(reason) => write!(f, "RAR internal failure ({reason:?})"),
