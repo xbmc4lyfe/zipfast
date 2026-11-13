@@ -269,91 +269,362 @@ impl From<SourceCheckError> for ZipReadError {
         }
     }
 }
+/// Phase-local observations. Each physical phase is reported once, separately
+/// from the later action's encrypted and run accounting.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum BootstrapPhase {
+    /// Only the opportunistic identity attempt in a legacy constructor. Legacy
+    /// open/dispatch/parser calls are outside this partial snapshot.
+    LegacySourceProof,
+    SourceOpen,
+    ActionPlan,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct BootstrapUsage {
+    phase: BootstrapPhase,
+    attempts: u128,
+    bytes: u64,
+    metadata: u64,
+    dispatch_bytes: u64,
+    seeks: u64,
+    path_operations: u64,
+    opens: u64,
+    acquired_fds: u64,
+    acquisition_attempts: u64,
+    capacity: u64,
+    configuration_bytes: usize,
+    configuration_acquisitions: u64,
+    retirement: Option<CloseDisposition>,
+    source_retirement: Option<CloseDisposition>,
+    cwd_retirement: Option<CloseDisposition>,
+}
+impl BootstrapUsage {
+    pub fn phase(self) -> BootstrapPhase {
+        self.phase
+    }
+    pub fn attempts(self) -> u128 {
+        self.attempts
+    }
+    pub fn bytes(self) -> u64 {
+        self.bytes
+    }
+    pub fn metadata(self) -> u64 {
+        self.metadata
+    }
+    pub fn dispatch_bytes(self) -> u64 {
+        self.dispatch_bytes
+    }
+    pub fn seeks(self) -> u64 {
+        self.seeks
+    }
+    pub fn path_operations(self) -> u64 {
+        self.path_operations
+    }
+    pub fn opens(self) -> u64 {
+        self.opens
+    }
+    pub fn acquired_fds(self) -> u64 {
+        self.acquired_fds
+    }
+    pub fn acquisition_attempts(self) -> u64 {
+        self.acquisition_attempts
+    }
+    /// Sum of requested capacities for actual phase-local allocation attempts;
+    /// this is neither retained heap bytes nor process RSS.
+    pub fn capacity(self) -> u64 {
+        self.capacity
+    }
+    /// Requested caller-configuration metadata bytes, separate from payload scratch.
+    pub fn configuration_bytes(self) -> usize {
+        self.configuration_bytes
+    }
+    pub fn configuration_acquisitions(self) -> u64 {
+        self.configuration_acquisitions
+    }
+    pub fn source_retirement(self) -> Option<CloseDisposition> {
+        self.source_retirement
+    }
+    pub fn cwd_retirement(self) -> Option<CloseDisposition> {
+        self.cwd_retirement
+    }
+    pub fn retirement(self) -> Option<CloseDisposition> {
+        self.retirement
+    }
+}
+#[cfg(test)]
+#[derive(Clone, Copy)]
+pub(super) struct BootstrapTestFault {
+    pub(super) stage: Option<IoStage>,
+    pub(super) operation: ReadIoOperation,
+    pub(super) remaining: u64,
+    pub(super) errno: i32,
+    pub(super) deny_allocations: bool,
+}
+#[cfg(test)]
+thread_local! {pub(super) static BOOTSTRAP_FAULT:std::cell::Cell<Option<BootstrapTestFault>>=const {std::cell::Cell::new(None)};}
+#[cfg(test)]
+fn injected(stage: Option<IoStage>, operation: ReadIoOperation) -> Option<io::Error> {
+    BOOTSTRAP_FAULT.with(|s| {
+        let mut fault = s.get()?;
+        if fault.stage != stage || fault.operation != operation {
+            return None;
+        }
+        fault.remaining -= 1;
+        if fault.deny_allocations {
+            crate::test_alloc::REFUSE_ALLOCATIONS.with(|s| s.set(true));
+        }
+        s.set(if fault.remaining == 0 { None } else { Some(fault) });
+        Some(io::Error::from_raw_os_error(fault.errno))
+    })
+}
 /// Finite pre-catalogue accounting, independent of any encrypted quota.
 pub(crate) struct BootstrapIo {
     remaining_bytes: u64,
-    attempts: u128,
+    fetch_limit: u64,
     max_attempts: u128,
-    metadata: u8,
     retries: u64,
+    usage: BootstrapUsage,
+    eof: u8,
+    path_groups: u8,
+    resolution_attempts: u128,
+    retired_objects: u8,
 }
 impl BootstrapIo {
     pub(crate) fn new(fetch_bytes: u64, retries: u64) -> Result<Self, ReadFault> {
         let max_attempts = u128::from(fetch_bytes)
-            .checked_add(7)
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(15))
             .and_then(|v| v.checked_mul(u128::from(retries) + 1))
             .ok_or(ReadFault::CounterOverflow)?;
-        Ok(Self { remaining_bytes: fetch_bytes, attempts: 0, max_attempts, metadata: 6, retries })
+        Ok(Self {
+            remaining_bytes: fetch_bytes,
+            fetch_limit: fetch_bytes,
+            max_attempts,
+            retries,
+            usage: BootstrapUsage {
+                phase: BootstrapPhase::ActionPlan,
+                attempts: 0,
+                bytes: 0,
+                metadata: 0,
+                dispatch_bytes: 0,
+                seeks: 0,
+                path_operations: 0,
+                opens: 0,
+                acquired_fds: 0,
+                acquisition_attempts: 0,
+                capacity: 0,
+                configuration_bytes: 0,
+                configuration_acquisitions: 0,
+                retirement: None,
+                source_retirement: None,
+                cwd_retirement: None,
+            },
+            eof: 0,
+            path_groups: 0,
+            resolution_attempts: 0,
+            retired_objects: 0,
+        })
+    }
+    pub(super) fn legacy_proof() -> Result<Self, ReadFault> {
+        let mut state = Self::new(0, 16)?;
+        state.usage.phase = BootstrapPhase::LegacySourceProof;
+        Ok(state)
+    }
+    pub(super) fn opening() -> Result<Self, ReadFault> {
+        let mut state = Self::new(129 << 20, 16)?;
+        state.usage.phase = BootstrapPhase::SourceOpen;
+        Ok(state)
+    }
+    pub(super) fn usage(&self) -> BootstrapUsage {
+        self.usage
+    }
+    fn attempt(&mut self) -> Result<(), ReadFault> {
+        let attempted = self.usage.attempts.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+        budget::admit(ReadResource::BootstrapAttempts, self.max_attempts, attempted)?;
+        self.usage.attempts = attempted;
+        Ok(())
+    }
+    pub(super) fn resolve_charge(&mut self, charge: spool::ResolveCharge) -> Result<(), ReadFault> {
+        match charge {
+            spool::ResolveCharge::Group => {
+                self.path_groups = self.path_groups.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+                budget::admit(ReadResource::BootstrapMetadata, 5, self.path_groups.into())
+            }
+            spool::ResolveCharge::Attempt => {
+                let next = self.resolution_attempts.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+                budget::admit(ReadResource::BootstrapAttempts, 3 * (u128::from(self.retries) + 1), next)?;
+                self.resolution_attempts = next;
+                self.attempt()
+            }
+        }
+    }
+    pub(super) fn configuration_acquisition(&mut self, bytes: usize) -> Result<(), ReadFault> {
+        self.usage.configuration_acquisitions =
+            self.usage.configuration_acquisitions.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+        self.usage.configuration_bytes =
+            self.usage.configuration_bytes.checked_add(bytes).ok_or(ReadFault::CounterOverflow)?;
+        Ok(())
+    }
+    pub(super) fn acquisition(&mut self, capacity: usize) -> Result<(), ReadFault> {
+        self.usage.acquisition_attempts =
+            self.usage.acquisition_attempts.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+        self.usage.capacity = self.usage.capacity.checked_add(capacity as u64).ok_or(ReadFault::CounterOverflow)?;
+        Ok(())
+    }
+    /// Separate one-shot cwd/source close reservations, admitted before call.
+    pub(super) fn retire_once(
+        &mut self,
+        object: OwnedObject,
+        close: impl FnOnce() -> io::Result<()>,
+    ) -> Result<(), CleanupFault> {
+        let bit = match object {
+            OwnedObject::Source => 1,
+            OwnedObject::SourcePathDirectory => 2,
+            _ => 0,
+        };
+        let admitted = if bit == 0 || self.retired_objects & bit != 0 {
+            Err(ReadFault::InvalidPlan)
+        } else {
+            self.usage.attempts.checked_add(1).ok_or(ReadFault::CounterOverflow).map(|next| {
+                self.usage.attempts = next;
+                self.retired_objects |= bit;
+            })
+        };
+        let result = admitted.map_err(CleanupCause::Admission).and_then(|()| close().map_err(CleanupCause::Io));
+        let disposition = if result.is_ok() { CloseDisposition::Closed } else { CloseDisposition::Unresolved };
+        self.usage.retirement = Some(disposition);
+        match object {
+            OwnedObject::Source => self.usage.source_retirement = Some(disposition),
+            OwnedObject::SourcePathDirectory => self.usage.cwd_retirement = Some(disposition),
+            _ => {}
+        }
+        result.map_err(|cause| CleanupFault {
+            object,
+            operation: ReadIoOperation::Close,
+            offset: None,
+            cause,
+            close: disposition,
+        })
+    }
+    pub(super) fn dispatch(&mut self, bytes: u64) -> Result<(), ReadFault> {
+        let next = self.usage.dispatch_bytes.checked_add(bytes).ok_or(ReadFault::CounterOverflow)?;
+        budget::admit(ReadResource::BootstrapBytes, self.usage.bytes.into(), next.into())?;
+        self.usage.dispatch_bytes = next;
+        Ok(())
+    }
+    pub(super) fn call<T>(
+        &mut self,
+        operation: ReadIoOperation,
+        mut call: impl FnMut() -> io::Result<T>,
+    ) -> Result<T, ReadFault> {
+        let mut retries = 0u128;
+        loop {
+            self.attempt()?;
+            #[cfg(test)]
+            let result = match injected(None, operation) {
+                Some(error) => Err(error),
+                None => call(),
+            };
+            #[cfg(not(test))]
+            let result = call();
+            match result {
+                Ok(value) => return Ok(value),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    retries = retries.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+                    budget::admit(ReadResource::InterruptedRetries, self.retries.into(), retries)?;
+                }
+                Err(error) => return Err(ReadFault::Io { stage: IoStage::Bootstrap, operation, offset: 0, error }),
+            }
+        }
+    }
+    pub(super) fn path<T>(&mut self, call: impl FnMut() -> io::Result<T>) -> Result<T, ReadFault> {
+        budget::admit(ReadResource::BootstrapAttempts, 3, u128::from(self.usage.path_operations) + 1)?;
+        self.usage.path_operations += 1;
+        self.call(ReadIoOperation::Directory, call)
+    }
+    pub(super) fn opened<T>(&mut self, call: impl FnMut() -> io::Result<T>) -> Result<T, ReadFault> {
+        budget::admit(ReadResource::BootstrapAttempts, 1, u128::from(self.usage.opens) + 1)?;
+        self.usage.opens += 1;
+        let result = self.call(ReadIoOperation::Open, call);
+        if result.is_ok() {
+            self.usage.acquired_fds += 1;
+        }
+        result
     }
     pub(crate) fn stat<T>(
         &mut self,
         stage: IoStage,
         mut call: impl FnMut() -> io::Result<T>,
     ) -> Result<T, SourceCheckError> {
-        if self.metadata == 0 {
-            return Err(SourceCheckError::Admission(ReadFault::Limit {
-                resource: ReadResource::BootstrapMetadata,
-                limit: 6,
-                attempted: 7,
-            }));
-        }
-        self.metadata -= 1;
-        let mut retries = 0;
+        budget::admit(ReadResource::BootstrapMetadata, 6, u128::from(self.usage.metadata) + 1)
+            .map_err(SourceCheckError::Admission)?;
+        self.usage.metadata += 1;
+        let mut retries = 0u64;
         loop {
-            if self.attempts >= self.max_attempts {
-                return Err(SourceCheckError::Admission(ReadFault::Limit {
-                    resource: ReadResource::BootstrapAttempts,
-                    limit: self.max_attempts,
-                    attempted: self
-                        .attempts
-                        .checked_add(1)
-                        .ok_or(SourceCheckError::Admission(ReadFault::CounterOverflow))?,
-                }));
-            }
-            self.attempts += 1;
-            match call() {
+            self.attempt().map_err(SourceCheckError::Admission)?;
+            #[cfg(test)]
+            let result = match injected(Some(stage), ReadIoOperation::Stat) {
+                Some(error) => Err(error),
+                None => call(),
+            };
+            #[cfg(not(test))]
+            let result = call();
+            match result {
                 Ok(value) => return Ok(value),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted && retries < self.retries => {
-                    retries += 1;
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                    retries = retries.checked_add(1).ok_or(SourceCheckError::Admission(ReadFault::CounterOverflow))?;
+                    budget::admit(ReadResource::InterruptedRetries, self.retries.into(), retries.into())
+                        .map_err(SourceCheckError::Admission)?;
                 }
                 Err(error) => return Err(SourceCheckError::Source(CheckedSourceFault::Unavailable { stage, error })),
             }
         }
     }
-    #[allow(dead_code)] // Task4 parser bootstrap will consume this finite fetch wrapper.
+    pub(super) fn seek(&mut self, file: &mut impl Seek, at: u64, cancel: &Cancellation) -> Result<(), ReadFault> {
+        canceled(Some(cancel))?;
+        budget::admit(
+            ReadResource::BootstrapAttempts,
+            u128::from(self.fetch_limit) + 2,
+            u128::from(self.usage.seeks) + 1,
+        )?;
+        self.usage.seeks += 1;
+        let actual = self.call(ReadIoOperation::Seek, || file.seek(SeekFrom::Start(at)))?;
+        if actual != at {
+            return Err(ReadFault::CheckedFormat { reason: "incorrect source seek" });
+        }
+        Ok(())
+    }
     pub(super) fn read(
         &mut self,
         reader: &mut (impl Read + ?Sized),
         bytes: &mut [u8],
         cancel: &Cancellation,
     ) -> Result<usize, ReadFault> {
+        canceled(Some(cancel))?;
+        if self.eof >= 3 {
+            return Err(ReadFault::Limit { resource: ReadResource::BootstrapAttempts, limit: 3, attempted: 4 });
+        }
         let count = bytes.len().min(WINDOW).min(self.remaining_bytes.min(WINDOW as u64) as usize);
         if count == 0 {
-            return Err(ReadFault::InvalidPlan);
+            return Err(ReadFault::Limit {
+                resource: ReadResource::BootstrapBytes,
+                limit: self.fetch_limit.into(),
+                attempted: u128::from(self.usage.bytes) + 1,
+            });
         }
-        let mut retries = 0;
-        loop {
-            canceled(Some(cancel))?;
-            if self.attempts >= self.max_attempts {
-                return Err(ReadFault::InvalidPlan);
-            }
-            self.attempts += 1;
-            match reader.read(&mut bytes[..count]) {
-                Ok(n) => {
-                    self.remaining_bytes -= n as u64;
-                    return Ok(n);
-                }
-                Err(e) if e.kind() == io::ErrorKind::Interrupted && retries < self.retries => retries += 1,
-                Err(error) => {
-                    return Err(ReadFault::Io {
-                        stage: IoStage::Bootstrap,
-                        operation: ReadIoOperation::Read,
-                        offset: 0,
-                        error,
-                    });
-                }
-            }
+        let n = self.call(ReadIoOperation::Read, || reader.read(&mut bytes[..count]))?;
+        if n > count {
+            return Err(ReadFault::CheckedFormat { reason: "reader exceeded requested slice" });
         }
+        if n == 0 {
+            self.eof += 1;
+            budget::admit(ReadResource::BootstrapAttempts, 3, self.eof.into())?;
+        }
+        self.remaining_bytes -= n as u64;
+        self.usage.bytes += n as u64;
+        Ok(n)
     }
 }
 

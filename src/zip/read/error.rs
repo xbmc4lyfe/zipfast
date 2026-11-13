@@ -98,6 +98,7 @@ pub enum IntegrityReason {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ReadResource {
+    BootstrapBytes,
     BootstrapMetadata,
     BootstrapAttempts,
     MemberPackedBytes,
@@ -125,6 +126,7 @@ pub enum ReadResource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RunCategory {
+    SourceSeeks,
     Records,
     SourceCheckGroups,
     PathSteps,
@@ -142,6 +144,7 @@ pub enum RunCategory {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ReadFault {
+    Directory { error: zip_container::DirectoryError },
     PasswordRequired,
     PasswordCheckFailed { cipher: CipherKind },
     AuthenticationFailed,
@@ -149,6 +152,7 @@ pub enum ReadFault {
     Limit { resource: ReadResource, limit: u128, attempted: u128 },
     Allocation { capacity: usize },
     Io { stage: IoStage, operation: ReadIoOperation, offset: u64, error: io::Error },
+    UnsupportedCheckedFormat,
     UnsupportedIdentity,
     UnsupportedMethod { method: u16 },
     CheckedFormat { reason: &'static str },
@@ -187,6 +191,7 @@ pub enum CloseDisposition {
 #[non_exhaustive]
 pub enum OwnedObject {
     Source,
+    SourcePathDirectory,
     Output,
     OutputParent,
     Ciphertext,
@@ -245,11 +250,15 @@ pub struct ZipReadError {
     publication: PublicationState,
     accepted_output_bytes: u64,
     usage: OperationUsage,
+    bootstrap: Option<super::io::BootstrapUsage>,
+    parser_usage: Option<crate::zip::Usage>,
 }
 impl ZipReadError {
     fn empty(primary: ZipReadErrorKind) -> Self {
         Self {
             primary,
+            bootstrap: None,
+            parser_usage: None,
             operation: None,
             sink: None,
             diagnostic: None,
@@ -261,6 +270,20 @@ impl ZipReadError {
             accepted_output_bytes: 0,
             usage: OperationUsage::default(),
         }
+    }
+    pub fn parser_usage(&self) -> Option<crate::zip::Usage> {
+        self.parser_usage
+    }
+    pub(super) fn with_parser_usage(mut self, usage: crate::zip::Usage) -> Self {
+        self.parser_usage = Some(usage);
+        self
+    }
+    pub fn bootstrap_usage(&self) -> Option<super::io::BootstrapUsage> {
+        self.bootstrap
+    }
+    pub(super) fn with_bootstrap(mut self, usage: super::io::BootstrapUsage) -> Self {
+        self.bootstrap = Some(usage);
+        self
     }
     pub fn kind(&self) -> ZipReadErrorKind {
         self.primary
@@ -338,7 +361,7 @@ impl ZipReadError {
             let existing = self.cleanup_errors().filter(|old| old.object == fault.object).count();
             assert!(existing < 8, "eight terminal operations per object exceeded");
             let index = usize::from(self.cleanup_len);
-            assert!(index < self.cleanup.len(), "five object cleanup bound exceeded");
+            assert!(index < self.cleanup.len(), "phase-exclusive forty-slot cleanup bound exceeded");
             self.cleanup[index] = Some(fault);
             self.cleanup_len += 1;
         }

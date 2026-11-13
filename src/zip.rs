@@ -198,6 +198,9 @@ impl ReadDescription<'_> {
     }
 }
 
+pub(crate) fn check_selected_legacy(entry: &ZipEntry, limit: u64) -> Result<()> {
+    check_selection(entry.is_dir(), entry.is_link(), entry.packed, entry.size, limit)
+}
 fn check_selection(is_dir: bool, is_link: bool, packed: u64, size: u64, limit: u64) -> Result<()> {
     if is_dir || is_link {
         return Err(Error::Unsupported("the selected ZIP entry is not a regular file".into()));
@@ -295,27 +298,7 @@ impl Archive {
         let mut file = File::open(path)?;
         let len = file.metadata()?.len();
         check_cancel(cancel)?;
-        let parser = DirectoryParser::with_projection_and_name_crc32(
-            len,
-            Profile::Zipfast,
-            Limits::default(),
-            crate::crc32::hash,
-            project_record,
-        )
-        .map_err(directory_error)?;
-        let directory = read_directory(&mut file, len, parser, cancel)?;
-        let mut entries = directory.entries;
-        if directory.prefix_shift != 0 {
-            for entry in &mut entries {
-                check_cancel(cancel)?;
-                entry.local_at = entry
-                    .local_at
-                    .checked_add(directory.prefix_shift)
-                    .filter(|&at| at < len)
-                    .ok_or(Error::Corrupt("local header offset"))?;
-            }
-        }
-        check_cancel(cancel)?;
+        let (entries, _) = read_projected_legacy(&mut file, len, cancel)?;
         Ok(Archive { file, len, entries })
     }
 
@@ -352,6 +335,44 @@ impl Archive {
         let mut buffer = vec![0; BUF];
         read_entry(&mut self.file, self.len, &entry, password, &mut buffer, &mut sink, cancel)
     }
+}
+
+fn projected_parser(len: u64, limits: Limits) -> std::result::Result<DirectoryParser<ZipEntry>, DirectoryError> {
+    DirectoryParser::with_projection_and_name_crc32(len, Profile::Zipfast, limits, crate::crc32::hash, project_record)
+}
+fn relocate_projected(
+    entries: &mut [ZipEntry],
+    shift: u64,
+    len: u64,
+    cancel: Option<&Cancellation>,
+) -> std::result::Result<(), read::ReadFault> {
+    if shift != 0 {
+        for entry in entries {
+            if cancel.is_some_and(Cancellation::is_canceled) {
+                return Err(read::ReadFault::Cancelled);
+            }
+            entry.local_at = entry
+                .local_at
+                .checked_add(shift)
+                .filter(|at| *at < len)
+                .ok_or(read::ReadFault::CheckedFormat { reason: "invalid local header offset" })?;
+        }
+    }
+    Ok(())
+}
+fn read_projected_legacy(file: &mut File, len: u64, cancel: Option<&Cancellation>) -> Result<(Vec<ZipEntry>, Usage)> {
+    let parser = projected_parser(len, Limits::default()).map_err(directory_error)?;
+    let directory = read_directory(file, len, parser, cancel)?;
+    let usage = directory.usage;
+    let mut entries = directory.entries;
+    relocate_projected(&mut entries, directory.prefix_shift, len, cancel).map_err(|fault| match fault {
+        read::ReadFault::Cancelled => {
+            Error::Io(std::io::Error::new(std::io::ErrorKind::ConnectionAborted, "operation canceled"))
+        }
+        _ => Error::Corrupt("local header offset"),
+    })?;
+    check_cancel(cancel)?;
+    Ok((entries, usage))
 }
 
 /// Where an entry's data starts, from its local header.
@@ -622,6 +643,8 @@ fn stream_decoder<'a>(e: &ReadDescription<'_>, method: u16, packed: impl BufRead
 }
 
 fn project_record(record: ReducedCentralRecord<'_>) -> std::result::Result<ZipEntry, DirectoryError> {
+    #[cfg(test)]
+    read::observe_projected(2);
     let view = record.view();
     let known = record.known();
     project_entry(
@@ -707,6 +730,8 @@ fn cp437(byte: u8) -> char {
 }
 
 fn decode_name(raw: &[u8], utf8: bool) -> std::result::Result<String, DirectoryError> {
+    #[cfg(test)]
+    read::observe_projected(3);
     // Many tools write valid UTF-8 without setting the flag.
     if let Ok(valid) = std::str::from_utf8(raw) {
         let mut name = String::new();

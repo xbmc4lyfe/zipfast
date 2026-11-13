@@ -448,8 +448,9 @@ fn all_record_geometry_categories_have_exact_finite_allowances() {
         output_encrypted: true,
     };
     bind_plan(&mut state, budget::ActionPlan::derive(geometry, 16, 16).unwrap());
-    let m = 3 * 32 + 5 * 60 + 12 * 16 * 2 + 8 + 32 + 36 + 16;
+    let m = 3 * 32 + 5 * 60 + 12 * 16 * 2 + 8 + 32 + 36 + 16 + 2;
     for (category, exact) in [
+        (RunCategory::SourceSeeks, 2),
         (RunCategory::Records, 3),
         (RunCategory::SourceCheckGroups, 32),
         (RunCategory::PathSteps, 60),

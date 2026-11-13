@@ -143,9 +143,10 @@ impl From<Error> for SessionError {
 /// Callers should stage sink bytes and publish them only after a successful
 /// read and a final caller cancellation check.
 pub struct ReadSession {
-    file: File,
-    source: SourceBinding,
-    metadata: Arc<Metadata>,
+    pub(super) file: File,
+    pub(super) source: SourceBinding,
+    pub(super) metadata: Arc<Metadata>,
+    pub(super) checked_identity: u64,
     dispatch_bytes: u64,
 }
 
@@ -201,7 +202,14 @@ impl ReadSession {
         })();
         let metadata = source.finish_checked(&file, parsed)?;
         check_cancel(Some(cancel))?;
-        Ok(Self { file, source, metadata: Arc::new(metadata), dispatch_bytes })
+        Ok(Self {
+            file,
+            source,
+            metadata: Arc::new(metadata),
+            dispatch_bytes,
+            checked_identity: super::read::projected_identity()
+                .map_err(|_| Error::Corrupt("ZIP identity counter exhausted"))?,
+        })
     }
 
     /// Source bytes fetched by format dispatch before ZIP directory parsing.
@@ -222,6 +230,7 @@ impl ReadSession {
     /// The first observation is moved out; subsequent checks return a Copy invalidation code.
     #[allow(clippy::result_large_err)] // Fixed inline terminal evidence must survive allocation refusal.
     pub fn check_source_checked(&mut self, context: &mut EncryptedReadContext) -> ZipReadResult<()> {
+        context.verify_identity(self.checked_identity)?;
         if let Some(fault) = self.source.previous_invalidation() {
             return Err(ZipReadError::from(fault).with_usage(context.usage(), context.run_usage()));
         }
@@ -254,7 +263,7 @@ impl ReadSession {
         let entry = self.metadata.view(ordinal);
         check_selection(entry.is_dir(), entry.is_link(), entry.packed_size(), entry.size(), max_bytes)?;
         let relative_path = sanitize(entry.name(), entry.creator_host() != HOST_UNIX)?;
-        Ok(SelectedZipEntry { session: self, ordinal, relative_path, cancel })
+        Ok(SelectedZipEntry { session: self, ordinal, relative_path, cancel, max_bytes })
     }
 }
 
@@ -330,8 +339,22 @@ struct SessionIdentity {
 /// An opaque reference to one central-directory ordinal in one snapshot.
 #[derive(Clone, Debug)]
 pub struct EntryId {
-    identity: Arc<SessionIdentity>,
-    ordinal: usize,
+    identity: EntryIdentity,
+    pub(super) ordinal: usize,
+}
+
+#[derive(Clone, Debug)]
+enum EntryIdentity {
+    Canonical(Arc<SessionIdentity>),
+    Projected(u64),
+}
+impl EntryId {
+    pub(super) fn projected(identity: u64, ordinal: usize) -> Self {
+        Self { identity: EntryIdentity::Projected(identity), ordinal }
+    }
+    pub(super) fn is_projected(&self, identity: u64) -> bool {
+        matches!(self.identity, EntryIdentity::Projected(id) if id == identity)
+    }
 }
 
 /// The immutable ZIP directory and archive envelope from a successfully opened session.
@@ -375,11 +398,14 @@ impl Metadata {
 
     /// Returns an ID for an ordinal in central order.
     pub fn entry_id(&self, ordinal: usize) -> Option<EntryId> {
-        (ordinal < self.len()).then(|| EntryId { identity: Arc::clone(&self.identity), ordinal })
+        (ordinal < self.len())
+            .then(|| EntryId { identity: EntryIdentity::Canonical(Arc::clone(&self.identity)), ordinal })
     }
 
     pub(super) fn ordinal(&self, id: &EntryId) -> SessionResult<usize> {
-        if !Arc::ptr_eq(&id.identity, &self.identity) || id.ordinal >= self.len() {
+        if !matches!(&id.identity, EntryIdentity::Canonical(identity) if Arc::ptr_eq(identity, &self.identity))
+            || id.ordinal >= self.len()
+        {
             return Err(SessionError::ForeignEntryId);
         }
         Ok(id.ordinal)
@@ -709,7 +735,7 @@ impl<'a> EntryMetadata<'a> {
         self.entry.modified
     }
 
-    fn read_description(self) -> ReadDescription<'a> {
+    pub(super) fn read_description(self) -> ReadDescription<'a> {
         ReadDescription {
             name: self.name(),
             flags: self.entry.header.flags,
@@ -729,6 +755,7 @@ pub struct SelectedZipEntry<'a> {
     ordinal: usize,
     relative_path: PathBuf,
     cancel: Cancellation,
+    max_bytes: u64,
 }
 
 impl SelectedZipEntry<'_> {
@@ -757,6 +784,30 @@ impl SelectedZipEntry<'_> {
         self.metadata().modified()
     }
 
+    /// Streams this original selection under its bound single-use action.
+    #[allow(clippy::result_large_err)]
+    pub fn read_with_context(
+        self,
+        password: Option<&str>,
+        context: &mut EncryptedReadContext,
+        mut sink: impl FnMut(&[u8]) -> super::read::ZipSinkResult<()>,
+    ) -> ZipReadResult<()> {
+        let Self { session, ordinal, cancel, max_bytes, .. } = self;
+        let e = session.metadata.view(ordinal).read_description();
+        super::read::checked_read(
+            &mut session.file,
+            &mut session.source,
+            session.checked_identity,
+            ordinal,
+            e,
+            password,
+            max_bytes,
+            &cancel,
+            context,
+            &mut sink,
+        )
+    }
+
     /// Decodes and verifies the complete entry. Every sink byte is provisional
     /// until this returns success. Caller output publication is a separate step.
     ///
@@ -779,14 +830,17 @@ impl SelectedZipEntry<'_> {
     }
 }
 
-struct SourceBinding {
-    path: PathBuf,
-    stamp: SourceStamp,
+pub(super) struct SourceBinding {
+    pub(super) path: PathBuf,
+    pub(super) stamp: SourceStamp,
     invalid: Option<SourceChange>,
     checked_invalid: Option<(SourceInvalidationCode, Option<i32>)>,
 }
 
 impl SourceBinding {
+    pub(super) fn from_checked(path: PathBuf, stamp: SourceStamp) -> Self {
+        Self { path, stamp, invalid: None, checked_invalid: None }
+    }
     fn capture(file: &File, path: PathBuf) -> SessionResult<Self> {
         let stamp = SourceStamp::capture(file, &path)
             .map_err(|change| SessionError::SourceChanged { change, context: None })?;
@@ -800,7 +854,7 @@ impl SourceBinding {
         }
     }
 
-    fn previous_invalidation(&self) -> Option<CheckedSourceFault> {
+    pub(super) fn previous_invalidation(&self) -> Option<CheckedSourceFault> {
         if let Some((code, raw_os_error)) = self.checked_invalid {
             return Some(CheckedSourceFault::PreviouslyInvalidated { code, raw_os_error });
         }
@@ -814,29 +868,34 @@ impl SourceBinding {
         }
         None
     }
-    fn verify_checked(
+    pub(super) fn verify_checked(
         &mut self,
         file: &File,
         context: &mut EncryptedReadContext,
     ) -> std::result::Result<(), SourceCheckError> {
+        self.verify_with(file, |stage, call| context.source_stat(stage, call))
+    }
+    pub(super) fn verify_with(
+        &mut self,
+        file: &File,
+        stat: impl FnMut(
+            IoStage,
+            &mut dyn FnMut() -> io::Result<SourceStamp>,
+        ) -> std::result::Result<SourceStamp, SourceCheckError>,
+    ) -> std::result::Result<(), SourceCheckError> {
         if let Some(fault) = self.previous_invalidation() {
             return Err(SourceCheckError::Source(fault));
         }
-        let result = SourceStamp::capture_checked(file, &self.path, |stage, call| context.source_stat(stage, call))
-            .and_then(|stamp| {
-                if stamp == self.stamp {
-                    Ok(())
-                } else {
-                    Err(SourceCheckError::Source(CheckedSourceFault::StampMismatch))
-                }
-            });
+        let result = SourceStamp::capture_checked(file, &self.path, stat).and_then(|stamp| {
+            if stamp == self.stamp { Ok(()) } else { Err(SourceCheckError::Source(CheckedSourceFault::StampMismatch)) }
+        });
         if let Err(SourceCheckError::Source(fault)) = &result {
             self.checked_invalid = Some(fault.invalidation());
         }
         result
     }
 
-    fn verify(&mut self, file: &File) -> std::result::Result<(), SourceChange> {
+    pub(super) fn verify(&mut self, file: &File) -> std::result::Result<(), SourceChange> {
         if let Some(change) = &self.invalid {
             return Err(change.clone());
         }
@@ -861,9 +920,9 @@ impl SourceBinding {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SourceStamp {
     regular: bool,
-    len: u64,
-    dev: u64,
-    ino: u64,
+    pub(super) len: u64,
+    pub(super) dev: u64,
+    pub(super) ino: u64,
     mtime: (i64, i64),
     ctime: (i64, i64),
 }

@@ -19,6 +19,13 @@ mod budget;
 mod cipher;
 mod codecs;
 mod error;
+mod projected;
+pub use io::{BootstrapPhase, BootstrapUsage};
+pub use projected::ProjectedReadSession;
+#[cfg(test)]
+pub(in crate::zip) use projected::observe as observe_projected;
+pub(crate) use projected::{CheckedOpen, ProjectedOwner};
+pub(in crate::zip) use projected::{checked_read, identity as projected_identity};
 pub(super) mod io;
 mod shared;
 mod spool;
@@ -113,14 +120,38 @@ pub struct EncryptedReadContext {
     ledger: ContextLedger,
     options: EncryptedReadOptions,
     bootstrap: io::BootstrapIo,
+    action: Option<projected::Action>,
+    temp: Option<spool::ResolvedTempDirectory>,
+}
+impl Drop for EncryptedReadContext {
+    fn drop(&mut self) {
+        if let Some(temp) = self.temp.take() {
+            let result = temp.finish_capacity(&self.ledger);
+            debug_assert!(result.is_ok(), "same ledger owns temporary path capacity");
+        }
+        if let Some(action) = self.action.take() {
+            drop(action.destination);
+        }
+    }
 }
 impl EncryptedReadContext {
+    pub(in crate::zip) fn verify_identity(&self, identity: u64) -> Result<(), ReadFault> {
+        if let Some(action) = &self.action {
+            if action.identity != identity {
+                return Err(ReadFault::InvalidPlan);
+            }
+            self.ledger.with_state(|s| s.verify_action(action))?;
+        }
+        Ok(())
+    }
     // Fixed inline terminal evidence (measured in core tests) cannot be boxed on failure.
     #[allow(clippy::result_large_err)]
     pub fn new(options: EncryptedReadOptions) -> ZipReadResult<Self> {
         let state = budget::LedgerState::new(&options)?;
-        let bootstrap = io::BootstrapIo::new(129 << 20, options.limits.interrupted_retries)?;
-        Ok(Self { ledger: ContextLedger::try_new(state)?, options, bootstrap })
+        let mut bootstrap = io::BootstrapIo::new(129 << 20, options.limits.interrupted_retries)?;
+        bootstrap.acquisition(shared::SHARED_LEDGER_CAPACITY)?;
+        let ledger = ContextLedger::try_new(state).map_err(|error| error.with_bootstrap(bootstrap.usage()))?;
+        Ok(Self { ledger, options, bootstrap, action: None, temp: None })
     }
     pub(in crate::zip) fn source_group(&mut self, source: super::session::SourceStamp) -> Result<(), ReadFault> {
         self.ledger.with_state(|s| {
@@ -144,11 +175,15 @@ impl EncryptedReadContext {
             self.ledger.with_state(|s| s.attempt(false)).map_err(io::SourceCheckError::Admission)?;
             match call() {
                 Ok(value) => return Ok(value),
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::Interrupted
-                        && retries < self.options.limits.interrupted_retries =>
-                {
-                    retries += 1
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    retries =
+                        retries.checked_add(1).ok_or(io::SourceCheckError::Admission(ReadFault::CounterOverflow))?;
+                    budget::admit(
+                        ReadResource::InterruptedRetries,
+                        self.options.limits.interrupted_retries.into(),
+                        retries.into(),
+                    )
+                    .map_err(io::SourceCheckError::Admission)?;
                 }
                 Err(error) => {
                     return Err(io::SourceCheckError::Source(CheckedSourceFault::Unavailable { stage, error }));

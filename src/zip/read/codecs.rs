@@ -77,11 +77,8 @@ pub(super) struct ClearInput<'a, 's> {
 }
 #[allow(clippy::large_enum_variant)] // Inline authenticated capability (528 bytes); no extra owner/allocation.
 pub(super) enum PlainInput<'a, 's> {
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 consumes the retained clear capability.
     Clear(ClearInput<'a, 's>),
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 consumes accepted weak-header capability.
     ZipCrypto(ZipCryptoInput<'a, 's>),
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 supplies only post-HMAC owned capability.
     Aes(AuthenticatedAes<'a, 's>),
 }
 impl PlainInput<'_, '_> {
@@ -195,12 +192,10 @@ fn observe_native(ledger: LedgerView<'_>, encrypted: bool, produced: usize, work
     Ok(())
 }
 #[derive(Debug)]
-#[cfg_attr(not(test), allow(dead_code))] // Task4 verifies the exact completed C/U receipt.
 pub(super) struct DecodeReceipt {
     pub(super) consumed: u64,
     pub(super) decoded: u64,
 }
-#[cfg_attr(not(test), allow(dead_code))] // Task4 checked streaming member path; receipt follows explicit input finish.
 #[allow(clippy::result_large_err)] // Fixed inline terminal evidence; includes input cleanup errors.
 pub(super) fn decode(
     mut input: PlainInput<'_, '_>,

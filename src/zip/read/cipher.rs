@@ -28,21 +28,36 @@ use std::io::Read;
 use subtle::ConstantTimeEq;
 
 /// A retained source, with a checked final observation; never a reopened path.
+#[derive(Clone, Copy, Default)]
+pub(super) struct PrepareReceipt {
+    pub(super) time: Option<u8>,
+}
 pub(super) trait CiphertextSource: Read {
+    #[allow(clippy::result_large_err)] // Fixed inline terminal evidence, including failed preparation.
+    fn prepare_member(
+        &mut self,
+        _plan: &budget::MemberPlan,
+        _ledger: LedgerView<'_>,
+        _cancel: &Cancellation,
+    ) -> ZipReadResult<PrepareReceipt> {
+        Ok(PrepareReceipt::default())
+    }
     fn verify_source(&mut self, ledger: LedgerView<'_>) -> Result<(), io::SourceCheckError>;
 }
 /// Adapter for the retained Session/SourceBinding check in Task4. The closure
 /// may inspect the borrowed context because no ledger RefMut crosses a call.
-#[cfg_attr(not(test), allow(dead_code))] // Task4 retained source adapter; tests provide real checked sources.
+#[cfg(test)]
 pub(super) struct CheckedInput<R, F> {
     pub(super) reader: R,
     pub(super) check: F,
 }
+#[cfg(test)]
 impl<R: Read, F> Read for CheckedInput<R, F> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
         self.reader.read(bytes)
     }
 }
+#[cfg(test)]
 impl<R: Read, F: FnMut(LedgerView<'_>) -> Result<(), io::SourceCheckError>> CiphertextSource for CheckedInput<R, F> {
     fn verify_source(&mut self, ledger: LedgerView<'_>) -> Result<(), io::SourceCheckError> {
         (self.check)(ledger)
@@ -104,11 +119,8 @@ pub(super) fn checked<T>(
 }
 #[derive(Clone, Copy)]
 pub(super) enum InputKind {
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 clear-member dispatcher.
     Clear,
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 encrypted-member dispatcher.
     ZipCrypto { descriptor: bool, time: u8 },
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 AES metadata dispatcher.
     Aes { strength: u8, version: u16 },
 }
 /// Owns one charged member attempt and the original source borrow. No decoder
@@ -122,7 +134,6 @@ pub(super) struct Admission<'a, 's, 'p> {
     key_len: usize,
 }
 impl<'a, 's, 'p> Admission<'a, 's, 'p> {
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 admission precedes workspace acquisition.
     #[allow(clippy::result_large_err)] // Fixed inline terminal evidence.
     pub(super) fn new(
         ledger: &'a impl LedgerAccess,
@@ -190,7 +201,19 @@ impl<'a, 's, 'p> Admission<'a, 's, 'p> {
         };
         Ok(Self { ledger: view, source, plan, password: password.unwrap_or(""), kind, key_len })
     }
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 consumes proof before copy/auth/decode.
+    #[allow(clippy::result_large_err)]
+    pub(super) fn prepare(mut self, cancel: &Cancellation) -> ZipReadResult<Self> {
+        let result = self.source.prepare_member(&self.plan, self.ledger, cancel);
+        match checked(result, self.source, self.ledger) {
+            Ok(receipt) => {
+                if let (InputKind::ZipCrypto { time, .. }, Some(actual)) = (&mut self.kind, receipt.time) {
+                    *time = actual;
+                }
+                Ok(self)
+            }
+            Err(error) => Err(error),
+        }
+    }
     #[allow(clippy::result_large_err)] // Fixed inline errors, including refused source completion.
     pub(super) fn workspace(self) -> ZipReadResult<(Self, super::codecs::Workspace<'a>)> {
         match super::codecs::Workspace::acquire(self.ledger, &self.plan) {
@@ -198,12 +221,11 @@ impl<'a, 's, 'p> Admission<'a, 's, 'p> {
             Err(error) => checked(Err(error), self.source, self.ledger),
         }
     }
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 aborts after lazy-directory/pre-cipher dispatch failure.
     #[allow(clippy::result_large_err)] // Same typed source finalization; admission owns no payload yet.
+    #[cfg(test)] // Already-positioned source controls; production preparation owns this finalization.
     pub(super) fn finish(self, result: ZipReadResult<()>) -> ZipReadResult<()> {
         checked(result, self.source, self.ledger)
     }
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 clear dispatch consumes admitted retained source.
     #[allow(clippy::result_large_err)] // Fixed inline evidence.
     pub(super) fn clear(self) -> ZipReadResult<super::codecs::PlainInput<'a, 's>> {
         if !matches!(self.kind, InputKind::Clear) {
@@ -235,7 +257,6 @@ impl<'a, 's> PendingAes<'a, 's> {
             Admission::new(ledger, source, plan, password, InputKind::Aes { strength, version: vendor_version })?;
         Self::copy_admitted(admission, Some(directory), scratch, cancel)
     }
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 consumes admitted proof after workspace acquisition.
     #[allow(clippy::result_large_err)] // Fixed inline terminal evidence.
     pub(super) fn copy_admitted(
         admission: Admission<'a, 's, '_>,
@@ -299,7 +320,6 @@ impl<'a, 's> PendingAes<'a, 's> {
         })
     }
     #[allow(clippy::result_large_err)]
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 authenticates before constructing the Task3 pump.
     pub(super) fn authenticate(
         mut self,
         scratch: &mut [u8],
@@ -345,7 +365,7 @@ impl<'a, 's> PendingAes<'a, 's> {
         })
     }
     #[allow(clippy::result_large_err)]
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 explicit pre-authentication abort.
+    #[cfg(test)] // Standalone pre-authentication abort controls.
     pub(super) fn finish(self, result: ZipReadResult<()>) -> ZipReadResult<()> {
         let result = match self.owned.finish() {
             Ok(()) => result,
@@ -417,7 +437,6 @@ impl<'a, 's> ZipCryptoInput<'a, 's> {
             Admission::new(ledger, source, plan, password, InputKind::ZipCrypto { descriptor, time: local_time_high })?;
         Self::open_admitted(admission, cancel)
     }
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 consumes admitted ZipCrypto proof after workspace acquisition.
     #[allow(clippy::result_large_err)] // Fixed inline terminal evidence.
     pub(super) fn open_admitted(admission: Admission<'a, 's, '_>, cancel: &Cancellation) -> ZipReadResult<Self> {
         let Admission { ledger: view, source, plan, password, kind, .. } = admission;

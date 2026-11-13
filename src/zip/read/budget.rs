@@ -94,6 +94,7 @@ pub struct EncryptedReadUsage {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct RunUsage {
+    pub source_seeks: u128,
     pub records: u128,
     pub source_check_groups: u128,
     pub path_steps: u128,
@@ -112,6 +113,7 @@ pub struct RunUsage {
 impl RunUsage {
     fn counter(&mut self, category: RunCategory) -> &mut u128 {
         match category {
+            RunCategory::SourceSeeks => &mut self.source_seeks,
             RunCategory::Records => &mut self.records,
             RunCategory::SourceCheckGroups => &mut self.source_check_groups,
             RunCategory::PathSteps => &mut self.path_steps,
@@ -324,11 +326,9 @@ pub(super) struct PlanBinding {
     pub(super) output: PlannedOutput,
     // Exact paths remain in their original owners; their per-action identity is
     // fixed by the catalogue factory and cannot be changed through the context.
-    #[allow(dead_code)] // Task4 factories tie retained exact path owners to this action identity.
     pub(super) configuration_id: u64,
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[allow(dead_code)] // Task4 fixes output mode before deriving all-record envelopes.
 pub(super) enum PlannedOutput {
     Discard,
     Callback,
@@ -348,7 +348,9 @@ pub(super) struct MemberPlan {
     pub(super) output: PlannedOutput,
 }
 impl ActionPlan {
-    #[allow(dead_code)] // Task4 supplies binding after deriving geometry from the same catalogue pass.
+    pub(super) fn attempt_bound(&self) -> u128 {
+        self.bounds.io_attempts
+    }
     pub(super) fn with_binding(mut self, binding: PlanBinding) -> Result<Self, ReadFault> {
         let passes = match binding.output {
             PlannedOutput::Discard | PlannedOutput::Callback => 0,
@@ -364,7 +366,6 @@ impl ActionPlan {
         self.binding = Some(binding);
         Ok(self)
     }
-    #[allow(dead_code)] // Task4 catalogue factories will invoke this checked geometry derivation.
     pub(super) fn derive(g: PlanGeometry, creates: u64, retries: u64) -> Result<Self, ReadFault> {
         if checked_sum(g.regular, g.directories)? > g.records
             || g.large_aes > g.regular
@@ -386,15 +387,24 @@ impl ActionPlan {
         let terminal = product(4, rg1)?;
         let stage = product(16, rg1)?;
         let dirs = product(12, rd1)?;
-        let m =
-            [product(3, source)?, product(5, l)?, product(product(12, creates.into())?, t)?, terminal, stage, dirs, 16]
-                .into_iter()
-                .try_fold(0, checked_sum)?;
+        let m = [
+            product(3, source)?,
+            product(5, l)?,
+            product(product(12, creates.into())?, t)?,
+            terminal,
+            stage,
+            dirs,
+            16,
+            product(2, g.regular)?,
+        ]
+        .into_iter()
+        .try_fold(0, checked_sum)?;
         let attempts = product(checked_sum(checked_sum(j, m)?, 1)?, checked_sum(retries.into(), 1)?)?;
         let decode =
             product(4, checked_sum(checked_sum(g.packed, g.decoded)?, checked_sum(product(64, g.regular)?, 1)?)?)?;
         Ok(Self {
             bounds: RunUsage {
+                source_seeks: product(2, g.regular)?,
                 records: g.records,
                 source_check_groups: source,
                 path_steps: l,
@@ -466,7 +476,6 @@ impl LedgerState {
             active_encrypted: None,
         })
     }
-    #[allow(dead_code)] // Task4 catalogue factories own the sole production bind site.
     pub(super) fn bind(&mut self, plan: ActionPlan) -> Result<(), ReadFault> {
         if self.run.plan.is_some() || self.poisoned || plan.binding.is_none() {
             return Err(ReadFault::InvalidPlan);
@@ -504,6 +513,21 @@ impl LedgerState {
         }
         Ok(())
     }
+    pub(super) fn verify_action(&self, action: &super::projected::Action) -> Result<(), ReadFault> {
+        self.verify_configuration(action.identity)?;
+        let binding = self.run.plan.as_ref().and_then(|p| p.binding.as_ref()).ok_or(ReadFault::InvalidPlan)?;
+        if binding.scope != action.scope || binding.output != action.output {
+            return Err(ReadFault::InvalidPlan);
+        }
+        Ok(())
+    }
+    pub(super) fn verify_configuration(&self, identity: u64) -> Result<(), ReadFault> {
+        let binding = self.run.plan.as_ref().and_then(|p| p.binding.as_ref()).ok_or(ReadFault::InvalidPlan)?;
+        if binding.configuration_id != identity {
+            return Err(ReadFault::InvalidPlan);
+        }
+        Ok(())
+    }
     pub(super) fn verify_source(&self, source: SourceStamp) -> Result<(), ReadFault> {
         let binding = self.run.plan.as_ref().and_then(|plan| plan.binding.as_ref()).ok_or(ReadFault::InvalidPlan)?;
         if binding.source != source {
@@ -521,6 +545,10 @@ impl LedgerState {
             ProjectedReadScope::Entry(_) => Ok(plan.output_encrypted),
             _ => Err(ReadFault::InvalidPlan),
         }
+    }
+    #[cfg(test)]
+    pub(super) fn run_bounds(&self) -> RunUsage {
+        self.run.plan.as_ref().unwrap().bounds
     }
     pub(super) fn bound(&self) -> bool {
         self.run.plan.is_some()

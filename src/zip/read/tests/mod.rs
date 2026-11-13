@@ -23,3 +23,6 @@ mod spool;
 
 #[cfg(unix)]
 mod codecs;
+
+#[cfg(unix)]
+mod projected;

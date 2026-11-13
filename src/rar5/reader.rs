@@ -358,7 +358,26 @@ thread_local! {
     pub(crate) static VOLUME_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+/// Recognition and its initial held data handle cannot become separated.
+pub(crate) struct HeldSignature {
+    file: File,
+    len: u64,
+    next: u64,
+    format: RarFormat,
+}
+impl HeldSignature {
+    pub(crate) fn recognize(file: File, len: u64, head: &[u8]) -> std::result::Result<Self, File> {
+        match signature_location(head) {
+            Ok((next, format)) => Ok(Self { file, len, next, format }),
+            Err(_) => Err(file),
+        }
+    }
+}
 impl Volume {
+    pub(crate) fn from_held_signature(path: &Path, signature: HeldSignature, password: Option<&str>) -> Result<Self> {
+        let HeldSignature { file, len, next, format } = signature;
+        Self::initialize_held(path, file, len, password, next, format, false, None).map_err(RarFault::into_legacy)
+    }
     pub fn open(path: &Path) -> Result<Volume> {
         Self::open_with_password(path, None)
     }
@@ -417,6 +436,19 @@ impl Volume {
         } else {
             Self::probe_signature(path, &file, len, first, budget.as_deref_mut())?
         };
+        Self::initialize_held(path, file, len, password, next, format, detailed, budget)
+    }
+    #[allow(clippy::too_many_arguments)] // Shared post-recognition legacy initialization.
+    fn initialize_held(
+        path: &Path,
+        file: File,
+        len: u64,
+        password: Option<&str>,
+        next: u64,
+        format: RarFormat,
+        detailed: bool,
+        budget: Option<&mut ScanBudget<'_>>,
+    ) -> RarResult<Volume> {
         let mut vol = Volume {
             path: path.to_path_buf(),
             src: Source::new(file, len),

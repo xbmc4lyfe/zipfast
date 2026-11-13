@@ -729,7 +729,7 @@ pub(super) struct ResolvedTempDirectory {
 }
 impl ResolvedTempDirectory {
     pub(super) const CAPACITY: usize = 4096;
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 derives geometry from this same retained path choice.
+    #[cfg(test)] // Standalone encrypted admission/resolver controls; production uses the scoped retained plan choice.
     pub(super) fn resolve(
         ledger: &impl LedgerAccess,
         configured: Option<&Path>,
@@ -745,16 +745,43 @@ impl ResolvedTempDirectory {
     }
     /// Task4 supplies finite pre-plan bootstrap charges, then carries this same
     /// bounded value into ActionPlan derivation/binding and file acquisition.
-    #[cfg(unix)]
+    #[cfg(all(test, unix))]
     pub(super) fn resolve_charged(
         ledger: &impl LedgerAccess,
         configured: Option<&Path>,
         cancel: &Cancellation,
         retries: u64,
+        charge: impl FnMut(ResolveCharge) -> Result<(), ReadFault>,
+    ) -> Result<Self, ReadFault> {
+        Self::resolve_inner(ledger, configured, cancel, retries, true, charge)
+    }
+    #[cfg(unix)]
+    pub(super) fn resolve_plan(
+        ledger: &impl LedgerAccess,
+        configured: Option<&Path>,
+        cancel: &Cancellation,
+        retries: u64,
+        charge: impl FnMut(ResolveCharge) -> Result<(), ReadFault>,
+    ) -> Result<Self, ReadFault> {
+        Self::resolve_inner(ledger, configured, cancel, retries, false, charge)
+    }
+    #[cfg(unix)]
+    fn resolve_inner(
+        ledger: &impl LedgerAccess,
+        configured: Option<&Path>,
+        cancel: &Cancellation,
+        retries: u64,
+        encrypted: bool,
         mut charge: impl FnMut(ResolveCharge) -> Result<(), ReadFault>,
     ) -> Result<Self, ReadFault> {
         charge(ResolveCharge::Group)?;
-        ledger.with_state(|s| s.encrypted.allocation(Self::CAPACITY as u64))?;
+        ledger.with_state(|s| {
+            if encrypted {
+                s.encrypted.allocation(Self::CAPACITY as u64)
+            } else {
+                s.reserve_capacity(Self::CAPACITY as u64)
+            }
+        })?;
         let mut bytes = Vec::new();
         if bytes.try_reserve_exact(Self::CAPACITY).is_err() {
             ledger.with_state(|s| s.release_capacity(Self::CAPACITY as u64));
@@ -803,8 +830,18 @@ impl ResolvedTempDirectory {
         }
         Ok(resolved)
     }
-    #[cfg(not(unix))]
+    #[cfg(all(test, not(unix)))]
     pub(super) fn resolve_charged(
+        _ledger: &impl LedgerAccess,
+        _configured: Option<&Path>,
+        _cancel: &Cancellation,
+        _retries: u64,
+        _charge: impl FnMut(ResolveCharge) -> Result<(), ReadFault>,
+    ) -> Result<Self, ReadFault> {
+        Err(ReadFault::UnsupportedIdentity)
+    }
+    #[cfg(not(unix))]
+    pub(super) fn resolve_plan(
         _ledger: &impl LedgerAccess,
         _configured: Option<&Path>,
         _cancel: &Cancellation,
@@ -900,7 +937,6 @@ impl ResolvedTempDirectory {
     ) -> Result<(), ReadFault> {
         self.set(b"/tmp")
     }
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 context/action controlled teardown releases this owned path capacity.
     pub(super) fn finish_capacity(self, ledger: &impl LedgerAccess) -> Result<(), ReadFault> {
         if self.identity != ledger.identity() {
             return Err(ReadFault::InvalidPlan);
@@ -913,7 +949,6 @@ impl ResolvedTempDirectory {
     pub(super) fn test_path(&self) -> &[u8] {
         &self.bytes[..self.bytes.len() - 1]
     }
-    #[cfg_attr(not(test), allow(dead_code))] // Task4 derives geometry from this same retained path choice.
     pub(super) fn path_bytes(&self) -> usize {
         self.bytes.len() - 1
     }
