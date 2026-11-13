@@ -14,7 +14,7 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-//! Bounded metadata for a RAR5 volume set. A session owns the read-only
+//! Bounded metadata for a RAR4 or RAR5 volume set. A session owns the read-only
 //! files used for its catalogue. Member metadata describes the headers,
 //! including any known issue that would prevent reading a payload.
 
@@ -87,14 +87,19 @@ pub struct RarCatalogueUsage {
     pub read_bytes: u64,
 }
 
-/// Summary of a RAR5 catalogue.
+/// Summary of a RAR catalogue.
 #[derive(Debug, Default)]
 pub struct RarArchiveMetadata {
+    format: super::RarFormat,
     volumes: usize,
     orphan_continuations: u64,
 }
 
 impl RarArchiveMetadata {
+    pub fn format(&self) -> super::RarFormat {
+        self.format
+    }
+
     pub fn volume_count(&self) -> usize {
         self.volumes
     }
@@ -107,11 +112,16 @@ impl RarArchiveMetadata {
 /// Header metadata for an observed volume.
 #[derive(Debug)]
 pub struct RarVolumeMetadata {
+    format: super::RarFormat,
     main: MainHeader,
     encrypted_headers: bool,
 }
 
 impl RarVolumeMetadata {
+    pub fn format(&self) -> super::RarFormat {
+        self.format
+    }
+
     pub fn flags(&self) -> u64 {
         self.main.flags
     }
@@ -175,11 +185,29 @@ pub struct RarMember<'a> {
 }
 
 impl<'a> RarMember<'a> {
+    pub fn format(&self) -> super::RarFormat {
+        self.member.header.format
+    }
+
+    pub fn rar4_metadata(&self) -> Option<super::Rar4Metadata> {
+        self.member.header.rar4
+    }
+
+    /// Original wire name, including RAR4 legacy and Unicode encoding.
+    pub fn raw_name(&self) -> &'a [u8] {
+        &self.member.wire.name
+    }
+
+    /// Raw RAR5 compression bits. Returns None for RAR4 members.
+    pub fn rar5_compression_info(&self) -> Option<u64> {
+        (self.format() == super::RarFormat::Rar5).then_some(self.member.wire.compression)
+    }
+
     pub fn ordinal(&self) -> u64 {
         self.ordinal
     }
 
-    /// Stored name decoded using the same rules as the RAR5 header parser.
+    /// Name decoded by the member format parser. Original bytes remain available through raw_name().
     pub fn name(&self) -> &'a str {
         &self.member.header.name
     }
@@ -221,10 +249,12 @@ impl<'a> RarMember<'a> {
         self.member.header.method
     }
 
+    /// RAR5 algorithm value. For RAR4, use rar4_metadata().unpack_version.
     pub fn algorithm(&self) -> u8 {
         self.member.header.algorithm
     }
 
+    /// RAR5 wire bits, or zero for RAR4. Prefer rar5_compression_info() for format-aware callers.
     pub fn compression_info(&self) -> u64 {
         self.member.wire.compression
     }
@@ -279,7 +309,7 @@ struct HeldVolume {
     stamp: SourceStamp,
 }
 
-/// A read-only RAR5 catalogue with the original volume descriptors held open.
+/// A read-only RAR catalogue with the original volume descriptors held open.
 pub struct RarSession {
     archive: RarArchiveMetadata,
     volumes: Vec<HeldVolume>,
@@ -417,6 +447,12 @@ impl Catalogue {
             }
             self.owned_capacity = add(self.owned_capacity, path_bytes)?;
             let mut volume = Volume::open_catalogue(&path, file, stamp.len, password, &mut self.scan_budget())?;
+            let format = volume.format();
+            if self.session.volumes.is_empty() {
+                self.session.archive.format = format;
+            } else if self.session.archive.format != format {
+                return Err(volume_framing(&path, "RAR volume format changed"));
+            }
             self.session.usage.volumes = volumes;
             let encrypted_headers = volume.encrypted_headers();
             if self.session.volumes.first().is_some_and(|v| v.metadata.encrypted_headers != encrypted_headers) {
@@ -438,7 +474,7 @@ impl Catalogue {
                     Block::Service(_) | Block::Unknown => {}
                 }
             }
-            let metadata = RarVolumeMetadata { main: volume.main.clone(), encrypted_headers };
+            let metadata = RarVolumeMetadata { format, main: volume.main.clone(), encrypted_headers };
             let file = volume.into_catalogue_file();
             stamp.check(&file, &path)?;
             let next_path = next.and_then(|_| next_volume(&path));
@@ -674,6 +710,9 @@ fn target_name(header: &FileHeader) -> Option<&String> {
 }
 
 fn payload_issue(header: &FileHeader, crypt: MemberCrypt, ordinal: u64) -> Option<RarFailure> {
+    if let Some(reason) = header.rar4_unsupported() {
+        return Some(RarFailure::Unsupported(reason));
+    }
     match crypt {
         Some(Err(error)) => Some(RarFailure::crypt(error, RarScope::Member { index: Some(ordinal) })),
         _ if header.method != 0 && header.algorithm != 0 => {
@@ -756,6 +795,14 @@ pub(super) struct ScanBudget<'a> {
 }
 
 impl ScanBudget<'_> {
+    pub(super) fn temporary(&self, bytes: u64) -> RarResult<()> {
+        limit(add(self.usage.capacity, bytes)?, self.limits.capacity, RarResource::CatalogueCapacity)
+    }
+
+    pub(super) fn names(&self, bytes: u64) -> RarResult<()> {
+        limit(add(self.usage.name_bytes, bytes)?, self.limits.name_bytes, RarResource::CatalogueNameBytes)
+    }
+
     pub(super) fn check(&self) -> RarResult<()> {
         check_cancel(self.cancel)
     }

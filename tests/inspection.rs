@@ -139,16 +139,13 @@ fn sfx_rar_wins_at_the_search_boundary_but_a_signature_one_byte_beyond_it_does_n
 }
 
 #[test]
-fn raw_rar4_refusal_and_corrupt_sfx_rar_are_terminal() {
+fn corrupt_rar4_and_sfx_rar_are_terminal() {
     let source = tempfile::NamedTempFile::new().unwrap();
     let mut prefix = b"Rar!\x1a\x07\x00".to_vec();
     prefix.extend(common::archive(&[])); // RAR4 at byte zero overrides a later valid RAR5.
     fs::write(source.path(), zip_bytes(&prefix)).unwrap();
-    assert!(matches!(extract::list(source.path()), Err(Error::Unsupported(message)) if message.contains("RAR 4.x")));
-    assert!(matches!(
-        extract::inspect(source.path()),
-        Err(SessionError::Archive(Error::Unsupported(message))) if message.contains("RAR 4.x")
-    ));
+    assert!(matches!(extract::list(source.path()), Err(Error::Corrupt(_))));
+    assert!(matches!(extract::inspect(source.path()), Err(SessionError::Archive(Error::Corrupt(_)))));
 
     let mut prefix = b"launcher".to_vec();
     let mut rar = common::archive(&[]);

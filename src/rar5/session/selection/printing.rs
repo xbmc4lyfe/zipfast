@@ -45,6 +45,39 @@ impl Default for RarPrintOptions {
 }
 
 impl RarSession {
+    /// Check a caller-owned output descriptor against every held archive volume.
+    ///
+    /// This checks the session's source bindings and uses descriptor metadata
+    /// without reopening the output or exposing input paths. It writes no bytes.
+    /// Keep this descriptor as the writer and retain the source namespace
+    /// contract required by print_selected().
+    #[cfg(unix)]
+    #[allow(clippy::result_large_err, reason = "reuse the typed RAR error with partial counts")]
+    pub fn check_output_file(&mut self, output: &std::fs::File) -> Result<(), RarRunError> {
+        use std::os::unix::fs::MetadataExt;
+
+        let mut summary = self.summary(0);
+        self.check_run_sources(&mut summary)?;
+        let metadata = match output.metadata() {
+            Ok(metadata) => metadata,
+            Err(source) => {
+                return Err(run_error(
+                    summary,
+                    None,
+                    Arc::new(RarFailure::Output { operation: IoOperation::Metadata, path: None, offset: None, source }),
+                ));
+            }
+        };
+        if self
+            .volumes
+            .iter()
+            .any(|volume| metadata.dev() == volume.stamp.device && metadata.ino() == volume.stamp.inode)
+        {
+            return Err(run_error(summary, None, Arc::new(RarFailure::OutputAliasesInput)));
+        }
+        self.check_run_sources(&mut summary)
+    }
+
     /// Verify each selected regular member and its required solid history,
     /// then copy that member to the caller's writer in archive order.
     ///

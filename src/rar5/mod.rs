@@ -159,9 +159,62 @@ pub enum Redirection {
     Unknown(u64),
 }
 
+/// Archive format governing the member's wire fields and payload decoder.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RarFormat {
+    Rar4,
+    #[default]
+    Rar5,
+}
+
+/// RAR4 wire metadata retained alongside normalized session fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Rar4Metadata {
+    pub flags: u16,
+    pub host: u8,
+    pub method: u8,
+    pub unpack_version: u8,
+    /// Local DOS wall-clock bits. The normalized timestamp projects these as UTC.
+    pub dos_time: u32,
+}
+
+impl Rar4Metadata {
+    pub(crate) fn unsupported(self, attributes: u64) -> Option<crate::error::RarUnsupported> {
+        let feature = if self.flags & 3 != 0 {
+            "split payload"
+        } else if self.flags & 4 != 0 {
+            "encrypted payload"
+        } else if self.method != 0x30 {
+            "compressed payload"
+        } else if self.flags & 0x10 != 0 {
+            "solid payload"
+        } else if self.flags & 0x800 != 0 {
+            "old file revision"
+        } else if self.host > 3 {
+            "host attributes"
+        } else if self.host == 3 && !matches!(attributes & 0o170000, 0 | 0o100000 | 0o040000 | 0o120000) {
+            "special file"
+        } else if !matches!(self.unpack_version, 20 | 29) {
+            "unpack version"
+        } else if self.host == 3
+            && attributes & 0o170000 != 0
+            && (self.flags & 0xe0 == 0xe0) != (attributes & 0o170000 == 0o040000)
+        {
+            "file type flags"
+        } else if self.host == 3 && attributes & 0o170000 == 0o120000 {
+            "symbolic link"
+        } else {
+            return None;
+        };
+        Some(crate::error::RarUnsupported::Rar4Feature(feature))
+    }
+}
+
 /// A file or service header.
 #[derive(Clone, Debug, Default)]
 pub struct FileHeader {
+    pub format: RarFormat,
+    pub rar4: Option<Rar4Metadata>,
     pub service: bool,
     pub block_flags: u64,
     pub file_flags: u64,
@@ -191,6 +244,21 @@ pub struct FileHeader {
 }
 
 impl FileHeader {
+    pub(crate) fn rar4_unsupported(&self) -> Option<crate::error::RarUnsupported> {
+        let raw = self.rar4?;
+        raw.unsupported(self.attributes).or_else(|| {
+            if self.solid {
+                Some(crate::error::RarUnsupported::Rar4Feature("solid payload"))
+            } else if self.is_dir()
+                && (self.packed_size != 0 || self.unpacked_size != 0 || self.crc32.is_some_and(|crc| crc != 0))
+            {
+                Some(crate::error::RarUnsupported::Rar4Feature("directory payload"))
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn is_dir(&self) -> bool {
         self.file_flags & FHFL_DIRECTORY != 0
     }
