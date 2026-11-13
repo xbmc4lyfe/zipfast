@@ -194,6 +194,47 @@ impl CreatePlan {
         CreateUsage { transaction_attempts: self.attempts.get(), ..self.usage }
     }
 
+    /// Borrow the actual held destination directory. Clone it before consuming
+    /// the plan if needed afterward. This accessor performs no I/O or binding
+    /// check; callers bound and account for their own descriptor operations.
+    pub fn output_parent_file(&self) -> &File {
+        &self.parent.file
+    }
+
+    /// Check this output descriptor against every currently admitted source.
+    /// Identity aliases are rejected before source/parent binding failures where
+    /// a captured source identity is already known. No bytes are read or written.
+    ///
+    /// Finish admission first and retain this same output File for writing.
+    /// Further admission invalidates this observation. Other failures, including
+    /// I/O, cancellation and limits, do not establish output safety. This is not
+    /// namespace locking; the source/publication checks still apply afterward.
+    pub fn check_output_file(&mut self, output: &File) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let budget = Attempts::new(&self.options, &self.attempts);
+        let metadata = budget.run(|| {
+            #[cfg(test)]
+            tests::event_io(tests::Event::OutputMetadata, None)?;
+            output.metadata()
+        })?;
+        let identity = unix::Identity(metadata.dev(), metadata.ino());
+        for (index, entry) in self.entries.iter().enumerate() {
+            work(&self.options, &mut self.usage.plan, 1)?;
+            if entry.source.as_ref().is_some_and(|source| source.stamp.identity == identity) {
+                return Err(CreateError::OutputAliasesInput(CreateEntryId(index)));
+            }
+        }
+        self.parent.check(&budget)?;
+        for (index, entry) in self.entries.iter().enumerate() {
+            work(&self.options, &mut self.usage.plan, 1)?;
+            let Some(source) = &entry.source else {
+                continue;
+            };
+            check_source_for_output(source, CreateEntryId(index), identity, &budget)?;
+        }
+        self.parent.check(&budget)
+    }
+
     fn admit(
         &mut self,
         metadata: EntryOptions<'_>,
@@ -721,6 +762,32 @@ impl PlannedEntry {
             + self.comment.capacity() as u64
             + self.keys.as_ref().map_or(0, |keys| keys.capacity() as u64)
             + self.source.as_ref().map_or(0, |source| source.path.capacity() as u64)
+    }
+}
+
+fn check_source_for_output(
+    source: &Source,
+    id: CreateEntryId,
+    output: unix::Identity,
+    budget: &Attempts<'_>,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let reopened =
+        if !source.directory && source.file.is_none() { Some(unix::open_source(&source.path, budget)?) } else { None };
+    let file = source.file.as_ref().or(reopened.as_ref());
+    let observed = budget.run(|| match file {
+        Some(file) => file.metadata(),
+        None => std::fs::symlink_metadata(&source.path),
+    })?;
+    if unix::Identity(observed.dev(), observed.ino()) == output {
+        return Err(CreateError::OutputAliasesInput(id));
+    }
+    if source.directory {
+        check_directory_source(source, id, source.stamp, budget)
+    } else {
+        let file = file.expect("regular source is retained or reopened");
+        let current = capture(file, &source.path, id, budget)?;
+        transaction::verify_stamp(source.stamp, current, id)
     }
 }
 

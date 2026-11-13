@@ -246,6 +246,7 @@ pub(super) enum Event {
     AfterAdmissionClose,
     MetadataReserve,
     SourceOpen,
+    OutputMetadata,
     AfterSourceReopen,
     BeforeSourceRead,
     ReadSource,
@@ -1906,4 +1907,80 @@ fn zipcrypto_stage_cursor_retries_respect_typed_transaction_stops() {
         assert!(matches!(failure.cleanup, CleanupState::Clean));
         assert!(!output.exists() && stages(dir.path()).is_empty());
     }
+}
+
+#[test]
+fn create_output_metadata_retries_and_io_failures_keep_their_accounting() {
+    use std::rc::Rc;
+    let (_root, _input, output_path, mut baseline) = simple_plan(CreateOptions::default());
+    let output = tempfile::tempfile().unwrap();
+    let before = baseline.usage().transaction_attempts;
+    baseline.check_output_file(&output).unwrap();
+    let normal = baseline.usage().transaction_attempts - before;
+    let (_root, _input, _target, mut plan) = simple_plan(CreateOptions::default());
+    let before = plan.usage().transaction_attempts;
+    let calls = Rc::new(Cell::new(0));
+    let seen = Rc::clone(&calls);
+    with_hook(
+        move |event, _| {
+            if event == Event::OutputMetadata {
+                seen.set(seen.get() + 1);
+                if seen.get() == 1 {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+            }
+            Ok(())
+        },
+        || plan.check_output_file(&output),
+    )
+    .unwrap();
+    assert_eq!(calls.get(), 2);
+    assert_eq!(plan.usage().transaction_attempts - before, normal + 1);
+    for fault in [Event::OutputMetadata, Event::SourceOpen] {
+        let error = with_hook(
+            move |event, _| {
+                if event == fault { Err(io::ErrorKind::PermissionDenied.into()) } else { Ok(()) }
+            },
+            || plan.check_output_file(&output),
+        )
+        .unwrap_err();
+        assert!(matches!(error, CreateError::Io(error) if error.kind() == io::ErrorKind::PermissionDenied));
+    }
+    assert_eq!(output.metadata().unwrap().len(), 0);
+    assert!(!output_path.exists());
+}
+
+#[test]
+fn create_output_cancellation_and_overflow_do_not_wrap_or_continue() {
+    let cancel = Cancellation::default();
+    let (_root, input, output_path, mut plan) =
+        simple_plan(CreateOptions { cancel: cancel.clone(), ..CreateOptions::default() });
+    let output = tempfile::tempfile().unwrap();
+    let before = plan.usage();
+    let canceled = cancel.clone();
+    let error = with_hook(
+        move |event, _| {
+            if event == Event::OutputMetadata {
+                canceled.cancel();
+            }
+            Ok(())
+        },
+        || plan.check_output_file(&output),
+    )
+    .unwrap_err();
+    assert!(matches!(error, CreateError::Canceled));
+    assert_eq!(plan.usage().transaction_attempts, before.transaction_attempts + 1);
+    assert_eq!(plan.usage().plan.work, before.plan.work);
+    let (_other, _input, _target, mut plan) = simple_plan(CreateOptions::default());
+    plan.attempts.set(u64::MAX);
+    assert!(matches!(plan.check_output_file(&output), Err(CreateError::Overflow)));
+    assert_eq!(plan.attempts.get(), u64::MAX);
+    plan.attempts.set(0);
+    plan.options.limits.plan_work = u64::MAX;
+    plan.usage.plan.work = u64::MAX;
+    assert!(matches!(plan.check_output_file(&output), Err(CreateError::Overflow)));
+    assert_eq!(plan.usage.plan.work, u64::MAX);
+    assert_eq!(output.metadata().unwrap().len(), 0);
+    assert_eq!(std::fs::read(input).unwrap(), b"source data");
+    assert!(!output_path.exists());
 }
