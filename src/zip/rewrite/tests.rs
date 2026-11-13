@@ -37,6 +37,7 @@ type Hook = dyn FnMut(Event, Option<&Path>) -> io::Result<()>;
 
 thread_local! {
     static HOOK: RefCell<Option<Box<Hook>>> = RefCell::new(None);
+    static SOURCE_READ_CAP: std::cell::Cell<usize> = const { std::cell::Cell::new(usize::MAX) };
 }
 
 pub(in crate::zip) fn test_event(event: Event, path: Option<&Path>) -> io::Result<()> {
@@ -63,7 +64,8 @@ fn with_hook<T>(hook: impl FnMut(Event, Option<&Path>) -> io::Result<()> + 'stat
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
-            HOOK.with_borrow_mut(|hook| *hook = None)
+            HOOK.with_borrow_mut(|hook| *hook = None);
+            SOURCE_READ_CAP.set(usize::MAX)
         }
     }
     HOOK.with_borrow_mut(|stored| *stored = Some(Box::new(hook)));
@@ -612,4 +614,126 @@ fn source_change_after_the_stream_binding_check_blocks_publication() {
     assert_eq!(fs::read(source).unwrap(), b"external");
     unchanged(&archive, &old, &before);
     assert_eq!(fs::read_dir(root.path()).unwrap().count(), 2);
+}
+
+#[test]
+fn recovery_rechecks_source_and_stage_before_publication() {
+    use crate::zip::recovery::{RecoveryOptions, RecoveryPlan};
+    for source_change in [true, false] {
+        let (root, source, original) = old_archive();
+        let target = root.path().join("recovered.zip");
+        let plan = RecoveryPlan::open(&source, &target, RecoveryOptions::default()).unwrap();
+        let mutated_source = source.clone();
+        let report = with_hook(
+            move |event, stage| {
+                if event == Event::AfterVerify {
+                    let path = if source_change { mutated_source.as_path() } else { stage.unwrap() };
+                    OpenOptions::new().write(true).open(path)?.write_at(b"x", 0)?;
+                }
+                Ok(())
+            },
+            || plan.recover(),
+        );
+        let failure = report.outcome.unwrap_err();
+        assert_eq!(failure.publication, Publication::NotPublished);
+        assert!(matches!(failure.cleanup, CleanupState::Clean));
+        if source_change {
+            assert!(matches!(failure.cause, RewriteError::SourceChanged));
+        } else {
+            assert!(matches!(
+                failure.cause,
+                RewriteError::Infrastructure(crate::zip::create::CreateError::StageChanged)
+            ));
+            assert_eq!(fs::read(&source).unwrap(), original);
+        }
+        assert!(!target.exists());
+        assert_eq!(report.entries.len(), 1);
+    }
+}
+
+#[test]
+fn recovery_preserves_foreign_stage_name_and_late_destination() {
+    use crate::zip::recovery::{RecoveryOptions, RecoveryPlan};
+    for substitute in [false, true] {
+        let (root, source, original) = old_archive();
+        let target = root.path().join("recovered.zip");
+        let target_hook = target.clone();
+        let stage_path = std::rc::Rc::new(RefCell::new(None));
+        let path_hook = stage_path.clone();
+        let plan = RecoveryPlan::open(&source, &target, RecoveryOptions::default()).unwrap();
+        let report = with_hook(
+            move |event, path| {
+                if event == Event::AfterVerify && substitute {
+                    let path = path.unwrap();
+                    fs::remove_file(path)?;
+                    fs::write(path, b"foreign stage")?;
+                    *path_hook.borrow_mut() = Some(path.to_path_buf());
+                }
+                if event == Event::AfterFinalCheck && !substitute {
+                    fs::write(&target_hook, b"late destination")?;
+                }
+                Ok(())
+            },
+            || plan.recover(),
+        );
+        let failure = report.outcome.unwrap_err();
+        assert_eq!(failure.publication, Publication::NotPublished);
+        if substitute {
+            assert!(matches!(failure.cleanup, CleanupState::ForeignStageName { .. }));
+            assert_eq!(fs::read(stage_path.borrow().as_ref().unwrap()).unwrap(), b"foreign stage");
+            assert!(!target.exists());
+        } else {
+            assert!(matches!(failure.cause, RewriteError::Infrastructure(crate::zip::create::CreateError::Conflict)));
+            assert!(matches!(failure.cleanup, CleanupState::Clean));
+            assert_eq!(fs::read(&target).unwrap(), b"late destination");
+        }
+        assert_eq!(fs::read(source).unwrap(), original);
+    }
+}
+
+#[test]
+fn recovery_sync_failure_reports_published_survivors() {
+    use crate::zip::recovery::{RecoveryOptions, RecoveryPlan};
+    let (root, source, original) = old_archive();
+    let target = root.path().join("recovered.zip");
+    let options = RecoveryOptions { durability: Durability::SyncFileAndDirectory, ..RecoveryOptions::default() };
+    let plan = RecoveryPlan::open(&source, &target, options).unwrap();
+    let report = with_hook(
+        |event, _| {
+            if event == Event::DirectorySync { Err(io::Error::from_raw_os_error(libc::EIO)) } else { Ok(()) }
+        },
+        || plan.recover(),
+    );
+    let failure = report.outcome.unwrap_err();
+    assert_eq!(failure.stage, RewriteStage::DirectorySync);
+    assert_eq!(failure.publication, Publication::Published);
+    assert!(failure.verification.is_some());
+    assert!(target.exists());
+    assert_eq!(fs::read(source).unwrap(), original);
+    assert_eq!(report.entries.len(), 1);
+}
+
+pub(in crate::zip) fn source_read_cap() -> usize {
+    SOURCE_READ_CAP.get()
+}
+
+#[test]
+fn recovery_raw_copy_handles_single_byte_reads_through_descriptor_patch() {
+    use crate::zip::recovery::{RecoveryOptions, RecoveryOutcome, RecoveryPlan};
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("old.zip");
+    let target = root.path().join("recovered.zip");
+    let old = include_bytes!("layout/fixtures/signed-descriptor-bad-crc-with-central.zip");
+    fs::write(&source, old).unwrap();
+    let plan = RecoveryPlan::open(&source, &target, RecoveryOptions::default()).unwrap();
+    let report = with_hook(
+        |_, _| Ok(()),
+        || {
+            SOURCE_READ_CAP.set(1);
+            plan.recover()
+        },
+    );
+    assert!(matches!(report.outcome, Ok(RecoveryOutcome::Published(_))));
+    assert_eq!(&fs::read(target).unwrap()[483..499], &[80, 75, 7, 8, 147, 68, 241, 76, 184, 1, 0, 0, 184, 1, 0, 0]);
+    assert_eq!(fs::read(source).unwrap(), old);
 }

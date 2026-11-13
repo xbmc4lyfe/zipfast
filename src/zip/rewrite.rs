@@ -49,7 +49,7 @@ use super::write::{EntryWritten, WriteError};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod layout;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-mod native;
+pub(in crate::zip) mod native;
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
 mod tests;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -57,7 +57,7 @@ mod verify;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub use native::RewritePlan;
 #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
-pub(super) use tests::{Event, test_event};
+pub(super) use tests::{Event, source_read_cap as test_source_read_cap, test_event};
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod unsupported;
 #[cfg(not(any(target_os = "macos", target_os = "linux")))]

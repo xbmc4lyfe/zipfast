@@ -414,7 +414,7 @@ impl PublishError {
 }
 
 impl Parent {
-    pub(super) fn publish_noreplace(
+    pub(in crate::zip) fn publish_noreplace(
         &self,
         stage: &CStr,
         budget: &Attempts<'_>,

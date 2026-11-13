@@ -671,6 +671,4 @@ pub(super) fn members(
 #[cfg(test)]
 mod recovery_tests;
 
-// The central-directed transaction will consume this independently reviewed seam.
-#[allow(dead_code)]
 pub(in crate::zip) mod recovery;

@@ -38,6 +38,7 @@ use unix::{NameState, Parent, PublishError, Stage, Stamp};
 
 mod names;
 mod preflight;
+pub(in crate::zip) mod recovery;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) enum Action {
@@ -533,6 +534,7 @@ impl RewritePlan {
             inputs: &self.inputs,
             actions: &self.actions,
             appends: &self.appends,
+            repairs: None,
         };
         let summary = output.write_stage(stage, original, plan, attempts, &mut self.usage)?;
         let finalized = unix::file_stamp(&stage.file, &attempts).at(RewriteStage::Finish)?;
@@ -548,6 +550,7 @@ impl RewritePlan {
             entries: &plan.written,
             prefix: plan.prefix,
             summary,
+            repairs: None,
         };
         let outcomes = std::mem::take(&mut plan.outcomes);
         let verification = manifest
@@ -723,6 +726,7 @@ struct OutputPlan<'a> {
     inputs: &'a [PlannedEntry],
     actions: &'a [Action],
     appends: &'a [usize],
+    repairs: Option<&'a [Option<layout::recovery::DescriptorRepair>]>,
 }
 
 impl OutputPlan<'_> {
@@ -749,14 +753,30 @@ impl OutputPlan<'_> {
                 return Err(Stop::at(RewriteStage::Write, rewrite_writer_error(error)));
             }
         };
+        let active_repair: Cell<Option<layout::recovery::DescriptorRepair>> = Cell::new(None);
         let mut source = |at: u64, bytes: &mut [u8]| {
             let used = &mut usage.raw_copy_bytes;
             if add(*used, bytes.len() as u64).map_err(io::Error::other)? > self.options.limits.raw_copy_bytes {
                 return Err(io::Error::other(RewriteError::Limit(RewriteLimit::RawCopyBytes)));
             }
             attempts.charge().map_err(io::Error::other)?;
+            #[cfg(test)]
+            let bytes = {
+                let size = bytes.len().min(super::test_source_read_cap());
+                &mut bytes[..size]
+            };
             let read = self.source.read_at(bytes, at)?;
             *used += read as u64;
+            if let Some(repair) = active_repair.get() {
+                let start = at.max(repair.offset);
+                let end =
+                    add(at, read as u64).map_err(io::Error::other)?.min(repair.offset + repair.bytes().len() as u64);
+                if start < end {
+                    bytes[(start - at) as usize..(end - at) as usize].copy_from_slice(
+                        &repair.bytes()[(start - repair.offset) as usize..(end - repair.offset) as usize],
+                    );
+                }
+            }
             Ok(read)
         };
         let prefix = writer.write_prefix(prepared.prefix, &mut source);
@@ -768,6 +788,7 @@ impl OutputPlan<'_> {
             let written = match action {
                 Action::Remove => continue,
                 Action::Keep => {
+                    active_repair.set(self.repairs.and_then(|repairs| repairs[ordinal]));
                     let raw = raw_entry(self.metadata, prepared.members[ordinal], ordinal);
                     writer
                         .add_preserved(&raw, &mut source)

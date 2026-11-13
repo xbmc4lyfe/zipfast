@@ -16,7 +16,7 @@
 
 //! A bounded per-member recovery proof, separate from ordinary rewrite admission.
 //!
-//! The future recovery transaction owns the held source, strict central snapshot,
+//! The recovery transaction owns the held source, strict central snapshot,
 //! nonoverlapping physical boundary index and binding checks. This seam neither
 //! discovers candidates nor writes or publishes output.
 
@@ -31,12 +31,7 @@ pub(in crate::zip) enum RecoveryOutcome {
     Omitted(RecoveryIssue),
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub(in crate::zip) enum RecoveryIssue {
-    UnsupportedPayload,
-    Framing(&'static str),
-    Payload(&'static str),
-}
+pub(in crate::zip) use crate::zip::recovery::RecoveryIssue;
 
 #[derive(Debug)]
 pub(in crate::zip) struct RecoveredMember {
@@ -45,7 +40,7 @@ pub(in crate::zip) struct RecoveredMember {
 }
 
 /// A signed descriptor replacement proved by exact framing and decoded data.
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(in crate::zip) struct DescriptorRepair {
     pub(in crate::zip) offset: u64,
     pub(super) data: [u8; 24],
@@ -79,6 +74,12 @@ pub(in crate::zip) fn recover_member(
     attempts.check_cancel()?;
     if central.encrypted() || !matches!(central.header().method, 0 | 8) {
         return Ok(RecoveryOutcome::Omitted(RecoveryIssue::UnsupportedPayload));
+    }
+    if central.display_unix_mode().is_some_and(|mode| {
+        let kind = mode & 0o170000;
+        !matches!(kind, 0 | 0o100000 | 0o040000) || (kind == 0o040000 && !raw_directory(central))
+    }) {
+        return Ok(RecoveryOutcome::Omitted(RecoveryIssue::UnsupportedEntryKind));
     }
     preflight(central, limits.common, &usage.payload)?;
     let mut buffer = [0; BUFFER];
