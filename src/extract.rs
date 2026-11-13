@@ -2642,7 +2642,7 @@ pub(crate) fn make_dirs(root: &Path, rel: &Path) -> Result<()> {
     make_dirs_detailed(root, rel).map_err(RarFault::into_legacy)
 }
 
-fn make_dirs_detailed(root: &Path, rel: &Path) -> crate::error::RarResult<()> {
+pub(crate) fn make_dirs_detailed(root: &Path, rel: &Path) -> crate::error::RarResult<()> {
     let mut at = root.to_path_buf();
     for part in rel.components() {
         at.push(part);
