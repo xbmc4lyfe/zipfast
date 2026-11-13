@@ -117,6 +117,42 @@ is `Published` with `Unconfirmed` durability. Cancellation is cooperative
 before commit. After commit, the bounded cleanup and sync attempts still
 run.
 
+## Authenticated creation
+
+Use `publish_winzip_aes_with_receipts` with a
+`WinZipAesRequest::new(password, strength, variant)` to select AES-128,
+AES-192, or AES-256 and AE-1 or AE-2 explicitly. The validated request
+borrows 1–65,535 UTF-8 password bytes without NUL through synchronous
+writing and verification. Its Debug output redacts the password.
+Returned reports retain the selected strength and variant without credentials.
+
+All regular files, including empty ones, use AES. Explicit and tracked
+directories remain clear. Native creation reads each captured source length
+exactly. The low-level writer and strict verifier also support unknown
+lengths. Native salt comes from the operating system once per regular member.
+Empty and directory-only plans complete with clear framing. A failed salt request
+returns a typed failure before publication.
+
+The `AesCreateReport` uses the existing publication rules for common write
+receipts. Their CRC equals the plaintext CRC for AE-1 and the wire value
+zero for AE-2. Private plaintext CRC data remains inside creation until authenticated stage
+verification completes. AES creation reserves and charges that additional
+capacity before staging. Clear and ZipCrypto creation keep their existing
+allocations and budget charges.
+
+Verification checks exact AES extras and packed ranges, authenticates
+ciphertext, requires complete decoded length and CRC, and consumes the
+entire Deflate stream before publication. It streams fixed buffers and
+can verify encrypted members exceeding the public buffered reader's 128 MiB
+packed ceiling. All ordinary source, stage, permission, namespace,
+durability, and cleanup checks still apply.
+
+Use `publish_winzip_aes_with_bound_receipts` to request the existing held
+output binding alongside the AES report. Use an available binding to establish
+the held destination identity through finalization. Common receipts can
+accompany confirmed publication followed by a cleanup or sync failure.
+Ambiguous publication returns its reconciliation state with an empty receipt list.
+
 ## Resource ceilings
 
 | Component | Default |

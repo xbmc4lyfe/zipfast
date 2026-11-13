@@ -17,7 +17,9 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 
-use crate::zip::write::{InputLength, IoStage, WriteSummary, WriterOptions, ZipStreamWriter, ZipWriter};
+use crate::zip::write::{
+    AesEntryWritten, InputLength, IoStage, WinZipAesRequest, WriteSummary, WriterOptions, ZipStreamWriter, ZipWriter,
+};
 
 use super::unix::{NameState, PublishError, Stage};
 use super::*;
@@ -40,8 +42,37 @@ impl CreatePlan {
     /// not authenticate content. See [`CreateReport`] for receipt semantics.
     pub fn publish_zipcrypto_with_receipts(self, password: &str) -> CreateReport {
         let mut written = Vec::new();
-        let outcome = self.publish_inner(Some(&mut written), Some(password), None);
+        let outcome = self.publish_inner(Some(&mut written), Some(NativeEncryption::ZipCrypto(password)), None);
         CreateReport { outcome, written }
+    }
+
+    /// Verify and publish with the requested AES strength and variant for all
+    /// regular files. Explicit directories remain clear. The request's password
+    /// is borrowed only through this synchronous operation.
+    pub fn publish_winzip_aes_with_receipts(self, request: WinZipAesRequest<'_>) -> AesCreateReport {
+        self.publish_aes(request, None)
+    }
+
+    /// Publish with AES wire receipts and an optional held binding to the
+    /// verified output. Use an available binding to establish its held identity.
+    pub fn publish_winzip_aes_with_bound_receipts(
+        self,
+        request: WinZipAesRequest<'_>,
+    ) -> (AesCreateReport, Option<PublishedArchiveBinding>) {
+        let mut binding = None;
+        let report = self.publish_aes(request, Some(&mut binding));
+        (report, binding)
+    }
+
+    fn publish_aes(
+        self,
+        request: WinZipAesRequest<'_>,
+        binding: Option<&mut Option<PublishedArchiveBinding>>,
+    ) -> AesCreateReport {
+        let (_, strength, variant) = request.parameters();
+        let mut written = Vec::new();
+        let outcome = self.publish_inner(Some(&mut written), Some(NativeEncryption::Aes(&request)), binding);
+        AesCreateReport { outcome, written, strength, variant }
     }
 
     /// Publish with write receipts and a held binding to the verified output.
@@ -66,16 +97,16 @@ impl CreatePlan {
     fn publish_inner(
         mut self,
         written: Option<&mut Vec<EntryWritten>>,
-        password: Option<&str>,
+        encryption: Option<NativeEncryption<'_>>,
         binding: Option<&mut Option<PublishedArchiveBinding>>,
     ) -> std::result::Result<CreatedArchive, CreateFailure> {
-        if password.is_some_and(|password| {
-            password.is_empty() || password.len() > u16::MAX as usize || password.as_bytes().contains(&0)
-        }) {
+        if let Some(NativeEncryption::ZipCrypto(password)) = encryption
+            && (password.is_empty() || password.len() > u16::MAX as usize || password.as_bytes().contains(&0))
+        {
             let cause = CreateError::InvalidOptions("ZIP password must be 1 to 65,535 UTF-8 bytes without NUL");
             return Err(self.failure(Stopped::at(CreateStage::Planning, cause), CleanupState::Clean));
         }
-        let mut receipts = match self.preflight(password.is_some()) {
+        let mut receipts = match self.preflight(encryption) {
             Ok(receipts) => receipts,
             Err(error) => return Err(self.failure(Stopped::at(CreateStage::Planning, error), CleanupState::Clean)),
         };
@@ -95,11 +126,11 @@ impl CreatePlan {
         let reserve = Attempts::finalization(&reserve_count);
         let binding_count = Cell::new(0);
         let binding_budget = Attempts::finalization(&binding_count);
-        let result = self.execute(&mut stage, &mut receipts, password, binding.as_ref().map(|_| &binding_budget));
+        let result = self.execute(&mut stage, &mut receipts, encryption, binding.as_ref().map(|_| &binding_budget));
         if result.is_ok()
             && let Some(written) = written
         {
-            *written = receipts;
+            *written = receipts.common;
         } else {
             drop(receipts);
         }
@@ -160,8 +191,8 @@ impl CreatePlan {
     fn execute(
         &mut self,
         stage: &mut Stage,
-        receipts: &mut Vec<EntryWritten>,
-        password: Option<&str>,
+        receipts: &mut PreparedReceipts,
+        encryption: Option<NativeEncryption<'_>>,
         binding: Option<&Attempts<'_>>,
     ) -> std::result::Result<Option<Stamp>, Stopped> {
         let attempts = Attempts::new(&self.options, &self.attempts);
@@ -186,23 +217,50 @@ impl CreatePlan {
             (stage, original),
             attempts,
             receipts,
-            password,
+            encryption,
         )?;
         #[cfg(test)]
         tests::event(tests::Event::AfterFinish, Some(stage.path())).at(CreateStage::Finish)?;
         #[cfg(test)]
         tests::event(tests::Event::BeforeVerify, Some(stage.path())).at(CreateStage::Verify)?;
+        #[cfg(test)]
+        if let Some(crcs) = &mut receipts.aes_crcs {
+            for crc in crcs {
+                *crc = tests::aes_private_crc(*crc);
+            }
+        }
+        if matches!(encryption, Some(NativeEncryption::Aes(_))) {
+            let complete = receipts.aes_crcs.as_ref().map_or_else(
+                || self.entries.iter().all(|entry| entry.payload_source().is_none()),
+                |crcs| crcs.len() == self.entries.len(),
+            );
+            if !complete {
+                return Err(Stopped::at(
+                    CreateStage::Verify,
+                    CreateError::Verification("missing private AES CRC receipts"),
+                ));
+            }
+        }
         let verified = verify::verify_created(
             &mut stage.file,
-            (&self.entries, receipts),
+            (&self.entries, &receipts.common),
             &self.options,
             summary,
             &attempts,
             &mut self.usage.verification,
             |ordinal| {
-                let password = password?;
+                let mode = encryption?;
                 let source = self.entries[ordinal].payload_source()?;
-                Some(verify::ZipCryptoExpectation { password, length: InputLength::Exact(source.stamp.len) }.into())
+                let length = InputLength::Exact(source.stamp.len);
+                Some(match mode {
+                    NativeEncryption::ZipCrypto(password) => verify::ZipCryptoExpectation { password, length }.into(),
+                    NativeEncryption::Aes(request) => verify::AesExpectation {
+                        request,
+                        length,
+                        plaintext_crc32: receipts.aes_crcs.as_ref().expect("checked private AES receipts")[ordinal],
+                    }
+                    .into(),
+                })
             },
         )
         .at(CreateStage::Verify)?;
@@ -261,8 +319,8 @@ impl CreatePlan {
         usage: &mut WriteUsage,
         stage: (&'a Stage, Stamp),
         attempts: Attempts<'a>,
-        receipts: &mut Vec<EntryWritten>,
-        password: Option<&str>,
+        receipts: &mut PreparedReceipts,
+        encryption: Option<NativeEncryption<'_>>,
     ) -> std::result::Result<WriteSummary, Stopped> {
         let options = WriterOptions {
             comment: &create_options.archive_comment,
@@ -271,7 +329,7 @@ impl CreatePlan {
         };
         let (stage, original) = stage;
         let mut sink = RawIo::new(&stage.file, attempts);
-        let mut writer = if let Some(password) = password {
+        let mut writer = if let Some(encryption) = encryption {
             if original.len != 0 {
                 return Err(Stopped::at(CreateStage::StageCreate, CreateError::StageChanged));
             }
@@ -280,7 +338,7 @@ impl CreatePlan {
             }
             StageWriter::Encrypted(
                 ZipStreamWriter::new(sink, options).map_err(writer_error).at(CreateStage::Write)?,
-                password,
+                encryption,
             )
         } else {
             match ZipWriter::new_accounted(sink, options) {
@@ -334,7 +392,22 @@ impl CreatePlan {
                 }
             })();
             *usage = writer.usage();
-            receipts.push(receipt?);
+            let (common, crc) = match receipt? {
+                CompletedMember::Common(common) => {
+                    if matches!(encryption, Some(NativeEncryption::Aes(_))) && entry.payload_source().is_some() {
+                        return Err(Stopped::at(
+                            CreateStage::Write,
+                            CreateError::Verification("missing actual AES write receipt"),
+                        ));
+                    }
+                    (common, 0)
+                }
+                CompletedMember::Aes(aes) => (aes.entry, aes.plaintext_crc32),
+            };
+            receipts.common.push(common);
+            if let Some(crcs) = &mut receipts.aes_crcs {
+                crcs.push(crc);
+            }
         }
         match writer.finish_accounted() {
             Ok(finished) => {
@@ -351,14 +424,19 @@ impl CreatePlan {
 
 enum StageWriter<'a, 'p> {
     Clear(ZipWriter<RawIo<'a>>),
-    Encrypted(ZipStreamWriter<RawIo<'a>>, &'p str),
+    Encrypted(ZipStreamWriter<RawIo<'a>>, NativeEncryption<'p>),
+}
+
+enum CompletedMember {
+    Common(EntryWritten),
+    Aes(AesEntryWritten),
 }
 
 impl<'a> StageWriter<'a, '_> {
-    fn add_directory(&mut self, options: EntryOptions<'_>) -> std::result::Result<EntryWritten, WriteError> {
+    fn add_directory(&mut self, options: EntryOptions<'_>) -> std::result::Result<CompletedMember, WriteError> {
         match self {
-            Self::Clear(writer) => writer.add_directory(options),
-            Self::Encrypted(writer, _) => writer.add_directory(options),
+            Self::Clear(writer) => writer.add_directory(options).map(CompletedMember::Common),
+            Self::Encrypted(writer, _) => writer.add_directory(options).map(CompletedMember::Common),
         }
     }
 
@@ -368,16 +446,28 @@ impl<'a> StageWriter<'a, '_> {
         input: &mut SourceInput<'_>,
         length: InputLength,
         attempts: Attempts<'_>,
-    ) -> std::result::Result<EntryWritten, WriteError> {
+    ) -> std::result::Result<CompletedMember, WriteError> {
         match self {
-            Self::Clear(writer) => writer.add_file(options, input, length),
-            Self::Encrypted(writer, password) => {
-                writer.add_zipcrypto_file(options, input, length, password, |random| {
+            Self::Clear(writer) => writer.add_file(options, input, length).map(CompletedMember::Common),
+            Self::Encrypted(writer, NativeEncryption::ZipCrypto(password)) => writer
+                .add_zipcrypto_file(options, input, length, password, |random| {
                     attempts.charge().map_err(into_io)?;
                     #[cfg(test)]
                     tests::event_io(tests::Event::EncryptionEntropy, None)?;
                     getrandom::fill(random).map_err(io::Error::other)
                 })
+                .map(CompletedMember::Common),
+            Self::Encrypted(writer, NativeEncryption::Aes(request)) => {
+                let (password, strength, variant) = request.parameters();
+                let request = WinZipAesRequest::new(password, strength, variant)?;
+                writer
+                    .add_winzip_aes_file(options, input, length, request, |salt| {
+                        attempts.charge().map_err(into_io)?;
+                        #[cfg(test)]
+                        tests::event_io(tests::Event::AesEntropy { bytes: salt.len() }, None)?;
+                        getrandom::fill(salt).map_err(io::Error::other)
+                    })
+                    .map(CompletedMember::Aes)
             }
         }
     }

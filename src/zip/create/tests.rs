@@ -17,6 +17,9 @@
 use super::*;
 use crate::zip::write::{DosDateTime, EntryName, Method, Permissions};
 
+#[path = "aes_tests.rs"]
+mod aes;
+
 pub(super) fn metadata(name: &str) -> EntryOptions<'_> {
     EntryOptions {
         name: EntryName::Utf8(name),
@@ -160,7 +163,7 @@ fn hierarchy_rejects_exact_and_normalized_conflicts() {
                 plan.add_file(&path, metadata(name), keys).unwrap();
             }
         }
-        assert_eq!(plan.preflight(false).is_err(), expected, "{first} {second}");
+        assert_eq!(plan.preflight(None).is_err(), expected, "{first} {second}");
         assert!(!temp.path().join("out.zip").exists());
     }
 }
@@ -253,6 +256,8 @@ pub(super) enum Event {
     SinkWrite { at: u64, signature: Option<[u8; 4]> },
     SinkSeek,
     EncryptionEntropy,
+    AesEntropy { bytes: usize },
+    AesCrcReserve,
     SinkFlush,
     AfterFinish,
     BeforeVerify,
@@ -276,6 +281,7 @@ thread_local! {
     static SINK_WRITE_CAP: Cell<usize> = const { Cell::new(usize::MAX) };
     static SOURCE_READ_CAP: Cell<usize> = const { Cell::new(usize::MAX) };
     static VERIFY_READ_CAP: Cell<usize> = const { Cell::new(usize::MAX) };
+    static AES_PRIVATE_CRC_XOR: Cell<u32> = const { Cell::new(0) };
 }
 
 pub(super) fn with_hook<T>(
@@ -289,6 +295,7 @@ pub(super) fn with_hook<T>(
             SINK_WRITE_CAP.set(usize::MAX);
             SOURCE_READ_CAP.set(usize::MAX);
             VERIFY_READ_CAP.set(usize::MAX);
+            AES_PRIVATE_CRC_XOR.set(0);
         }
     }
     HOOK.with_borrow_mut(|cell| {
@@ -309,6 +316,10 @@ pub(super) fn source_read_cap() -> usize {
 
 pub(super) fn verify_read_cap() -> usize {
     VERIFY_READ_CAP.get()
+}
+
+pub(super) fn aes_private_crc(crc: u32) -> u32 {
+    crc ^ AES_PRIVATE_CRC_XOR.get()
 }
 
 pub(super) fn cap_verification_reads(bytes: usize) {

@@ -22,7 +22,7 @@ use std::mem::size_of;
 use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 
-use crate::zip::write::{EntryName, EntryOptions, EntryWritten, Method};
+use crate::zip::write::{EntryName, EntryOptions, EntryWritten, Method, WinZipAesRequest};
 
 use super::*;
 
@@ -39,6 +39,17 @@ pub(in crate::zip) mod verify;
 use unix::{Parent, Stamp};
 
 const STAGE_ATTEMPTS: u64 = 64;
+
+#[derive(Clone, Copy)]
+enum NativeEncryption<'a> {
+    ZipCrypto(&'a str),
+    Aes(&'a WinZipAesRequest<'a>),
+}
+
+struct PreparedReceipts {
+    common: Vec<EntryWritten>,
+    aes_crcs: Option<Vec<u32>>,
+}
 
 impl CreateLimits {
     fn directory_entries(&self) -> u64 {
@@ -240,7 +251,7 @@ impl CreatePlan {
         Ok(ordinal)
     }
 
-    fn preflight(&mut self, encrypted: bool) -> Result<Vec<EntryWritten>> {
+    fn preflight(&mut self, encryption: Option<NativeEncryption<'_>>) -> Result<PreparedReceipts> {
         work(&self.options, &mut self.usage.plan, 0)?;
         let limits = self.options.limits;
         let mut indices = Vec::new();
@@ -250,21 +261,54 @@ impl CreatePlan {
         receipts.try_reserve_exact(self.entries.len())?;
         let extra = indices.capacity() as u64 * size_of::<usize>() as u64
             + receipts.capacity() as u64 * size_of::<EntryWritten>() as u64;
-        let capacity = add(self.usage.plan.capacity, extra)?;
+        let mut capacity = add(self.usage.plan.capacity, extra)?;
         limit(capacity, limits.plan_capacity, CreateLimit::PlanCapacity)?;
+        let mut aes_crcs = None;
+        if matches!(encryption, Some(NativeEncryption::Aes(_))) {
+            // These existing buffers already overlap even if the additional
+            // AES reservation or its validation later refuses the attempt.
+            self.usage.plan.capacity = capacity;
+            let mut regular = false;
+            for entry in &self.entries {
+                work(&self.options, &mut self.usage.plan, 1)?;
+                if entry.payload_source().is_some() {
+                    regular = true;
+                    break;
+                }
+            }
+            if regular {
+                let needed =
+                    (self.entries.len() as u64).checked_mul(size_of::<u32>() as u64).ok_or(CreateError::Overflow)?;
+                limit(add(capacity, needed)?, limits.plan_capacity, CreateLimit::PlanCapacity)?;
+                #[cfg(test)]
+                if tests::event_io(tests::Event::AesCrcReserve, None).is_err() {
+                    return Err(CreateError::Allocation(Vec::<u32>::new().try_reserve_exact(usize::MAX).unwrap_err()));
+                }
+                let mut values = Vec::new();
+                values.try_reserve_exact(self.entries.len())?;
+                capacity = add(
+                    capacity,
+                    (values.capacity() as u64).checked_mul(size_of::<u32>() as u64).ok_or(CreateError::Overflow)?,
+                )?;
+                self.usage.plan.capacity = capacity;
+                limit(capacity, limits.plan_capacity, CreateLimit::PlanCapacity)?;
+                aes_crcs = Some(values);
+            }
+        }
         self.usage.plan.capacity = capacity;
         check_hierarchy(&self.entries, &mut indices, &self.options, &mut self.usage.plan, false)?;
         if self.options.collisions == CollisionPolicy::CallerKeys {
             check_hierarchy(&self.entries, &mut indices, &self.options, &mut self.usage.plan, true)?;
         }
-        self.check_feasibility(encrypted)?;
-        Ok(receipts)
+        self.check_feasibility(encryption)?;
+        Ok(PreparedReceipts { common: receipts, aes_crcs })
     }
 
-    fn check_feasibility(&mut self, encrypted: bool) -> Result<()> {
+    fn check_feasibility(&mut self, encryption: Option<NativeEncryption<'_>>) -> Result<()> {
         use crate::zip::write::Limit as W;
         let options = &self.options;
         let limits = options.limits;
+        let encrypted = encryption.is_some();
         writer_limit(limits.writer.central_bytes, isize::MAX as u64, W::CentralBytes)?;
         writer_limit(limits.writer.metadata_capacity, isize::MAX as u64, W::MetadataCapacity)?;
         let mut local = 0;
@@ -305,7 +349,19 @@ impl CreatePlan {
             }
             if encrypted {
                 let (local_bytes, central_bytes, member_wide, writes) = if payload.is_some() {
-                    crate::zip::write::exact_zipcrypto_geometry(entry.options(), size, local)?
+                    match encryption {
+                        Some(NativeEncryption::Aes(request)) => {
+                            let (_, strength, variant) = request.parameters();
+                            crate::zip::write::exact_winzip_aes_geometry(
+                                entry.options(),
+                                size,
+                                local,
+                                strength,
+                                variant,
+                            )?
+                        }
+                        _ => crate::zip::write::exact_zipcrypto_geometry(entry.options(), size, local)?,
+                    }
                 } else {
                     let geometry = crate::zip::write::exact_member_geometry(entry.options(), 0, true, local)?;
                     let writes = 2 + u64::from(entry.extended_mtime.is_some());
@@ -365,7 +421,7 @@ impl CreatePlan {
         directory_limit(central, limits.directory.directory_bytes, zip_container::LimitKind::DirectoryBytes)?;
         directory_limit(names, limits.directory.name_bytes, zip_container::LimitKind::NameBytes)?;
         directory_limit(comments, limits.directory.comment_bytes, zip_container::LimitKind::CommentBytes)?;
-        // The strict parser's variable extra ownership excludes ZIP64 and UT.
+        // The strict parser's variable extra ownership excludes ZIP64, UT and AES.
         // Charge all raw extras to the wrapper's independent metadata ceiling.
         limit(add(add(names, comments)?, extra)?, limits.verification_metadata, CreateLimit::VerificationMetadata)?;
         limit(

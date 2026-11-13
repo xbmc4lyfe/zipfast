@@ -230,20 +230,14 @@ impl<W: Write> ZipStreamWriter<W> {
         self.check_failed()?;
         let encrypted = zipcrypto || aes.is_some();
         let local_at = self.output.position;
-        let mut member = if zipcrypto {
+        let member = if let Some((strength, variant)) = aes {
+            aes_member(options, length, local_at, strength, variant)?
+        } else if zipcrypto {
             encrypted_member(options, length, local_at)?
         } else {
             prepare_member(options, length, directory, local_at)?
         };
-        let overhead = if let Some((strength, variant)) = aes {
-            member.aes = Some((strength, variant));
-            member.flags |= FLAG_DESCRIPTOR | FLAG_ENCRYPTED;
-            if member.method == Method::Stored
-                && let InputLength::Exact(size) = length
-            {
-                member.width =
-                    Width::new(Method::Stored, InputLength::Exact(add(size, strength.overhead())?), local_at, false);
-            }
+        let overhead = if let Some((strength, _)) = aes {
             strength.overhead()
         } else if zipcrypto {
             ZIPCRYPTO_HEADER
@@ -401,6 +395,40 @@ fn encrypted_member(options: EntryOptions<'_>, length: InputLength, local_at: u6
         member.width = Width::new(Method::Stored, InputLength::Exact(add(size, ZIPCRYPTO_HEADER)?), local_at, false);
     }
     Ok(member)
+}
+
+fn aes_member(
+    options: EntryOptions<'_>,
+    length: InputLength,
+    local_at: u64,
+    strength: AesStrength,
+    variant: AesVariant,
+) -> Result<Member, WriteError> {
+    let mut member = prepare_member(options, length, false, local_at)?;
+    member.aes = Some((strength, variant));
+    member.flags |= FLAG_DESCRIPTOR | FLAG_ENCRYPTED;
+    if member.method == Method::Stored
+        && let InputLength::Exact(size) = length
+    {
+        member.width = Width::new(Method::Stored, InputLength::Exact(add(size, strength.overhead())?), local_at, false);
+    }
+    Ok(member)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(in crate::zip) fn exact_winzip_aes_geometry(
+    options: EntryOptions<'_>,
+    size: u64,
+    offset: u64,
+    strength: AesStrength,
+    variant: AesVariant,
+) -> Result<(u64, u64, bool, u64), WriteError> {
+    let member = aes_member(options, InputLength::Exact(size), offset, strength, variant)?;
+    let stored = member.method == Method::Stored;
+    let packed = add(if stored { size } else { 1 }, strength.overhead())?;
+    let local = add(add(member.local_len(), packed)?, member.descriptor_len())?;
+    let attempts = 7 + if stored { size.div_ceil(BUFFER as u64) } else { 1 };
+    Ok((local, member.central_len(), member.width.is_wide(), attempts))
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

@@ -70,7 +70,7 @@ pub use split::ZipSplitWriter;
 mod stream;
 pub use stream::ZipStreamWriter;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(super) use stream::exact_zipcrypto_geometry;
+pub(super) use stream::{exact_winzip_aes_geometry, exact_zipcrypto_geometry};
 #[cfg(test)]
 mod tests;
 
