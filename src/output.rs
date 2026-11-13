@@ -180,6 +180,33 @@ impl WriteFile {
     pub(crate) fn target(&self) -> Option<&Path> {
         self.pending.as_ref().and_then(PendingPath::target)
     }
+
+    #[cfg(unix)]
+    pub(crate) fn publish_noclobber(self) -> Result<(), OutputError> {
+        let Self { file, pending } = self;
+        drop(file);
+        let Some(PendingPath::Replacement(temporary, target)) = pending else {
+            unreachable!("new selected output has a stage");
+        };
+        temporary.persist_noclobber(&target).map_err(|error| OutputError::Io {
+            operation: IoOperation::Publish,
+            path: Some(target),
+            source: error.error,
+        })
+    }
+
+    pub(crate) fn publish(self) -> Result<(), OutputError> {
+        let Self { file, pending } = self;
+        drop(file);
+        match pending {
+            Some(PendingPath::Replacement(temporary, target)) => replace_detailed(temporary, &target),
+            Some(PendingPath::New(mut cleanup)) => {
+                cleanup.0 = None;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
 }
 
 impl Output {
@@ -229,6 +256,11 @@ impl Output {
         let mut output = Self::new(file, size);
         output.pending = Some(PendingPath::Replacement(temporary, target));
         output
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn staged_direct(file: File, temporary: TempPath, target: PathBuf) -> Self {
+        Self { inner: Inner::Direct(file), pending: Some(PendingPath::Replacement(temporary, target)) }
     }
 
     pub(crate) fn write_detailed(&mut self, data: &[u8]) -> Result<(), OutputError> {
@@ -284,17 +316,9 @@ impl Output {
     }
 
     pub(crate) fn finish_detailed(self, prepare: impl FnOnce(&File)) -> Result<(), OutputError> {
-        let WriteFile { file, pending } = self.handoff_detailed()?;
-        prepare(&file);
-        drop(file);
-        match pending {
-            Some(PendingPath::Replacement(temporary, target)) => replace_detailed(temporary, &target),
-            Some(PendingPath::New(mut cleanup)) => {
-                cleanup.0 = None;
-                Ok(())
-            }
-            None => Ok(()),
-        }
+        let output = self.handoff_detailed()?;
+        prepare(&output.file);
+        output.publish()
     }
 }
 

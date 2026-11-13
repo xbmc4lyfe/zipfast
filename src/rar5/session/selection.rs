@@ -24,8 +24,12 @@ use crate::rar5::unpack::{Sink, Unpacker, window_for_detailed};
 
 use super::*;
 
+#[cfg(unix)]
+mod extraction;
+
 const WINDOW_MAX: u64 = 256 << 20;
 const CHUNK: usize = 64 << 10;
+type DecodedOutput<'a> = &'a mut dyn FnMut(&[u8]) -> RarResult<()>;
 
 pub(super) struct SessionToken {
     pub(super) _private: u8,
@@ -89,6 +93,17 @@ impl RarSession {
         &mut self,
         selection: &RarSelection,
         limits: RarDecodeLimits,
+        on_entry: impl FnMut(&RarEntryOutcome),
+    ) -> Result<RarRunSummary, RarRunError> {
+        self.execute_selected(selection, limits, |run, session, index| run.test(session, index, None), on_entry)
+    }
+
+    #[allow(clippy::result_large_err, reason = "reuse the typed RAR error with partial counts")]
+    fn execute_selected(
+        &mut self,
+        selection: &RarSelection,
+        limits: RarDecodeLimits,
+        mut member: impl FnMut(&mut SelectedRun, &mut RarSession, usize) -> Result<RarOutcome, Arc<RarFailure>>,
         mut on_entry: impl FnMut(&RarEntryOutcome),
     ) -> Result<RarRunSummary, RarRunError> {
         if !Arc::ptr_eq(&self.token, &selection.token) {
@@ -107,17 +122,17 @@ impl RarSession {
             while bits != 0 {
                 let index = word * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                let member = &self.members[index];
+                let header = &self.members[index].header;
                 let context = EntryContext {
                     entry: RarEntryIdentity {
                         index: Some(index as u64),
                         order: index as u64,
-                        name: member.header.name.clone(),
+                        name: header.name.clone(),
                     },
-                    method: member.header.method,
+                    method: header.method,
                     password: RarPasswordEvidence::NotEncrypted,
                 };
-                match run.test(self, index) {
+                match member(&mut run, self, index) {
                     Ok(outcome) => {
                         if let Err(fault) = count_outcome(&mut summary, &outcome) {
                             return Err(run_error(summary, Some(context.entry), Arc::from(fault.failure)));
@@ -226,7 +241,12 @@ impl SelectedRun {
         })
     }
 
-    fn test(&mut self, session: &mut RarSession, index: usize) -> Result<RarOutcome, Arc<RarFailure>> {
+    fn test(
+        &mut self,
+        session: &mut RarSession,
+        index: usize,
+        output: Option<DecodedOutput<'_>>,
+    ) -> Result<RarOutcome, Arc<RarFailure>> {
         check_cancel(&session.options.cancel).map_err(|fault| Arc::from(fault.failure))?;
         let member = &session.members[index];
         if member.header.is_dir() || member.header.redirection.is_some() {
@@ -268,7 +288,7 @@ impl SelectedRun {
                 if session.members[predecessor].chain != Some(chain) {
                     continue;
                 }
-                if let Err(failure) = self.decode(session, predecessor, true) {
+                if let Err(failure) = self.decode(session, predecessor, true, None) {
                     if is_terminal(&failure) {
                         return Err(failure);
                     }
@@ -279,7 +299,7 @@ impl SelectedRun {
             }
             self.next = index + 1;
         }
-        match self.decode(session, index, compressed) {
+        match self.decode(session, index, compressed, output) {
             Ok((bytes, checks)) => Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Tested }),
             Err(failure) if is_terminal(&failure) => Err(failure),
             Err(failure) => {
@@ -297,13 +317,20 @@ impl SelectedRun {
         session: &mut RarSession,
         index: usize,
         compressed: bool,
+        output: Option<DecodedOutput<'_>>,
     ) -> Result<(u64, RarVerification), Arc<RarFailure>> {
         check_cancel(&session.options.cancel).map_err(|fault| Arc::from(fault.failure))?;
         let member = &session.members[index];
         let mut used_volumes = if compressed { self.history_volumes } else { [0; VOLUME_WORDS] };
         mark_volumes(&mut used_volumes, &session.parts[member.parts.clone()]);
         check_volumes(session, &used_volumes)?;
-        let result = self.decode_bound(session, index).map_err(Arc::new);
+        let result = self.decode_bound(session, index, output).map_err(Arc::new);
+        if result.as_ref().is_err_and(|failure| matches!(failure.as_ref(), RarFailure::Output { .. })) {
+            // Record any observed binding loss without replacing the original
+            // output failure returned to this run.
+            let _ = check_volumes(session, &used_volumes);
+            return result;
+        }
         #[cfg(test)]
         AFTER_DECODE.with_borrow_mut(|hook| {
             if let Some(hook) = hook.take() {
@@ -318,7 +345,12 @@ impl SelectedRun {
         result
     }
 
-    fn decode_bound(&mut self, session: &RarSession, index: usize) -> Result<(u64, RarVerification), RarFailure> {
+    fn decode_bound(
+        &mut self,
+        session: &RarSession,
+        index: usize,
+        mut output: Option<DecodedOutput<'_>>,
+    ) -> Result<(u64, RarVerification), RarFailure> {
         let member = &session.members[index];
         if let Some(issue) = member.issue {
             return Err(copy_catalogue_issue(&session.issues[issue]));
@@ -399,6 +431,7 @@ impl SelectedRun {
                     limit: self.limits.decoded_bytes,
                     cancel: &session.options.cancel,
                     failure: None,
+                    output: &mut output,
                 };
                 let decoder = self.decoder.as_mut().filter(|_| compressed);
                 match decoder {
@@ -435,6 +468,7 @@ impl SelectedRun {
                 limit: self.limits.decoded_bytes,
                 cancel: &session.options.cancel,
                 failure: None,
+                output: &mut output,
             };
             let result = decoder.finish(&mut sink);
             sink.finish(result, decoder.take_size_failure())?;
@@ -544,7 +578,10 @@ fn is_terminal(failure: &RarFailure) -> bool {
             | RarFailure::Canceled
             | RarFailure::Internal(_)
             | RarFailure::Limit {
-                resource: RarResource::Counter | RarResource::SelectedPackedBytes | RarResource::SelectedDecodedBytes,
+                resource: RarResource::Counter
+                    | RarResource::CatalogueAllocation
+                    | RarResource::SelectedPackedBytes
+                    | RarResource::SelectedDecodedBytes,
                 ..
             }
     )
@@ -581,15 +618,16 @@ fn verify_part(
     Ok(())
 }
 
-struct SelectedSink<'a> {
+struct SelectedSink<'a, 'out> {
     pending: &'a mut Pending,
     decoded: &'a mut u64,
     limit: u64,
     cancel: &'a Cancellation,
     failure: Option<RarFailure>,
+    output: &'a mut Option<DecodedOutput<'out>>,
 }
 
-impl SelectedSink<'_> {
+impl SelectedSink<'_, '_> {
     fn finish(self, result: crate::Result<()>, size: Option<(u64, u64)>) -> Result<(), RarFailure> {
         if let Some(failure) = self.failure {
             return Err(failure);
@@ -607,13 +645,16 @@ impl SelectedSink<'_> {
                 *self.decoded =
                     charge(*self.decoded, chunk.len() as u64, self.limit, RarResource::SelectedDecodedBytes)
                         .map_err(|failure| RarFault::new(failure, Error::Corrupt("selected RAR decoded work limit")))?;
+                if let Some(output) = &mut self.output {
+                    output(chunk)?;
+                }
                 Ok(())
             })
             .map_err(|fault| *fault.failure)
     }
 }
 
-impl Sink for SelectedSink<'_> {
+impl Sink for SelectedSink<'_, '_> {
     fn put(&mut self, bytes: &[u8]) -> crate::Result<()> {
         if self.failure.is_none() {
             self.failure = self.take(bytes).err();

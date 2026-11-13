@@ -173,6 +173,7 @@ pub enum RarPolicyReason {
     Symlink,
     Directory,
     ParentIsFile,
+    TargetChanged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,6 +185,7 @@ pub enum IoOperation {
     CreateFile,
     Read,
     Write,
+    Flush,
     Seek,
     Publish,
 }
