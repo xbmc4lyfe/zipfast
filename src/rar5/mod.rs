@@ -18,6 +18,7 @@
 //! headers with their extra records, and the end of archive header.
 
 pub mod reader;
+pub mod session;
 #[doc(hidden)]
 pub mod testenc;
 pub mod unpack;
@@ -220,6 +221,35 @@ pub(crate) type MemberCrypt =
     Option<std::result::Result<crate::crypto::Rar5CryptParams, crate::crypto::Rar5CryptError>>;
 
 pub(crate) fn parse_file_detailed(head: &BlockHead, body: &[u8], extra: &[u8]) -> Result<(FileHeader, MemberCrypt)> {
+    match parse_file_impl(head, body, extra, false) {
+        Ok((file, crypt, _)) => Ok((file, crypt)),
+        Err(FileParseError::Format(error)) => Err(error),
+        Err(FileParseError::Allocation) => unreachable!("legacy names use the legacy allocation path"),
+    }
+}
+
+enum FileParseError {
+    Format(Error),
+    Allocation,
+}
+
+impl From<Error> for FileParseError {
+    fn from(error: Error) -> Self {
+        Self::Format(error)
+    }
+}
+
+pub(super) struct FileWire {
+    pub(super) name: Vec<u8>,
+    pub(super) compression: u64,
+}
+
+fn parse_file_impl(
+    head: &BlockHead,
+    body: &[u8],
+    extra: &[u8],
+    catalogue: bool,
+) -> std::result::Result<(FileHeader, MemberCrypt, Option<FileWire>), FileParseError> {
     let mut c = Cursor::new(body);
     let mut f = FileHeader {
         service: head.kind == HEAD_SERVICE,
@@ -254,12 +284,50 @@ pub(crate) fn parse_file_detailed(head: &BlockHead, body: &[u8], extra: &[u8]) -
     f.dictionary = dictionary;
     f.host_os = c.vint()?;
     let name_len = c.vsize()?;
-    f.name = String::from_utf8_lossy(c.bytes(name_len)?).into_owned();
-    let crypt = parse_file_extra(&mut f, extra)?;
-    Ok((f, crypt))
+    let name = c.bytes(name_len)?;
+    f.name = display_name(name, catalogue)?;
+    let crypt = parse_file_extra(&mut f, extra, catalogue)?;
+    let wire = if catalogue && !f.service {
+        let mut encoded = Vec::new();
+        encoded.try_reserve_exact(name.len()).map_err(|_| FileParseError::Allocation)?;
+        encoded.extend_from_slice(name);
+        Some(FileWire { name: encoded, compression: info })
+    } else {
+        None
+    };
+    Ok((f, crypt, wire))
 }
 
-fn parse_file_extra(f: &mut FileHeader, extra: &[u8]) -> Result<MemberCrypt> {
+fn display_name(bytes: &[u8], catalogue: bool) -> std::result::Result<String, FileParseError> {
+    if !catalogue {
+        return Ok(String::from_utf8_lossy(bytes).into_owned());
+    }
+    let len = bytes
+        .utf8_chunks()
+        .try_fold(0usize, |len, chunk| {
+            len.checked_add(chunk.valid().len())?.checked_add(if chunk.invalid().is_empty() {
+                0
+            } else {
+                '\u{fffd}'.len_utf8()
+            })
+        })
+        .ok_or(FileParseError::Allocation)?;
+    let mut text = String::new();
+    text.try_reserve_exact(len).map_err(|_| FileParseError::Allocation)?;
+    for chunk in bytes.utf8_chunks() {
+        text.push_str(chunk.valid());
+        if !chunk.invalid().is_empty() {
+            text.push('\u{fffd}');
+        }
+    }
+    Ok(text)
+}
+
+fn parse_file_extra(
+    f: &mut FileHeader,
+    extra: &[u8],
+    catalogue: bool,
+) -> std::result::Result<MemberCrypt, FileParseError> {
     let mut crypt = None;
     let mut c = Cursor::new(extra);
     while c.remaining() > 0 {
@@ -289,7 +357,12 @@ fn parse_file_extra(f: &mut FileHeader, extra: &[u8]) -> Result<MemberCrypt> {
                 let kind = r.vint()?;
                 let _flags = r.vint()?;
                 let len = r.vsize()?;
-                let target = String::from_utf8_lossy(r.bytes(len)?).into_owned();
+                let target = r.bytes(len)?;
+                if catalogue && !(1..=5).contains(&kind) {
+                    f.redirection = Some(Redirection::Unknown(kind));
+                    continue;
+                }
+                let target = display_name(target, catalogue)?;
                 f.redirection = Some(match kind {
                     1 => Redirection::UnixSymlink(target),
                     2 => Redirection::WindowsSymlink(target),

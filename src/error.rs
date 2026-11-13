@@ -124,6 +124,10 @@ pub enum RarIntegrityReason {
     IncompleteCipherBlock,
     MissingSplitContinuation,
     ChangedContinuationEncoding,
+    SplitSizeMismatch {
+        expected: u64,
+        actual: u64,
+    },
     DeclaredHashUnavailable,
     InvalidDictionary {
         requested: u64,
@@ -134,6 +138,7 @@ pub enum RarIntegrityReason {
 #[non_exhaustive]
 pub enum RarUnsupported {
     ArchiveVersion(u8),
+    SourceIdentity,
     CompressionAlgorithm { algorithm: u8, method: u8 },
     EncryptionVersion(u64),
     Redirection { kind: u64 },
@@ -148,6 +153,14 @@ pub enum RarResource {
     DictionarySize,
     DictionaryAllocation,
     Counter,
+    CatalogueVolumes,
+    CatalogueEntries,
+    CatalogueNameBytes,
+    CatalogueCapacity,
+    CatalogueParts,
+    CatalogueBlocks,
+    CatalogueReadBytes,
+    CatalogueAllocation,
 }
 
 #[derive(Debug)]
@@ -197,6 +210,8 @@ pub enum RarFailure {
     Policy { reason: RarPolicyReason, path: PathBuf },
     MissingVolume { path: PathBuf },
     UnnamedVolume { path: PathBuf },
+    SourceChanged { path: PathBuf },
+    Canceled,
     NotRar,
     Internal(RarInternal),
 }
@@ -227,6 +242,8 @@ impl fmt::Display for RarFailure {
             Self::Policy { reason, path } => write!(f, "RAR path blocked ({reason:?}): {}", path.display()),
             Self::MissingVolume { path } => write!(f, "missing volume {}", path.display()),
             Self::UnnamedVolume { path } => write!(f, "cannot determine the next volume after {}", path.display()),
+            Self::SourceChanged { path } => write!(f, "RAR source changed: {}", path.display()),
+            Self::Canceled => f.write_str("RAR operation canceled"),
             Self::NotRar => f.write_str("not a RAR archive"),
             Self::Internal(reason) => write!(f, "RAR internal failure ({reason:?})"),
         }

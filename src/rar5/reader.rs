@@ -24,6 +24,7 @@ use std::sync::mpsc::{Receiver, Sender, SyncSender, channel, sync_channel};
 
 use crate::batch::{PositionReadError, read_at_detailed};
 
+use super::session::{ScanBudget, allocation};
 use super::*;
 use crate::error::{
     Error, IoOperation, RarFailure, RarFault, RarIntegrityReason, RarInternal, RarPasswordEvidence, RarResult,
@@ -47,7 +48,16 @@ pub(crate) enum ReadDataError<E> {
     Sink(E),
 }
 
-fn read_failure(e: PositionReadError, path: Option<PathBuf>, reason: RarIntegrityReason) -> RarFault {
+type ParsedBlock = (Block, MemberCrypt, Option<FileWire>);
+
+fn header_buffer(size: usize) -> RarResult<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(size).map_err(|_| allocation())?;
+    bytes.resize(size, 0);
+    Ok(bytes)
+}
+
+pub(super) fn read_failure(e: PositionReadError, path: Option<PathBuf>, reason: RarIntegrityReason) -> RarFault {
     match e {
         PositionReadError::Eof => RarFault::new(
             RarFailure::integrity(
@@ -359,16 +369,42 @@ impl Volume {
         #[cfg(all(test, unix))]
         VOLUME_OPENS.set(VOLUME_OPENS.get() + 1);
         let len = volume_length(path, || file.metadata())?;
-        let mut head = vec![0u8; len.min(SIGNATURE_PROBE_BYTES) as usize];
-        read_at_detailed(&file, &mut head, 0)
-            .map_err(|e| read_failure(e, Some(path.to_path_buf()), RarIntegrityReason::TruncatedHeader))?;
-        let next = signature_end(&head).map_err(|e| {
-            let failure = match e {
-                Error::NotAnArchive => RarFailure::NotRar,
-                _ => RarFailure::Unsupported(RarUnsupported::ArchiveVersion(4)),
-            };
-            RarFault::new(failure, e)
-        })?;
+        Self::open_file(path, file, len, password, detailed, None)
+    }
+
+    pub(super) fn open_catalogue(
+        path: &Path,
+        file: File,
+        len: u64,
+        password: Option<&str>,
+        budget: &mut ScanBudget<'_>,
+    ) -> RarResult<Self> {
+        Self::open_file(path, file, len, password, true, Some(budget))
+    }
+
+    fn open_file(
+        path: &Path,
+        file: File,
+        len: u64,
+        password: Option<&str>,
+        detailed: bool,
+        mut budget: Option<&mut ScanBudget<'_>>,
+    ) -> RarResult<Volume> {
+        let first = if let Some(budget) = budget.as_deref_mut() {
+            let mut first = [0; SIGNATURE.len()];
+            let used = len.min(SIGNATURE.len() as u64) as usize;
+            budget.read(&file, path, &mut first[..used], 0)?;
+            Some((first, used))
+        } else {
+            None
+        };
+        let next = if let Some((first, _)) = first
+            && first == *SIGNATURE
+        {
+            SIGNATURE.len() as u64
+        } else {
+            Self::probe_signature(path, &file, len, first, budget.as_deref_mut())?
+        };
         let mut vol = Volume {
             path: path.to_path_buf(),
             src: Source::new(file, len),
@@ -378,9 +414,9 @@ impl Volume {
             password: password.filter(|s| !s.is_empty()).map(str::to_owned),
             header_key: None,
         };
-        match vol.next_block_impl(detailed)? {
-            Some((Block::Main(m), _)) => vol.main = m,
-            Some((Block::Crypt, _)) => return Err(vol.password_required()),
+        match vol.next_block_impl(detailed, budget, true)? {
+            Some((Block::Main(m), _, _)) => vol.main = m,
+            Some((Block::Crypt, _, _)) => return Err(vol.password_required()),
             _ => {
                 return Err(vol.header_fault(
                     RarIntegrityReason::HeaderFraming("main archive header missing"),
@@ -392,13 +428,56 @@ impl Volume {
         Ok(vol)
     }
 
+    fn probe_signature(
+        path: &Path,
+        file: &File,
+        len: u64,
+        first: Option<([u8; SIGNATURE.len()], usize)>,
+        budget: Option<&mut ScanBudget<'_>>,
+    ) -> RarResult<u64> {
+        let len = len.min(SIGNATURE_PROBE_BYTES) as usize;
+        if let (Some(budget), Some((_, used))) = (&budget, first) {
+            budget.check_read(len - used)?;
+        }
+        let mut head = header_buffer(len)?;
+        if let Some(budget) = budget {
+            let (first, used) = first.expect("catalogue probe reads the signature prefix");
+            head[..used].copy_from_slice(&first[..used]);
+            budget.read(file, path, &mut head[used..], used as u64)?;
+        } else {
+            read_at_detailed(file, &mut head, 0)
+                .map_err(|e| read_failure(e, Some(path.to_path_buf()), RarIntegrityReason::TruncatedHeader))?;
+        }
+        signature_end(&head).map_err(|e| {
+            let failure = match e {
+                Error::NotAnArchive => RarFailure::NotRar,
+                _ => RarFailure::Unsupported(RarUnsupported::ArchiveVersion(4)),
+            };
+            RarFault::new(failure, e)
+        })
+    }
+
     /// The next block, or None at the physical end of the volume.
     pub fn next_block(&mut self) -> Result<Option<Block>> {
-        self.next_block_impl(false).map(|result| result.map(|(block, _)| block)).map_err(RarFault::into_legacy)
+        self.next_block_impl(false, None, false)
+            .map(|result| result.map(|(block, _, _)| block))
+            .map_err(RarFault::into_legacy)
     }
 
     pub(crate) fn next_block_detailed(&mut self) -> RarResult<Option<(Block, MemberCrypt)>> {
-        self.next_block_impl(true)
+        self.next_block_impl(true, None, false).map(|result| result.map(|(block, crypt, _)| (block, crypt)))
+    }
+
+    pub(super) fn next_catalogue(&mut self, budget: &mut ScanBudget<'_>) -> RarResult<Option<ParsedBlock>> {
+        self.next_block_impl(true, Some(budget), false)
+    }
+
+    pub(super) fn encrypted_headers(&self) -> bool {
+        self.header_key.is_some()
+    }
+
+    pub(super) fn into_catalogue_file(self) -> File {
+        self.src.file
     }
 
     fn scope(&self) -> RarScope {
@@ -426,23 +505,35 @@ impl Volume {
         }
     }
 
-    fn next_block_impl(&mut self, detailed: bool) -> RarResult<Option<(Block, MemberCrypt)>> {
+    fn next_block_impl(
+        &mut self,
+        detailed: bool,
+        mut budget: Option<&mut ScanBudget<'_>>,
+        catalogue_main: bool,
+    ) -> RarResult<Option<ParsedBlock>> {
         loop {
             if self.next >= self.len {
                 return Ok(None);
             }
-            self.src.seek(self.next);
             let start = self.next;
+            if let Some(budget) = budget.as_deref_mut() {
+                budget.block()?;
+            } else {
+                self.src.seek(start);
+            }
+            let mut at = start;
             let (body, header_end) = if let Some(key) = self.header_key.as_ref().map(|keys| keys.key) {
                 if start.checked_add(32).is_none_or(|e| e > self.len) {
                     return Err(self.header_fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false));
                 }
                 let mut iv = [0u8; 16];
                 let mut first_ct = [0u8; 16];
-                self.read_header_exact(&mut iv)?;
-                self.read_header_exact(&mut first_ct)?;
-                let first_dec = crate::crypto::decrypt_cbc(&key, &iv, &first_ct)
+                self.read_header_exact(&mut budget, &mut at, &mut iv)?;
+                self.read_header_exact(&mut budget, &mut at, &mut first_ct)?;
+                let cipher = crate::crypto::AesKey::new(&key)
                     .ok_or_else(|| self.framing("encrypted header block", Error::Encrypted))?;
+                let mut first_dec = first_ct;
+                cipher.decrypt_cbc_in_place(&mut iv, &mut first_dec);
                 let mut size = 0u64;
                 let mut size_len = 0usize;
                 for i in 0..3 {
@@ -469,28 +560,32 @@ impl Volume {
                 if header_end > self.len {
                     return Err(self.header_fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, true));
                 }
-                let mut ct = vec![0u8; padded_len];
-                ct[..16].copy_from_slice(&first_ct);
-                if padded_len > 16 {
-                    self.read_header_exact(&mut ct[16..])?;
+                if let Some(budget) = &budget {
+                    budget.check_read(padded_len - 16)?;
                 }
-                let dec = crate::crypto::decrypt_cbc(&key, &iv, &ct)
-                    .ok_or_else(|| self.framing("encrypted header block", Error::Encrypted))?;
-                let stored_crc = u32::from_le_bytes(dec[..4].try_into().unwrap());
-                if crate::crc32::hash(&dec[4..plain_need]) != stored_crc {
+                let mut body = header_buffer(padded_len)?;
+                body[..16].copy_from_slice(&first_dec);
+                if padded_len > 16 {
+                    self.read_header_exact(&mut budget, &mut at, &mut body[16..])?;
+                    cipher.decrypt_cbc_in_place(&mut iv, &mut body[16..]);
+                }
+                let stored_crc = u32::from_le_bytes(body[..4].try_into().unwrap());
+                if crate::crc32::hash(&body[4..plain_need]) != stored_crc {
                     return Err(self.header_fault(RarIntegrityReason::HeaderCrc, Error::Encrypted, true));
                 }
-                (dec[4 + size_len..plain_need].to_vec(), header_end)
+                body.copy_within(4 + size_len..plain_need, 0);
+                body.truncate(size as usize);
+                (body, header_end)
             } else {
                 let mut crc_bytes = [0u8; 4];
-                self.read_header_exact(&mut crc_bytes)?;
+                self.read_header_exact(&mut budget, &mut at, &mut crc_bytes)?;
                 let stored_crc = u32::from_le_bytes(crc_bytes);
                 // the size field is a vint of at most 3 bytes
                 let mut size_field = Vec::with_capacity(3);
                 let mut size = 0u64;
                 for i in 0..3 {
                     let mut b = [0u8; 1];
-                    self.read_header_exact(&mut b)?;
+                    self.read_header_exact(&mut budget, &mut at, &mut b)?;
                     size_field.push(b[0]);
                     size |= u64::from(b[0] & 0x7f) << (7 * i);
                     if b[0] & 0x80 == 0 {
@@ -509,8 +604,11 @@ impl Volume {
                 if header_end > self.len {
                     return Err(self.header_fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false));
                 }
-                let mut body = vec![0u8; size as usize];
-                self.read_header_exact(&mut body)?;
+                if let Some(budget) = &budget {
+                    budget.check_read(size as usize)?;
+                }
+                let mut body = header_buffer(size as usize)?;
+                self.read_header_exact(&mut budget, &mut at, &mut body)?;
                 let mut hasher = crate::crc32::Hasher::new();
                 hasher.update(&size_field);
                 hasher.update(&body);
@@ -551,21 +649,31 @@ impl Volume {
                     let flags = f.vint().map_err(|e| self.parse_fault(e))?;
                     let volume_number =
                         if flags & MHFL_VOLNUMBER != 0 { f.vint().map_err(|e| self.parse_fault(e))? } else { 0 };
-                    return Ok(Some((Block::Main(MainHeader { flags, volume_number }), None)));
+                    return Ok(Some((Block::Main(MainHeader { flags, volume_number }), None, None)));
                 }
                 HEAD_FILE | HEAD_SERVICE => {
-                    let (h, crypt) = parse_file_detailed(&head, fields, extra).map_err(|e| self.parse_fault(e))?;
+                    let (h, crypt, wire) =
+                        parse_file_impl(&head, fields, extra, budget.is_some()).map_err(|error| match error {
+                            FileParseError::Format(error) => self.parse_fault(error),
+                            FileParseError::Allocation => allocation(),
+                        })?;
                     let block = if kind == HEAD_FILE { Block::File(h) } else { Block::Service(h) };
-                    return Ok(Some((block, crypt)));
+                    return Ok(Some((block, crypt, wire)));
                 }
                 HEAD_CRYPT => {
+                    if budget.is_some() && (!catalogue_main || self.header_key.is_some()) {
+                        return Err(self.framing("unexpected RAR header encryption block", Error::Encrypted));
+                    }
                     if !detailed && self.password.is_none() {
-                        return Ok(Some((Block::Crypt, None)));
+                        return Ok(Some((Block::Crypt, None, None)));
                     }
                     let crypt_fault = |e| RarFault::new(RarFailure::crypt(e, self.scope()), Error::Encrypted);
                     let params = crate::crypto::parse_rar5_crypt(fields, crate::crypto::Rar5CryptLayout::Header)
                         .map_err(crypt_fault)?;
                     let pw = self.password.as_deref().ok_or_else(|| self.password_required())?;
+                    if let Some(budget) = budget.as_deref_mut() {
+                        budget.check()?;
+                    }
                     let keys = crate::crypto::derive_rar5_keys(pw, params.kdf_count, &params.salt, params.check)
                         .map_err(crypt_fault)?;
                     self.header_key = Some(keys);
@@ -573,11 +681,15 @@ impl Volume {
                 }
                 HEAD_END => {
                     let mut f = Cursor::new(fields);
-                    let flags = f.vint().unwrap_or(0);
+                    let flags = if budget.is_some() {
+                        f.vint().map_err(|e| self.parse_fault(e))?
+                    } else {
+                        f.vint().unwrap_or(0)
+                    };
                     self.next = self.len;
-                    return Ok(Some((Block::End { more_volumes: flags & EOAFL_MORE_VOLUMES != 0 }, None)));
+                    return Ok(Some((Block::End { more_volumes: flags & EOAFL_MORE_VOLUMES != 0 }, None, None)));
                 }
-                _ => return Ok(Some((Block::Unknown, None))),
+                _ => return Ok(Some((Block::Unknown, None, None))),
             }
         }
     }
@@ -599,7 +711,17 @@ impl Volume {
         self.len
     }
 
-    fn read_header_exact(&mut self, mut out: &mut [u8]) -> RarResult<()> {
+    fn read_header_exact(
+        &mut self,
+        budget: &mut Option<&mut ScanBudget<'_>>,
+        at: &mut u64,
+        mut out: &mut [u8],
+    ) -> RarResult<()> {
+        if let Some(budget) = budget {
+            budget.read(&self.src.file, &self.path, out, *at)?;
+            *at += out.len() as u64;
+            return Ok(());
+        }
         while !out.is_empty() {
             if !self.src.fill().map_err(|e| e.detailed(&self.path, RarIntegrityReason::TruncatedHeader))? {
                 return Err(self.header_fault(RarIntegrityReason::TruncatedHeader, Error::Truncated, false));
