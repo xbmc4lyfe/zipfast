@@ -442,7 +442,8 @@ fn descriptor(
     central: CentralHeader,
     sizes: (u64, u64),
     wide: bool,
-) -> Result<()> {
+    recover_signed: bool,
+) -> Result<Option<recovery::DescriptorRepair>> {
     let length = end.checked_sub(at).ok_or(RewriteError::UnsupportedLayout("overlapping local records"))?;
     let mut bytes = [0; 24];
     let body = if wide { 20 } else { 12 };
@@ -469,7 +470,26 @@ fn descriptor(
             matches += 1;
         }
     }
-    ensure(matches == 1, "no unique matching data descriptor")
+    if matches == 1 {
+        return Ok(None);
+    }
+    ensure(
+        recover_signed && length == body + 4 && le32(&bytes, 0) == DESC_SIGNATURE,
+        "no unique matching data descriptor",
+    )?;
+    ensure(
+        wide || (sizes.0 < u64::from(CLASSIC_SENTINEL) && sizes.1 < u64::from(CLASSIC_SENTINEL)),
+        "classic descriptor sizes require ZIP64",
+    )?;
+    bytes[4..8].copy_from_slice(&central.crc32.to_le_bytes());
+    if wide {
+        bytes[8..16].copy_from_slice(&sizes.0.to_le_bytes());
+        bytes[16..24].copy_from_slice(&sizes.1.to_le_bytes());
+    } else {
+        bytes[8..12].copy_from_slice(&(sizes.0 as u32).to_le_bytes());
+        bytes[12..16].copy_from_slice(&(sizes.1 as u32).to_le_bytes());
+    }
+    Ok(Some(recovery::DescriptorRepair { offset: at, data: bytes, len: length as u8 }))
 }
 
 pub(super) fn member(
@@ -478,6 +498,16 @@ pub(super) fn member(
     end: u64,
     scratch: &mut [u8; BUFFER],
 ) -> Result<Member> {
+    framed_member(reader, central, end, scratch, false).map(|(member, _)| member)
+}
+
+fn framed_member(
+    reader: &mut Reader<'_, '_, '_>,
+    central: crate::zip::EntryMetadata<'_>,
+    end: u64,
+    scratch: &mut [u8; BUFFER],
+    recover_signed: bool,
+) -> Result<(Member, Option<recovery::DescriptorRepair>)> {
     let local_at = central.physical_local_header_offset();
     let header = central.header();
     let resolved = central.resolved();
@@ -544,20 +574,24 @@ pub(super) fn member(
         .payload_range(sizes.0, end)
         .map_err(|_| RewriteError::UnsupportedLayout("packed data exceeds its boundary"))?;
     let wide_sizes = local_packed || local_decoded || central_packed || central_decoded;
-    if has_descriptor {
-        descriptor(reader, payload.end, end, header, sizes, wide_sizes)?;
+    let repair = if has_descriptor {
+        descriptor(reader, payload.end, end, header, sizes, wide_sizes, recover_signed)?
     } else {
         ensure(payload.end == end, "unowned bytes between local records and directory")?;
-    }
-    Ok(Member {
-        local_at,
-        end,
-        payload_at: payload.start,
-        local_version: local.version_needed,
-        central_zip64: central_extras.zip64,
-        wide_sizes,
-        directory,
-    })
+        None
+    };
+    Ok((
+        Member {
+            local_at,
+            end,
+            payload_at: payload.start,
+            local_version: local.version_needed,
+            central_zip64: central_extras.zip64,
+            wide_sizes,
+            directory,
+        },
+        repair,
+    ))
 }
 
 pub(super) fn raw_directory(entry: crate::zip::EntryMetadata<'_>) -> bool {
@@ -633,3 +667,10 @@ pub(super) fn members(
     }
     Ok(prefix_end)
 }
+
+#[cfg(test)]
+mod recovery_tests;
+
+// The central-directed transaction will consume this independently reviewed seam.
+#[allow(dead_code)]
+pub(in crate::zip) mod recovery;
