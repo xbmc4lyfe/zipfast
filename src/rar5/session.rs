@@ -37,7 +37,7 @@ use super::reader::{Block, Volume, read_failure};
 use super::{FileHeader, FileWire, MHFL_VOLNUMBER, MainHeader, MemberCrypt, Redirection};
 
 mod selection;
-pub use selection::{RarDecodeLimits, RarSelection};
+pub use selection::{RarDecodeLimits, RarPrintOptions, RarSelection};
 
 const MAX_VOLUMES: u64 = 4_096;
 
@@ -334,7 +334,12 @@ impl RarSession {
                 volumes: catalogue.session.usage.volumes,
                 ..RarRunSummary::default()
             };
-            return Err(RarRunError { partial, entry: None, failure: Arc::from(fault.failure) });
+            return Err(RarRunError {
+                partial,
+                entry: None,
+                failure: Arc::from(fault.failure),
+                partial_member_bytes: 0,
+            });
         }
         Ok(catalogue.session)
     }
