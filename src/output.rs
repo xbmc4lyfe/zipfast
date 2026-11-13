@@ -42,9 +42,15 @@ pub(crate) struct Output {
 
 #[derive(Debug)]
 pub(crate) enum OutputError {
-    Io { operation: IoOperation, path: Option<PathBuf>, source: io::Error },
+    Io {
+        operation: IoOperation,
+        path: Option<PathBuf>,
+        source: io::Error,
+    },
     Worker(WriterFailure),
     Symlink(PathBuf),
+    #[cfg(unix)]
+    StageChanged(PathBuf),
 }
 
 impl OutputError {
@@ -53,6 +59,8 @@ impl OutputError {
             Self::Io { source, .. } => source,
             Self::Worker(failure) => failure.into_legacy(),
             Self::Symlink(_) => io::Error::new(io::ErrorKind::AlreadyExists, "a symlink is in the way"),
+            #[cfg(unix)]
+            Self::StageChanged(_) => io::Error::other("the verified output stage changed"),
         }
     }
 
@@ -70,6 +78,11 @@ impl OutputError {
             Self::Symlink(path) => RarFault::new(
                 RarFailure::Policy { reason: RarPolicyReason::Symlink, path },
                 Error::Io(io::Error::new(io::ErrorKind::AlreadyExists, "a symlink is in the way")),
+            ),
+            #[cfg(unix)]
+            Self::StageChanged(path) => RarFault::new(
+                RarFailure::Policy { reason: RarPolicyReason::StageChanged, path },
+                Error::Io(io::Error::other("the verified output stage changed")),
             ),
         }
     }
@@ -115,6 +128,35 @@ pub(crate) struct WriteFile {
 enum PendingPath {
     New(Cleanup),
     Replacement(TempPath, PathBuf),
+    #[cfg(unix)]
+    Selected(SelectedStage, PathBuf),
+}
+
+#[cfg(unix)]
+struct SelectedStage {
+    path: Option<TempPath>,
+    identity: (u64, u64),
+}
+
+#[cfg(unix)]
+impl SelectedStage {
+    fn owns_name(&self) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        self.path.as_ref().is_some_and(|path| {
+            fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && (meta.dev(), meta.ino()) == self.identity)
+        })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for SelectedStage {
+    fn drop(&mut self) {
+        if !self.owns_name()
+            && let Some(path) = &mut self.path
+        {
+            path.disable_cleanup(true);
+        }
+    }
 }
 
 struct Cleanup(Option<PathBuf>);
@@ -172,6 +214,8 @@ impl PendingPath {
         match self {
             Self::New(cleanup) => cleanup.0.as_deref(),
             Self::Replacement(_, target) => Some(target),
+            #[cfg(unix)]
+            Self::Selected(_, target) => Some(target),
         }
     }
 }
@@ -182,17 +226,26 @@ impl WriteFile {
     }
 
     #[cfg(unix)]
-    pub(crate) fn publish_noclobber(self) -> Result<(), OutputError> {
+    pub(crate) fn publish_selected(self, replace: bool) -> Result<(), OutputError> {
         let Self { file, pending } = self;
-        drop(file);
-        let Some(PendingPath::Replacement(temporary, target)) = pending else {
-            unreachable!("new selected output has a stage");
+        let Some(PendingPath::Selected(mut stage, target)) = pending else {
+            unreachable!("selected output has a stage");
         };
-        temporary.persist_noclobber(&target).map_err(|error| OutputError::Io {
-            operation: IoOperation::Publish,
-            path: Some(target),
-            source: error.error,
-        })
+        if !stage.owns_name() {
+            return Err(OutputError::StageChanged(target));
+        }
+        let temporary = stage.path.take().expect("selected stage pathname");
+        let result = if replace {
+            replace_detailed(temporary, &target)
+        } else {
+            temporary.persist_noclobber(&target).map_err(|error| OutputError::Io {
+                operation: IoOperation::Publish,
+                path: Some(target),
+                source: error.error,
+            })
+        };
+        drop(file);
+        result
     }
 
     pub(crate) fn publish(self) -> Result<(), OutputError> {
@@ -200,6 +253,8 @@ impl WriteFile {
         drop(file);
         match pending {
             Some(PendingPath::Replacement(temporary, target)) => replace_detailed(temporary, &target),
+            #[cfg(unix)]
+            Some(PendingPath::Selected(_, _)) => unreachable!("selected output uses checked publication"),
             Some(PendingPath::New(mut cleanup)) => {
                 cleanup.0 = None;
                 Ok(())
@@ -259,8 +314,11 @@ impl Output {
     }
 
     #[cfg(unix)]
-    pub(crate) fn staged_direct(file: File, temporary: TempPath, target: PathBuf) -> Self {
-        Self { inner: Inner::Direct(file), pending: Some(PendingPath::Replacement(temporary, target)) }
+    pub(crate) fn staged_direct(file: File, temporary: TempPath, target: PathBuf) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = file.metadata()?;
+        let stage = SelectedStage { path: Some(temporary), identity: (metadata.dev(), metadata.ino()) };
+        Ok(Self { inner: Inner::Direct(file), pending: Some(PendingPath::Selected(stage, target)) })
     }
 
     pub(crate) fn write_detailed(&mut self, data: &[u8]) -> Result<(), OutputError> {

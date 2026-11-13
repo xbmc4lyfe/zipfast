@@ -101,6 +101,59 @@ fn selected_extraction_orders_duplicates_preserves_metadata_and_refuses_unsafe_p
 }
 
 #[test]
+fn last_selected_directory_record_sets_permissions() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.rar");
+    let first = FileSpec { dir: true, unix_mode: Some(0), ..FileSpec::new("folder", b"") };
+    let last = FileSpec { dir: true, unix_mode: Some(0o750), ..FileSpec::new("folder", b"") };
+    fs::write(&path, archive(&[first, last])).unwrap();
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    let dest = dir.path().join("out");
+    let summary = session
+        .extract_selected(&selected, &options(&dest, Overwrite::Always), RarDecodeLimits::default(), |_| {})
+        .unwrap();
+    assert_eq!(summary.dirs, 2);
+    let mode = fs::metadata(dest.join("folder")).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode, 0o750);
+}
+
+#[test]
+fn protects_the_name_of_an_unselected_volume_removed_during_extraction() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("set.part1.rar");
+    let second = dir.path().join("set.part2.rar");
+    let ordinary = FileSpec::new("first", b"first");
+    let colliding = FileSpec::new("set.part2.rar", b"replacement");
+    let mut contents = SIG.to_vec();
+    contents.extend(main_block(true, None));
+    contents.extend(file_block(&ordinary, ordinary.data, crc32fast::hash(ordinary.data), false, false));
+    contents.extend(file_block(&colliding, colliding.data, crc32fast::hash(colliding.data), false, false));
+    contents.extend(end_block(true));
+    fs::write(&first, contents).unwrap();
+    fs::write(&second, archive(&[])).unwrap();
+    let mut session = RarSession::open(&first, None, RarSessionOptions::default()).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    let summary = session
+        .extract_selected(&selected, &options(dir.path(), Overwrite::Always), RarDecodeLimits::default(), |event| {
+            match event.entry.order {
+                0 => fs::remove_file(&second).unwrap(),
+                1 => assert!(matches!(
+                    &event.outcome,
+                    RarOutcome::Failed(failure) if matches!(
+                        failure.as_ref(),
+                        RarFailure::Policy { reason: RarPolicyReason::ProtectedInput, .. }
+                    )
+                )),
+                order => panic!("unexpected ordinal {order}"),
+            }
+        })
+        .unwrap();
+    assert_eq!((summary.files, summary.failed), (1, 1));
+    assert!(!second.exists());
+}
+
+#[test]
 fn protects_a_hard_link_to_an_unselected_later_volume() {
     let dir = tempfile::tempdir().unwrap();
     let first = dir.path().join("set.part1.rar");

@@ -174,6 +174,7 @@ pub enum RarPolicyReason {
     Directory,
     ParentIsFile,
     TargetChanged,
+    StageChanged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -53,6 +53,7 @@ struct Extraction<'a> {
 struct DirectoryOutput {
     path: PathBuf,
     identity: (u64, u64),
+    ordinal: usize,
     meta: Meta,
 }
 
@@ -97,16 +98,22 @@ impl<'a> Extraction<'a> {
         if header.is_dir() {
             let outcome = run.test(session, index, None)?;
             if !self.options.flatten && matches!(outcome, RarOutcome::Directory) {
+                let path = self.options.dest.join(&relative);
+                self.protect_source_name(session, &path)?;
                 self.dirs.try_reserve(1).map_err(|_| own_fault(allocation()))?;
                 self.ensure_root().map_err(own_fault)?;
                 make_dirs_detailed(&self.options.dest, &relative).map_err(own_fault)?;
-                let path = self.options.dest.join(relative);
                 let observed =
                     fs::symlink_metadata(&path).map_err(|source| output_fault(IoOperation::Metadata, &path, source))?;
                 if !observed.is_dir() {
                     return Err(policy(RarPolicyReason::TargetChanged, path));
                 }
-                self.dirs.push(DirectoryOutput { path, identity: (observed.dev(), observed.ino()), meta });
+                self.dirs.push(DirectoryOutput {
+                    path,
+                    identity: (observed.dev(), observed.ino()),
+                    ordinal: index,
+                    meta,
+                });
             }
             return Ok(outcome);
         }
@@ -142,6 +149,7 @@ impl<'a> Extraction<'a> {
         event(Event::Flush, &target).map_err(|source| output_fault(IoOperation::Flush, &target, source))?;
         file.file.flush().map_err(|source| output_fault(IoOperation::Flush, &target, source))?;
         finish_file(&file.file, &meta);
+        let stage_stamp = self.stage_stamp(&file.file, &target)?;
         #[cfg(test)]
         event(Event::BeforePublish, &target).map_err(|source| output_fault(IoOperation::Publish, &target, source))?;
 
@@ -153,8 +161,10 @@ impl<'a> Extraction<'a> {
         if self.inspect_target(session, &target)? != initial {
             return Err(policy(RarPolicyReason::TargetChanged, target));
         }
-        if initial.is_some() { file.publish() } else { file.publish_noclobber() }
-            .map_err(|error| own_fault(error.detailed(false)))?;
+        if self.stage_stamp(&file.file, &target)? != stage_stamp {
+            return Err(policy(RarPolicyReason::StageChanged, target));
+        }
+        file.publish_selected(initial.is_some()).map_err(|error| own_fault(error.detailed(false)))?;
         Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written })
     }
 
@@ -176,6 +186,7 @@ impl<'a> Extraction<'a> {
             return Err(policy(RarPolicyReason::UnsafePath, target.to_path_buf()));
         };
         self.inspect_parents(parent)?;
+        self.protect_source_name(session, target)?;
         let metadata = match fs::symlink_metadata(target) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -200,6 +211,32 @@ impl<'a> Extraction<'a> {
         let stamp = SourceStamp::from_metadata(metadata)
             .map_err(|source| output_fault(IoOperation::Metadata, target, source))?;
         Ok(Some(stamp))
+    }
+
+    fn protect_source_name(&self, session: &RarSession, target: &Path) -> Result<(), Arc<RarFailure>> {
+        let absolute =
+            std::path::absolute(target).map_err(|source| output_fault(IoOperation::Metadata, target, source))?;
+        let target_parent = std::cell::OnceCell::new();
+        for source in session.volumes.iter().map(|volume| &volume.path).chain(self.options.protected_paths.iter()) {
+            if absolute == *source
+                || (target.file_name() == source.file_name()
+                    && target_parent
+                        .get_or_init(|| absolute.parent().and_then(|parent| fs::canonicalize(parent).ok()))
+                        .as_ref()
+                        .is_some_and(|parent| {
+                            source.parent().and_then(|path| fs::canonicalize(path).ok()).as_ref() == Some(parent)
+                        }))
+            {
+                return Err(policy(RarPolicyReason::ProtectedInput, target.to_path_buf()));
+            }
+        }
+        Ok(())
+    }
+
+    fn stage_stamp(&self, file: &File, target: &Path) -> Result<SourceStamp, Arc<RarFailure>> {
+        file.metadata()
+            .and_then(SourceStamp::from_metadata)
+            .map_err(|source| output_fault(IoOperation::Metadata, target, source))
     }
 
     fn inspect_parents(&self, parent: &Path) -> Result<(), Arc<RarFailure>> {
@@ -228,7 +265,8 @@ impl<'a> Extraction<'a> {
             RarFault::output(IoOperation::CreateFile, Some(target.to_path_buf()), None, source, false)
         })?;
         let (file, path) = stage.into_parts();
-        Ok(Output::staged_direct(file, path, target.to_path_buf()))
+        Output::staged_direct(file, path, target.to_path_buf())
+            .map_err(|source| RarFault::output(IoOperation::Metadata, Some(target.to_path_buf()), None, source, false))
     }
 }
 
@@ -236,7 +274,13 @@ impl Drop for Extraction<'_> {
     fn drop(&mut self) {
         use std::os::unix::fs::OpenOptionsExt;
 
-        self.dirs.sort_by_key(|entry| std::cmp::Reverse(entry.path.components().count()));
+        use std::cmp::Reverse;
+
+        // Apply metadata once per directory, using the last selected record
+        // even when an earlier record would make the directory unreadable.
+        self.dirs.sort_unstable_by_key(|entry| (entry.identity, Reverse(entry.ordinal)));
+        self.dirs.dedup_by_key(|entry| entry.identity);
+        self.dirs.sort_unstable_by_key(|entry| Reverse(entry.path.components().count()));
         for entry in &self.dirs {
             let Some(parent) = entry.path.parent() else { continue };
             if self.inspect_parents(parent).is_err() {
@@ -342,6 +386,39 @@ mod tests {
         let _clear = Clear;
         HOOK.with_borrow_mut(|stored| *stored = Some(Box::new(hook)));
         run()
+    }
+
+    #[test]
+    fn replaced_stage_name_is_neither_published_nor_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("archive.rar");
+        fs::write(&source, archive(false, &[(b'x', b'n')])).unwrap();
+        let dest = dir.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        let target = dest.join("x");
+        fs::write(&target, b"old").unwrap();
+        let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selection = session.select(|_| true).unwrap();
+        let moved = dest.join("displaced");
+        let displaced = moved.clone();
+        let result = with_hook(
+            move |event, target| {
+                if event == Event::BeforePublish {
+                    let stage = fs::read_dir(target.parent().unwrap())?
+                        .map(|entry| entry.unwrap().path())
+                        .find(|path| path != target)
+                        .expect("the same-directory stage");
+                    fs::rename(&stage, &displaced)?;
+                    fs::write(stage, b"foreign")?;
+                }
+                Ok(())
+            },
+            || session.extract_selected(&selection, &options(&dest), RarDecodeLimits::default(), |_| {}).unwrap(),
+        );
+        assert_eq!((result.files, result.failed), (0, 1));
+        assert_eq!(fs::read(&target).unwrap(), b"old");
+        assert_eq!(fs::read(&moved).unwrap(), b"n");
+        assert!(fs::read_dir(&dest).unwrap().any(|entry| fs::read(entry.unwrap().path()).unwrap() == b"foreign"));
     }
 
     #[test]
