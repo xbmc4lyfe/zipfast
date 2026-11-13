@@ -27,6 +27,12 @@ use crate::zip::write::{EntryName, EntryOptions, EntryWritten, Method, WinZipAes
 use super::*;
 
 #[cfg(test)]
+#[path = "split_verify.rs"]
+mod split_verify;
+#[cfg(test)]
+#[path = "split_verify_tests.rs"]
+mod split_verify_tests;
+#[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
 #[path = "transaction.rs"]
