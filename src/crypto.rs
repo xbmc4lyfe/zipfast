@@ -253,21 +253,25 @@ pub fn encrypt_cbc(key: &[u8], iv: &[u8; 16], data: &[u8]) -> Option<Vec<u8>> {
 /// Decrypts WinZip AES CTR-mode ciphertext (little-endian counter starting at 1).
 pub fn decrypt_winzip_ctr(key: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
     let cipher = AesKey::new(key)?;
-    let mut out = Vec::with_capacity(ciphertext.len());
-    let mut counter = [0u8; 16];
-    for chunk in ciphertext.chunks(16) {
-        for b in &mut counter {
+    let mut out = ciphertext.to_vec();
+    winzip_ctr_xor(&cipher, &mut [0; 16], &mut out);
+    Some(out)
+}
+
+// Calls before the last must end at a whole counter block.
+fn winzip_ctr_xor(cipher: &AesKey, counter: &mut [u8; 16], bytes: &mut [u8]) {
+    for chunk in bytes.chunks_mut(16) {
+        for b in counter.iter_mut() {
             *b = b.wrapping_add(1);
             if *b != 0 {
                 break;
             }
         }
-        let ks = cipher.encrypt_block(&counter);
-        for (&c, &k) in chunk.iter().zip(&ks) {
-            out.push(c ^ k);
+        let ks = cipher.encrypt_block(counter);
+        for (byte, key) in chunk.iter_mut().zip(ks) {
+            *byte ^= key;
         }
     }
-    Some(out)
 }
 
 // ---------------------------------------------------------------------------
@@ -1005,7 +1009,6 @@ impl ZipCrypto {
         Self(crypto_keys(password.as_bytes()))
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) fn decrypt(&mut self, data: &mut [u8]) {
         for byte in data {
             *byte = crypto_step(&mut self.0, *byte);
@@ -1038,6 +1041,28 @@ pub fn decrypt_zipcrypto(password: &str, check: u8, data: &[u8]) -> Option<Vec<u
         out.push(crypto_step(&mut keys, *b));
     }
     Some(out)
+}
+
+/// Reuses a complete owned member while retaining the encryption header.
+pub(crate) fn decrypt_zipcrypto_in_place<E>(
+    password: &str,
+    expected: u8,
+    data: &mut [u8],
+    mut check: impl FnMut() -> Result<(), E>,
+) -> Result<Option<std::ops::Range<usize>>, E> {
+    check()?;
+    let Some(header) = data.get(..12) else { return Ok(None) };
+    let mut header: [u8; 12] = header.try_into().expect("fixed encryption header");
+    let mut cipher = ZipCrypto::new(password);
+    cipher.decrypt(&mut header);
+    if header[11] != expected {
+        return Ok(None);
+    }
+    for chunk in data[12..].chunks_mut(64 << 10) {
+        check()?;
+        cipher.decrypt(chunk);
+    }
+    Ok(Some(12..data.len()))
 }
 
 fn hmac_sha1(ipad: &[u8; 64], opad: &[u8; 64], data: &[u8]) -> [u8; 20] {
@@ -1277,6 +1302,51 @@ pub fn decrypt_winzip_aes(password: &str, strength: u8, data: &[u8], full_packed
     decrypt_winzip_ctr(&derived[..key_len], ct)
 }
 
+/// Authenticates a complete member before modifying its ciphertext in place.
+/// The returned range excludes the salt, verifier and authentication tag.
+pub(crate) fn decrypt_winzip_aes_in_place<E>(
+    password: &str,
+    strength: u8,
+    data: &mut [u8],
+    mut check: impl FnMut() -> Result<(), E>,
+) -> Result<Option<std::ops::Range<usize>>, E> {
+    use subtle::ConstantTimeEq;
+
+    check()?;
+    if !(1..=3).contains(&strength) {
+        return Ok(None);
+    }
+    let key_len = (usize::from(strength) + 1) * 8;
+    let salt_len = key_len / 2;
+    if data.len() < salt_len + 12 {
+        return Ok(None);
+    }
+    let range = salt_len + 2..data.len() - 10;
+    let Some(derived) = derive_winzip_fixed(password.as_bytes(), &data[..salt_len], key_len) else {
+        return Ok(None);
+    };
+    if !bool::from(derived[2 * key_len..2 * key_len + 2].ct_eq(&data[salt_len..salt_len + 2])) {
+        return Ok(None);
+    }
+    let mut hmac = HmacSha1::new(&derived[key_len..2 * key_len]);
+    for chunk in data[range.clone()].chunks(64 << 10) {
+        check()?;
+        if hmac.update(chunk).is_none() {
+            return Ok(None);
+        }
+    }
+    if !bool::from(hmac.finish()[..10].ct_eq(&data[range.end..])) {
+        return Ok(None);
+    }
+    let Some(cipher) = AesKey::new(&derived[..key_len]) else { return Ok(None) };
+    let mut counter = [0; 16];
+    for chunk in data[range.clone()].chunks_mut(64 << 10) {
+        check()?;
+        winzip_ctr_xor(&cipher, &mut counter, chunk);
+    }
+    Ok(Some(range))
+}
+
 /// Parses WinZip AES extra field `0x9901`: `(strength, actual_method)`.
 pub fn aes_extra(extra: &[u8]) -> Option<(u8, u16)> {
     let (strength, _, method) = aes_extra_info(extra)?;
@@ -1407,6 +1477,88 @@ mod tests {
         let mut cipher = WinZipAesEncryptor::new(b"password", &[1; 8], 16).unwrap();
         cipher.hmac.inner.total_len = u64::MAX / 8;
         assert!(cipher.encrypt(&mut [1]).is_none());
+    }
+
+    #[test]
+    fn in_place_aes_authenticates_before_modifying_independent_vectors() {
+        for (strength, encrypted, plaintext) in AES_FIXTURES {
+            let mut data = encrypted.to_vec();
+            let range =
+                decrypt_winzip_aes_in_place(AES_PASSWORD, strength, &mut data, || Ok::<_, ()>(())).unwrap().unwrap();
+            assert_eq!(&data[range.clone()], plaintext);
+            assert_eq!(&data[..range.start], &encrypted[..range.start]);
+            assert_eq!(&data[range.end..], &encrypted[range.end..]);
+            for password in [AES_PASSWORD, "wrong password"] {
+                let mut damaged = encrypted.to_vec();
+                if password == AES_PASSWORD {
+                    *damaged.last_mut().unwrap() ^= 1;
+                }
+                let before = damaged.clone();
+                assert!(
+                    decrypt_winzip_aes_in_place(password, strength, &mut damaged, || Ok::<_, ()>(()))
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(damaged, before);
+            }
+            for len in [0, range.start - 1, range.start, encrypted.len() - 1] {
+                let mut truncated = encrypted[..len].to_vec();
+                let before = truncated.clone();
+                assert!(
+                    decrypt_winzip_aes_in_place(AES_PASSWORD, strength, &mut truncated, || Ok::<_, ()>(()))
+                        .unwrap()
+                        .is_none()
+                );
+                assert_eq!(truncated, before);
+            }
+        }
+    }
+
+    #[test]
+    fn in_place_crypto_checks_cancellation_during_authentication_and_decryption() {
+        let plain = vec![7; (64 << 10) + 17];
+        let mut cipher = WinZipAesEncryptor::new(b"password", &[3; 16], 32).unwrap();
+        let mut encrypted = vec![3; 16];
+        encrypted.extend(cipher.verifier());
+        let mut payload = plain.clone();
+        cipher.encrypt(&mut payload).unwrap();
+        encrypted.extend(payload);
+        encrypted.extend(cipher.tag());
+        for stop in 1..=5 {
+            let mut data = encrypted.clone();
+            let mut checks = 0;
+            let result = decrypt_winzip_aes_in_place("password", 3, &mut data, || {
+                checks += 1;
+                if checks == stop { Err("cancelled") } else { Ok(()) }
+            });
+            assert_eq!(result, Err("cancelled"));
+            assert_eq!(checks, stop);
+            if stop <= 4 {
+                assert_eq!(data, encrypted);
+            }
+        }
+        let mut data = encrypted;
+        let range = decrypt_winzip_aes_in_place("password", 3, &mut data, || Ok::<_, ()>(())).unwrap().unwrap();
+        assert_eq!(data[range], plain);
+
+        let mut data = vec![0; 12];
+        data[11] = 0x5b;
+        data.extend(&plain);
+        ZipCrypto::new("password").encrypt(&mut data);
+        for stop in 1..=3 {
+            let mut encrypted = data.clone();
+            let mut checks = 0;
+            assert_eq!(
+                decrypt_zipcrypto_in_place("password", 0x5b, &mut encrypted, || {
+                    checks += 1;
+                    if checks == stop { Err("cancelled") } else { Ok(()) }
+                }),
+                Err("cancelled")
+            );
+            assert_eq!(checks, stop);
+        }
+        let range = decrypt_zipcrypto_in_place("password", 0x5b, &mut data, || Ok::<_, ()>(())).unwrap().unwrap();
+        assert_eq!(data[range], plain);
     }
 
     #[test]
