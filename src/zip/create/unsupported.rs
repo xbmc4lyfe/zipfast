@@ -91,6 +91,11 @@ impl CreatePlan {
         match self.0 {}
     }
 
+    /// Publishes using ZipCrypto for regular files on supported platforms.
+    pub fn publish_zipcrypto_with_receipts(self, _password: &str) -> CreateReport {
+        match self.0 {}
+    }
+
     /// Publishes with write receipts on supported platforms.
     pub fn publish_with_receipts(self) -> CreateReport {
         match self.0 {}

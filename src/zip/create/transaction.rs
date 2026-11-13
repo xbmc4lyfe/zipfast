@@ -17,7 +17,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 
-use crate::zip::write::{InputLength, IoStage, WriterOptions, ZipWriter};
+use crate::zip::write::{InputLength, IoStage, WriteSummary, WriterOptions, ZipStreamWriter, ZipWriter};
 
 use super::unix::{NameState, PublishError, Stage};
 use super::*;
@@ -28,7 +28,19 @@ impl CreatePlan {
     /// See [`CreateReport`] for when receipts are available.
     pub fn publish_with_receipts(self) -> CreateReport {
         let mut written = Vec::new();
-        let outcome = self.publish_inner(Some(&mut written));
+        let outcome = self.publish_inner(Some(&mut written), None);
+        CreateReport { outcome, written }
+    }
+
+    /// Publish and verify a new archive using traditional ZIP encryption.
+    ///
+    /// All regular files, including empty ones, use one password. Directories
+    /// remain clear. Use a nonempty password of at most 65,535 UTF-8 bytes
+    /// without NUL bytes. ZipCrypto is for legacy interoperability and does
+    /// not authenticate content. See [`CreateReport`] for receipt semantics.
+    pub fn publish_zipcrypto_with_receipts(self, password: &str) -> CreateReport {
+        let mut written = Vec::new();
+        let outcome = self.publish_inner(Some(&mut written), Some(password));
         CreateReport { outcome, written }
     }
 
@@ -37,15 +49,22 @@ impl CreatePlan {
     /// deciding whether another creation attempt is appropriate.
     #[allow(clippy::result_large_err, reason = "creation failures retain component usage and outcome inline")]
     pub fn publish(self) -> std::result::Result<CreatedArchive, CreateFailure> {
-        self.publish_inner(None)
+        self.publish_inner(None, None)
     }
 
     #[allow(clippy::result_large_err, reason = "creation failures retain component usage and outcome inline")]
     fn publish_inner(
         mut self,
         written: Option<&mut Vec<EntryWritten>>,
+        password: Option<&str>,
     ) -> std::result::Result<CreatedArchive, CreateFailure> {
-        let mut receipts = match self.preflight() {
+        if password.is_some_and(|password| {
+            password.is_empty() || password.len() > u16::MAX as usize || password.as_bytes().contains(&0)
+        }) {
+            let cause = CreateError::InvalidOptions("ZIP password must be 1 to 65,535 UTF-8 bytes without NUL");
+            return Err(self.failure(Stopped::at(CreateStage::Planning, cause), CleanupState::Clean));
+        }
+        let mut receipts = match self.preflight(password.is_some()) {
             Ok(receipts) => receipts,
             Err(error) => return Err(self.failure(Stopped::at(CreateStage::Planning, error), CleanupState::Clean)),
         };
@@ -61,7 +80,7 @@ impl CreatePlan {
             Err(error) => return Err(self.failure(Stopped::at(CreateStage::StageCreate, error), CleanupState::Clean)),
         };
 
-        let result = self.execute(&mut stage, &mut receipts);
+        let result = self.execute(&mut stage, &mut receipts, password);
         if matches!(result, Ok(Publication::Published))
             && let Some(written) = written
         {
@@ -126,6 +145,7 @@ impl CreatePlan {
         &mut self,
         stage: &mut Stage,
         receipts: &mut Vec<EntryWritten>,
+        password: Option<&str>,
     ) -> std::result::Result<Publication, Stopped> {
         let attempts = Attempts::new(&self.options, &self.attempts);
         let parent_stamp =
@@ -146,10 +166,10 @@ impl CreatePlan {
             &self.entries,
             &self.options,
             &mut self.usage.writer,
-            stage,
-            original,
+            (stage, original),
             attempts,
             receipts,
+            password,
         )?;
         #[cfg(test)]
         tests::event(tests::Event::AfterFinish, Some(stage.path())).at(CreateStage::Finish)?;
@@ -162,7 +182,11 @@ impl CreatePlan {
             summary,
             &attempts,
             &mut self.usage.verification,
-            |_| None,
+            |ordinal| {
+                let password = password?;
+                let source = self.entries[ordinal].payload_source()?;
+                Some(verify::ZipCryptoExpectation { password, length: InputLength::Exact(source.stamp.len) })
+            },
         )
         .at(CreateStage::Verify)?;
         #[cfg(test)]
@@ -218,21 +242,36 @@ impl CreatePlan {
         entries: &[PlannedEntry],
         create_options: &'a CreateOptions,
         usage: &mut WriteUsage,
-        stage: &'a mut Stage,
-        original: Stamp,
+        stage: (&'a Stage, Stamp),
         attempts: Attempts<'a>,
         receipts: &mut Vec<EntryWritten>,
-    ) -> std::result::Result<crate::zip::write::WriteSummary, Stopped> {
+        password: Option<&str>,
+    ) -> std::result::Result<WriteSummary, Stopped> {
         let options = WriterOptions {
             comment: &create_options.archive_comment,
             limits: create_options.limits.writer,
             cancel: Some(create_options.cancel.clone()),
         };
-        let mut writer = match ZipWriter::new_accounted(RawIo::new(&stage.file, attempts), options) {
-            Ok(writer) => writer,
-            Err((error, partial)) => {
-                *usage = partial;
-                return Err(Stopped::at(CreateStage::Write, writer_error(error)));
+        let (stage, original) = stage;
+        let mut sink = RawIo::new(&stage.file, attempts);
+        let mut writer = if let Some(password) = password {
+            if original.len != 0 {
+                return Err(Stopped::at(CreateStage::StageCreate, CreateError::StageChanged));
+            }
+            if sink.seek(SeekFrom::Start(0)).map_err(CreateError::from).at(CreateStage::Write)? != 0 {
+                return Err(Stopped::at(CreateStage::Write, CreateError::StageChanged));
+            }
+            StageWriter::Encrypted(
+                ZipStreamWriter::new(sink, options).map_err(writer_error).at(CreateStage::Write)?,
+                password,
+            )
+        } else {
+            match ZipWriter::new_accounted(sink, options) {
+                Ok(writer) => StageWriter::Clear(writer),
+                Err((error, partial)) => {
+                    *usage = partial;
+                    return Err(Stopped::at(CreateStage::Write, writer_error(error)));
+                }
             }
         };
         for (ordinal, entry) in entries.iter().enumerate() {
@@ -261,7 +300,7 @@ impl CreatePlan {
                     tests::event(tests::Event::BeforeSourceRead, Some(&source.path)).at(CreateStage::SourceRead)?;
                     let mut input = SourceInput::new(file, attempts);
                     let receipt = writer
-                        .add_file(entry.options(), &mut input, InputLength::Exact(source.stamp.len))
+                        .add_file(entry.options(), &mut input, InputLength::Exact(source.stamp.len), attempts)
                         .map_err(classify_member_error)?;
                     #[cfg(test)]
                     tests::event(tests::Event::AfterSourceRead, Some(&source.path)).at(CreateStage::SourceRead)?;
@@ -289,6 +328,54 @@ impl CreatePlan {
                 *usage = partial;
                 Err(Stopped::at(CreateStage::Finish, writer_error(error)))
             }
+        }
+    }
+}
+
+enum StageWriter<'a, 'p> {
+    Clear(ZipWriter<RawIo<'a>>),
+    Encrypted(ZipStreamWriter<RawIo<'a>>, &'p str),
+}
+
+impl<'a> StageWriter<'a, '_> {
+    fn add_directory(&mut self, options: EntryOptions<'_>) -> std::result::Result<EntryWritten, WriteError> {
+        match self {
+            Self::Clear(writer) => writer.add_directory(options),
+            Self::Encrypted(writer, _) => writer.add_directory(options),
+        }
+    }
+
+    fn add_file(
+        &mut self,
+        options: EntryOptions<'_>,
+        input: &mut SourceInput<'_>,
+        length: InputLength,
+        attempts: Attempts<'_>,
+    ) -> std::result::Result<EntryWritten, WriteError> {
+        match self {
+            Self::Clear(writer) => writer.add_file(options, input, length),
+            Self::Encrypted(writer, password) => {
+                writer.add_zipcrypto_file(options, input, length, password, |random| {
+                    attempts.charge().map_err(into_io)?;
+                    #[cfg(test)]
+                    tests::event_io(tests::Event::EncryptionEntropy, None)?;
+                    getrandom::fill(random).map_err(io::Error::other)
+                })
+            }
+        }
+    }
+
+    fn usage(&self) -> WriteUsage {
+        match self {
+            Self::Clear(writer) => writer.usage(),
+            Self::Encrypted(writer, _) => writer.usage(),
+        }
+    }
+
+    fn finish_accounted(self) -> std::result::Result<crate::zip::write::Finished<RawIo<'a>>, (WriteError, WriteUsage)> {
+        match self {
+            Self::Clear(writer) => writer.finish_accounted(),
+            Self::Encrypted(writer, _) => writer.finish_accounted(),
         }
     }
 }
