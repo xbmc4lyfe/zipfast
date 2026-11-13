@@ -245,9 +245,11 @@ impl EncryptedReadLedger {
         )?;
         charge64(&mut self.usage.reader_capacity, capacity, self.limits.reader_capacity, ReadResource::ReaderCapacity)
     }
-    #[allow(dead_code)] // Task3 consumes actual decoded/work and cooperative codec-step charges.
     pub(super) fn decode(&mut self, output: u64, work: u128) -> Result<(), ReadFault> {
         charge(&mut self.usage.codec_steps, 1, self.limits.codec_steps, ReadResource::CodecSteps)?;
+        self.decode_bytes(output, work)
+    }
+    pub(super) fn decode_bytes(&mut self, output: u64, work: u128) -> Result<(), ReadFault> {
         let actual = self.usage.member_decoded_bytes.checked_add(output).ok_or(ReadFault::CounterOverflow)?;
         admit(
             ReadResource::MemberDecodedBytes,
@@ -303,7 +305,7 @@ pub(super) enum PlannedOutput {
     StagedFiles,
     VerifiedStdout,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct MemberPlan {
     pub(super) source: SourceStamp,
     pub(super) scope: ProjectedReadScope,
@@ -460,12 +462,12 @@ impl LedgerState {
             Ok((creates, retries))
         }
     }
-    pub(super) fn verify_member(&self, member: &MemberPlan, cipher: CipherKind) -> Result<(), ReadFault> {
+    pub(super) fn verify_member_kind(&self, member: &MemberPlan, cipher: Option<CipherKind>) -> Result<(), ReadFault> {
         self.verify_source(member.source)?;
         let binding = self.run.plan.as_ref().and_then(|p| p.binding.as_ref()).ok_or(ReadFault::InvalidPlan)?;
         if member.scope != binding.scope
             || member.output != binding.output
-            || member.cipher != Some(cipher)
+            || member.cipher != cipher
             || matches!(member.scope, ProjectedReadScope::Entry(n) if n as u64 != member.ordinal)
         {
             return Err(ReadFault::InvalidPlan);

@@ -20,3 +20,6 @@ mod core;
 mod cipher;
 #[cfg(unix)]
 mod spool;
+
+#[cfg(unix)]
+mod codecs;

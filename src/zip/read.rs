@@ -17,6 +17,7 @@
 //! Checked ZIP read policy, bounded output leases, and inline terminal evidence.
 mod budget;
 mod cipher;
+mod codecs;
 mod error;
 pub(super) mod io;
 mod shared;

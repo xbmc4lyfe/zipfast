@@ -1,0 +1,14 @@
+Original first-party ZIP LZMA known-size/no-EOS fixture.
+Generator: generate-lzma-no-eos.c (RPL-1.5); calls public liblzma encoder APIs.
+Generated with liblzma 5.8.4, Apple clang21.0.0, arm64 macOS.
+Input: 65535 bytes, byte[i]=(i*31+i/17) modulo256.
+Input SHA256: 8da8171cb81ccf686b1a269252ea48dab576ce095531eb21684976a7adcd1fbd
+Output: 333 bytes, ZIP method14 version/properties header + raw LZMA1EXT.
+Output SHA256: df025cbe6bfb485fdfcbdaa52b88f13ac654dca49d3a489fd03c0a11dd25157a
+LZMA1EXT ext_flags=0, declared U65535: no end-of-payload marker.
+Reproduce with the installed liblzma development headers/library:
+  cc generate-lzma-no-eos.c $(pkg-config --cflags --libs liblzma) -o /tmp/lzma-fixture
+  /tmp/lzma-fixture lzma-no-eos-u65535.bin
+This is a native-encoder fixture, not an independent decoder implementation.
+Pinned Rust/liblzma reader and legacy bufread control both verify exact bytes;
+EOS-required flag, truncation and tail rejection are separate regression cases.

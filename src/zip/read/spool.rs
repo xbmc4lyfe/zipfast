@@ -137,6 +137,7 @@ pub(super) struct PrivateCiphertextFile<'a> {
 }
 impl<'a> OwnedCiphertext<'a> {
     #[allow(clippy::result_large_err)] // Inline terminal evidence is allocation independent.
+    #[cfg(test)] // Standalone Task2 storage tests; production consumes admitted copy_view.
     pub(super) fn copy(
         ledger: &'a impl LedgerAccess,
         directory: &ResolvedTempDirectory,
@@ -145,8 +146,19 @@ impl<'a> OwnedCiphertext<'a> {
         scratch: &mut [u8],
         cancel: &Cancellation,
     ) -> ZipReadResult<Self> {
+        Self::copy_view(ledger.view(), Some(directory), source, len, scratch, cancel)
+    }
+    #[allow(clippy::result_large_err)] // Fixed inline terminal evidence.
+    pub(super) fn copy_view(
+        view: LedgerView<'a>,
+        directory: Option<&ResolvedTempDirectory>,
+        source: &mut (impl Read + ?Sized),
+        len: u64,
+        scratch: &mut [u8],
+        cancel: &Cancellation,
+    ) -> ZipReadResult<Self> {
+        let ledger = view;
         let threshold = ledger.with_state(|s| s.encrypted.limits.ciphertext_memory_bytes);
-        let view = ledger.view();
         if len <= threshold {
             let capacity = usize::try_from(len).map_err(|_| ReadFault::CounterOverflow)?;
             let mut bytes = Vec::new();
@@ -181,7 +193,7 @@ impl<'a> OwnedCiphertext<'a> {
         }
         #[cfg(unix)]
         {
-            let mut file = PrivateCiphertextFile::create(view, directory, len, cancel)?;
+            let mut file = PrivateCiphertextFile::create(view, directory.ok_or(ReadFault::InvalidPlan)?, len, cancel)?;
             let copied = (|| -> Result<(), ReadFault> {
                 let mut position = 0;
                 while position < len {

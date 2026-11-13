@@ -54,6 +54,7 @@ pub(super) struct PendingAes<'a, 's> {
     ledger: LedgerView<'a>,
     source: &'s mut dyn CiphertextSource,
     plan: budget::MemberPlan,
+    crc_required: bool,
     hmac: HmacSha1,
     key: [u8; 32],
     key_len: usize,
@@ -61,15 +62,19 @@ pub(super) struct PendingAes<'a, 's> {
 }
 pub(super) struct AuthenticatedAes<'a, 's> {
     owned: OwnedCiphertext<'a>,
-    ledger: LedgerView<'a>,
+    pub(super) ledger: LedgerView<'a>,
     source: &'s mut dyn CiphertextSource,
-    #[cfg_attr(not(test), allow(dead_code))] // Task3 uses original decoded length/CRC evidence.
     pub(super) plan: budget::MemberPlan,
+    pub(super) crc_required: bool,
     ctr: WinZipCtr,
     remaining: u64,
 }
 #[allow(clippy::result_large_err)] // Fixed inline failure evidence; never Box on failure.
-fn checked<T>(result: ZipReadResult<T>, source: &mut dyn CiphertextSource, ledger: LedgerView<'_>) -> ZipReadResult<T> {
+pub(super) fn checked<T>(
+    result: ZipReadResult<T>,
+    source: &mut dyn CiphertextSource,
+    ledger: LedgerView<'_>,
+) -> ZipReadResult<T> {
     let result = match source.verify_source(ledger) {
         Ok(()) => result,
         Err(io::SourceCheckError::Source(fault)) => Err(match result {
@@ -97,9 +102,123 @@ fn checked<T>(result: ZipReadResult<T>, source: &mut dyn CiphertextSource, ledge
     };
     result.map_err(|error| ledger.with_state(|s| error.with_usage(s.encrypted.usage, s.run.usage)))
 }
+#[derive(Clone, Copy)]
+pub(super) enum InputKind {
+    #[cfg_attr(not(test), allow(dead_code))] // Task4 clear-member dispatcher.
+    Clear,
+    #[cfg_attr(not(test), allow(dead_code))] // Task4 encrypted-member dispatcher.
+    ZipCrypto { descriptor: bool, time: u8 },
+    #[cfg_attr(not(test), allow(dead_code))] // Task4 AES metadata dispatcher.
+    Aes { strength: u8, version: u16 },
+}
+/// Owns one charged member attempt and the original source borrow. No decoder
+/// or workspace allocation can precede admission. This proof is consumed once.
+pub(super) struct Admission<'a, 's, 'p> {
+    ledger: LedgerView<'a>,
+    plan: budget::MemberPlan,
+    source: &'s mut dyn CiphertextSource,
+    password: &'p str,
+    kind: InputKind,
+    key_len: usize,
+}
+impl<'a, 's, 'p> Admission<'a, 's, 'p> {
+    #[cfg_attr(not(test), allow(dead_code))] // Task4 admission precedes workspace acquisition.
+    #[allow(clippy::result_large_err)] // Fixed inline terminal evidence.
+    pub(super) fn new(
+        ledger: &'a impl LedgerAccess,
+        source: &'s mut dyn CiphertextSource,
+        plan: budget::MemberPlan,
+        password: Option<&'p str>,
+        kind: InputKind,
+    ) -> ZipReadResult<Self> {
+        let view = ledger.view();
+        checked(Ok(()), source, view)?;
+        let result = (|| -> Result<usize, ReadFault> {
+            let cipher = match kind {
+                InputKind::Clear => None,
+                InputKind::ZipCrypto { .. } => Some(CipherKind::ZipCrypto),
+                InputKind::Aes { .. } => Some(CipherKind::Aes),
+            };
+            view.with_state(|s| s.verify_member_kind(&plan, cipher))?;
+            if plan.crc.is_none() && !matches!(kind, InputKind::Aes { version: 2, .. }) {
+                return Err(if cipher.is_some() {
+                    view.with_state(|s| s.encrypted.reject_member(plan.packed, ReadFault::InvalidPlan))
+                } else {
+                    ReadFault::InvalidPlan
+                });
+            }
+            if cipher.is_none() {
+                return if plan.ciphertext == plan.packed { Ok(0) } else { Err(ReadFault::InvalidPlan) };
+            }
+            let key_len = match kind {
+                InputKind::Aes { strength, version: 1 | 2 } => match strength {
+                    1 => 16,
+                    2 => 24,
+                    3 => 32,
+                    _ => 0,
+                },
+                _ => 0,
+            };
+            let framing = if cipher == Some(CipherKind::Aes) { key_len as u64 / 2 + 12 } else { 12 };
+            let rejection = if cipher == Some(CipherKind::Aes) && key_len == 0 {
+                Some(ReadFault::CheckedFormat { reason: "invalid AES metadata" })
+            } else if plan.packed.checked_sub(framing) != Some(plan.ciphertext) {
+                Some(ReadFault::CheckedFormat { reason: "invalid cipher framing" })
+            } else if password.is_none_or(str::is_empty) {
+                Some(ReadFault::PasswordRequired)
+            } else {
+                None
+            };
+            if let Some(rejection) = rejection {
+                return Err(view.with_state(|s| s.encrypted.reject_member(plan.packed, rejection)));
+            }
+            view.with_state(|s| {
+                s.encrypted.begin_member(
+                    plan.packed,
+                    plan.decoded,
+                    plan.ciphertext,
+                    password.unwrap().len() as u64,
+                    cipher == Some(CipherKind::Aes),
+                )
+            })?;
+            Ok(key_len)
+        })();
+        let key_len = match result {
+            Ok(value) => value,
+            Err(fault) => return checked(Err(fault.into()), source, view),
+        };
+        Ok(Self { ledger: view, source, plan, password: password.unwrap_or(""), kind, key_len })
+    }
+    #[cfg_attr(not(test), allow(dead_code))] // Task4 consumes proof before copy/auth/decode.
+    #[allow(clippy::result_large_err)] // Fixed inline errors, including refused source completion.
+    pub(super) fn workspace(self) -> ZipReadResult<(Self, super::codecs::Workspace<'a>)> {
+        match super::codecs::Workspace::acquire(self.ledger, &self.plan) {
+            Ok(workspace) => Ok((self, workspace)),
+            Err(error) => checked(Err(error), self.source, self.ledger),
+        }
+    }
+    #[cfg_attr(not(test), allow(dead_code))] // Task4 aborts after lazy-directory/pre-cipher dispatch failure.
+    #[allow(clippy::result_large_err)] // Same typed source finalization; admission owns no payload yet.
+    pub(super) fn finish(self, result: ZipReadResult<()>) -> ZipReadResult<()> {
+        checked(result, self.source, self.ledger)
+    }
+    #[cfg_attr(not(test), allow(dead_code))] // Task4 clear dispatch consumes admitted retained source.
+    #[allow(clippy::result_large_err)] // Fixed inline evidence.
+    pub(super) fn clear(self) -> ZipReadResult<super::codecs::PlainInput<'a, 's>> {
+        if !matches!(self.kind, InputKind::Clear) {
+            return checked(Err(ReadFault::InvalidPlan.into()), self.source, self.ledger);
+        }
+        Ok(super::codecs::PlainInput::Clear(super::codecs::ClearInput {
+            ledger: self.ledger,
+            source: self.source,
+            plan: self.plan,
+            remaining: self.plan.packed,
+        }))
+    }
+}
 impl<'a, 's> PendingAes<'a, 's> {
     #[allow(clippy::too_many_arguments, clippy::result_large_err)] // Narrow private framing seam; fixed errors.
-    #[cfg_attr(not(test), allow(dead_code))] // Task3 decoder / Task4 checked dispatch consumes this tested capability entry.
+    #[cfg(test)] // Standalone Task2 convenience; production consumes admitted proof.
     pub(super) fn copy(
         ledger: &'a impl LedgerAccess,
         directory: &ResolvedTempDirectory,
@@ -111,42 +230,24 @@ impl<'a, 's> PendingAes<'a, 's> {
         scratch: &mut [u8],
         cancel: &Cancellation,
     ) -> ZipReadResult<Self> {
-        let view = ledger.view();
-        checked(Ok(()), source, view)?;
-        let packed = plan.packed;
-        let decoded = plan.decoded;
+        let admission =
+            Admission::new(ledger, source, plan, password, InputKind::Aes { strength, version: vendor_version })?;
+        Self::copy_admitted(admission, Some(directory), scratch, cancel)
+    }
+    #[cfg_attr(not(test), allow(dead_code))] // Task4 consumes admitted proof after workspace acquisition.
+    #[allow(clippy::result_large_err)] // Fixed inline terminal evidence.
+    pub(super) fn copy_admitted(
+        admission: Admission<'a, 's, '_>,
+        directory: Option<&ResolvedTempDirectory>,
+        scratch: &mut [u8],
+        cancel: &Cancellation,
+    ) -> ZipReadResult<Self> {
+        let Admission { ledger: view, source, plan, password, kind, key_len } = admission;
+        if !matches!(kind, InputKind::Aes { .. }) {
+            return checked(Err(ReadFault::InvalidPlan.into()), source, view);
+        }
+        let len = plan.ciphertext;
         let keys = (|| -> Result<([u8; 66], usize, u64), ReadFault> {
-            view.with_state(|s| s.verify_member(&plan, CipherKind::Aes))?;
-            if !matches!(vendor_version, 1 | 2) {
-                return Err(view.with_state(|s| {
-                    s.encrypted.reject_member(packed, ReadFault::CheckedFormat { reason: "invalid AES vendor version" })
-                }));
-            }
-            let key_len = match strength {
-                1 => 16,
-                2 => 24,
-                3 => 32,
-                _ => {
-                    return Err(view.with_state(|s| {
-                        s.encrypted.reject_member(packed, ReadFault::CheckedFormat { reason: "invalid AES strength" })
-                    }));
-                }
-            };
-            let framing = key_len as u64 / 2 + 12;
-            let Some(len) = packed.checked_sub(framing) else {
-                return Err(view.with_state(|s| {
-                    s.encrypted.reject_member(packed, ReadFault::CheckedFormat { reason: "truncated AES framing" })
-                }));
-            };
-            if plan.ciphertext != len {
-                return Err(view.with_state(|s| s.encrypted.reject_member(packed, ReadFault::InvalidPlan)));
-            }
-            let password = password.filter(|p| !p.is_empty());
-            if password.is_none() {
-                return Err(view.with_state(|s| s.encrypted.reject_member(packed, ReadFault::PasswordRequired)));
-            }
-            let password = password.unwrap();
-            view.with_state(|s| s.encrypted.begin_member(packed, decoded, len, password.len() as u64, true))?;
             io::canceled(Some(cancel))?;
             let mut salt = [0; 16];
             let mut verifier = [0; 2];
@@ -166,7 +267,7 @@ impl<'a, 's> PendingAes<'a, 's> {
             Err(e) => return checked(Err(e.into()), source, view),
         };
         // Verifier failure above never acquires owned payload storage.
-        let mut owned = match OwnedCiphertext::copy(ledger, directory, source, len, scratch, cancel) {
+        let mut owned = match OwnedCiphertext::copy_view(view, directory, source, len, scratch, cancel) {
             Ok(owned) => owned,
             Err(error) => return checked(Err(error), source, view),
         };
@@ -189,6 +290,7 @@ impl<'a, 's> PendingAes<'a, 's> {
             ledger: view,
             source,
             plan,
+            crc_required: matches!(kind, InputKind::Aes { version: 1, .. }),
             hmac: HmacSha1::new(&keys[key_len..2 * key_len]),
             key,
             key_len,
@@ -196,7 +298,7 @@ impl<'a, 's> PendingAes<'a, 's> {
         })
     }
     #[allow(clippy::result_large_err)]
-    #[cfg_attr(not(test), allow(dead_code))] // Task3 decoder / Task4 checked dispatch consumes this tested capability entry.
+    #[cfg_attr(not(test), allow(dead_code))] // Task4 authenticates before constructing the Task3 pump.
     pub(super) fn authenticate(
         mut self,
         scratch: &mut [u8],
@@ -236,12 +338,13 @@ impl<'a, 's> PendingAes<'a, 's> {
             owned: self.owned,
             ledger: self.ledger,
             source: self.source,
+            crc_required: self.crc_required,
             ctr,
             remaining,
         })
     }
     #[allow(clippy::result_large_err)]
-    #[cfg_attr(not(test), allow(dead_code))] // Task3 decoder / Task4 checked dispatch consumes this tested capability entry.
+    #[cfg_attr(not(test), allow(dead_code))] // Task4 explicit pre-authentication abort.
     pub(super) fn finish(self, result: ZipReadResult<()>) -> ZipReadResult<()> {
         let result = match self.owned.finish() {
             Ok(()) => result,
@@ -255,7 +358,6 @@ impl<'a, 's> PendingAes<'a, 's> {
 }
 impl AuthenticatedAes<'_, '_> {
     #[allow(clippy::result_large_err)]
-    #[cfg_attr(not(test), allow(dead_code))] // Task3 decoder / Task4 checked dispatch consumes this tested capability entry.
     pub(super) fn read_plain_chunk(&mut self, out: &mut [u8], cancel: &Cancellation) -> ZipReadResult<usize> {
         let result = (|| -> Result<usize, ReadFault> {
             io::canceled(Some(cancel))?;
@@ -271,7 +373,6 @@ impl AuthenticatedAes<'_, '_> {
         result.map_err(|e| self.ledger.with_state(|s| ZipReadError::from(e).with_usage(s.encrypted.usage, s.run.usage)))
     }
     #[allow(clippy::result_large_err)]
-    #[cfg_attr(not(test), allow(dead_code))] // Task3 decoder / Task4 checked dispatch consumes this tested capability entry.
     pub(super) fn finish(self, result: ZipReadResult<()>) -> ZipReadResult<()> {
         let result = result.and_then(|()| {
             if self.remaining == 0 {
@@ -293,14 +394,15 @@ impl AuthenticatedAes<'_, '_> {
 
 /// Weak header evidence; this capability never claims authentication.
 pub(super) struct ZipCryptoInput<'a, 's> {
-    ledger: LedgerView<'a>,
+    pub(super) ledger: LedgerView<'a>,
     source: &'s mut dyn CiphertextSource,
+    pub(super) plan: budget::MemberPlan,
     cipher: ZipCrypto,
     remaining: u64,
 }
 impl<'a, 's> ZipCryptoInput<'a, 's> {
     #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-    #[cfg_attr(not(test), allow(dead_code))] // Task3 decoder / Task4 checked dispatch consumes this tested capability entry.
+    #[cfg(test)] // Standalone Task2 convenience; production consumes admitted proof.
     pub(super) fn open(
         ledger: &'a impl LedgerAccess,
         source: &'s mut dyn CiphertextSource,
@@ -310,21 +412,19 @@ impl<'a, 's> ZipCryptoInput<'a, 's> {
         local_time_high: u8,
         cancel: &Cancellation,
     ) -> ZipReadResult<Self> {
-        let view = ledger.view();
-        checked(Ok(()), source, view)?;
-        let packed = plan.packed;
-        let decoded = plan.decoded;
+        let admission =
+            Admission::new(ledger, source, plan, password, InputKind::ZipCrypto { descriptor, time: local_time_high })?;
+        Self::open_admitted(admission, cancel)
+    }
+    #[cfg_attr(not(test), allow(dead_code))] // Task4 consumes admitted ZipCrypto proof after workspace acquisition.
+    #[allow(clippy::result_large_err)] // Fixed inline terminal evidence.
+    pub(super) fn open_admitted(admission: Admission<'a, 's, '_>, cancel: &Cancellation) -> ZipReadResult<Self> {
+        let Admission { ledger: view, source, plan, password, kind, .. } = admission;
+        let InputKind::ZipCrypto { descriptor, time: local_time_high } = kind else {
+            return checked(Err(ReadFault::InvalidPlan.into()), source, view);
+        };
         let result = (|| -> Result<(ZipCrypto, u64), ReadFault> {
-            view.with_state(|s| s.verify_member(&plan, CipherKind::ZipCrypto))?;
-            let Some(remaining) = packed.checked_sub(12) else {
-                return Err(view.with_state(|s| {
-                    s.encrypted.reject_member(packed, ReadFault::CheckedFormat { reason: "truncated ZipCrypto header" })
-                }));
-            };
-            let Some(password) = password.filter(|p| !p.is_empty()) else {
-                return Err(view.with_state(|s| s.encrypted.reject_member(packed, ReadFault::PasswordRequired)));
-            };
-            view.with_state(|s| s.encrypted.begin_member(packed, decoded, remaining, password.len() as u64, false))?;
+            let remaining = plan.ciphertext;
             let mut cipher = ZipCrypto::new_cancellable(password, || io::canceled(Some(cancel)))?;
             let mut header = [0; 12];
             spool::read_exact(view, source, &mut header, IoStage::Source, cancel)?;
@@ -338,10 +438,9 @@ impl<'a, 's> ZipCryptoInput<'a, 's> {
             Ok((cipher, remaining))
         })();
         let (cipher, remaining) = checked(result.map_err(Into::into), source, view)?;
-        Ok(Self { ledger: view, source, cipher, remaining })
+        Ok(Self { ledger: view, source, plan, cipher, remaining })
     }
     #[allow(clippy::result_large_err)]
-    #[cfg_attr(not(test), allow(dead_code))] // Task3 decoder / Task4 checked dispatch consumes this tested capability entry.
     pub(super) fn read_plain_chunk(&mut self, out: &mut [u8], cancel: &Cancellation) -> ZipReadResult<usize> {
         let result = (|| -> Result<usize, ReadFault> {
             io::canceled(Some(cancel))?;
@@ -369,7 +468,6 @@ impl<'a, 's> ZipCryptoInput<'a, 's> {
         result.map_err(|e| self.ledger.with_state(|s| ZipReadError::from(e).with_usage(s.encrypted.usage, s.run.usage)))
     }
     #[allow(clippy::result_large_err)]
-    #[cfg_attr(not(test), allow(dead_code))] // Task3 decoder / Task4 checked dispatch consumes this tested capability entry.
     pub(super) fn finish(self, result: ZipReadResult<()>) -> ZipReadResult<()> {
         let result = result.and_then(|()| {
             if self.remaining == 0 {

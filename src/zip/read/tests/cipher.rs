@@ -79,7 +79,7 @@ impl std::io::Read for Fragments {
         std::io::Read::read(&mut self.bytes, &mut out[..n])
     }
 }
-fn framed(strength: u8, password: &str, plain: &[u8]) -> Vec<u8> {
+pub(super) fn framed(strength: u8, password: &str, plain: &[u8]) -> Vec<u8> {
     let key_len = (strength as usize + 1) * 8;
     let salt = (1..=key_len / 2).map(|n| n as u8).collect::<Vec<_>>();
     let mut writer = crate::crypto::WinZipAesEncryptor::new(password.as_bytes(), &salt, key_len).unwrap();
@@ -359,7 +359,7 @@ fn zipcrypto_stream_header_descriptor_and_collision_evidence() {
         for password in [None, Some(""), Some("wrong"), Some("password")] {
             let (ledger, stamp) = super::spool::ledger(0);
             ledger.with_state(|s| s.encrypted.limits.member_spool_bytes = 0);
-            let mut plan = member(stamp, frame.len() as u64, 0, CipherKind::ZipCrypto);
+            let mut plan = member(stamp, frame.len() as u64, frame.len() as u64 - 12, CipherKind::ZipCrypto);
             plan.crc = Some(0xa7000000);
             plan.decoded = 18;
             let mut source = cipher::CheckedInput {
