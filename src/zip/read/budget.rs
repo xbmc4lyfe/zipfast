@@ -165,14 +165,13 @@ impl EncryptedReadLedger {
         password: u64,
         aes: bool,
     ) -> Result<(), ReadFault> {
+        // Attempts and declared P are spent even when later policy/framing rejects the member.
+        self.charge_member_attempt(packed)?;
         admit(ReadResource::MemberPackedBytes, self.limits.member_packed_bytes.into(), packed.into())?;
         admit(ReadResource::MemberDecodedBytes, self.limits.member_decoded_bytes.into(), decoded.into())?;
         if ciphertext > self.limits.ciphertext_memory_bytes {
             admit(ReadResource::MemberSpoolBytes, self.limits.member_spool_bytes.into(), ciphertext.into())?;
         }
-        // Charge attempted members/P before password admission: wrong/overlong passwords never refund them.
-        charge64(&mut self.usage.members, 1, self.limits.members, ReadResource::Members)?;
-        charge(&mut self.usage.packed_bytes, packed.into(), self.limits.packed_bytes, ReadResource::PackedBytes)?;
         admit(ReadResource::PasswordBytes, self.limits.password_bytes.into(), password.into())?;
         self.usage.password_bytes = password;
         self.usage.member_packed_bytes = packed;
@@ -184,6 +183,22 @@ impl EncryptedReadLedger {
             charge64(&mut self.usage.kdf_calls, 1, self.limits.kdf_calls, ReadResource::KdfCalls)?;
         }
         Ok(())
+    }
+    fn charge_member_attempt(&mut self, packed: u64) -> Result<(), ReadFault> {
+        // Member refusal takes priority over packed refusal; a spent member charge
+        // is retained if declared P subsequently exhausts the cumulative budget.
+        charge64(&mut self.usage.members, 1, self.limits.members, ReadResource::Members)?;
+        charge(&mut self.usage.packed_bytes, packed.into(), self.limits.packed_bytes, ReadResource::PackedBytes)
+    }
+    /// Terminal admission for malformed/unsupported encrypted records. The caller
+    /// returns this fault directly, rather than calling begin_member afterward:
+    /// both paths spend exactly one member/P attempt, without KDF or payload work.
+    #[allow(dead_code)] // Task2/4 framing/method rejection uses this terminal-only admission seam.
+    pub(super) fn reject_member(&mut self, packed: u64, rejection: ReadFault) -> ReadFault {
+        match self.charge_member_attempt(packed) {
+            Ok(()) => rejection,
+            Err(exhausted) => exhausted,
+        }
     }
     // Task2 owns fallible reader buffer acquisition, and Task3 native step/work admission.
     #[allow(dead_code)]

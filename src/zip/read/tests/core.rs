@@ -954,3 +954,73 @@ fn emergency_close_is_separate_finite_and_never_retries_interrupted() {
     assert_eq!(calls.get(), 1);
     assert_eq!(context.usage().live_fds, 1);
 }
+
+#[test]
+fn policy_rejected_attempts_spend_members_and_packed_before_size_checks() {
+    for policy in [ReadResource::MemberPackedBytes, ReadResource::MemberDecodedBytes, ReadResource::MemberSpoolBytes] {
+        for exhausted in [ReadResource::Members, ReadResource::PackedBytes] {
+            let mut limits =
+                EncryptedReadLimits { members: 2, packed_bytes: 6, ciphertext_memory_bytes: 0, ..Default::default() };
+            if exhausted == ReadResource::PackedBytes {
+                limits.members = 10;
+            }
+            match policy {
+                ReadResource::MemberPackedBytes => limits.member_packed_bytes = 2,
+                ReadResource::MemberDecodedBytes => limits.member_decoded_bytes = 2,
+                ReadResource::MemberSpoolBytes => limits.member_spool_bytes = 2,
+                _ => unreachable!(),
+            }
+            let mut state = budget::LedgerState::new(&EncryptedReadOptions::default().with_limits(limits)).unwrap();
+            for attempt in 1..=3 {
+                let (decoded, ciphertext) = match policy {
+                    ReadResource::MemberDecodedBytes => (3, 0),
+                    ReadResource::MemberSpoolBytes => (0, 3),
+                    _ => (0, 0),
+                };
+                let fault = state.encrypted.begin_member(3, decoded, ciphertext, 1, true).unwrap_err();
+                let expected = if attempt < 3 { policy } else { exhausted };
+                assert!(
+                    matches!(fault, ReadFault::Limit { resource, .. } if resource == expected),
+                    "policy={policy:?} attempt={attempt} fault={fault:?}"
+                );
+                let expected_members = if exhausted == ReadResource::Members { attempt.min(2) } else { attempt };
+                assert_eq!(state.encrypted.usage.members, expected_members);
+                assert_eq!(state.encrypted.usage.packed_bytes, u128::from(attempt.min(2) * 3));
+                assert_eq!(state.encrypted.usage.kdf_calls, 0);
+                assert_eq!(state.encrypted.usage.decoded_bytes, 0);
+                assert_eq!(state.encrypted.usage.source_bytes, 0);
+                assert_eq!(state.encrypted.usage.io_bytes, 0);
+                assert_eq!(state.encrypted.usage.io_attempts, 0);
+                assert_eq!(state.encrypted.usage.work_bytes, 0);
+                assert_eq!(state.encrypted.usage.live_spool_bytes, 0);
+                assert_eq!(state.live_fds, 0);
+                assert_eq!(state.encrypted.usage.allocation_attempts, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_and_unsupported_terminal_attempts_share_finite_admission_without_kdf() {
+    let limits = EncryptedReadLimits { members: 3, packed_bytes: 8, ..Default::default() };
+    let mut state = budget::LedgerState::new(&EncryptedReadOptions::default().with_limits(limits)).unwrap();
+    let malformed = state.encrypted.reject_member(3, ReadFault::CheckedFormat { reason: "invalid cipher framing" });
+    assert!(matches!(malformed, ReadFault::CheckedFormat { .. }));
+    let unsupported = state.encrypted.reject_member(3, ReadFault::UnsupportedMethod { method: 999 });
+    assert!(matches!(unsupported, ReadFault::UnsupportedMethod { method: 999 }));
+    assert_eq!(state.encrypted.usage.members, 2);
+    assert_eq!(state.encrypted.usage.packed_bytes, 6);
+    let fault = state.encrypted.begin_member(3, 0, 0, 1, true).unwrap_err();
+    assert!(matches!(fault, ReadFault::Limit { resource: ReadResource::PackedBytes, limit: 8, attempted: 9 }));
+    assert_eq!(state.encrypted.usage.members, 3);
+    assert_eq!(state.encrypted.usage.packed_bytes, 6);
+    let fault = state.encrypted.reject_member(0, ReadFault::CheckedFormat { reason: "another invalid record" });
+    assert!(matches!(fault, ReadFault::Limit { resource: ReadResource::Members, limit: 3, attempted: 4 }));
+    assert_eq!(state.encrypted.usage.members, 3);
+    assert_eq!(state.encrypted.usage.kdf_calls, 0);
+    assert_eq!(state.encrypted.usage.io_attempts, 0);
+    assert_eq!(state.encrypted.usage.decoded_bytes, 0);
+    assert_eq!(state.encrypted.usage.live_spool_bytes, 0);
+    assert_eq!(state.live_fds, 0);
+    assert_eq!(state.encrypted.usage.allocation_attempts, 0);
+}
