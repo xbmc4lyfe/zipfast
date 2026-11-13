@@ -209,6 +209,10 @@ impl RewritePlan {
     }
 
     /// Admit directory metadata bound to the source path.
+    ///
+    /// The plan snapshots the directory at admission and writes the supplied
+    /// metadata. Callers that sampled metadata earlier must ensure it still
+    /// describes the same directory when this call returns.
     pub fn add_directory_from_path(
         &mut self,
         at: Placement,
@@ -220,6 +224,9 @@ impl RewritePlan {
     }
 
     /// Admit directory metadata bound to a held handle and its path.
+    ///
+    /// The supplied metadata is used as is. See [Self::add_directory_from_path]
+    /// for the source snapshot contract.
     pub fn add_open_directory(
         &mut self,
         at: Placement,

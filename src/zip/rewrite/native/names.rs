@@ -196,7 +196,7 @@ pub(super) fn validate(plan: &RewritePlan, usage: &mut RewriteUsage, order: &mut
         let input = &plan.inputs[index];
         let raw = input.name.strip_suffix(b"/").unwrap_or(&input.name);
         let key = if keyed { input.keys.as_deref().expect("admitted keys") } else { raw };
-        Name { raw, key, directory: input.source.is_none(), introduced: true }
+        Name { raw, key, directory: input.payload_source().is_none(), introduced: true }
     };
     let name = |index| {
         if index >= old {

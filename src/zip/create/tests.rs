@@ -866,6 +866,131 @@ fn precommit_cancellation_and_unsupported_native_errors_are_definite() {
 }
 
 #[test]
+fn tracked_directory_rejects_final_symlink_with_trailing_slashes_or_dots() {
+    let root = test_dir();
+    let source = root.path().join("source");
+    let link = root.path().join("link");
+    std::fs::create_dir(&source).unwrap();
+    std::os::unix::fs::symlink(&source, &link).unwrap();
+    let mut plan = CreatePlan::new(&root.path().join("archive.zip"), CreateOptions::default()).unwrap();
+    for path in [link.clone(), link.join(""), link.join("."), link.join("././")] {
+        assert!(plan.add_directory_from_path(&path, metadata("source/"), None).is_err(), "{path:?}");
+        let handle = std::fs::File::open(&source).unwrap();
+        assert!(plan.add_open_directory(&path, handle, metadata("source/"), None).is_err(), "{path:?}");
+    }
+    plan.add_directory_from_path(&source.join("././"), metadata("source/"), None).unwrap();
+    plan.publish().unwrap();
+}
+
+#[test]
+fn tracked_directory_charges_path_capacity_at_admission() {
+    let root = test_dir();
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let output = root.path().join("archive.zip");
+    let mut plan = CreatePlan::new(&output, CreateOptions::default()).unwrap();
+    plan.add_directory(metadata("source/"), None).unwrap();
+    let capacity = plan.usage().plan.capacity;
+
+    let mut options = CreateOptions::default();
+    options.limits.plan_capacity = capacity + (size_of::<usize>() + size_of::<EntryWritten>()) as u64;
+    let mut plan = CreatePlan::new(&output, options).unwrap();
+    assert!(matches!(
+        plan.add_directory_from_path(&source, metadata("source/"), None),
+        Err(CreateError::Limit(CreateLimit::PlanCapacity))
+    ));
+    assert_eq!(plan.usage().plan.entries, 0);
+    plan.add_directory(metadata("source/"), None).unwrap();
+    plan.publish().unwrap();
+}
+
+#[test]
+fn tracked_directory_removal_is_reported_as_a_source_change() {
+    let root = test_dir();
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let output = root.path().join("archive.zip");
+    let mut plan = CreatePlan::new(&output, CreateOptions::default()).unwrap();
+    plan.add_directory_from_path(&source, metadata("source/"), None).unwrap();
+    let failure = with_hook(
+        move |event, _| {
+            if event == Event::BeforeFinalSourceCheck {
+                std::fs::remove_dir(&source)?;
+            }
+            Ok(())
+        },
+        || plan.publish().unwrap_err(),
+    );
+    assert!(matches!(failure.cause, CreateError::SourceChanged(CreateEntryId(0))));
+    assert_eq!(failure.publication, Publication::NotPublished);
+    assert!(!output.exists());
+    assert!(stages(root.path()).is_empty());
+}
+
+#[test]
+fn tracked_held_directory_checks_binding_mode_and_limits() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = test_dir();
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    let output = root.path().join("archive.zip");
+    let mut options = CreateOptions::default();
+    options.limits.retained_handles = 1;
+    let mut plan = CreatePlan::new(&output, options).unwrap();
+    assert!(matches!(
+        plan.add_open_directory(&source, File::open(root.path()).unwrap(), metadata("source/"), None),
+        Err(CreateError::SourceChanged(CreateEntryId(0)))
+    ));
+    assert_eq!(plan.usage().plan.retained_handles, 0);
+    plan.add_open_directory(&source, File::open(&source).unwrap(), metadata("source/"), None).unwrap();
+    assert!(matches!(
+        plan.add_open_directory(&source, File::open(&source).unwrap(), metadata("second/"), None),
+        Err(CreateError::Limit(CreateLimit::RetainedHandles))
+    ));
+    assert_eq!(plan.usage().plan.retained_handles, 1);
+    let failure = with_hook(
+        move |event, _| {
+            if event == Event::BeforeFinalSourceCheck {
+                let mut permissions = std::fs::metadata(&source)?.permissions();
+                permissions.set_mode(permissions.mode() ^ 0o100);
+                std::fs::set_permissions(&source, permissions)?;
+            }
+            Ok(())
+        },
+        || plan.publish().unwrap_err(),
+    );
+    assert!(matches!(failure.cause, CreateError::SourceChanged(CreateEntryId(0))));
+    assert_eq!(failure.publication, Publication::NotPublished);
+    assert!(!output.exists());
+    assert!(stages(root.path()).is_empty());
+}
+
+#[test]
+fn tracked_output_parent_charges_known_attempts_before_opening_a_stage() {
+    let root = test_dir();
+    let output = root.path().join("archive.zip");
+    let plan = |mut options: CreateOptions, remaining| {
+        options.limits.transaction_attempts = remaining;
+        let mut plan = CreatePlan::new(&output, options).unwrap();
+        plan.add_open_directory(root.path(), File::open(root.path()).unwrap(), metadata("parent/"), None).unwrap();
+        plan
+    };
+    let options = CreateOptions::default();
+    let admission = plan(options.clone(), u64::MAX).usage().transaction_attempts;
+    // Seven base calls plus three path/handle checks and one held parent stat.
+    let failure = plan(options.clone(), admission + 13).publish().unwrap_err();
+    assert_eq!(failure.stage, CreateStage::Planning);
+    assert!(matches!(failure.cause, CreateError::Limit(CreateLimit::TransactionAttempts)));
+    assert_eq!(failure.summary.stage_attempts, 0);
+
+    let failure = plan(options, admission + 14).publish().unwrap_err();
+    assert_eq!(failure.summary.stage_attempts, 1);
+    assert!(!output.exists());
+    assert!(stages(root.path()).is_empty());
+}
+
+#[test]
 fn tracked_directory_source_is_checked_after_staging() {
     let root = test_dir();
     let source = root.path().join("source");

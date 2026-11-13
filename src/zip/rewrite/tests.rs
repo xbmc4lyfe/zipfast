@@ -525,6 +525,36 @@ fn stage_change_after_successful_verification_blocks_publication() {
 }
 
 #[test]
+fn tracked_directory_can_be_appended_or_replaced_with_a_descendant() {
+    for replace in [false, true] {
+        let (root, archive, _) = old_archive();
+        let source = root.path().join("directory");
+        fs::create_dir(&source).unwrap();
+        let child = source.join("child");
+        fs::write(&child, b"contents").unwrap();
+        if replace {
+            let mut initial = edited(&archive, options(), "directory/");
+            initial.add_file(Placement::Append, &child, entry("directory/child"), None).unwrap();
+            initial.publish().unwrap();
+        }
+
+        let mut plan = RewritePlan::open(&archive, options()).unwrap();
+        let directory =
+            if replace { Placement::Replace(plan.metadata().entry_id(1).unwrap()) } else { Placement::Append };
+        plan.add_directory_from_path(directory, &source, entry("directory/"), None).unwrap();
+        if !replace {
+            plan.add_file(Placement::Append, &child, entry("directory/child"), None).unwrap();
+        }
+        plan.publish().unwrap();
+        let result = RewritePlan::open(&archive, options()).unwrap();
+        assert_eq!(
+            result.metadata().entries().map(|entry| entry.raw_name()).collect::<Vec<_>>(),
+            [b"old".as_slice(), b"directory/", b"directory/child"]
+        );
+    }
+}
+
+#[test]
 fn tracked_directory_substitution_blocks_rewrite_publication() {
     let (root, archive, old) = old_archive();
     let before = fs::metadata(&archive).unwrap();

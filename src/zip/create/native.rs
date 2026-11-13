@@ -19,6 +19,7 @@ use std::cmp::Ordering;
 use std::ffi::OsString;
 use std::fs::File;
 use std::mem::size_of;
+use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 
 use crate::zip::write::{EntryName, EntryOptions, EntryWritten, Method};
@@ -150,6 +151,10 @@ impl CreatePlan {
     }
 
     /// Admit directory metadata bound to the source path.
+    ///
+    /// The plan snapshots the directory at admission and writes the supplied
+    /// metadata. Callers that sampled metadata earlier must ensure it still
+    /// describes the same directory when this call returns.
     pub fn add_directory_from_path(
         &mut self,
         source: &Path,
@@ -160,6 +165,9 @@ impl CreatePlan {
     }
 
     /// Admit directory metadata bound to a held handle and its path.
+    ///
+    /// The supplied metadata is used as is. See [Self::add_directory_from_path]
+    /// for the source snapshot contract.
     pub fn add_open_directory(
         &mut self,
         source: &Path,
@@ -270,7 +278,7 @@ impl CreatePlan {
         let mut extra = 0;
         // Parent recheck, exclusive stage open, initial stage stat and
         // the writer's three sink probes. Further work is charged live.
-        let mut minimum_attempts = 7;
+        let mut minimum_attempts = add(7, directory_check_attempts(&self.entries, &self.parent)?)?;
         for entry in &self.entries {
             work(options, &mut self.usage.plan, 1)?;
             let size = entry.payload_source().map_or(0, |s| s.stamp.len);
@@ -364,6 +372,23 @@ fn absolute(path: &Path, max: u64, budget: &Attempts<'_>) -> Result<PathBuf> {
     pathbuf.push(path);
     limit(pathbuf.capacity() as u64, max, CreateLimit::PlanCapacity)?;
     Ok(pathbuf)
+}
+
+fn directory_lookup_path(path: PathBuf) -> PathBuf {
+    let mut path_bytes = path.into_os_string().into_vec();
+    let mut bytes = path_bytes.as_slice();
+    // A trailing slash or dot makes lstat follow a symlink in the preceding
+    // component. Preserve the rest of the spelling, including interior '..'.
+    loop {
+        match bytes {
+            [.., b'/'] if bytes.len() > 1 => bytes = &bytes[..bytes.len() - 1],
+            [.., b'/', b'.'] => bytes = &bytes[..bytes.len() - 1],
+            _ => break,
+        }
+    }
+    let len = bytes.len();
+    path_bytes.truncate(len);
+    PathBuf::from(OsString::from_vec(path_bytes))
 }
 
 pub(in crate::zip) fn name_bytes<'a>(name: EntryName<'a>) -> &'a [u8] {
@@ -568,6 +593,7 @@ pub(in crate::zip) fn prepare_input(
     let source = source
         .map(|(path, file, directory)| -> Result<_> {
             let path = absolute(path, remaining, budget)?;
+            let path = if directory { directory_lookup_path(path) } else { path };
             let (file, stamp) = if directory {
                 let stamp = unix::directory_stamp(&budget.run(|| std::fs::symlink_metadata(&path))?)?;
                 if let Some(file) = &file
@@ -703,7 +729,10 @@ pub(in crate::zip) fn check_directory_source(
     budget: &Attempts<'_>,
 ) -> Result<()> {
     let changed = || CreateError::SourceChanged(id);
-    let path = budget.run(|| std::fs::symlink_metadata(&source.path))?;
+    let path = budget.run(|| std::fs::symlink_metadata(&source.path)).map_err(|error| match error {
+        CreateError::Io(io) if matches!(io.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => changed(),
+        other => other,
+    })?;
     if unix::directory_stamp(&path).map_err(|_| changed())? != expected {
         return Err(changed());
     }
@@ -715,6 +744,20 @@ pub(in crate::zip) fn check_directory_source(
     Ok(())
 }
 
+pub(in crate::zip) fn directory_check_attempts(entries: &[PlannedEntry], parent: &Parent) -> Result<u64> {
+    let mut attempts = 0;
+    let mut check_parent = false;
+    for source in entries.iter().filter_map(|entry| entry.source.as_ref()).filter(|source| source.directory) {
+        let is_parent = source.stamp.identity == parent.identity;
+        check_parent |= is_parent;
+        // Check before staging and before commit. For the stage parent,
+        // also check each selected binding against the post-create stamp.
+        let checks = 2 + u64::from(is_parent);
+        attempts = add(attempts, checks * (1 + u64::from(source.file.is_some())))?;
+    }
+    add(attempts, u64::from(check_parent))
+}
+
 pub(in crate::zip) fn stage_parent_stamp(
     entries: &[PlannedEntry],
     parent: &Parent,
@@ -724,6 +767,9 @@ pub(in crate::zip) fn stage_parent_stamp(
         entry.source.as_ref().filter(|s| s.directory && s.stamp.identity == parent.identity).map(|s| (index, s))
     });
     let Some((index, first)) = selected.next() else { return Ok(None) };
+    // Stage creation changes the output parent's times and can change its
+    // size. After checking the original stamp before stage creation, reset
+    // the baseline for those fields here. Identity and mode must still match.
     let stamp = unix::directory_stamp(&budget.run(|| parent.file.metadata())?)?;
     for (index, source) in std::iter::once((index, first)).chain(selected) {
         if stamp.identity != source.stamp.identity || stamp.mode != source.stamp.mode {

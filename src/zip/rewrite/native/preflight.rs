@@ -149,7 +149,8 @@ impl RewritePlan {
                 }
             }
             limit(full_packed, limits.common.verification_read_bytes, CreateLimit::VerificationReadBytes)?;
-            feasibility.finish(entries, self.attempts.get(), full_packed)
+            let directory_attempts = create::native::directory_check_attempts(&self.inputs, &self.parent)?;
+            feasibility.finish(entries, add(self.attempts.get(), directory_attempts)?, full_packed)
         })();
         self.usage = loop_usage;
         result?;
