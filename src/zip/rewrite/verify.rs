@@ -57,6 +57,7 @@ pub(super) struct Manifest<'a> {
     pub(super) entries: &'a [WrittenEntry],
     pub(super) prefix: u64,
     pub(super) summary: WriteSummary,
+    pub(super) repairs: Option<&'a [Option<layout::recovery::DescriptorRepair>]>,
 }
 
 impl Manifest<'_> {
@@ -145,7 +146,15 @@ impl Manifest<'_> {
                     let source = self.metadata.view(raw.source_ordinal);
                     let member = self.members[raw.source_ordinal];
                     let mut comparison = Comparison::new(old, stage, options, attempts, usage, &mut buffers);
-                    wide |= verify_retained(&mut comparison, source, member, central, *raw, next)?;
+                    wide |= verify_retained(
+                        &mut comparison,
+                        source,
+                        member,
+                        central,
+                        *raw,
+                        next,
+                        self.repairs.and_then(|repairs| repairs[raw.source_ordinal]),
+                    )?;
                     if member.directory {
                         EntryVerification::RetainedDirectoryVerified
                     } else if options.verification == Verification::Full {
@@ -306,6 +315,7 @@ fn verify_retained(
     central: &CentralRecord,
     receipt: RawWritten,
     boundary: u64,
+    repair: Option<layout::recovery::DescriptorRepair>,
 ) -> Result<bool> {
     let old = source.header();
     let old_central = source.source();
@@ -341,6 +351,13 @@ fn verify_retained(
     let mut local = Segments { compare: comparison, source: member.local_at, output: new_offset };
     if widen && member.local_version < 45 {
         local.literal(member.local_at + 4, 2, &45_u16.to_le_bytes())?;
+    }
+    if let Some(repair) = repair {
+        check(
+            repair.offset >= member.payload_at && add(repair.offset, repair.bytes().len() as u64)? == member.end,
+            "recovered descriptor outside member",
+        )?;
+        local.literal(repair.offset, repair.bytes().len() as u64, repair.bytes())?;
     }
     local.copy_to(member.end)?;
     check(local.output == boundary, "retained local span differs")?;

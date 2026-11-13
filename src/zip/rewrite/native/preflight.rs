@@ -165,7 +165,7 @@ fn decoded(total: u64, size: u64, limits: CreateLimits) -> Result<u64> {
     Ok(total)
 }
 
-struct Feasibility<'a> {
+pub(super) struct Feasibility<'a> {
     limits: &'a RewriteLimits,
     changed: bool,
     local: u64,
@@ -188,7 +188,7 @@ struct Feasibility<'a> {
 }
 
 impl<'a> Feasibility<'a> {
-    fn new(plan: &'a RewritePlan, prefix: u64, changed: bool) -> Self {
+    pub(super) fn new(plan: &'a RewritePlan, prefix: u64, changed: bool) -> Self {
         let comment = plan.metadata.raw_comment().len() as u64;
         Self {
             limits: &plan.options.limits,
@@ -213,7 +213,7 @@ impl<'a> Feasibility<'a> {
         }
     }
 
-    fn preserved(&mut self, entry: PreparedRaw, projection: u64) -> Result<()> {
+    pub(super) fn preserved(&mut self, entry: PreparedRaw, projection: u64) -> Result<()> {
         let proof = entry.proof(self.local).map_err(rewrite_writer_error)?;
         let central = entry.output_central_len(proof).map_err(rewrite_writer_error)?;
         let local = entry.local.end - entry.local.start;
@@ -275,7 +275,7 @@ impl<'a> Feasibility<'a> {
         Ok(())
     }
 
-    fn finish(&self, entries: u64, attempts: u64, full_packed: u64) -> Result<()> {
+    pub(super) fn finish(&self, entries: u64, attempts: u64, full_packed: u64) -> Result<()> {
         if !self.changed {
             return Ok(());
         }

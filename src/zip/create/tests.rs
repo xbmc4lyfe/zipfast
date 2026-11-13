@@ -1488,6 +1488,46 @@ fn corrupted_central_name_length_cannot_grow_scratch_past_the_cap() {
 }
 
 #[test]
+fn recovery_short_writes_and_uncertain_publication_keep_honest_state() {
+    use crate::zip::recovery::{RecoveryOptions, RecoveryOutcome, RecoveryPlan};
+    for uncertain in [false, true] {
+        let root = test_dir();
+        let source = root.path().join("old.zip");
+        let target = root.path().join("recovered.zip");
+        let old = include_bytes!("../rewrite/layout/fixtures/signed-descriptor-bad-crc-with-central.zip");
+        std::fs::write(&source, old).unwrap();
+        let plan = RecoveryPlan::open(&source, &target, RecoveryOptions::default()).unwrap();
+        let report = with_hook(
+            move |event, _| {
+                if uncertain && matches!(event, Event::NativePublish) {
+                    Err(io::Error::from_raw_os_error(libc::EIO))
+                } else {
+                    Ok(())
+                }
+            },
+            || {
+                SINK_WRITE_CAP.set(1);
+                plan.recover()
+            },
+        );
+        if uncertain {
+            let failure = report.outcome.unwrap_err();
+            assert_eq!(failure.publication, Publication::Unknown);
+            assert!(matches!(failure.cleanup, CleanupState::RetainedOwnedStage { .. }));
+            assert!(failure.recovery.is_some());
+            assert!(!target.exists());
+        } else {
+            assert!(matches!(report.outcome, Ok(RecoveryOutcome::Published(_))));
+            assert_eq!(
+                &std::fs::read(target).unwrap()[483..499],
+                &[80, 75, 7, 8, 147, 68, 241, 76, 184, 1, 0, 0, 184, 1, 0, 0]
+            );
+        }
+        assert_eq!(std::fs::read(source).unwrap(), old);
+    }
+}
+
+#[test]
 fn zipcrypto_entropy_failure_stops_the_transaction_and_charges_the_attempt() {
     use crate::zip::write::IoStage;
     use std::os::unix::fs::MetadataExt;
