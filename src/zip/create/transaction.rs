@@ -23,12 +23,29 @@ use super::unix::{NameState, PublishError, Stage};
 use super::*;
 
 impl CreatePlan {
+    /// Publish with actual write receipts for the verified members.
+    /// The report reuses the receipts already budgeted for verification.
+    /// See [`CreateReport`] for when receipts are available.
+    pub fn publish_with_receipts(self) -> CreateReport {
+        let mut written = Vec::new();
+        let outcome = self.publish_inner(Some(&mut written));
+        CreateReport { outcome, written }
+    }
+
     /// Write and verify a private stage and atomically publish a new archive.
     /// The plan is consumed. Inspect the publication state on failure before
     /// deciding whether another creation attempt is appropriate.
     #[allow(clippy::result_large_err, reason = "creation failures retain component usage and outcome inline")]
-    pub fn publish(mut self) -> std::result::Result<CreatedArchive, CreateFailure> {
-        let receipts = match self.preflight() {
+    pub fn publish(self) -> std::result::Result<CreatedArchive, CreateFailure> {
+        self.publish_inner(None)
+    }
+
+    #[allow(clippy::result_large_err, reason = "creation failures retain component usage and outcome inline")]
+    fn publish_inner(
+        mut self,
+        written: Option<&mut Vec<EntryWritten>>,
+    ) -> std::result::Result<CreatedArchive, CreateFailure> {
+        let mut receipts = match self.preflight() {
             Ok(receipts) => receipts,
             Err(error) => return Err(self.failure(Stopped::at(CreateStage::Planning, error), CleanupState::Clean)),
         };
@@ -41,7 +58,14 @@ impl CreatePlan {
             Err(error) => return Err(self.failure(Stopped::at(CreateStage::StageCreate, error), CleanupState::Clean)),
         };
 
-        let result = self.execute(&mut stage, receipts);
+        let result = self.execute(&mut stage, &mut receipts);
+        if matches!(result, Ok(Publication::Published))
+            && let Some(written) = written
+        {
+            *written = receipts;
+        } else {
+            drop(receipts);
+        }
         let reserve_count = Cell::new(0);
         let reserve = Attempts::finalization(&reserve_count);
         let publication = result.as_ref().map_or_else(|stop| stop.publication, |&committed| committed);
@@ -98,7 +122,7 @@ impl CreatePlan {
     fn execute(
         &mut self,
         stage: &mut Stage,
-        mut receipts: Vec<EntryWritten>,
+        receipts: &mut Vec<EntryWritten>,
     ) -> std::result::Result<Publication, Stopped> {
         let attempts = Attempts::new(&self.options, &self.attempts);
         let original = unix::file_stamp(&stage.file, &attempts).at(CreateStage::StageCreate)?;
@@ -120,7 +144,7 @@ impl CreatePlan {
             stage,
             original,
             attempts,
-            &mut receipts,
+            receipts,
         )?;
         #[cfg(test)]
         tests::event(tests::Event::AfterFinish, Some(stage.path())).at(CreateStage::Finish)?;
@@ -129,7 +153,7 @@ impl CreatePlan {
         let verified = verify::verify_created(
             &mut stage.file,
             &self.entries,
-            &receipts,
+            receipts,
             &self.options,
             summary,
             &attempts,

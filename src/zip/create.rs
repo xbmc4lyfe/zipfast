@@ -49,7 +49,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-use super::write::{WriteError, WriteLimits, WriteUsage};
+use super::write::{EntryWritten, WriteError, WriteLimits, WriteUsage};
 use crate::extract::Cancellation;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -477,4 +477,17 @@ pub struct CreatedArchive {
     pub cleanup: CleanupState,
     /// Plan, writer, and full-payload verification accounting.
     pub summary: CreateUsage,
+}
+
+/// Creation result with opt-in member write receipts.
+#[derive(Debug)]
+#[must_use]
+pub struct CreateReport {
+    pub outcome: std::result::Result<CreatedArchive, CreateFailure>,
+    /// Actual writer results in central-directory order. Each zero-based
+    /// ordinal equals the corresponding [`CreateEntryId::ordinal`].
+    ///
+    /// Receipts require confirmed publication. They are also available when
+    /// publication succeeded and finalization returned an error.
+    pub written: Vec<EntryWritten>,
 }
