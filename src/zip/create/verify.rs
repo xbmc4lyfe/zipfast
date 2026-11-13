@@ -101,7 +101,7 @@ pub(super) fn verify_created(
         let record = Member { central, expected, receipt, framing };
         record.check_central(&mut reader)?;
         let payload_end = record.check_local(&mut reader, directory.directory_range.start, &mut input)?;
-        if expected.source.is_some() {
+        if expected.payload_source().is_some() {
             reader.verify_payload((*receipt).into(), &mut input)?;
             reader.usage.payloads += 1;
         }
@@ -250,7 +250,7 @@ struct Framing {
 
 impl Framing {
     fn new(entry: &PlannedEntry, receipt: &EntryWritten) -> Result<Self> {
-        let decoded = entry.source.as_ref().map_or(0, |source| source.stamp.len);
+        let decoded = entry.payload_source().map_or(0, |source| source.stamp.len);
         let expected_method = if decoded == 0 { Method::Stored } else { entry.method };
         ensure(
             receipt.decoded_size == decoded
@@ -267,7 +267,7 @@ impl Framing {
         };
         let wide_sizes = method == METHOD_DEFLATE || decoded >= SIZE_SENTINEL;
         let wide_offset = receipt.local_offset >= SIZE_SENTINEL;
-        let (kind, dos_attributes) = if entry.source.is_some() { (0o100000, 0) } else { (S_IFDIR, 0x10) };
+        let (kind, dos_attributes) = if entry.payload_source().is_some() { (0o100000, 0) } else { (S_IFDIR, 0x10) };
         Ok(Self {
             method,
             version: if wide_sizes || wide_offset { 45 } else { 20 },
@@ -463,7 +463,7 @@ impl<'a, 'b> Reader<'a, 'b> {
         record.check_central(self)?;
         let payload_end = record.check_local(self, boundary, buffer)?;
         ensure(payload_end == boundary, "new entry leaves a gap before the next record")?;
-        if expected.source.is_some() {
+        if expected.payload_source().is_some() {
             self.verify_payload((*receipt).into(), buffer)?;
             self.usage.payloads += 1;
         }

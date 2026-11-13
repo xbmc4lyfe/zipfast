@@ -18,6 +18,9 @@
 //! Publication uses explicit last-writer-wins semantics on qualified local
 //! filesystems. Keep the parent and source namespaces under caller control.
 //!
+//! If a tracked directory is also the destination's parent, it follows the
+//! same stage-creation stamp checks and stability requirement as [creation](super::create).
+//!
 //! ```no_run
 //! use std::path::Path;
 //! use zipfast::zip::rewrite::{Replacement, RewriteOptions, RewritePlan};

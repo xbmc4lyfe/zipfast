@@ -19,6 +19,7 @@ use std::cmp::Ordering;
 use std::ffi::OsString;
 use std::fs::File;
 use std::mem::size_of;
+use std::os::unix::ffi::OsStringExt;
 use std::path::Path;
 
 use crate::zip::write::{EntryName, EntryOptions, EntryWritten, Method};
@@ -73,6 +74,7 @@ pub(in crate::zip) struct Source {
     pub(in crate::zip) stamp: Stamp,
     // Only add_open_file retains a descriptor in the plan.
     pub(in crate::zip) file: Option<File>,
+    pub(in crate::zip) directory: bool,
 }
 
 impl PlannedEntry {
@@ -128,7 +130,7 @@ impl CreatePlan {
         metadata: EntryOptions<'_>,
         keys: Option<&CollisionPath>,
     ) -> Result<CreateEntryId> {
-        self.admit(metadata, keys, Some((source, None)))
+        self.admit(metadata, keys, Some((source, None, false)))
     }
 
     /// Admit and retain a supplied regular file bound to the named path.
@@ -140,12 +142,40 @@ impl CreatePlan {
         metadata: EntryOptions<'_>,
         keys: Option<&CollisionPath>,
     ) -> Result<CreateEntryId> {
-        self.admit(metadata, keys, Some((source, Some(file))))
+        self.admit(metadata, keys, Some((source, Some(file), false)))
     }
 
     /// Admit an explicit metadata-only Stored directory with a terminal slash.
     pub fn add_directory(&mut self, metadata: EntryOptions<'_>, keys: Option<&CollisionPath>) -> Result<CreateEntryId> {
         self.admit(metadata, keys, None)
+    }
+
+    /// Admit directory metadata bound to the source path.
+    ///
+    /// The plan snapshots the directory at admission and writes the supplied
+    /// metadata. Callers that sampled metadata earlier must ensure it still
+    /// describes the same directory when this call returns.
+    pub fn add_directory_from_path(
+        &mut self,
+        source: &Path,
+        metadata: EntryOptions<'_>,
+        keys: Option<&CollisionPath>,
+    ) -> Result<CreateEntryId> {
+        self.admit(metadata, keys, Some((source, None, true)))
+    }
+
+    /// Admit directory metadata bound to a held handle and its path.
+    ///
+    /// The supplied metadata is used as is. See [Self::add_directory_from_path]
+    /// for the source snapshot contract.
+    pub fn add_open_directory(
+        &mut self,
+        source: &Path,
+        file: File,
+        metadata: EntryOptions<'_>,
+        keys: Option<&CollisionPath>,
+    ) -> Result<CreateEntryId> {
+        self.admit(metadata, keys, Some((source, Some(file), true)))
     }
 
     /// Return current component accounting.
@@ -157,7 +187,7 @@ impl CreatePlan {
         &mut self,
         metadata: EntryOptions<'_>,
         keys: Option<&CollisionPath>,
-        source: Option<(&Path, Option<File>)>,
+        source: Option<(&Path, Option<File>, bool)>,
     ) -> Result<CreateEntryId> {
         let limits = self.options.limits;
         let ordinal = CreateEntryId(self.entries.len());
@@ -166,13 +196,13 @@ impl CreatePlan {
         writer_limit(entries, limits.writer.entries, crate::zip::write::Limit::Entries)?;
         limit(entries, limits.directory.entries, CreateLimit::Entries)?;
         limit(entries, limits.directory_entries(), CreateLimit::VerificationRecords)?;
-        let held = source.as_ref().is_some_and(|(_, file)| file.is_some());
+        let held = source.as_ref().is_some_and(|(_, file, _)| file.is_some());
         let retained = add(self.usage.plan.retained_handles, u64::from(held))?;
         limit(retained, limits.retained_handles, CreateLimit::RetainedHandles)?;
 
-        let (scan, metadata_capacity) = input_cost(metadata, keys, source.as_ref().map(|(path, _)| *path))?;
+        let (scan, metadata_capacity) = input_cost(metadata, keys, source.as_ref().map(|(path, _, _)| *path))?;
         work(&self.options, &mut self.usage.plan, scan)?;
-        validate_input(metadata, keys, source.is_none(), self.options.collisions)?;
+        validate_input(metadata, keys, source.as_ref().is_none_or(|source| source.2), self.options.collisions)?;
         let reserved = entries
             .checked_mul((size_of::<usize>() + size_of::<EntryWritten>()) as u64)
             .ok_or(CreateError::Overflow)?;
@@ -248,12 +278,12 @@ impl CreatePlan {
         let mut extra = 0;
         // Parent recheck, exclusive stage open, initial stage stat and
         // the writer's three sink probes. Further work is charged live.
-        let mut minimum_attempts = 7;
+        let mut minimum_attempts = add(7, directory_check_attempts(&self.entries, &self.parent)?)?;
         for entry in &self.entries {
             work(options, &mut self.usage.plan, 1)?;
-            let size = entry.source.as_ref().map_or(0, |s| s.stamp.len);
+            let size = entry.payload_source().map_or(0, |s| s.stamp.len);
             let deflate = size != 0 && matches!(entry.method, Method::Deflate(_));
-            if entry.source.is_some() {
+            if entry.payload_source().is_some() {
                 // Exact readers need a probe slot, but a successful EOF probe
                 // returns zero and leaves that slot available for the next file.
                 source_bytes = add(source_bytes, size)?;
@@ -344,6 +374,23 @@ fn absolute(path: &Path, max: u64, budget: &Attempts<'_>) -> Result<PathBuf> {
     Ok(pathbuf)
 }
 
+fn directory_lookup_path(path: PathBuf) -> PathBuf {
+    let mut path_bytes = path.into_os_string().into_vec();
+    let mut bytes = path_bytes.as_slice();
+    // A trailing slash or dot makes lstat follow a symlink in the preceding
+    // component. Preserve the rest of the spelling, including interior '..'.
+    loop {
+        match bytes {
+            [.., b'/'] if bytes.len() > 1 => bytes = &bytes[..bytes.len() - 1],
+            [.., b'/', b'.'] => bytes = &bytes[..bytes.len() - 1],
+            _ => break,
+        }
+    }
+    let len = bytes.len();
+    path_bytes.truncate(len);
+    PathBuf::from(OsString::from_vec(path_bytes))
+}
+
 pub(in crate::zip) fn name_bytes<'a>(name: EntryName<'a>) -> &'a [u8] {
     match name {
         EntryName::Utf8(name) => name.as_bytes(),
@@ -424,7 +471,7 @@ fn check_hierarchy(
                 break;
             }
             let conflict = || CreateError::NameConflict { first: CreateEntryId(a), second: CreateEntryId(b) };
-            if left.0.is_empty() && (right.0.is_empty() || entries[a].source.is_some()) {
+            if left.0.is_empty() && (right.0.is_empty() || entries[a].payload_source().is_some()) {
                 return Err(conflict());
             }
             if keyed
@@ -538,15 +585,24 @@ pub(in crate::zip) fn validate_input(
 pub(in crate::zip) fn prepare_input(
     metadata: EntryOptions<'_>,
     keys: Option<&CollisionPath>,
-    source: Option<(&Path, Option<File>)>,
+    source: Option<(&Path, Option<File>, bool)>,
     ordinal: CreateEntryId,
     remaining: u64,
     budget: &Attempts<'_>,
 ) -> Result<PlannedEntry> {
     let source = source
-        .map(|(path, file)| -> Result<_> {
+        .map(|(path, file, directory)| -> Result<_> {
             let path = absolute(path, remaining, budget)?;
-            let (file, stamp) = if let Some(file) = file {
+            let path = if directory { directory_lookup_path(path) } else { path };
+            let (file, stamp) = if directory {
+                let stamp = unix::directory_stamp(&budget.run(|| std::fs::symlink_metadata(&path))?)?;
+                if let Some(file) = &file
+                    && unix::directory_stamp(&budget.run(|| file.metadata())?)? != stamp
+                {
+                    return Err(CreateError::SourceChanged(ordinal));
+                }
+                (file, stamp)
+            } else if let Some(file) = file {
                 let stamp = capture(&file, &path, ordinal, budget)?;
                 (Some(file), stamp)
             } else {
@@ -557,7 +613,7 @@ pub(in crate::zip) fn prepare_input(
                 tests::event(tests::Event::AfterAdmissionClose, Some(&path))?;
                 (None, stamp)
             };
-            Ok(Source { path, stamp, file })
+            Ok(Source { path, stamp, file, directory })
         })
         .transpose()?;
     Ok(PlannedEntry {
@@ -574,6 +630,10 @@ pub(in crate::zip) fn prepare_input(
 }
 
 impl PlannedEntry {
+    pub(in crate::zip) fn payload_source(&self) -> Option<&Source> {
+        self.source.as_ref().filter(|source| !source.directory)
+    }
+
     pub(in crate::zip) fn variable_capacity(&self) -> u64 {
         self.name.capacity() as u64
             + self.comment.capacity() as u64
@@ -660,4 +720,78 @@ impl<'a> Attempts<'a> {
             }
         }
     }
+}
+
+pub(in crate::zip) fn check_directory_source(
+    source: &Source,
+    id: CreateEntryId,
+    expected: Stamp,
+    budget: &Attempts<'_>,
+) -> Result<()> {
+    let changed = || CreateError::SourceChanged(id);
+    let path = budget.run(|| std::fs::symlink_metadata(&source.path)).map_err(|error| match error {
+        CreateError::Io(io) if matches!(io.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => changed(),
+        other => other,
+    })?;
+    if unix::directory_stamp(&path).map_err(|_| changed())? != expected {
+        return Err(changed());
+    }
+    if let Some(file) = &source.file
+        && unix::directory_stamp(&budget.run(|| file.metadata())?).map_err(|_| changed())? != expected
+    {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+pub(in crate::zip) fn directory_check_attempts(entries: &[PlannedEntry], parent: &Parent) -> Result<u64> {
+    let mut attempts = 0;
+    let mut check_parent = false;
+    for source in entries.iter().filter_map(|entry| entry.source.as_ref()).filter(|source| source.directory) {
+        let is_parent = source.stamp.identity == parent.identity;
+        check_parent |= is_parent;
+        // Check before staging and before commit. For the stage parent,
+        // also check each selected binding against the post-create stamp.
+        let checks = 2 + u64::from(is_parent);
+        attempts = add(attempts, checks * (1 + u64::from(source.file.is_some())))?;
+    }
+    add(attempts, u64::from(check_parent))
+}
+
+pub(in crate::zip) fn stage_parent_stamp(
+    entries: &[PlannedEntry],
+    parent: &Parent,
+    budget: &Attempts<'_>,
+) -> Result<Option<Stamp>> {
+    let mut selected = entries.iter().enumerate().filter_map(|(index, entry)| {
+        entry.source.as_ref().filter(|s| s.directory && s.stamp.identity == parent.identity).map(|s| (index, s))
+    });
+    let Some((index, first)) = selected.next() else { return Ok(None) };
+    // Stage creation changes the output parent's times and can change its
+    // size. After checking the original stamp before stage creation, reset
+    // the baseline for those fields here. Identity and mode must still match.
+    let stamp = unix::directory_stamp(&budget.run(|| parent.file.metadata())?)?;
+    for (index, source) in std::iter::once((index, first)).chain(selected) {
+        if stamp.identity != source.stamp.identity || stamp.mode != source.stamp.mode {
+            return Err(CreateError::SourceChanged(CreateEntryId(index)));
+        }
+        check_directory_source(source, CreateEntryId(index), stamp, budget)?;
+    }
+    Ok(Some(stamp))
+}
+
+pub(in crate::zip) fn check_directories(
+    entries: &[PlannedEntry],
+    parent_stamp: Option<Stamp>,
+    budget: &Attempts<'_>,
+) -> Result<()> {
+    for (index, entry) in entries.iter().enumerate() {
+        if let Some(source) = &entry.source
+            && source.directory
+        {
+            let expected = parent_stamp.filter(|stamp| stamp.identity == source.stamp.identity).unwrap_or(source.stamp);
+            check_directory_source(source, CreateEntryId(index), expected, budget)?;
+        }
+    }
+    Ok(())
 }

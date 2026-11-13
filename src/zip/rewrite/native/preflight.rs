@@ -141,7 +141,7 @@ impl RewritePlan {
                     }
                     Action::Replace(input) => {
                         let entry = &self.inputs[input];
-                        let size = entry.source.as_ref().map_or(0, |source| source.stamp.len);
+                        let size = entry.payload_source().map_or(0, |source| source.stamp.len);
                         verify_total = decoded(verify_total, size, limits.common)?;
                         feasibility.new_input(entry, size)?;
                     }
@@ -149,7 +149,8 @@ impl RewritePlan {
                 }
             }
             limit(full_packed, limits.common.verification_read_bytes, CreateLimit::VerificationReadBytes)?;
-            feasibility.finish(entries, self.attempts.get(), full_packed)
+            let directory_attempts = create::native::directory_check_attempts(&self.inputs, &self.parent)?;
+            feasibility.finish(entries, add(self.attempts.get(), directory_attempts)?, full_packed)
         })();
         self.usage = loop_usage;
         result?;
@@ -246,13 +247,13 @@ impl<'a> Feasibility<'a> {
     fn new_input(&mut self, entry: &PlannedEntry, size: u64) -> Result<()> {
         let options = entry.options();
         let limits = self.limits.common;
-        let geometry =
-            exact_member_geometry(options, size, entry.source.is_none(), self.local).map_err(rewrite_writer_error)?;
+        let geometry = exact_member_geometry(options, size, entry.payload_source().is_none(), self.local)
+            .map_err(rewrite_writer_error)?;
         let name = entry.name.len() as u64;
         let comment = entry.comment.len() as u64;
         let central_extra = geometry.central_bytes - 46 - name - comment;
         let payload = if geometry.deflate { 1 } else { size };
-        if entry.source.is_some() {
+        if entry.payload_source().is_some() {
             self.new_source = add(self.new_source, size)?;
             writer_limit(add(self.new_source, 1)?, limits.writer.source_bytes, W::SourceBytes)?;
             writer_limit(size, limits.writer.entry_decoded_bytes, W::EntryDecodedBytes)?;

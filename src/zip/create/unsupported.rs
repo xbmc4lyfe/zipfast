@@ -61,6 +61,25 @@ impl CreatePlan {
         match self.0 {}
     }
 
+    pub fn add_directory_from_path(
+        &mut self,
+        _: &Path,
+        _: EntryOptions<'_>,
+        _: Option<&CollisionPath>,
+    ) -> Result<CreateEntryId> {
+        match self.0 {}
+    }
+
+    pub fn add_open_directory(
+        &mut self,
+        _: &Path,
+        _: File,
+        _: EntryOptions<'_>,
+        _: Option<&CollisionPath>,
+    ) -> Result<CreateEntryId> {
+        match self.0 {}
+    }
+
     /// Return component accounting.
     pub fn usage(&self) -> CreateUsage {
         match self.0 {}
