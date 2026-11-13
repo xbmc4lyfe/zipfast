@@ -1005,6 +1005,13 @@ impl ZipCrypto {
         Self(crypto_keys(password.as_bytes()))
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(crate) fn decrypt(&mut self, data: &mut [u8]) {
+        for byte in data {
+            *byte = crypto_step(&mut self.0, *byte);
+        }
+    }
+
     pub(crate) fn encrypt(&mut self, data: &mut [u8]) {
         for byte in data {
             let plaintext = *byte;

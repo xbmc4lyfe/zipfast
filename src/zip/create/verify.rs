@@ -28,17 +28,19 @@ use zip_container::{
 };
 
 use crate::crc32::Hasher;
-use crate::zip::{FLAG_UTF8, HOST_UNIX, METHOD_DEFLATE, METHOD_STORED, S_IFDIR};
+use crate::crypto::ZipCrypto;
+use crate::zip::{FLAG_DESCRIPTOR, FLAG_ENCRYPTED, FLAG_UTF8, HOST_UNIX, METHOD_DEFLATE, METHOD_STORED, S_IFDIR};
 
 use super::{
     Attempts, CreateError, CreateLimit, CreateLimits, CreateOptions, PlannedEntry, Result, Stamp, VerificationUsage,
     add, limit, unix,
 };
-use crate::zip::write::{EntryWritten, Method, WriteSummary};
+use crate::zip::write::{EntryWritten, InputLength, Method, WriteSummary};
 
 const BUFFER: usize = 64 << 10;
 pub(in crate::zip) const DISCOVERY_TAIL_BYTES: u64 = 22 + u16::MAX as u64 + 56 + 20;
 const MAX_EXTRA: usize = 37;
+const ZIPCRYPTO_HEADER: u64 = 12;
 const SIZE_SENTINEL: u64 = u32::MAX as u64;
 
 #[derive(Debug)]
@@ -46,15 +48,22 @@ pub(super) struct VerifiedCreation {
     pub(super) stamp: Stamp,
 }
 
-pub(super) fn verify_created(
+#[derive(Clone, Copy)]
+pub(super) struct ZipCryptoExpectation<'a> {
+    pub(super) password: &'a str,
+    pub(super) length: InputLength,
+}
+
+pub(super) fn verify_created<'a>(
     file: &mut File,
-    entries: &[PlannedEntry],
-    receipts: &[EntryWritten],
+    members: (&[PlannedEntry], &[EntryWritten]),
     options: &CreateOptions,
     summary: WriteSummary,
     attempts: &Attempts<'_>,
     usage: &mut VerificationUsage,
+    mut encryption: impl FnMut(usize) -> Option<ZipCryptoExpectation<'a>>,
 ) -> Result<VerifiedCreation> {
+    let (entries, receipts) = members;
     let stamp = unix::file_stamp(file, attempts)?;
     ensure(
         stamp.len == summary.usage.archive_extent
@@ -96,16 +105,10 @@ pub(super) fn verify_created(
             + u64::from(central.header.extra_len);
         reader.usage.metadata_bytes = add(reader.usage.metadata_bytes, metadata)?;
         limit(reader.usage.metadata_bytes, options.limits.verification_metadata, CreateLimit::VerificationMetadata)?;
-        let framing = Framing::new(expected, receipt)?;
-        wide_entry |= framing.version == 45;
-        let record = Member { central, expected, receipt, framing };
-        record.check_central(&mut reader)?;
-        let payload_end = record.check_local(&mut reader, directory.directory_range.start, &mut input)?;
-        if expected.payload_source().is_some() {
-            reader.verify_payload((*receipt).into(), &mut input)?;
-            reader.usage.payloads += 1;
-        }
-        local_at = payload_end;
+        let next = receipts.get(ordinal + 1).map_or(directory.directory_range.start, |next| next.local_offset);
+        ensure(next <= directory.directory_range.start, "local records overlap the central directory")?;
+        wide_entry |= reader.check_member(central, expected, receipt, next, &mut input, encryption(ordinal))?;
+        local_at = next;
         central_at = central.source.raw_range().end;
         reader.usage.entries += 1;
     }
@@ -246,36 +249,50 @@ struct Framing {
     attributes: u32,
     wide_sizes: bool,
     wide_offset: bool,
+    encrypted: bool,
 }
 
 impl Framing {
-    fn new(entry: &PlannedEntry, receipt: &EntryWritten) -> Result<Self> {
-        let decoded = entry.payload_source().map_or(0, |source| source.stamp.len);
+    fn new(entry: &PlannedEntry, receipt: &EntryWritten, encryption: Option<ZipCryptoExpectation<'_>>) -> Result<Self> {
+        let source = entry.payload_source();
+        let decoded = source.map_or(0, |source| source.stamp.len);
+        if let Some(encryption) = encryption {
+            ensure(source.is_some(), "a directory cannot have encrypted framing")?;
+            if let InputLength::Exact(size) = encryption.length {
+                ensure(size == decoded, "encrypted writer length differs from the source")?;
+            }
+        }
+        let overhead = if encryption.is_some() { ZIPCRYPTO_HEADER } else { 0 };
         let expected_method = if decoded == 0 { Method::Stored } else { entry.method };
         ensure(
             receipt.decoded_size == decoded
                 && receipt.method == expected_method
-                && (decoded != 0 || (receipt.crc32 == 0 && receipt.packed_size == 0)),
+                && (decoded != 0 || (receipt.crc32 == 0 && receipt.packed_size == overhead))
+                && receipt.packed_size >= overhead,
             "writer receipt differs from the expected source framing",
         )?;
         let method = match receipt.method {
             Method::Stored => {
-                ensure(receipt.packed_size == decoded, "Stored payload sizes differ")?;
+                ensure(receipt.packed_size == add(decoded, overhead)?, "Stored payload sizes differ")?;
                 METHOD_STORED
             }
             Method::Deflate(_) => METHOD_DEFLATE,
         };
-        let wide_sizes = method == METHOD_DEFLATE || decoded >= SIZE_SENTINEL;
+        let wide_sizes = method == METHOD_DEFLATE
+            || receipt.packed_size >= SIZE_SENTINEL
+            || (decoded != 0 && encryption.is_some_and(|mode| mode.length == InputLength::Unknown));
         let wide_offset = receipt.local_offset >= SIZE_SENTINEL;
         let (kind, dos_attributes) = if entry.payload_source().is_some() { (0o100000, 0) } else { (S_IFDIR, 0x10) };
         Ok(Self {
             method,
             version: if wide_sizes || wide_offset { 45 } else { 20 },
-            flags: if entry.utf8 { FLAG_UTF8 } else { 0 },
+            flags: (if entry.utf8 { FLAG_UTF8 } else { 0 })
+                | (if encryption.is_some() { FLAG_DESCRIPTOR | FLAG_ENCRYPTED } else { 0 }),
             dos: entry.modified.wire_fields(),
             attributes: ((kind | u32::from(entry.permissions.bits())) << 16) | dos_attributes,
             wide_sizes,
             wide_offset,
+            encrypted: encryption.is_some(),
         })
     }
 
@@ -284,8 +301,8 @@ impl Framing {
     }
 
     fn valid_flags(&self, flags: u16) -> bool {
-        // Bit 1/2 may indicate a Deflate level hint. All other flags are
-        // forbidden except the EFS bit selected by the plan.
+        // Bit 1/2 may indicate a Deflate level hint. The plan selects EFS
+        // and whether encrypted descriptor framing is required.
         let hints = if self.method == METHOD_DEFLATE { 0b110 } else { 0 };
         flags & !hints == self.flags
     }
@@ -334,32 +351,35 @@ impl Member<'_> {
         if header.extra_len != 0 {
             reader.seek(extra_at)?;
         }
-        self.check_extras(reader, header.extra_len, extra_at, framing.wide_offset)
+        self.check_extras(reader, header.extra_len, extra_at, true)
     }
 
-    fn check_local(&self, reader: &mut Reader<'_, '_>, central_at: u64, buffer: &mut [u8]) -> Result<u64> {
+    fn check_local(&self, reader: &mut Reader<'_, '_>, boundary: u64, buffer: &mut [u8]) -> Result<u64> {
         let receipt = self.receipt;
         let framing = &self.framing;
         let offset = receipt.local_offset;
-        ensure(add(offset, LOCAL_HEADER_LEN as u64)? <= central_at, "local header overlaps the directory")?;
+        ensure(add(offset, LOCAL_HEADER_LEN as u64)? <= boundary, "local header overlaps the next record")?;
         reader.seek(offset)?;
         let mut fixed = [0; LOCAL_HEADER_LEN];
         reader.read_exact(&mut fixed)?;
         let local = LocalHeader::parse(&fixed).map_err(|error| CreateError::Directory(error.into()))?;
-        let layout = local_layout(local, offset, central_at).map_err(|error| CreateError::Directory(error.into()))?;
+        let layout = local_layout(local, offset, boundary).map_err(|error| CreateError::Directory(error.into()))?;
+        let local_crc = if framing.encrypted { 0 } else { receipt.crc32 };
+        let (local_packed, local_decoded) =
+            if framing.encrypted { (0, 0) } else { (receipt.packed_size, receipt.decoded_size) };
         ensure(
             local.version_needed == framing.version
                 && local.flags == self.central.header.flags
                 && local.method == framing.method
                 && (local.mod_time, local.mod_date) == framing.dos
-                && local.crc32 == receipt.crc32
-                && local.packed_size == framing.size_field(receipt.packed_size)
-                && local.unpacked_size == framing.size_field(receipt.decoded_size)
+                && local.crc32 == local_crc
+                && local.packed_size == framing.size_field(local_packed)
+                && local.unpacked_size == framing.size_field(local_decoded)
                 && local.name_len as usize == self.expected.name.len(),
             "local header differs from the central header",
         )?;
         let payload = layout
-            .payload_range(receipt.packed_size, central_at)
+            .payload_range(receipt.packed_size, boundary)
             .map_err(|error| CreateError::Directory(error.into()))?;
         let name = &mut buffer[..self.expected.name.len()];
         reader.read_exact(name)?;
@@ -368,11 +388,12 @@ impl Member<'_> {
         Ok(payload.end)
     }
 
-    fn check_extras(&self, reader: &mut Reader<'_, '_>, len: u16, at: u64, offset: bool) -> Result<()> {
+    fn check_extras(&self, reader: &mut Reader<'_, '_>, len: u16, at: u64, central: bool) -> Result<()> {
         let mut data = [0; MAX_EXTRA];
         let data = data.get_mut(..usize::from(len)).ok_or(CreateError::Verification("unexpected extra fields"))?;
         reader.read_exact(data)?;
         let mut fields = ExtraIter::new(data, at).map_err(|error| CreateError::Directory(error.into()))?;
+        let offset = central && self.framing.wide_offset;
         if self.framing.wide_sizes || offset {
             let field = fields
                 .next()
@@ -382,8 +403,9 @@ impl Member<'_> {
             let mut body = field.body;
             ensure(field.id == 1, "unexpected ZIP64 extra ID")?;
             if self.framing.wide_sizes {
-                expect_qword(&mut body, self.receipt.decoded_size)?;
-                expect_qword(&mut body, self.receipt.packed_size)?;
+                let provisional = self.framing.encrypted && !central;
+                expect_qword(&mut body, if provisional { 0 } else { self.receipt.decoded_size })?;
+                expect_qword(&mut body, if provisional { 0 } else { self.receipt.packed_size })?;
             }
             if offset {
                 expect_qword(&mut body, self.receipt.local_offset)?;
@@ -458,13 +480,43 @@ impl<'a, 'b> Reader<'a, 'b> {
         boundary: u64,
         buffer: &mut [u8],
     ) -> Result<bool> {
-        let framing = Framing::new(expected, receipt)?;
+        self.check_member(central, expected, receipt, boundary, buffer, None)
+    }
+
+    fn check_member(
+        &mut self,
+        central: &CentralRecord,
+        expected: &PlannedEntry,
+        receipt: &EntryWritten,
+        boundary: u64,
+        buffer: &mut [u8],
+        encryption: Option<ZipCryptoExpectation<'_>>,
+    ) -> Result<bool> {
+        let framing = Framing::new(expected, receipt, encryption)?;
         let record = Member { central, expected, receipt, framing };
         record.check_central(self)?;
         let payload_end = record.check_local(self, boundary, buffer)?;
-        ensure(payload_end == boundary, "new entry leaves a gap before the next record")?;
+        let wide = record.framing.wide_sizes;
+        let descriptor_len = if encryption.is_some() { if wide { 24 } else { 16 } } else { 0 };
+        ensure(add(payload_end, descriptor_len)? == boundary, "new entry leaves a gap or overlaps the next record")?;
         if expected.payload_source().is_some() {
-            self.verify_payload((*receipt).into(), buffer)?;
+            let password_check = encryption.map(|mode| (mode.password, (record.framing.dos.0 >> 8) as u8));
+            self.verify_payload((*receipt).into(), buffer, password_check)?;
+            if encryption.is_some() {
+                let mut descriptor = [0; 24];
+                let descriptor = &mut descriptor[..descriptor_len as usize];
+                self.read_exact(descriptor)?;
+                ensure(
+                    crate::zip::descriptor_matches(
+                        descriptor,
+                        wide,
+                        true,
+                        receipt.crc32,
+                        (receipt.packed_size, receipt.decoded_size),
+                    ),
+                    "signed data descriptor differs from the receipt",
+                )?;
+            }
             self.usage.payloads += 1;
         }
         Ok(record.framing.version == 45)
@@ -472,7 +524,7 @@ impl<'a, 'b> Reader<'a, 'b> {
 
     pub(in crate::zip) fn check_payload(&mut self, at: u64, payload: Payload, buffer: &mut [u8]) -> Result<()> {
         self.seek(at)?;
-        self.verify_payload(payload, buffer)?;
+        self.verify_payload(payload, buffer, None)?;
         self.usage.payloads += 1;
         Ok(())
     }
@@ -612,14 +664,31 @@ impl<'a, 'b> Reader<'a, 'b> {
         self.usage.scratch_capacity = self.usage.scratch_capacity.max(bytes as u64);
     }
 
-    fn verify_payload(&mut self, receipt: Payload, buffer: &mut [u8]) -> Result<()> {
+    fn verify_payload(
+        &mut self,
+        receipt: Payload,
+        buffer: &mut [u8],
+        password_check: Option<(&str, u8)>,
+    ) -> Result<()> {
         let mut remaining = receipt.packed_size;
+        let mut cipher = if let Some((password, check)) = password_check {
+            remaining =
+                remaining.checked_sub(ZIPCRYPTO_HEADER).ok_or(CreateError::Verification("short ZipCrypto header"))?;
+            let mut header = [0; ZIPCRYPTO_HEADER as usize];
+            self.read_exact(&mut header)?;
+            let mut cipher = ZipCrypto::new(password);
+            cipher.decrypt(&mut header);
+            ensure(header[11] == check, "ZipCrypto password hint differs")?;
+            Some(cipher)
+        } else {
+            None
+        };
         let mut decoded = 0;
         let mut crc = Hasher::new();
         if receipt.method == METHOD_STORED {
             while remaining != 0 {
                 let len = remaining.min(buffer.len() as u64) as usize;
-                self.read_exact(&mut buffer[..len])?;
+                self.read_packed(&mut buffer[..len], &mut cipher)?;
                 self.decoded(&mut crc, &mut decoded, receipt, &buffer[..len])?;
                 remaining -= len as u64;
             }
@@ -631,7 +700,7 @@ impl<'a, 'b> Reader<'a, 'b> {
             loop {
                 if current.is_empty() && remaining != 0 {
                     let len = remaining.min(buffer.len() as u64) as usize;
-                    self.read_exact(&mut buffer[..len])?;
+                    self.read_packed(&mut buffer[..len], &mut cipher)?;
                     remaining -= len as u64;
                     current = 0..len;
                 }
@@ -652,6 +721,14 @@ impl<'a, 'b> Reader<'a, 'b> {
             }
         }
         ensure(decoded == receipt.decoded_size && crc.finalize() == receipt.crc32, "decoded length or CRC differs")
+    }
+
+    fn read_packed(&mut self, buffer: &mut [u8], cipher: &mut Option<ZipCrypto>) -> Result<()> {
+        self.read_exact(buffer)?;
+        if let Some(cipher) = cipher {
+            cipher.decrypt(buffer);
+        }
+        Ok(())
     }
 
     fn decoded(&mut self, crc: &mut Hasher, member: &mut u64, receipt: Payload, bytes: &[u8]) -> Result<()> {

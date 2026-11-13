@@ -112,7 +112,9 @@ fn verify_fixture(file: &mut File, receipt: EntryWritten, summary: WriteSummary)
     let mut usage = CreateUsage::default();
     let count = Cell::new(0);
     let budget = Attempts::new(&plan.options, &count);
-    verify_created(file, &plan.entries, &[receipt], &plan.options, summary, &budget, &mut usage.verification)
+    verify_created(file, (&plan.entries, &[receipt]), &plan.options, summary, &budget, &mut usage.verification, |_| {
+        None
+    })
 }
 
 #[test]
@@ -278,4 +280,218 @@ fn agreeing_headers_still_have_to_match_the_plan_and_receipt_order() {
     file.write_all(&bytes).unwrap();
     receipt.ordinal = 1;
     assert!(matches!(verify_fixture(&mut file, receipt, summary), Err(CreateError::Verification(_))));
+}
+
+#[test]
+fn encrypted_descriptor_and_payload_are_verified_against_the_plan() {
+    use crate::zip::write::{InputLength, WriterOptions, ZipStreamWriter};
+
+    let temp = test_dir();
+    let path = temp.path().join("source");
+    std::fs::write(&path, b"abc").unwrap();
+    let mut plan = CreatePlan::new(&temp.path().join("out.zip"), CreateOptions::default()).unwrap();
+    let mut meta = metadata("a");
+    meta.method = Method::Stored;
+    plan.add_file(&path, meta, None).unwrap();
+
+    let mut writer = ZipStreamWriter::new(Vec::new(), WriterOptions::default()).unwrap();
+    let receipt = writer
+        .add_zipcrypto_file(meta, &mut b"abc".as_slice(), InputLength::Exact(3), "verify-test", |entropy| {
+            entropy.fill(0x59);
+            Ok(())
+        })
+        .unwrap();
+    let finished = writer.finish().unwrap();
+    assert_eq!(receipt.packed_size, 15);
+    let encryption = ZipCryptoExpectation { password: "verify-test", length: InputLength::Exact(3) };
+    let verify = |bytes: &[u8], encryption, limit| {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(bytes).unwrap();
+        let options = CreateOptions {
+            limits: CreateLimits { verification_read_bytes: limit, ..CreateLimits::default() },
+            ..CreateOptions::default()
+        };
+        let count = Cell::new(0);
+        let budget = Attempts::new(&options, &count);
+        let mut usage = VerificationUsage::default();
+        verify_created(
+            &mut file,
+            (&plan.entries, &[receipt]),
+            &options,
+            finished.summary,
+            &budget,
+            &mut usage,
+            |_| encryption,
+        )?;
+        assert_eq!((usage.payloads, usage.decoded_bytes), (1, 3));
+        Ok::<_, CreateError>(usage.read_bytes)
+    };
+
+    let descriptor_at = finished.summary.central_offset as usize - 16;
+    assert_eq!(
+        &finished.sink[31..descriptor_at],
+        &[0xa7, 0x21, 0x9a, 0xcd, 0x93, 0x13, 0x80, 0x42, 0x7a, 0x62, 0x8e, 0x58, 0x4d, 0x1a, 0x28],
+    );
+    let read_bytes = verify(&finished.sink, Some(encryption), u64::MAX).unwrap();
+    assert!(verify(&finished.sink, None, u64::MAX).is_err());
+    assert!(matches!(
+        verify(&finished.sink, Some(encryption), read_bytes - 1),
+        Err(CreateError::Limit(CreateLimit::VerificationReadBytes))
+    ));
+    let colliding = ZipCryptoExpectation { password: "455", ..encryption };
+    assert_eq!(
+        crate::crypto::decrypt_zipcrypto("455", 0, &finished.sink[31..descriptor_at]).unwrap(),
+        [0x18, 0x7f, 0xbb],
+    );
+    assert!(matches!(
+        verify(&finished.sink, Some(colliding), u64::MAX),
+        Err(CreateError::Verification("decoded length or CRC differs"))
+    ));
+    let wrong = ZipCryptoExpectation { password: "wrong", ..encryption };
+    assert!(matches!(
+        verify(&finished.sink, Some(wrong), u64::MAX),
+        Err(CreateError::Verification("ZipCrypto password hint differs"))
+    ));
+
+    for offset in [
+        6,
+        14,
+        18,
+        30,
+        descriptor_at - 4,
+        descriptor_at - 1,
+        descriptor_at,
+        descriptor_at + 4,
+        descriptor_at + 8,
+        descriptor_at + 12,
+        finished.summary.central_offset as usize + 8,
+    ] {
+        let mut bytes = finished.sink.clone();
+        bytes[offset] ^= 1;
+        assert!(verify(&bytes, Some(encryption), u64::MAX).is_err(), "mutation at {offset}");
+    }
+}
+
+#[test]
+fn verifies_mixed_clear_and_encrypted_entries_with_canonical_empty_and_wide_framing() {
+    use crate::zip::write::{InputLength, WriterOptions, ZipStreamWriter};
+
+    let temp = test_dir();
+    let mut plan = CreatePlan::new(&temp.path().join("out.zip"), CreateOptions::default()).unwrap();
+    let mut writer = ZipStreamWriter::new(tempfile::tempfile().unwrap(), WriterOptions::default()).unwrap();
+    let mut receipts = Vec::new();
+    let mut modes = Vec::new();
+    let payload: Vec<u8> = (0..=255).cycle().take(65_537).collect();
+    let deflate = Method::Deflate(DeflateLevel::new(6).unwrap());
+    let timestamp = crate::zip::write::DosDateTime::new(2024, 7, 8, 21, 16, 24).unwrap();
+    let directory = metadata("dir/");
+    plan.add_directory(directory, None).unwrap();
+    receipts.push(writer.add_directory(directory).unwrap());
+    modes.push(None);
+    for (name, method, length, bytes) in [
+        ("exact-empty", deflate, InputLength::Exact(0), b"".as_slice()),
+        ("unknown-empty", Method::Stored, InputLength::Unknown, b"".as_slice()),
+        ("unknown-stored", Method::Stored, InputLength::Unknown, payload.as_slice()),
+        ("deflate", deflate, InputLength::Exact(payload.len() as u64), payload.as_slice()),
+    ] {
+        let path = temp.path().join(name);
+        std::fs::write(&path, bytes).unwrap();
+        let mut meta = metadata(name);
+        meta.method = method;
+        meta.modified = timestamp;
+        meta.extended_mtime = Some(1_700_000_000);
+        meta.comment = b"file";
+        plan.add_file(&path, meta, None).unwrap();
+        let mut input = bytes;
+        receipts.push(
+            writer
+                .add_zipcrypto_file(meta, &mut input, length, "verify-test", |random| {
+                    random.fill(0x55);
+                    Ok(())
+                })
+                .unwrap(),
+        );
+        modes.push(Some(ZipCryptoExpectation { password: "verify-test", length }));
+    }
+    let mut finished = writer.finish().unwrap();
+    let attempts = Cell::new(0);
+    let budget = Attempts::new(&plan.options, &attempts);
+    let mut usage = VerificationUsage::default();
+    verify_created(
+        &mut finished.sink,
+        (&plan.entries, &receipts),
+        &plan.options,
+        finished.summary,
+        &budget,
+        &mut usage,
+        |ordinal| modes[ordinal],
+    )
+    .unwrap();
+    assert_eq!((usage.entries, usage.payloads, usage.decoded_bytes), (5, 4, 131_074));
+    assert_eq!((receipts[1].packed_size, receipts[2].packed_size), (12, 12));
+    let local_zip64_sizes = receipts[3].local_offset + 30 + "unknown-stored".len() as u64 + 4;
+    let local_deflate_descriptor = finished.summary.central_offset - 24;
+    for offset in [local_zip64_sizes, local_deflate_descriptor - 1, local_deflate_descriptor + 16] {
+        let mut original = [0];
+        finished.sink.seek(SeekFrom::Start(offset)).unwrap();
+        finished.sink.read_exact(&mut original).unwrap();
+        finished.sink.seek(SeekFrom::Start(offset)).unwrap();
+        finished.sink.write_all(&[original[0] ^ 0xff]).unwrap();
+        assert!(
+            verify_created(
+                &mut finished.sink,
+                (&plan.entries, &receipts),
+                &plan.options,
+                finished.summary,
+                &budget,
+                &mut VerificationUsage::default(),
+                |ordinal| modes[ordinal],
+            )
+            .is_err(),
+            "mutation at {offset}"
+        );
+        finished.sink.seek(SeekFrom::Start(offset)).unwrap();
+        finished.sink.write_all(&original).unwrap();
+    }
+}
+
+#[test]
+#[ignore = "streams a physical encrypted member larger than 128 MiB"]
+fn verifies_zipcrypto_packed_range_above_the_buffered_reader_ceiling() {
+    use crate::zip::write::{InputLength, WriterOptions, ZipStreamWriter};
+
+    const LENGTH: u64 = (128 << 20) + 1;
+    let temp = test_dir();
+    let path = temp.path().join("source");
+    File::create(&path).unwrap().set_len(LENGTH).unwrap();
+    let mut plan = CreatePlan::new(&temp.path().join("out.zip"), CreateOptions::default()).unwrap();
+    let mut meta = metadata("large");
+    meta.method = Method::Stored;
+    plan.add_file(&path, meta, None).unwrap();
+
+    let mut writer = ZipStreamWriter::new(tempfile::tempfile().unwrap(), WriterOptions::default()).unwrap();
+    let length = InputLength::Exact(LENGTH);
+    let receipt = writer
+        .add_zipcrypto_file(meta, &mut File::open(&path).unwrap(), length, "verify-test", |random| {
+            random.fill(0x11);
+            Ok(())
+        })
+        .unwrap();
+    let mut finished = writer.finish().unwrap();
+    let attempts = Cell::new(0);
+    let budget = Attempts::new(&plan.options, &attempts);
+    let mut usage = VerificationUsage::default();
+    verify_created(
+        &mut finished.sink,
+        (&plan.entries, &[receipt]),
+        &plan.options,
+        finished.summary,
+        &budget,
+        &mut usage,
+        |_| Some(ZipCryptoExpectation { password: "verify-test", length }),
+    )
+    .unwrap();
+    assert_eq!(receipt.packed_size, LENGTH + 12);
+    assert_eq!(usage.decoded_bytes, LENGTH);
+    assert_eq!(usage.payloads, 1);
 }
