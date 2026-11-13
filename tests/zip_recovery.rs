@@ -364,3 +364,107 @@ fn exact_deflate_framing_and_empty_files_keep_raw_metadata() {
         assert_eq!(fs::read(source).unwrap(), old);
     }
 }
+
+#[test]
+fn recovery_output_guard_rejects_direct_hardlink_and_symlink_aliases_before_parsing() {
+    use std::os::unix::fs::symlink;
+    use zipfast::zip::rewrite::RewriteError;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("malformed.zip");
+    let target = root.path().join("fixed.zip");
+    let hard = root.path().join("hard");
+    let link = root.path().join("symlink");
+    fs::write(&source, b"malformed central directory").unwrap();
+    fs::hard_link(&source, &hard).unwrap();
+    symlink(&source, &link).unwrap();
+    let original_error = RecoveryPlan::open(&source, &target, RecoveryOptions::default()).err().unwrap();
+    for path in [&source, &hard, &link] {
+        let output = fs::OpenOptions::new().append(true).open(path).unwrap();
+        let error =
+            RecoveryPlan::open_with_output_file(&source, &target, RecoveryOptions::default(), &output).err().unwrap();
+        assert!(matches!(error, RewriteError::OutputAliasesArchive));
+        assert!(!error.to_string().contains("malformed.zip"));
+        assert_eq!(fs::read(&source).unwrap(), b"malformed central directory");
+        assert!(!target.exists());
+    }
+    let safe = tempfile::tempfile().unwrap();
+    let error = RecoveryPlan::open_with_output_file(&source, &target, RecoveryOptions::default(), &safe).err().unwrap();
+    assert_eq!(error.to_string(), original_error.to_string());
+    assert_eq!(safe.metadata().unwrap().len(), 0);
+}
+
+#[test]
+fn recovery_output_guard_accepts_regular_and_pipe_and_rechecks_held_source() {
+    use std::os::fd::FromRawFd;
+    use zipfast::zip::rewrite::RewriteError;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("old.zip");
+    let target = root.path().join("fixed.zip");
+    let original = fixture();
+    fs::write(&source, &original).unwrap();
+    let mut pipe = [0; 2];
+    // SAFETY: pipe initializes both descriptor slots on success.
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let _reader = unsafe { fs::File::from_raw_fd(pipe[0]) };
+    let writer = unsafe { fs::File::from_raw_fd(pipe[1]) };
+    for output in [tempfile::tempfile().unwrap(), writer] {
+        let plan = RecoveryPlan::open_with_output_file(&source, &target, RecoveryOptions::default(), &output).unwrap();
+        plan.check_output_file(&output).unwrap();
+        let alias = fs::OpenOptions::new().append(true).open(&source).unwrap();
+        assert!(matches!(plan.check_output_file(&alias), Err(RewriteError::OutputAliasesArchive)));
+        assert!(!target.exists());
+        assert_eq!(output.metadata().unwrap().len(), 0);
+        assert_eq!(fs::read(&source).unwrap(), original);
+    }
+    let output = tempfile::tempfile().unwrap();
+    let plan = RecoveryPlan::open_with_output_file(&source, &target, RecoveryOptions::default(), &output).unwrap();
+    fs::write(&source, b"changed").unwrap();
+    assert!(matches!(plan.check_output_file(&output), Err(RewriteError::SourceChanged)));
+    assert_eq!(output.metadata().unwrap().len(), 0);
+}
+
+#[test]
+fn recovery_output_guard_charges_metadata_and_keeps_attempt_and_cancel_bounds() {
+    use zipfast::extract::Cancellation;
+    use zipfast::zip::create::{CreateError, CreateLimit};
+    use zipfast::zip::rewrite::RewriteError;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("old.zip");
+    let target = root.path().join("fixed.zip");
+    fs::write(&source, fixture()).unwrap();
+    let output = tempfile::tempfile().unwrap();
+    let old = RecoveryPlan::open(&source, &target, RecoveryOptions::default()).unwrap();
+    let old_attempts = old.usage().common.transaction_attempts;
+    let plan = RecoveryPlan::open_with_output_file(&source, &target, RecoveryOptions::default(), &output).unwrap();
+    let opening = plan.usage().common.transaction_attempts;
+    assert_eq!(opening, old_attempts + 1);
+    plan.check_output_file(&output).unwrap();
+    let exact = plan.usage().common.transaction_attempts;
+    assert!(exact > opening);
+    for (limit, succeeds) in [(exact, true), (exact - 1, false)] {
+        let mut options = RecoveryOptions::default();
+        options.limits.common.transaction_attempts = limit;
+        let plan = RecoveryPlan::open_with_output_file(&source, &target, options, &output).unwrap();
+        let result = plan.check_output_file(&output);
+        assert_eq!(result.is_ok(), succeeds);
+        if let Err(error) = result {
+            assert!(matches!(
+                error,
+                RewriteError::Infrastructure(CreateError::Limit(CreateLimit::TransactionAttempts))
+            ));
+        }
+    }
+    let cancel = Cancellation::default();
+    let options = RecoveryOptions { cancel: cancel.clone(), ..RecoveryOptions::default() };
+    let plan = RecoveryPlan::open_with_output_file(&source, &target, options.clone(), &output).unwrap();
+    cancel.cancel();
+    let before = plan.usage().common.transaction_attempts;
+    assert!(matches!(plan.check_output_file(&output), Err(RewriteError::Infrastructure(CreateError::Canceled))));
+    assert_eq!(plan.usage().common.transaction_attempts, before);
+    assert!(matches!(
+        RecoveryPlan::open_with_output_file(&source, &target, options, &output),
+        Err(RewriteError::Infrastructure(CreateError::Canceled))
+    ));
+    assert_eq!(output.metadata().unwrap().len(), 0);
+    assert!(!target.exists());
+}

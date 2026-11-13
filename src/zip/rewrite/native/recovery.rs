@@ -33,13 +33,33 @@ impl RecoveryPlan {
     /// Open the original without following its final symlink, snapshot its
     /// central directory and bind a distinct, absent output name. No writes.
     pub fn open(source: &Path, destination: &Path, options: RecoveryOptions) -> Result<Self> {
+        Self::open_inner(source, destination, options, None)
+    }
+
+    /// Open recovery while rejecting an output descriptor that aliases the
+    /// actually opened source, before parsing its ZIP directory. No bytes are
+    /// written. Keep the descriptor open and use that same file for output.
+    ///
+    /// Pre-open errors, including cancellation, limits, Open and Metadata,
+    /// can precede the identity comparison and do not authorize diagnostics.
+    /// Only the actually opened source is covered, not unvisited paths.
+    pub fn open_with_output_file(
+        source: &Path,
+        destination: &Path,
+        options: RecoveryOptions,
+        output: &File,
+    ) -> Result<Self> {
+        Self::open_inner(source, destination, options, Some(output))
+    }
+
+    fn open_inner(source: &Path, destination: &Path, options: RecoveryOptions, output: Option<&File>) -> Result<Self> {
         let mut rewrite = RewriteOptions::new(Replacement::LastWriterWins);
         rewrite.verification = Verification::Full;
         rewrite.limits = options.limits;
         rewrite.durability = options.durability;
         rewrite.output_permissions = Some(options.output_permissions);
         rewrite.cancel = options.cancel;
-        let mut source = RewritePlan::open(source, rewrite)?;
+        let mut source = RewritePlan::open_source(source, rewrite, false, output)?;
         let limits = source.options.limits.common;
         let attempts = Attempts::with_limits(&source.options.cancel, limits.transaction_attempts, &source.attempts);
         let remaining = limits
@@ -55,6 +75,21 @@ impl RecoveryPlan {
         source.usage.common.plan.capacity = source.usage.common.plan.capacity.max(capacity);
         check_source(&source.parent, &source.file, source.stamp, &attempts)?;
         Ok(Self { source, destination })
+    }
+
+    /// Validate the held source binding before and after checking this output
+    /// descriptor's identity. No output bytes are read or written. Retain and
+    /// use this same descriptor for subsequent output.
+    pub fn check_output_file(&self, output: &File) -> Result<()> {
+        let source = &self.source;
+        let attempts = Attempts::with_limits(
+            &source.options.cancel,
+            source.options.limits.common.transaction_attempts,
+            &source.attempts,
+        );
+        check_source(&source.parent, &source.file, source.stamp, &attempts)?;
+        check_output_identity(source.stamp, output, &attempts)?;
+        check_source(&source.parent, &source.file, source.stamp, &attempts)
     }
 
     pub fn metadata(&self) -> Arc<Metadata> {

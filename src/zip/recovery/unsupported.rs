@@ -16,7 +16,7 @@
 
 use super::*;
 use crate::zip::{Metadata, create::CreateError, rewrite::RewriteError};
-use std::{path::Path, sync::Arc};
+use std::{fs::File, path::Path, sync::Arc};
 
 /// Recovery is available only on qualified Linux and macOS filesystems.
 pub struct RecoveryPlan {
@@ -25,6 +25,12 @@ pub struct RecoveryPlan {
 impl RecoveryPlan {
     pub fn open(_: &Path, _: &Path, _: RecoveryOptions) -> Result<Self, RewriteError> {
         Err(CreateError::UnsupportedPlatform.into())
+    }
+    pub fn open_with_output_file(_: &Path, _: &Path, _: RecoveryOptions, _: &File) -> Result<Self, RewriteError> {
+        Err(CreateError::UnsupportedPlatform.into())
+    }
+    pub fn check_output_file(&self, _: &File) -> Result<(), RewriteError> {
+        match self.unavailable {}
     }
     pub fn metadata(&self) -> Arc<Metadata> {
         match self.unavailable {}
