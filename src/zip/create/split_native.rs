@@ -864,8 +864,8 @@ fn execute(
                 report.barriers.prefix_parent = SplitBarrierState::Complete;
             }
             ctx.sources(&ctx.attempts).at(SplitCreateStage::SourceRead)?;
-            for n in 0..owner.opened {
-                check_slot(ctx, &owner.slots[n], n < disk, &ctx.attempts).at(SplitCreateStage::Verify)?;
+            for (n, slot) in owner.slots.iter().take(owner.opened).enumerate() {
+                check_slot(ctx, slot, n < disk, &ctx.attempts).at(SplitCreateStage::Verify)?;
             }
         }
         let stage = if last { SplitCreateStage::FinalPublish } else { SplitCreateStage::NumberedPublish };
