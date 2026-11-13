@@ -541,3 +541,20 @@ fn logical_completion_accepts_real_terminal_prefix_and_physical_slack() {
         assert_eq!(out, b"A");
     }
 }
+
+#[test]
+fn each_recent_slot_copies_distinct_initialized_history() {
+    for (slot, expected) in [b"HH", b"GH", b"FG", b"EF"].into_iter().enumerate() {
+        let mut d = decoder(1, 10);
+        d.dictionary[..8].copy_from_slice(b"ABCDEFGH");
+        d.produced = 8;
+        d.recent = [1, 2, 3, 4];
+        d.tables[4].build(&[1], &mut d.work).unwrap();
+        d.phase = Phase::RecentLength { slot };
+        let mut out = Vec::new();
+        assert_eq!(d.feed(&[0], &mut collect(&mut out)).unwrap(), Rar4FeedState::Complete);
+        d.finish(&mut collect(&mut out)).unwrap();
+        assert_eq!(out, expected, "slot {slot}");
+        assert_eq!(d.recent[0], slot as u64 + 1);
+    }
+}
