@@ -26,6 +26,8 @@ use super::*;
 
 #[cfg(unix)]
 mod extraction;
+mod printing;
+pub use printing::RarPrintOptions;
 
 const WINDOW_MAX: u64 = 256 << 20;
 const CHUNK: usize = 64 << 10;
@@ -190,7 +192,7 @@ impl RarSession {
 }
 
 fn run_error(partial: RarRunSummary, entry: Option<RarEntryIdentity>, failure: Arc<RarFailure>) -> RarRunError {
-    RarRunError { partial, entry, failure }
+    RarRunError { partial, entry, failure, partial_member_bytes: 0 }
 }
 
 fn count_outcome(summary: &mut RarRunSummary, outcome: &RarOutcome) -> RarResult<()> {
@@ -325,7 +327,10 @@ impl SelectedRun {
         mark_volumes(&mut used_volumes, &session.parts[member.parts.clone()]);
         check_volumes(session, &used_volumes)?;
         let result = self.decode_bound(session, index, output).map_err(Arc::new);
-        if result.as_ref().is_err_and(|failure| matches!(failure.as_ref(), RarFailure::Output { .. })) {
+        if result
+            .as_ref()
+            .is_err_and(|failure| matches!(failure.as_ref(), RarFailure::Output { .. } | RarFailure::PrintSpool { .. }))
+        {
             // Record any observed binding loss without replacing the original
             // output failure returned to this run.
             let _ = check_volumes(session, &used_volumes);
@@ -574,6 +579,7 @@ fn is_terminal(failure: &RarFailure) -> bool {
         failure,
         RarFailure::Input { .. }
             | RarFailure::Output { .. }
+            | RarFailure::PrintSpool { .. }
             | RarFailure::SourceChanged { .. }
             | RarFailure::Canceled
             | RarFailure::Internal(_)
@@ -581,7 +587,10 @@ fn is_terminal(failure: &RarFailure) -> bool {
                 resource: RarResource::Counter
                     | RarResource::CatalogueAllocation
                     | RarResource::SelectedPackedBytes
-                    | RarResource::SelectedDecodedBytes,
+                    | RarResource::SelectedDecodedBytes
+                    | RarResource::PrintMemberSpoolBytes
+                    | RarResource::PrintLiveSpoolBytes
+                    | RarResource::PrintIoAttempts,
                 ..
             }
     )

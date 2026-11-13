@@ -70,6 +70,8 @@ pub enum RarOutput {
     Tested,
     /// Output was finished and published. No durability guarantee is implied.
     Written,
+    /// All verified member bytes were accepted and the caller writer was flushed.
+    Printed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -111,6 +113,9 @@ pub struct RarRunError {
     pub partial: RarRunSummary,
     pub entry: Option<RarEntryIdentity>,
     pub failure: Arc<RarFailure>,
+    /// Bytes accepted by a print writer for the failed member. These are
+    /// separate from completed member bytes in `partial.bytes`.
+    pub partial_member_bytes: u64,
 }
 
 impl fmt::Display for RarRunError {
@@ -180,7 +185,7 @@ impl RunFault {
             Self::Fault(fault) => (None, Arc::from(fault.failure)),
             Self::Reported { entry, failure } => (Some(entry), failure),
         };
-        RarRunError { partial, entry, failure }
+        RarRunError { partial, entry, failure, partial_member_bytes: 0 }
     }
 }
 
