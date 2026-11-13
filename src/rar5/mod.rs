@@ -184,8 +184,10 @@ impl Rar4Metadata {
             "split payload"
         } else if self.flags & 4 != 0 {
             "encrypted payload"
-        } else if self.method != 0x30 {
-            "compressed payload"
+        } else if !(0x30..=0x35).contains(&self.method) {
+            "compression method"
+        } else if self.method != 0x30 && self.unpack_version != 29 {
+            "unpack version"
         } else if self.flags & 0x10 != 0 {
             "solid payload"
         } else if self.flags & 0x800 != 0 {

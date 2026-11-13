@@ -23,6 +23,8 @@ use crate::extract::{
 use crate::rar5::unpack::{Sink, Unpacker, window_for_detailed};
 
 use super::*;
+use crate::rar5::RarFormat;
+use crate::rar5::unpack::rar4::{Rar4DecodeError, Rar4Decoder};
 
 #[cfg(unix)]
 mod extraction;
@@ -272,7 +274,7 @@ impl SelectedRun {
             check_volumes(session, &volumes)?;
             return Ok(outcome);
         }
-        let compressed = member.header.method != 0;
+        let compressed = member.header.format == RarFormat::Rar5 && member.header.method != 0;
         if compressed {
             let Some(chain) = member.chain else {
                 return Ok(RarOutcome::Failed(history_failure(None)));
@@ -385,7 +387,21 @@ impl SelectedRun {
             pending.start_selected_cipher(params, password, member.unpacked_size)?;
         }
         let compressed = header.method != 0;
-        if compressed {
+        let mut rar4 = if compressed && header.format == RarFormat::Rar4 {
+            Some(
+                Rar4Decoder::new(
+                    header.dictionary,
+                    member.packed_size,
+                    header.unpacked_size,
+                    self.limits.window_bytes.min(WINDOW_MAX),
+                    session.options.cancel.clone(),
+                )
+                .map_err(|error| *error.detailed(pending.context().scope()).failure)?,
+            )
+        } else {
+            None
+        };
+        if compressed && header.format == RarFormat::Rar5 {
             self.prepare_decoder(session, member, pending.context())?;
         }
         for (part_index, part) in parts.iter().enumerate() {
@@ -438,18 +454,23 @@ impl SelectedRun {
                     failure: None,
                     output: &mut output,
                 };
-                let decoder = self.decoder.as_mut().filter(|_| compressed);
-                match decoder {
-                    Some(decoder) => {
-                        let result = match &mut blocks {
-                            Some(blocks) => blocks.feed(plaintext, decoder, &mut sink),
-                            None => decoder.feed(plaintext, &mut sink),
-                        };
-                        sink.finish(result, decoder.take_size_failure())?;
-                    }
-                    None => {
-                        let result = sink.put(plaintext);
-                        sink.finish(result, None)?;
+                let decoder = self.decoder.as_mut().filter(|_| compressed && header.format == RarFormat::Rar5);
+                if let Some(decoder) = rar4.as_mut() {
+                    let result = decoder.feed(plaintext, &mut sink).map(|_| ());
+                    sink.finish_rar4(result)?;
+                } else {
+                    match decoder {
+                        Some(decoder) => {
+                            let result = match &mut blocks {
+                                Some(blocks) => blocks.feed(plaintext, decoder, &mut sink),
+                                None => decoder.feed(plaintext, &mut sink),
+                            };
+                            sink.finish(result, decoder.take_size_failure())?;
+                        }
+                        None => {
+                            let result = sink.put(plaintext);
+                            sink.finish(result, None)?;
+                        }
                     }
                 }
                 if let Some(cipher) = pending.selected_cipher() {
@@ -466,7 +487,19 @@ impl SelectedRun {
         if let Some(cipher) = pending.selected_cipher() {
             cipher.finish_selected(&context)?;
         }
-        if let Some(decoder) = self.decoder.as_mut().filter(|_| compressed) {
+        if let Some(decoder) = rar4.as_mut() {
+            let mut sink = SelectedSink {
+                pending: &mut pending,
+                decoded: &mut self.decoded,
+                limit: self.limits.decoded_bytes,
+                cancel: &session.options.cancel,
+                failure: None,
+                output: &mut output,
+            };
+            let result = decoder.finish(&mut sink);
+            sink.finish_rar4(result)?;
+        }
+        if let Some(decoder) = self.decoder.as_mut().filter(|_| compressed && header.format == RarFormat::Rar5) {
             let mut sink = SelectedSink {
                 pending: &mut pending,
                 decoded: &mut self.decoded,
@@ -637,6 +670,13 @@ struct SelectedSink<'a, 'out> {
 }
 
 impl SelectedSink<'_, '_> {
+    fn finish_rar4(self, result: Result<(), Rar4DecodeError>) -> Result<(), RarFailure> {
+        if let Some(failure) = self.failure {
+            return Err(failure);
+        }
+        result.map_err(|error| *error.detailed(self.pending.context().scope()).failure)
+    }
+
     fn finish(self, result: crate::Result<()>, size: Option<(u64, u64)>) -> Result<(), RarFailure> {
         if let Some(failure) = self.failure {
             return Err(failure);
@@ -724,5 +764,23 @@ mod tests {
         assert_eq!(result.partial.files, 0);
         assert!(matches!(result.failure.as_ref(), RarFailure::SourceChanged { path: actual } if actual == &path));
         assert!(Arc::ptr_eq(session.invalid_binding.as_ref().unwrap(), &result.failure));
+    }
+    #[test]
+    fn rar4_source_rebound_after_decode_precedes_verified_print() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.rar");
+        let replacement = dir.path().join("replacement");
+        let bytes = crate::rar5::unpack::rar4::fixed_fixture();
+        fs::write(&path, &bytes).unwrap();
+        fs::write(&replacement, &bytes).unwrap();
+        let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let target = path.clone();
+        AFTER_DECODE.with_borrow_mut(|hook| *hook = Some(Box::new(move || fs::rename(replacement, target).unwrap())));
+        let mut stdout = Vec::new();
+        let failure = session.print_selected(&all, &mut stdout, &RarPrintOptions::default(), |_| {}).unwrap_err();
+        assert!(matches!(failure.failure.as_ref(), RarFailure::SourceChanged { .. }));
+        assert_eq!(failure.partial.files, 0);
+        assert!(stdout.is_empty());
     }
 }

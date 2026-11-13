@@ -31,8 +31,9 @@ use crate::error::{Error, RarPasswordEvidence, RarScope, Result};
 use crate::output::{Output, temporary};
 use crate::path::sanitize;
 use crate::rar5::reader::{Block, ReadDataError, SIGNATURE_PROBE_BYTES, Volume, signature_end};
+use crate::rar5::unpack::rar4::{Rar4DecodeError, Rar4Decoder};
 use crate::rar5::unpack::{Sink, Unpacker, window_for_detailed};
-use crate::rar5::{FileHeader, MemberCrypt, Redirection};
+use crate::rar5::{FileHeader, MemberCrypt, RarFormat, Redirection};
 use crate::volume::next_volume;
 use crate::zip::{InspectionSource, ReadSession, SessionResult};
 
@@ -881,7 +882,7 @@ impl Pending {
             context,
             out: None,
             hasher: crate::crc32::Hasher::new(),
-            decoder_crc: h.method != 0 && !h.encrypted,
+            decoder_crc: h.format == RarFormat::Rar5 && h.method != 0 && !h.encrypted,
             crc: None,
             blake: h.blake2sp.map(|_| Blake2sp::new()),
             bytes: 0,
@@ -1109,6 +1110,7 @@ impl PendingCipher {
 
 enum MemberDecodeError {
     Decoder(Error),
+    Rar4(Rar4DecodeError),
     Sink(RarFault),
 }
 
@@ -1131,6 +1133,26 @@ impl Sink for PendingSink<'_> {
 
     fn crc(&mut self, crc: u32) {
         self.pending.crc(crc);
+    }
+}
+
+fn with_rar4_member_sink(
+    pending: &mut Pending,
+    selection: Option<&mut RarSelection<'_>>,
+    decode: impl FnOnce(&mut dyn Sink) -> std::result::Result<(), Rar4DecodeError>,
+) -> std::result::Result<(), MemberDecodeError> {
+    if let Some(selection) = selection {
+        let result = decode(&mut SelectedSink { pending, selection });
+        if selection.cancel.is_canceled() {
+            return Err(MemberDecodeError::Sink(RarFault::new(RarFailure::Canceled, Error::Corrupt("RAR4 canceled"))));
+        }
+        return result.map_err(MemberDecodeError::Rar4);
+    }
+    let mut sink = PendingSink { pending, fault: None };
+    let result = decode(&mut sink);
+    match sink.fault {
+        Some(fault) => Err(MemberDecodeError::Sink(fault)),
+        None => result.map_err(MemberDecodeError::Rar4),
     }
 }
 
@@ -1705,7 +1727,8 @@ impl Run<'_, '_, '_> {
 
     /// Whether `h` can go to the workers whole: a small file standing alone in one volume.
     fn batchable(&self, vol: &Volume, h: &FileHeader) -> bool {
-        self.threads > 1
+        h.format == RarFormat::Rar5
+            && self.threads > 1
             && !vol.main.is_solid()
             && !h.solid
             && !h.encrypted
@@ -2002,7 +2025,10 @@ impl Run<'_, '_, '_> {
             p.discard();
             return Err(e);
         }
-        if h.method != 0 {
+        if h.format == RarFormat::Rar4 {
+            self.stream = None;
+        }
+        if h.format == RarFormat::Rar5 && h.method != 0 {
             let solid_archive = vol.main.is_solid();
             let ready = if h.solid {
                 match self.stream.as_mut() {
@@ -2074,7 +2100,8 @@ impl Run<'_, '_, '_> {
     /// Whether `h` is a whole compressed file, standing alone, that is decoded on this thread while the workers
     /// finish the files handed to them before it: one too big to hand them. Its reports wait for theirs.
     fn beside_batch(&self, vol: &Volume, h: &FileHeader) -> bool {
-        self.threads > 1
+        h.format == RarFormat::Rar5
+            && self.threads > 1
             && !vol.main.is_solid()
             && !h.solid
             && h.method != 0
@@ -2089,7 +2116,8 @@ impl Run<'_, '_, '_> {
     /// Whether `h` can be decoded behind the files before it in a solid stream: compressed, whole in this volume, of
     /// known size, with threads to spare.
     fn queueable(&self, vol: &Volume, h: &FileHeader) -> bool {
-        self.threads > 1
+        h.format == RarFormat::Rar5
+            && self.threads > 1
             && vol.main.is_solid()
             && h.method != 0
             && h.algorithm == 0
@@ -2286,7 +2314,8 @@ impl Run<'_, '_, '_> {
         // a part's checksums cover only its own packed bytes
         let mut part = crate::crc32::Hasher::new();
         let mut part_blake = h.blake2sp.filter(|_| split_after).map(|_| Blake2sp::new());
-        if !p.compressed
+        if h.format == RarFormat::Rar5
+            && !p.compressed
             && !p.encrypted
             && self.threads > 1
             && h.packed_size >= batch::STORED_PARALLEL_MIN
@@ -2295,52 +2324,77 @@ impl Run<'_, '_, '_> {
         {
             return self.stored_parallel(vol, h, p);
         }
-        let mut stream = if p.compressed { self.stream.take() } else { None };
+        let mut stream = if h.format == RarFormat::Rar5 && p.compressed { self.stream.take() } else { None };
+        let mut rar4_error = None;
+        let mut rar4 = if h.format == RarFormat::Rar4 && p.compressed {
+            let cancel = self.selection.as_ref().map(|selection| selection.cancel.clone());
+            match Rar4Decoder::new_with_cancel(
+                h.dictionary,
+                h.packed_size,
+                h.unpacked_size,
+                if self.selection.is_some() { RAR_SELECTED_WINDOW_LIMIT } else { 4 << 20 },
+                cancel,
+            ) {
+                Ok(decoder) => Some(decoder),
+                Err(error) => {
+                    rar4_error = Some(error);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // stored data is only checked (and copied) as it comes; compressed data goes to the decoder
         vol.read_fast(self.threads > 1 && !p.compressed && p.cipher.is_none());
         // The decoder needs the pending member as a sink while the framing state is borrowed.
         let mut blocks = p.cipher.as_mut().and_then(|cipher| cipher.blocks.take());
-        let read = vol.read_data_detailed(h.data_at, h.packed_size, |piece, range| {
-            if let Some(selection) = &self.selection {
-                selection.cancel.check_io().map_err(|e| MemberDecodeError::Decoder(e.into()))?;
-            }
-            let chunk = &piece.bytes()[range.clone()];
-            if split_after {
-                part.update(chunk);
-                if let Some(b) = part_blake.as_mut() {
-                    b.update(chunk);
+        let read = if let Some(error) = rar4_error {
+            Err(ReadDataError::Sink(MemberDecodeError::Rar4(error)))
+        } else {
+            vol.read_data_detailed(h.data_at, h.packed_size, |piece, range| {
+                if let Some(selection) = &self.selection {
+                    selection.cancel.check_io().map_err(|e| MemberDecodeError::Decoder(e.into()))?;
                 }
-            }
-            if let Some(PendingCipher { aes, iv, rem, .. }) = p.cipher.as_mut() {
-                let mut dec_buf;
-                let to_feed: &[u8] = if !rem.is_empty() || !chunk.len().is_multiple_of(16) {
-                    rem.extend_from_slice(chunk);
-                    let aligned = rem.len() & !15;
-                    if aligned == 0 {
-                        return Ok(());
+                let chunk = &piece.bytes()[range.clone()];
+                if split_after {
+                    part.update(chunk);
+                    if let Some(b) = part_blake.as_mut() {
+                        b.update(chunk);
                     }
-                    dec_buf = rem.drain(..aligned).collect::<Vec<u8>>();
-                    aes.decrypt_cbc_in_place(iv, &mut dec_buf);
-                    &dec_buf
+                }
+                if let Some(PendingCipher { aes, iv, rem, .. }) = p.cipher.as_mut() {
+                    let mut dec_buf;
+                    let to_feed: &[u8] = if !rem.is_empty() || !chunk.len().is_multiple_of(16) {
+                        rem.extend_from_slice(chunk);
+                        let aligned = rem.len() & !15;
+                        if aligned == 0 {
+                            return Ok(());
+                        }
+                        dec_buf = rem.drain(..aligned).collect::<Vec<u8>>();
+                        aes.decrypt_cbc_in_place(iv, &mut dec_buf);
+                        &dec_buf
+                    } else {
+                        dec_buf = chunk.to_vec();
+                        aes.decrypt_cbc_in_place(iv, &mut dec_buf);
+                        &dec_buf
+                    };
+                    with_member_sink(&mut p, self.selection.as_mut(), |sink| match stream.as_mut() {
+                        Some(decoder) => blocks
+                            .as_mut()
+                            .ok_or(Error::Corrupt("missing encrypted block state"))?
+                            .feed(to_feed, decoder, sink),
+                        None => sink.put(to_feed),
+                    })
+                } else if let Some(decoder) = rar4.as_mut() {
+                    with_rar4_member_sink(&mut p, self.selection.as_mut(), |sink| decoder.feed(chunk, sink).map(|_| ()))
                 } else {
-                    dec_buf = chunk.to_vec();
-                    aes.decrypt_cbc_in_place(iv, &mut dec_buf);
-                    &dec_buf
-                };
-                with_member_sink(&mut p, self.selection.as_mut(), |sink| match stream.as_mut() {
-                    Some(decoder) => blocks
-                        .as_mut()
-                        .ok_or(Error::Corrupt("missing encrypted block state"))?
-                        .feed(to_feed, decoder, sink),
-                    None => sink.put(to_feed),
-                })
-            } else {
-                with_member_sink(&mut p, self.selection.as_mut(), |sink| match stream.as_mut() {
-                    Some(u) => u.feed_shared(piece, range, sink),
-                    None => sink.put(chunk),
-                })
-            }
-        });
+                    with_member_sink(&mut p, self.selection.as_mut(), |sink| match stream.as_mut() {
+                        Some(u) => u.feed_shared(piece, range, sink),
+                        None => sink.put(chunk),
+                    })
+                }
+            })
+        };
         if let Some(cipher) = p.cipher.as_mut() {
             cipher.blocks = blocks;
         }
@@ -2349,6 +2403,7 @@ impl Run<'_, '_, '_> {
         };
         let sink_fault = |e, p: &Pending, size| match e {
             MemberDecodeError::Decoder(e) => decoder_fault(e, p, size),
+            MemberDecodeError::Rar4(e) => e.detailed(p.context.scope()),
             MemberDecodeError::Sink(e) => e,
         };
         let decoded = match read {
@@ -2365,13 +2420,21 @@ impl Run<'_, '_, '_> {
                         .map_err(|e| decoder_fault(e, &p, None)),
                     None => Ok(()),
                 };
-                padding.and_then(|()| match stream.as_mut() {
-                    Some(u) => with_member_sink(&mut p, self.selection.as_mut(), |sink| u.finish(sink))
-                        .map_err(|e| sink_fault(e, &p, u.take_size_failure())),
-                    None => Ok(()),
+                padding.and_then(|()| {
+                    if let Some(decoder) = rar4.as_mut() {
+                        with_rar4_member_sink(&mut p, self.selection.as_mut(), |sink| decoder.finish(sink))
+                            .map_err(|error| sink_fault(error, &p, None))
+                    } else {
+                        match stream.as_mut() {
+                            Some(u) => with_member_sink(&mut p, self.selection.as_mut(), |sink| u.finish(sink))
+                                .map_err(|e| sink_fault(e, &p, u.take_size_failure())),
+                            None => Ok(()),
+                        }
+                    }
                 })
             }
             Ok(()) => Ok(()),
+            Err(ReadDataError::Sink(MemberDecodeError::Rar4(error))) => Err(error.detailed(p.context.scope())),
             Err(ReadDataError::Sink(MemberDecodeError::Decoder(e @ (Error::Corrupt(_) | Error::Unsupported(_)))))
                 if self.selection.is_none() && (p.compressed || p.encrypted) =>
             {
@@ -2400,6 +2463,7 @@ impl Run<'_, '_, '_> {
             if matches!(
                 fault.failure.as_ref(),
                 RarFailure::Output { .. }
+                    | RarFailure::Canceled
                     | RarFailure::Internal(_)
                     | RarFailure::Limit { resource: RarResource::Counter, .. }
             ) {
