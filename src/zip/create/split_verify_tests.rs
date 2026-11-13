@@ -21,39 +21,8 @@ use crate::zip::write::{DeflateLevel, DosDateTime, InputLength, Permissions, Wri
 use std::io::{self, Cursor};
 use std::os::unix::fs::{FileExt, PermissionsExt};
 
-struct AllocationControl;
-thread_local! { static REFUSE_ALLOCATIONS: Cell<bool> = const { Cell::new(false) }; }
-#[global_allocator]
-static TEST_ALLOCATOR: AllocationControl = AllocationControl;
-// SAFETY: permitted calls delegate with the original layout/pointer to System;
-// refused requests return null as required by GlobalAlloc. Deallocation is
-// always delegated. Refusal is local to the invoking test thread.
-unsafe impl std::alloc::GlobalAlloc for AllocationControl {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        if REFUSE_ALLOCATIONS.try_with(Cell::get).unwrap_or(false) {
-            std::ptr::null_mut()
-        } else {
-            unsafe { std::alloc::GlobalAlloc::alloc(&std::alloc::System, layout) }
-        }
-    }
-    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
-        if REFUSE_ALLOCATIONS.try_with(Cell::get).unwrap_or(false) {
-            std::ptr::null_mut()
-        } else {
-            unsafe { std::alloc::GlobalAlloc::alloc_zeroed(&std::alloc::System, layout) }
-        }
-    }
-    unsafe fn realloc(&self, pointer: *mut u8, layout: std::alloc::Layout, size: usize) -> *mut u8 {
-        if REFUSE_ALLOCATIONS.try_with(Cell::get).unwrap_or(false) {
-            std::ptr::null_mut()
-        } else {
-            unsafe { std::alloc::GlobalAlloc::realloc(&std::alloc::System, pointer, layout, size) }
-        }
-    }
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
-        unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, pointer, layout) }
-    }
-}
+use crate::test_alloc::REFUSE_ALLOCATIONS;
+
 pub(super) fn set_allocations_refused(value: bool) {
     REFUSE_ALLOCATIONS.set(value);
 }

@@ -19,6 +19,9 @@
 //! RAR 5.0, ZIP, tar and gzip/xz/zstd/bzip2 streams are read from their published layouts. Each format lives in its own module and
 //! hands the extractor a stream of entries; the extractor owns paths, overwrite rules and checksums.
 
+#[cfg(test)]
+mod test_alloc;
+
 mod batch;
 pub mod blake2sp;
 pub mod crc32;

@@ -15,6 +15,7 @@
 // rights and limitations under the RPL.
 
 use super::*;
+use crate::test_alloc::{ALLOC_REQUESTS, DENY_DICTIONARY, TRACK_ALLOC};
 
 macro_rules! fixture {
     ($name:literal) => {
@@ -143,39 +144,10 @@ fn window_and_cancellation_are_typed() {
 
 thread_local! {
     static INIT_CANCEL: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
-    static TRACK_ALLOC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static ALLOC_REQUESTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static DENY_DICTIONARY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 pub(super) fn take_init_cancel() -> Option<u64> {
     INIT_CANCEL.with(|value| value.take())
 }
-
-struct FaultAllocator;
-// SAFETY: All admitted requests are forwarded unchanged to System. The
-// constant-initialized TLS flag performs no allocation and fails closed
-// during thread teardown. Only this thread's 64 KiB test request is denied.
-unsafe impl std::alloc::GlobalAlloc for FaultAllocator {
-    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
-        if TRACK_ALLOC.try_with(|flag| flag.get()).unwrap_or(false) {
-            let _ = ALLOC_REQUESTS.try_with(|count| count.set(count.get() + 1));
-        }
-        if layout.size() == 65536
-            && layout.align() == 1
-            && DENY_DICTIONARY.try_with(|flag| flag.replace(false)).unwrap_or(false)
-        {
-            return std::ptr::null_mut();
-        }
-        // SAFETY: The allocator caller provides the original valid layout.
-        unsafe { std::alloc::System.alloc(layout) }
-    }
-    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
-        // SAFETY: Admitted allocations came from System with this layout.
-        unsafe { std::alloc::System.dealloc(pointer, layout) }
-    }
-}
-#[global_allocator]
-static ALLOCATOR: FaultAllocator = FaultAllocator;
 
 #[test]
 fn dictionary_allocation_and_initialization_refusal() {
