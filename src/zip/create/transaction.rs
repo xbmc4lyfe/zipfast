@@ -17,7 +17,7 @@
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 
-use crate::zip::write::{InputLength, IoStage, WriterOptions, ZipWriter};
+use crate::zip::write::{InputLength, IoStage, WriteSummary, WriterOptions, ZipStreamWriter, ZipWriter};
 
 use super::unix::{NameState, PublishError, Stage};
 use super::*;
@@ -28,8 +28,30 @@ impl CreatePlan {
     /// See [`CreateReport`] for when receipts are available.
     pub fn publish_with_receipts(self) -> CreateReport {
         let mut written = Vec::new();
-        let outcome = self.publish_inner(Some(&mut written));
+        let outcome = self.publish_inner(Some(&mut written), None, None);
         CreateReport { outcome, written }
+    }
+
+    /// Publish and verify a new archive using traditional ZIP encryption.
+    ///
+    /// All regular files, including empty ones, use one password. Directories
+    /// remain clear. Use a nonempty password of at most 65,535 UTF-8 bytes
+    /// without NUL bytes. ZipCrypto is for legacy interoperability and does
+    /// not authenticate content. See [`CreateReport`] for receipt semantics.
+    pub fn publish_zipcrypto_with_receipts(self, password: &str) -> CreateReport {
+        let mut written = Vec::new();
+        let outcome = self.publish_inner(Some(&mut written), Some(password), None);
+        CreateReport { outcome, written }
+    }
+
+    /// Publish with write receipts and a held binding to the verified output.
+    /// A missing binding means the destination could not be proved stable
+    /// through finalization. Consult the report for the publication outcome.
+    pub fn publish_with_bound_receipts(self) -> (CreateReport, Option<PublishedArchiveBinding>) {
+        let mut written = Vec::new();
+        let mut binding = None;
+        let outcome = self.publish_inner(Some(&mut written), None, Some(&mut binding));
+        (CreateReport { outcome, written }, binding)
     }
 
     /// Write and verify a private stage and atomically publish a new archive.
@@ -37,15 +59,23 @@ impl CreatePlan {
     /// deciding whether another creation attempt is appropriate.
     #[allow(clippy::result_large_err, reason = "creation failures retain component usage and outcome inline")]
     pub fn publish(self) -> std::result::Result<CreatedArchive, CreateFailure> {
-        self.publish_inner(None)
+        self.publish_inner(None, None, None)
     }
 
     #[allow(clippy::result_large_err, reason = "creation failures retain component usage and outcome inline")]
     fn publish_inner(
         mut self,
         written: Option<&mut Vec<EntryWritten>>,
+        password: Option<&str>,
+        binding: Option<&mut Option<PublishedArchiveBinding>>,
     ) -> std::result::Result<CreatedArchive, CreateFailure> {
-        let mut receipts = match self.preflight() {
+        if password.is_some_and(|password| {
+            password.is_empty() || password.len() > u16::MAX as usize || password.as_bytes().contains(&0)
+        }) {
+            let cause = CreateError::InvalidOptions("ZIP password must be 1 to 65,535 UTF-8 bytes without NUL");
+            return Err(self.failure(Stopped::at(CreateStage::Planning, cause), CleanupState::Clean));
+        }
+        let mut receipts = match self.preflight(password.is_some()) {
             Ok(receipts) => receipts,
             Err(error) => return Err(self.failure(Stopped::at(CreateStage::Planning, error), CleanupState::Clean)),
         };
@@ -61,17 +91,19 @@ impl CreatePlan {
             Err(error) => return Err(self.failure(Stopped::at(CreateStage::StageCreate, error), CleanupState::Clean)),
         };
 
-        let result = self.execute(&mut stage, &mut receipts);
-        if matches!(result, Ok(Publication::Published))
+        let reserve_count = Cell::new(0);
+        let reserve = Attempts::finalization(&reserve_count);
+        let binding_count = Cell::new(0);
+        let binding_budget = Attempts::finalization(&binding_count);
+        let result = self.execute(&mut stage, &mut receipts, password, binding.as_ref().map(|_| &binding_budget));
+        if result.is_ok()
             && let Some(written) = written
         {
             *written = receipts;
         } else {
             drop(receipts);
         }
-        let reserve_count = Cell::new(0);
-        let reserve = Attempts::finalization(&reserve_count);
-        let publication = result.as_ref().map_or_else(|stop| stop.publication, |&committed| committed);
+        let publication = result.as_ref().map_or_else(|stop| stop.publication, |_| Publication::Published);
         let aftermath = cleanup(&self.parent, &stage, publication, &reserve);
         let sync =
             if publication == Publication::Published && self.options.durability == Durability::SyncFileAndDirectory {
@@ -79,8 +111,11 @@ impl CreatePlan {
             } else {
                 Ok(())
             };
+        if let (Some(binding), Ok(Some(stamp)), Ok(()), Aftermath::Clean) = (binding, &result, &sync, &aftermath) {
+            *binding = unix::bound_publication(&self.parent, &stage, *stamp, &binding_budget);
+        }
         let cleanup = aftermath.into_public(stage);
-        self.usage.finalization_attempts = reserve_count.get();
+        self.usage.finalization_attempts = reserve_count.get() + binding_count.get();
         let summary = self.usage();
         if let Err(stopped) = result {
             return Err(self.failure(stopped, cleanup));
@@ -126,7 +161,9 @@ impl CreatePlan {
         &mut self,
         stage: &mut Stage,
         receipts: &mut Vec<EntryWritten>,
-    ) -> std::result::Result<Publication, Stopped> {
+        password: Option<&str>,
+        binding: Option<&Attempts<'_>>,
+    ) -> std::result::Result<Option<Stamp>, Stopped> {
         let attempts = Attempts::new(&self.options, &self.attempts);
         let parent_stamp =
             super::stage_parent_stamp(&self.entries, &self.parent, &attempts).at(CreateStage::Precommit)?;
@@ -146,10 +183,10 @@ impl CreatePlan {
             &self.entries,
             &self.options,
             &mut self.usage.writer,
-            stage,
-            original,
+            (stage, original),
             attempts,
             receipts,
+            password,
         )?;
         #[cfg(test)]
         tests::event(tests::Event::AfterFinish, Some(stage.path())).at(CreateStage::Finish)?;
@@ -157,12 +194,16 @@ impl CreatePlan {
         tests::event(tests::Event::BeforeVerify, Some(stage.path())).at(CreateStage::Verify)?;
         let verified = verify::verify_created(
             &mut stage.file,
-            &self.entries,
-            receipts,
+            (&self.entries, receipts),
             &self.options,
             summary,
             &attempts,
             &mut self.usage.verification,
+            |ordinal| {
+                let password = password?;
+                let source = self.entries[ordinal].payload_source()?;
+                Some(verify::ZipCryptoExpectation { password, length: InputLength::Exact(source.stamp.len) })
+            },
         )
         .at(CreateStage::Verify)?;
         #[cfg(test)]
@@ -208,31 +249,46 @@ impl CreatePlan {
             },
             cause: error.into_cause(),
         })?;
-        let publication = Publication::Published;
+        let bound = binding.and_then(|budget| unix::publication_stamp(stage, held, budget));
         #[cfg(test)]
         let _ = tests::event(tests::Event::AfterCommit, Some(stage.path()));
-        Ok(publication)
+        Ok(bound)
     }
 
     fn write_stage<'a>(
         entries: &[PlannedEntry],
         create_options: &'a CreateOptions,
         usage: &mut WriteUsage,
-        stage: &'a mut Stage,
-        original: Stamp,
+        stage: (&'a Stage, Stamp),
         attempts: Attempts<'a>,
         receipts: &mut Vec<EntryWritten>,
-    ) -> std::result::Result<crate::zip::write::WriteSummary, Stopped> {
+        password: Option<&str>,
+    ) -> std::result::Result<WriteSummary, Stopped> {
         let options = WriterOptions {
             comment: &create_options.archive_comment,
             limits: create_options.limits.writer,
             cancel: Some(create_options.cancel.clone()),
         };
-        let mut writer = match ZipWriter::new_accounted(RawIo::new(&stage.file, attempts), options) {
-            Ok(writer) => writer,
-            Err((error, partial)) => {
-                *usage = partial;
-                return Err(Stopped::at(CreateStage::Write, writer_error(error)));
+        let (stage, original) = stage;
+        let mut sink = RawIo::new(&stage.file, attempts);
+        let mut writer = if let Some(password) = password {
+            if original.len != 0 {
+                return Err(Stopped::at(CreateStage::StageCreate, CreateError::StageChanged));
+            }
+            if attempts.run(|| sink.seek_once(SeekFrom::Start(0))).at(CreateStage::Write)? != 0 {
+                return Err(Stopped::at(CreateStage::Write, CreateError::StageChanged));
+            }
+            StageWriter::Encrypted(
+                ZipStreamWriter::new(sink, options).map_err(writer_error).at(CreateStage::Write)?,
+                password,
+            )
+        } else {
+            match ZipWriter::new_accounted(sink, options) {
+                Ok(writer) => StageWriter::Clear(writer),
+                Err((error, partial)) => {
+                    *usage = partial;
+                    return Err(Stopped::at(CreateStage::Write, writer_error(error)));
+                }
             }
         };
         for (ordinal, entry) in entries.iter().enumerate() {
@@ -261,7 +317,7 @@ impl CreatePlan {
                     tests::event(tests::Event::BeforeSourceRead, Some(&source.path)).at(CreateStage::SourceRead)?;
                     let mut input = SourceInput::new(file, attempts);
                     let receipt = writer
-                        .add_file(entry.options(), &mut input, InputLength::Exact(source.stamp.len))
+                        .add_file(entry.options(), &mut input, InputLength::Exact(source.stamp.len), attempts)
                         .map_err(classify_member_error)?;
                     #[cfg(test)]
                     tests::event(tests::Event::AfterSourceRead, Some(&source.path)).at(CreateStage::SourceRead)?;
@@ -289,6 +345,54 @@ impl CreatePlan {
                 *usage = partial;
                 Err(Stopped::at(CreateStage::Finish, writer_error(error)))
             }
+        }
+    }
+}
+
+enum StageWriter<'a, 'p> {
+    Clear(ZipWriter<RawIo<'a>>),
+    Encrypted(ZipStreamWriter<RawIo<'a>>, &'p str),
+}
+
+impl<'a> StageWriter<'a, '_> {
+    fn add_directory(&mut self, options: EntryOptions<'_>) -> std::result::Result<EntryWritten, WriteError> {
+        match self {
+            Self::Clear(writer) => writer.add_directory(options),
+            Self::Encrypted(writer, _) => writer.add_directory(options),
+        }
+    }
+
+    fn add_file(
+        &mut self,
+        options: EntryOptions<'_>,
+        input: &mut SourceInput<'_>,
+        length: InputLength,
+        attempts: Attempts<'_>,
+    ) -> std::result::Result<EntryWritten, WriteError> {
+        match self {
+            Self::Clear(writer) => writer.add_file(options, input, length),
+            Self::Encrypted(writer, password) => {
+                writer.add_zipcrypto_file(options, input, length, password, |random| {
+                    attempts.charge().map_err(into_io)?;
+                    #[cfg(test)]
+                    tests::event_io(tests::Event::EncryptionEntropy, None)?;
+                    getrandom::fill(random).map_err(io::Error::other)
+                })
+            }
+        }
+    }
+
+    fn usage(&self) -> WriteUsage {
+        match self {
+            Self::Clear(writer) => writer.usage(),
+            Self::Encrypted(writer, _) => writer.usage(),
+        }
+    }
+
+    fn finish_accounted(self) -> std::result::Result<crate::zip::write::Finished<RawIo<'a>>, (WriteError, WriteUsage)> {
+        match self {
+            Self::Clear(writer) => writer.finish_accounted(),
+            Self::Encrypted(writer, _) => writer.finish_accounted(),
         }
     }
 }
@@ -496,9 +600,9 @@ impl Write for RawIo<'_> {
     }
 }
 
-impl Seek for RawIo<'_> {
-    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        self.charge()?;
+impl RawIo<'_> {
+    // The seek caller owns attempt accounting and retry policy.
+    fn seek_once(&mut self, position: SeekFrom) -> io::Result<u64> {
         #[cfg(test)]
         tests::event_io(tests::Event::SinkSeek, None)?;
         let result = self.file.seek(position)?;
@@ -507,5 +611,12 @@ impl Seek for RawIo<'_> {
             self.position = result;
         }
         Ok(result)
+    }
+}
+
+impl Seek for RawIo<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.charge()?;
+        self.seek_once(position)
     }
 }

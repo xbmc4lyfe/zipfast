@@ -18,7 +18,7 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 use crate::crypto::ZipCrypto;
-use crate::zip::FLAG_ENCRYPTED;
+use crate::zip::{FLAG_DESCRIPTOR, FLAG_ENCRYPTED};
 
 use super::records::{End, Member, Width};
 use super::{
@@ -26,7 +26,6 @@ use super::{
     WriteSummary, WriteUsage, WriterOptions, add, archive_comment_len, bound, prepare_member, reserve_central,
 };
 
-const FLAG_DESCRIPTOR: u16 = 1 << 3;
 const ZIPCRYPTO_HEADER: u64 = 12;
 
 /// A fresh ZIP archive written forward to an owned or borrowed sink.
@@ -139,15 +138,25 @@ impl<W: Write> ZipStreamWriter<W> {
     /// Writes the directory, end records and archive comment, then flushes.
     /// Returns the sink only after a successful flush and cancellation check.
     /// On error, any bytes already delivered to the sink are provisional.
-    pub fn finish(mut self) -> Result<Finished<W>, WriteError> {
+    pub fn finish(self) -> Result<Finished<W>, WriteError> {
+        self.finish_accounted().map_err(|(error, _)| error)
+    }
+
+    pub(in crate::zip) fn finish_accounted(mut self) -> Result<Finished<W>, (WriteError, WriteUsage)> {
+        match self.finish_records() {
+            Ok(summary) => Ok(Finished { sink: self.output.sink, summary }),
+            Err(error) => Err((error, self.usage())),
+        }
+    }
+
+    fn finish_records(&mut self) -> Result<WriteSummary, WriteError> {
         self.check_failed()?;
         let usage = self.usage();
         let central_offset = self.output.position;
         let end = End::new(usage.entries, usage.central_bytes, central_offset, self.wide_member, self.comment_len);
         self.output.check_tail(end, 0)?;
         self.output.write_tail(end, &self.central, &self.comment)?;
-        let summary = WriteSummary { usage: self.usage(), central_offset, zip64: end.is_wide() };
-        Ok(Finished { sink: self.output.sink, summary })
+        Ok(WriteSummary { usage: self.usage(), central_offset, zip64: end.is_wide() })
     }
 
     fn check_failed(&self) -> Result<(), WriteError> {
@@ -173,16 +182,12 @@ impl<W: Write> ZipStreamWriter<W> {
     ) -> Result<(Member, u64), WriteError> {
         self.check_failed()?;
         let local_at = self.output.position;
-        let mut member = prepare_member(options, length, directory, local_at)?;
+        let member = if encrypted {
+            encrypted_member(options, length, local_at)?
+        } else {
+            prepare_member(options, length, directory, local_at)?
+        };
         let overhead = if encrypted { ZIPCRYPTO_HEADER } else { 0 };
-        if encrypted {
-            member.flags |= FLAG_DESCRIPTOR | FLAG_ENCRYPTED;
-            if member.method == Method::Stored
-                && let InputLength::Exact(size) = length
-            {
-                member.width = Width::new(Method::Stored, InputLength::Exact(add(size, overhead)?), local_at, false);
-            }
-        }
         let work = &self.output.work;
         let limits = work.limits;
         let entries = add(work.usage.entries, 1)?;
@@ -284,6 +289,35 @@ impl<W: Write> ZipStreamWriter<W> {
             local_offset: member.local_at,
         })
     }
+}
+
+fn encrypted_member(options: EntryOptions<'_>, length: InputLength, local_at: u64) -> Result<Member, WriteError> {
+    let mut member = prepare_member(options, length, false, local_at)?;
+    member.flags |= FLAG_DESCRIPTOR | FLAG_ENCRYPTED;
+    if member.method == Method::Stored
+        && let InputLength::Exact(size) = length
+    {
+        member.width = Width::new(Method::Stored, InputLength::Exact(add(size, ZIPCRYPTO_HEADER)?), local_at, false);
+    }
+    Ok(member)
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(in crate::zip) fn exact_zipcrypto_geometry(
+    options: EntryOptions<'_>,
+    size: u64,
+    offset: u64,
+) -> Result<(u64, u64, bool, u64), WriteError> {
+    let member = encrypted_member(options, InputLength::Exact(size), offset)?;
+    let stored = member.method == Method::Stored;
+    let packed = add(if stored { size } else { 1 }, ZIPCRYPTO_HEADER)?;
+    let local = add(add(member.local_len(), packed)?, member.descriptor_len())?;
+    // Local header, name, encryption header, descriptor, entropy,
+    // optional extra fields and the minimum payload writes.
+    let attempts = 5
+        + u64::from(!member.local_extra().as_bytes().is_empty())
+        + if stored { size.div_ceil(BUFFER as u64) } else { 1 };
+    Ok((local, member.central_len(), member.width.is_wide(), attempts))
 }
 
 #[cfg(test)]

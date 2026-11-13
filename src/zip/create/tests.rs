@@ -29,6 +29,73 @@ pub(super) fn metadata(name: &str) -> EntryOptions<'_> {
 }
 
 #[test]
+fn bound_receipt_refuses_a_destination_replaced_during_sync() {
+    use std::fs;
+
+    for substitute in [false, true] {
+        let options = CreateOptions { durability: Durability::SyncFileAndDirectory, ..CreateOptions::default() };
+        let (_dir, source, output, plan) = simple_plan(options);
+        let destination = output.clone();
+        let (report, binding) = with_hook(
+            move |event, _| {
+                if substitute && event == Event::DirectorySync {
+                    fs::rename(&destination, destination.with_extension("original"))?;
+                    fs::write(&destination, b"foreign")?;
+                }
+                Ok(())
+            },
+            || plan.publish_with_bound_receipts(),
+        );
+        assert_eq!(report.outcome.unwrap().durability, DurabilityState::Synced);
+        assert_eq!(report.written.len(), 1);
+        if substitute {
+            assert!(binding.is_none());
+            assert_eq!(fs::read(output).unwrap(), b"foreign");
+        } else {
+            let binding = binding.unwrap();
+            assert!(binding.matches(&fs::symlink_metadata(output).unwrap()));
+            assert!(!binding.matches(&fs::symlink_metadata(source).unwrap()));
+        }
+    }
+}
+
+#[test]
+fn bound_receipt_detects_later_mutation_of_the_published_inode() {
+    use std::fs;
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+
+    let (_dir, _, output, plan) = simple_plan(CreateOptions::default());
+    let (report, binding) = plan.publish_with_bound_receipts();
+    report.outcome.unwrap();
+    let binding = binding.unwrap();
+    let initial = fs::symlink_metadata(&output).unwrap();
+    assert!(binding.matches(&initial));
+    fs::OpenOptions::new().append(true).open(&output).unwrap().write_all(b"changed").unwrap();
+    let changed = fs::symlink_metadata(&output).unwrap();
+    assert_eq!(initial.ino(), changed.ino());
+    assert!(!binding.matches(&changed));
+    assert!(!binding.matches(&initial));
+}
+
+#[test]
+fn optional_binding_probe_does_not_starve_directory_sync() {
+    let options = CreateOptions { durability: Durability::SyncFileAndDirectory, ..CreateOptions::default() };
+    let (_dir, _, _, plan) = simple_plan(options);
+    let (report, binding) = with_hook(
+        |event, _| {
+            if event == Event::PublicationStamp {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            Ok(())
+        },
+        || plan.publish_with_bound_receipts(),
+    );
+    assert_eq!(report.outcome.unwrap().durability, DurabilityState::Synced);
+    assert!(binding.is_none());
+}
+
+#[test]
 fn names_and_caller_keys_are_checked_as_paths() {
     for bad in ["", "/", "../x", "x/./y", "x//y", "C:foo", "c:/foo", "a\\b", "x\u{80}"] {
         assert!(validate_name(metadata(bad), false).is_err(), "{bad:?}");
@@ -93,7 +160,7 @@ fn hierarchy_rejects_exact_and_normalized_conflicts() {
                 plan.add_file(&path, metadata(name), keys).unwrap();
             }
         }
-        assert_eq!(plan.preflight().is_err(), expected, "{first} {second}");
+        assert_eq!(plan.preflight(false).is_err(), expected, "{first} {second}");
         assert!(!temp.path().join("out.zip").exists());
     }
 }
@@ -185,6 +252,7 @@ pub(super) enum Event {
     StageOpen,
     SinkWrite { at: u64, signature: Option<[u8; 4]> },
     SinkSeek,
+    EncryptionEntropy,
     SinkFlush,
     AfterFinish,
     BeforeVerify,
@@ -196,6 +264,7 @@ pub(super) enum Event {
     BeforeCommit,
     NativePublish,
     AfterCommit,
+    PublicationStamp,
     BeforeCleanup,
     Unlink,
     DirectorySync,
@@ -1455,5 +1524,362 @@ fn recovery_short_writes_and_uncertain_publication_keep_honest_state() {
             );
         }
         assert_eq!(std::fs::read(source).unwrap(), old);
+    }
+}
+
+#[test]
+fn zipcrypto_entropy_failure_stops_the_transaction_and_charges_the_attempt() {
+    use crate::zip::write::IoStage;
+    use std::os::unix::fs::MetadataExt;
+
+    for failed in [1, 2] {
+        let (dir, input, output, mut plan) = simple_plan(CreateOptions::default());
+        let inode = std::fs::metadata(&input).unwrap().ino();
+        plan.add_file(&input, metadata("second"), None).unwrap();
+        let calls = std::rc::Rc::new(Cell::new(0));
+        let provider_calls = calls.clone();
+        let report = with_hook(
+            move |event, _| {
+                if event == Event::EncryptionEntropy {
+                    provider_calls.set(provider_calls.get() + 1);
+                    if provider_calls.get() == failed {
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                    }
+                }
+                Ok(())
+            },
+            || plan.publish_zipcrypto_with_receipts("test-password"),
+        );
+        let failure = report.outcome.unwrap_err();
+        assert_eq!(calls.get(), failed);
+        assert_eq!((failure.stage, failure.publication), (CreateStage::Write, Publication::NotPublished));
+        assert!(
+            matches!(failure.cause, CreateError::Writer(WriteError::Io { stage: IoStage::EncryptionEntropy, source }) if source.raw_os_error() == Some(libc::EIO))
+        );
+        let completed = failed - 1;
+        assert_eq!(failure.summary.writer.entries, completed);
+        assert_eq!(failure.summary.writer.output_bytes, completed * 73);
+        assert_eq!(failure.summary.writer.io_attempts, completed * 8 + 1);
+        assert!(report.written.is_empty());
+        assert!(matches!(failure.cleanup, CleanupState::Clean));
+        assert!(!output.exists() && stages(dir.path()).is_empty());
+        assert_eq!(std::fs::metadata(&input).unwrap().ino(), inode);
+        assert_eq!(std::fs::read(input).unwrap(), b"source data");
+    }
+}
+
+#[test]
+fn zipcrypto_mutated_header_ciphertext_and_descriptor_fail_verification() {
+    use std::os::unix::fs::FileExt;
+
+    for offset in [34, 46, 57] {
+        let (dir, input, output, plan) = simple_plan(CreateOptions::default());
+        let report = with_hook(
+            move |event, path| {
+                if event == Event::BeforeVerify {
+                    let file = std::fs::OpenOptions::new().read(true).write(true).open(path.unwrap())?;
+                    let mut byte = [0];
+                    file.read_exact_at(&mut byte, offset)?;
+                    byte[0] ^= 1;
+                    file.write_all_at(&byte, offset)?;
+                }
+                Ok(())
+            },
+            || plan.publish_zipcrypto_with_receipts("test-password"),
+        );
+        let failure = report.outcome.unwrap_err();
+        assert_eq!((failure.stage, failure.publication), (CreateStage::Verify, Publication::NotPublished));
+        assert!(matches!(failure.cause, CreateError::Verification(_)));
+        assert!(matches!(failure.cleanup, CleanupState::Clean));
+        assert!(report.written.is_empty());
+        assert!(!output.exists() && stages(dir.path()).is_empty());
+        assert_eq!(std::fs::read(input).unwrap(), b"source data");
+    }
+}
+
+#[test]
+fn zipcrypto_finalization_reports_partial_output_and_flush_failures() {
+    use crate::zip::write::IoStage;
+
+    for (fault, written) in [(IoStage::CentralDirectory, 76), (IoStage::Flush, 145)] {
+        let (dir, _, output, plan) = simple_plan(CreateOptions::default());
+        let report = with_hook(
+            move |event, _| {
+                match event {
+                    Event::SinkWrite { at: 73, .. } if fault == IoStage::CentralDirectory => SINK_WRITE_CAP.set(3),
+                    Event::SinkWrite { at: 76, .. } if fault == IoStage::CentralDirectory => {
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                    }
+                    Event::SinkFlush if fault == IoStage::Flush => return Err(io::Error::from_raw_os_error(libc::EIO)),
+                    _ => {}
+                }
+                Ok(())
+            },
+            || plan.publish_zipcrypto_with_receipts("test-password"),
+        );
+        let failure = report.outcome.unwrap_err();
+        assert_eq!(failure.stage, CreateStage::Finish);
+        assert!(matches!(failure.cause, CreateError::Writer(WriteError::Io { stage, .. }) if stage == fault));
+        assert_eq!(failure.summary.writer.entries, 1);
+        assert_eq!(failure.summary.writer.output_bytes, written);
+        assert_eq!(failure.summary.writer.archive_extent, written);
+        assert!(report.written.is_empty());
+        assert!(!output.exists() && stages(dir.path()).is_empty());
+    }
+}
+
+#[test]
+fn zipcrypto_directory_only_uses_no_entropy() {
+    let dir = test_dir();
+    let output = dir.path().join("archive.zip");
+    let mut plan = CreatePlan::new(&output, CreateOptions::default()).unwrap();
+    plan.add_directory(metadata("directory/"), None).unwrap();
+    let report = with_hook(
+        |event, _| {
+            assert_ne!(event, Event::EncryptionEntropy);
+            Ok(())
+        },
+        || plan.publish_zipcrypto_with_receipts("test-password"),
+    );
+    assert_eq!(report.written.len(), 1);
+    assert_eq!(report.outcome.unwrap().summary.verification.payloads, 0);
+    let encrypted_mode = std::fs::read(&output).unwrap();
+    std::fs::remove_file(&output).unwrap();
+    let mut plan = CreatePlan::new(&output, CreateOptions::default()).unwrap();
+    plan.add_directory(metadata("directory/"), None).unwrap();
+    plan.publish().unwrap();
+    assert_eq!(encrypted_mode, std::fs::read(output).unwrap());
+}
+
+#[test]
+fn zipcrypto_preflight_accounts_for_header_descriptor_and_attempts() {
+    use crate::zip::write::Limit;
+
+    let (_dir, _, _, plan) = simple_plan(CreateOptions::default());
+    let attempts = plan.usage().transaction_attempts;
+    let clear_extent = 117;
+    let encrypted_extent = clear_extent + 12 + 16;
+    let writer_attempts = 11;
+    let minimum_native_attempts = attempts + 5 + 11 + 6 + 3;
+    for (name, value) in [
+        ("extent", encrypted_extent - 1),
+        ("output", encrypted_extent - 1),
+        ("writer-attempts", writer_attempts - 1),
+        ("native-attempts", minimum_native_attempts - 1),
+    ] {
+        let mut options = CreateOptions::default();
+        let limits = &mut options.limits;
+        match name {
+            "extent" => limits.writer.archive_extent = value,
+            "output" => limits.writer.output_bytes = value,
+            "writer-attempts" => limits.writer.io_attempts = value,
+            "native-attempts" => limits.transaction_attempts = value,
+            _ => unreachable!(),
+        }
+        let (dir, _, output, plan) = simple_plan(options);
+        let failure = plan.publish_zipcrypto_with_receipts("test-password").outcome.unwrap_err();
+        assert_eq!(failure.stage, CreateStage::Planning, "{name}");
+        assert_eq!(failure.summary.stage_attempts, 0, "{name}");
+        assert!(matches!(
+            (name, failure.cause),
+            ("extent", CreateError::Writer(WriteError::Limit(Limit::ArchiveExtent)))
+                | ("output", CreateError::Writer(WriteError::Limit(Limit::OutputBytes)))
+                | ("writer-attempts", CreateError::Writer(WriteError::Limit(Limit::IoAttempts)))
+                | ("native-attempts", CreateError::Limit(CreateLimit::TransactionAttempts))
+        ));
+        assert!(!output.exists() && stages(dir.path()).is_empty());
+    }
+    let mut options = CreateOptions::default();
+    options.limits.writer.archive_extent = encrypted_extent;
+    options.limits.writer.output_bytes = encrypted_extent;
+    options.limits.writer.io_attempts = writer_attempts;
+    let (_dir, _, output, plan) = simple_plan(options);
+    let usage = plan.publish_zipcrypto_with_receipts("test-password").outcome.unwrap().summary;
+    assert_eq!(usage.writer.archive_extent, encrypted_extent);
+    assert_eq!(usage.writer.io_attempts, writer_attempts);
+    assert_eq!(std::fs::metadata(output).unwrap().len(), encrypted_extent);
+}
+
+#[test]
+fn zipcrypto_native_attempt_limit_stops_before_the_second_entropy_callback() {
+    let (_dir, input, _, mut plan) = simple_plan(CreateOptions::default());
+    plan.add_file(&input, metadata("second"), None).unwrap();
+    let initial = plan.usage().transaction_attempts;
+    let mut options = CreateOptions::default();
+    options.limits.transaction_attempts = initial + 42;
+    let (dir, input, output, mut plan) = simple_plan(options);
+    plan.add_file(&input, metadata("second"), None).unwrap();
+    let calls = std::rc::Rc::new(Cell::new(0));
+    let provider_calls = calls.clone();
+    let report = with_hook(
+        move |event, _| {
+            match event {
+                Event::SinkWrite { at: 0, .. } => SINK_WRITE_CAP.set(1),
+                Event::SinkWrite { at: 16, .. } => SINK_WRITE_CAP.set(usize::MAX),
+                Event::EncryptionEntropy => provider_calls.set(provider_calls.get() + 1),
+                _ => {}
+            }
+            Ok(())
+        },
+        || plan.publish_zipcrypto_with_receipts("test-password"),
+    );
+    let failure = report.outcome.unwrap_err();
+    assert_eq!(failure.stage, CreateStage::Write);
+    assert!(matches!(failure.cause, CreateError::Limit(CreateLimit::TransactionAttempts)));
+    assert_eq!(failure.summary.transaction_attempts, initial + 42);
+    assert_eq!(failure.summary.writer.io_attempts, 25);
+    assert_eq!(failure.summary.writer.entries, 1);
+    assert_eq!(calls.get(), 1);
+    assert!(report.written.is_empty());
+    assert!(!output.exists() && stages(dir.path()).is_empty());
+}
+
+#[test]
+fn zipcrypto_cancellation_preserves_the_typed_outcome_and_cleans_the_stage() {
+    let options = CreateOptions::default();
+    let cancel = options.cancel.clone();
+    let (dir, _, output, plan) = simple_plan(options);
+    let report = with_hook(
+        move |event, _| {
+            if event == Event::EncryptionEntropy {
+                cancel.cancel();
+            }
+            Ok(())
+        },
+        || plan.publish_zipcrypto_with_receipts("test-password"),
+    );
+    let failure = report.outcome.unwrap_err();
+    assert!(matches!(failure.cause, CreateError::Writer(WriteError::Canceled) | CreateError::Canceled));
+    assert_eq!(failure.publication, Publication::NotPublished);
+    assert_eq!(failure.summary.writer.io_attempts, 1);
+    assert_eq!(failure.summary.writer.output_bytes, 0);
+    assert!(matches!(failure.cleanup, CleanupState::Clean));
+    assert!(report.written.is_empty());
+    assert!(!output.exists() && stages(dir.path()).is_empty());
+}
+
+#[test]
+fn zipcrypto_publication_refuses_destination_source_and_stage_substitutions() {
+    for fault in [Event::BeforeCommit, Event::BeforeFinalSourceCheck, Event::BeforeVerify] {
+        let (dir, input, output, plan) = simple_plan(CreateOptions::default());
+        let held_input = input.clone();
+        let held_output = output.clone();
+        let displaced = dir.path().join("displaced");
+        let moved = displaced.clone();
+        let report = with_hook(
+            move |event, stage| {
+                if event == fault {
+                    match event {
+                        Event::BeforeCommit => std::fs::write(&held_output, b"foreign")?,
+                        Event::BeforeFinalSourceCheck => {
+                            std::fs::rename(&held_input, &moved)?;
+                            std::fs::write(&held_input, b"foreign")?;
+                        }
+                        Event::BeforeVerify => {
+                            let stage = stage.unwrap();
+                            std::fs::rename(stage, &moved)?;
+                            std::fs::write(stage, b"foreign")?;
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                Ok(())
+            },
+            || plan.publish_zipcrypto_with_receipts("test-password"),
+        );
+        let failure = report.outcome.unwrap_err();
+        assert_eq!(failure.publication, Publication::NotPublished);
+        assert!(report.written.is_empty());
+        match fault {
+            Event::BeforeCommit => {
+                assert_eq!(failure.stage, CreateStage::Publish);
+                assert!(matches!(failure.cause, CreateError::Conflict));
+                assert_eq!(std::fs::read(output).unwrap(), b"foreign");
+            }
+            Event::BeforeFinalSourceCheck => {
+                assert_eq!(failure.stage, CreateStage::Precommit);
+                assert!(matches!(failure.cause, CreateError::SourceChanged(CreateEntryId(0))));
+                assert_eq!(std::fs::read(input).unwrap(), b"foreign");
+                assert_eq!(std::fs::read(displaced).unwrap(), b"source data");
+                assert!(!output.exists());
+            }
+            Event::BeforeVerify => {
+                assert_eq!(failure.stage, CreateStage::Precommit);
+                assert!(matches!(failure.cause, CreateError::StageChanged));
+                let CleanupState::ForeignStageName { path } = failure.cleanup else { panic!("{failure:?}") };
+                assert_eq!(std::fs::read(&path).unwrap(), b"foreign");
+                assert_eq!(stages(dir.path()), [path]);
+                assert!(!output.exists());
+                continue;
+            }
+            _ => unreachable!(),
+        }
+        assert!(matches!(failure.cleanup, CleanupState::Clean));
+        assert!(stages(dir.path()).is_empty());
+    }
+}
+
+#[test]
+fn zipcrypto_stage_cursor_retries_interruption_with_one_native_charge() {
+    let (_dir, _, _, plan) = simple_plan(CreateOptions::default());
+    let baseline = plan.publish_zipcrypto_with_receipts("test-password").outcome.unwrap().summary;
+    let (dir, _, output, plan) = simple_plan(CreateOptions::default());
+    let mut interrupted = false;
+    let report = with_hook(
+        move |event, _| {
+            if event == Event::SinkSeek && !std::mem::replace(&mut interrupted, true) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            Ok(())
+        },
+        || plan.publish_zipcrypto_with_receipts("test-password"),
+    );
+    let usage = report.outcome.unwrap().summary;
+    assert_eq!(usage.transaction_attempts, baseline.transaction_attempts + 1);
+    assert_eq!(usage.writer, baseline.writer);
+    assert_eq!(report.written.len(), 1);
+    assert!(output.exists() && stages(dir.path()).is_empty());
+}
+
+#[test]
+fn zipcrypto_stage_cursor_retries_respect_typed_transaction_stops() {
+    let (_dir, _, _, plan) = simple_plan(CreateOptions::default());
+    let budget = plan.usage().transaction_attempts + 25;
+    for canceled in [false, true] {
+        let mut options = CreateOptions::default();
+        options.limits.transaction_attempts = budget;
+        let cancel = options.cancel.clone();
+        let (dir, _, output, plan) = simple_plan(options);
+        let admission = plan.usage().transaction_attempts;
+        let seeks = std::rc::Rc::new(Cell::new(0));
+        let attempted = seeks.clone();
+        let report = with_hook(
+            move |event, _| {
+                if event == Event::SinkSeek {
+                    attempted.set(attempted.get() + 1);
+                    if canceled {
+                        cancel.cancel();
+                    }
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                Ok(())
+            },
+            || plan.publish_zipcrypto_with_receipts("test-password"),
+        );
+        let failure = report.outcome.unwrap_err();
+        assert_eq!((failure.stage, failure.publication), (CreateStage::Write, Publication::NotPublished));
+        if canceled {
+            assert!(matches!(failure.cause, CreateError::Canceled));
+            assert_eq!(seeks.get(), 1);
+        } else {
+            assert!(matches!(failure.cause, CreateError::Limit(CreateLimit::TransactionAttempts)));
+            assert_eq!(failure.summary.transaction_attempts, budget);
+        }
+        // The stage setup uses four native attempts before its first seek.
+        assert_eq!(failure.summary.transaction_attempts, admission + 4 + seeks.get());
+        assert_eq!(failure.summary.writer, WriteUsage::default());
+        assert!(report.written.is_empty());
+        assert!(matches!(failure.cleanup, CleanupState::Clean));
+        assert!(!output.exists() && stages(dir.path()).is_empty());
     }
 }

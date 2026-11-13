@@ -328,7 +328,7 @@ impl RewritePlan {
     /// run before stage creation. An empty edit plan checks the original
     /// in place and returns without publication or synchronization.
     pub fn publish(self) -> std::result::Result<RewriteOutcome, RewriteFailure> {
-        self.publish_inner(None)
+        self.publish_inner(None, None)
     }
 
     /// Publish with actual write receipts for new and replaced members.
@@ -336,13 +336,24 @@ impl RewritePlan {
     /// See [`RewriteReport`] for when receipts are available.
     pub fn publish_with_receipts(self) -> RewriteReport {
         let mut written = Vec::new();
-        let outcome = self.publish_inner(Some(&mut written));
+        let outcome = self.publish_inner(Some(&mut written), None);
         RewriteReport { outcome, written }
+    }
+
+    /// Publish with write receipts and a held binding to the verified output.
+    /// No binding is returned for an unchanged archive or when the published
+    /// destination could not be proved stable through finalization.
+    pub fn publish_with_bound_receipts(self) -> (RewriteReport, Option<PublishedArchiveBinding>) {
+        let mut written = Vec::new();
+        let mut binding = None;
+        let outcome = self.publish_inner(Some(&mut written), Some(&mut binding));
+        (RewriteReport { outcome, written }, binding)
     }
 
     fn publish_inner(
         mut self,
         mut receipts: Option<&mut Vec<EntryWritten>>,
+        binding: Option<&mut Option<PublishedArchiveBinding>>,
     ) -> std::result::Result<RewriteOutcome, RewriteFailure> {
         let plan = self.preflight(receipts.as_deref_mut()).map_err(|cause| {
             self.failure(RewriteStage::Planning, cause, Publication::NotPublished, CleanupState::Clean)
@@ -357,7 +368,7 @@ impl RewritePlan {
             let usage = self.usage();
             return Ok(RewriteOutcome::Unchanged { source: self.parent.destination, verification, usage });
         }
-        self.publish_staged(plan, receipts)
+        self.publish_staged(plan, receipts, binding)
     }
 
     fn failure(
@@ -419,6 +430,7 @@ impl RewritePlan {
         mut self,
         mut prepared: preflight::Prepared,
         receipts: Option<&mut Vec<EntryWritten>>,
+        binding: Option<&mut Option<PublishedArchiveBinding>>,
     ) -> std::result::Result<RewriteOutcome, RewriteFailure> {
         let attempts = Attempts::with_limits(
             &self.options.cancel,
@@ -444,10 +456,12 @@ impl RewritePlan {
                 ));
             }
         };
-        let result = self.execute(&mut stage, &mut prepared);
-        let publication = result.as_ref().map_or_else(|stopped| stopped.publication, |_| Publication::Published);
         let final_count = Cell::new(0);
         let finalization = Attempts::finalization(&final_count);
+        let binding_count = Cell::new(0);
+        let binding_budget = Attempts::finalization(&binding_count);
+        let result = self.execute(&mut stage, &mut prepared, binding.as_ref().map(|_| &binding_budget));
+        let publication = result.as_ref().map_or_else(|stopped| stopped.publication, |_| Publication::Published);
         let recovery = match &result {
             Err(stop) if publication == Publication::Unknown => stop.stage_identity.map(|identity| {
                 let observed = self
@@ -466,11 +480,11 @@ impl RewritePlan {
         };
         let aftermath = cleanup(&self.parent, &stage, publication, &finalization);
         let clean = matches!(aftermath, Aftermath::Clean);
-        let cleanup = aftermath.into_public(stage);
-        self.usage.common.finalization_attempts = final_count.get();
-        let verification = match result {
-            Ok(verification) => verification,
+        self.usage.common.finalization_attempts = final_count.get() + binding_count.get();
+        let (verification, publication_stamp) = match result {
+            Ok(verified) => verified,
             Err(stop) => {
+                let cleanup = aftermath.into_public(stage);
                 let mut failure = self.failure(stop.stage, stop.cause, stop.publication, cleanup);
                 failure.recovery = recovery;
                 return Err(failure);
@@ -484,8 +498,9 @@ impl RewritePlan {
         }
         let durability = if self.options.durability == Durability::SyncFileAndDirectory {
             let synced = after_commit_sync(&self.parent.file, &finalization);
-            self.usage.common.finalization_attempts = final_count.get();
+            self.usage.common.finalization_attempts = final_count.get() + binding_count.get();
             if let Err(error) = synced {
+                let cleanup = aftermath.into_public(stage);
                 let mut failure =
                     self.failure(RewriteStage::DirectorySync, error.into(), Publication::Published, cleanup);
                 failure.verification = Some(Box::new(verification));
@@ -496,12 +511,18 @@ impl RewritePlan {
             DurabilityState::NotRequested
         };
         if !clean || self.options.cancel.is_canceled() {
+            let cleanup = aftermath.into_public(stage);
             let cause = if clean { CreateError::Canceled } else { CreateError::CleanupIncomplete };
             let mut failure = self.failure(RewriteStage::Cleanup, cause.into(), Publication::Published, cleanup);
             failure.durability = durability;
             failure.verification = Some(Box::new(verification));
             return Err(failure);
         }
+        if let (Some(binding), Some(stamp)) = (binding, publication_stamp) {
+            *binding = unix::bound_publication(&self.parent, &stage, stamp, &binding_budget);
+            self.usage.common.finalization_attempts = final_count.get() + binding_count.get();
+        }
+        let cleanup = aftermath.into_public(stage);
         let usage = self.usage();
         Ok(RewriteOutcome::Replaced(RewrittenArchive {
             destination: self.parent.destination,
@@ -517,7 +538,8 @@ impl RewritePlan {
         &mut self,
         stage: &mut Stage,
         plan: &mut preflight::Prepared,
-    ) -> std::result::Result<VerificationSummary, Stop> {
+        binding: Option<&Attempts<'_>>,
+    ) -> std::result::Result<(VerificationSummary, Option<Stamp>), Stop> {
         let options = &self.options;
         let attempts =
             Attempts::with_limits(&options.cancel, options.limits.common.transaction_attempts, &self.attempts);
@@ -616,9 +638,10 @@ impl RewritePlan {
             cause: error.into_cause().into(),
             stage_identity: Some(file_identity(held)),
         })?;
+        let bound = binding.and_then(|budget| unix::publication_stamp(stage, held, budget));
         #[cfg(test)]
         let _ = super::test_event(super::Event::AfterCommit, Some(stage.path()));
-        Ok(verification)
+        Ok((verification, bound))
     }
 }
 

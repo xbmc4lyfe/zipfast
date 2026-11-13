@@ -142,6 +142,7 @@ pub enum RarUnsupported {
     CompressionAlgorithm { algorithm: u8, method: u8 },
     EncryptionVersion(u64),
     Redirection { kind: u64 },
+    PrintDirectory,
     NameEncoding,
     Decoder(String),
 }
@@ -163,6 +164,9 @@ pub enum RarResource {
     CatalogueAllocation,
     SelectedPackedBytes,
     SelectedDecodedBytes,
+    PrintMemberSpoolBytes,
+    PrintLiveSpoolBytes,
+    PrintIoAttempts,
 }
 
 #[derive(Debug)]
@@ -173,6 +177,8 @@ pub enum RarPolicyReason {
     Symlink,
     Directory,
     ParentIsFile,
+    TargetChanged,
+    StageChanged,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -184,6 +190,7 @@ pub enum IoOperation {
     CreateFile,
     Read,
     Write,
+    Flush,
     Seek,
     Publish,
 }
@@ -209,6 +216,8 @@ pub enum RarFailure {
     SolidHistoryUnavailable { predecessor: Option<u64>, cause: Option<std::sync::Arc<RarFailure>> },
     Input { operation: IoOperation, path: Option<PathBuf>, offset: Option<u64>, source: io::Error },
     Output { operation: IoOperation, path: Option<PathBuf>, offset: Option<u64>, source: io::Error },
+    PrintSpool { operation: IoOperation, offset: u64, source: io::Error },
+    PrintWriter { operation: IoOperation, offset: u64, source: io::Error },
     Policy { reason: RarPolicyReason, path: PathBuf },
     MissingVolume { path: PathBuf },
     UnnamedVolume { path: PathBuf },
@@ -242,6 +251,12 @@ impl fmt::Display for RarFailure {
                 }
                 write!(f, ": {source}")
             }
+            Self::PrintSpool { operation, offset, source } => {
+                write!(f, "print spool {operation:?} at byte {offset}: {source}")
+            }
+            Self::PrintWriter { operation, offset, source } => {
+                write!(f, "print writer {operation:?} after {offset} bytes: {source}")
+            }
             Self::Policy { reason, path } => write!(f, "RAR path blocked ({reason:?}): {}", path.display()),
             Self::MissingVolume { path } => write!(f, "missing volume {}", path.display()),
             Self::UnnamedVolume { path } => write!(f, "cannot determine the next volume after {}", path.display()),
@@ -257,7 +272,10 @@ impl fmt::Display for RarFailure {
 impl std::error::Error for RarFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Input { source, .. } | Self::Output { source, .. } => Some(source),
+            Self::Input { source, .. }
+            | Self::Output { source, .. }
+            | Self::PrintSpool { source, .. }
+            | Self::PrintWriter { source, .. } => Some(source),
             Self::SolidHistoryUnavailable { cause: Some(cause), .. } => Some(cause.as_ref()),
             _ => None,
         }

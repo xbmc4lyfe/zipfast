@@ -52,6 +52,27 @@ pub use zip_container::{
 };
 
 const FLAG_ENCRYPTED: u16 = 0x0001;
+const FLAG_DESCRIPTOR: u16 = 0x0008;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn descriptor_matches(bytes: &[u8], wide: bool, signed: bool, crc: u32, sizes: (u64, u64)) -> bool {
+    let body = if signed {
+        let Some(body) = bytes.strip_prefix(b"PK\x07\x08") else { return false };
+        body
+    } else {
+        bytes
+    };
+    let width = if wide { 8 } else { 4 };
+    if body.len() != 4 + 2 * width || body[..4] != crc.to_le_bytes() {
+        return false;
+    }
+    let size = |bytes: &[u8]| {
+        let mut field = [0; 8];
+        field[..width].copy_from_slice(bytes);
+        u64::from_le_bytes(field)
+    };
+    (size(&body[4..4 + width]), size(&body[4 + width..])) == sizes
+}
 const FLAG_UTF8: u16 = 0x0800;
 
 const METHOD_STORED: u16 = 0;

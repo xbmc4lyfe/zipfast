@@ -308,6 +308,36 @@ fn cancellation_before_commit_preserves_original_and_after_commit_preserves_repl
 }
 
 #[test]
+fn bound_receipt_refuses_a_replacement_substituted_during_sync() {
+    for substitute in [false, true] {
+        let (_root, archive, _) = old_archive();
+        let mut options = options();
+        options.durability = Durability::SyncFileAndDirectory;
+        let plan = edited(&archive, options, "new/");
+        let destination = archive.clone();
+        let (report, binding) = with_hook(
+            move |event, _| {
+                if substitute && event == Event::DirectorySync {
+                    fs::rename(&destination, destination.with_extension("original"))?;
+                    fs::write(&destination, b"foreign")?;
+                }
+                Ok(())
+            },
+            || plan.publish_with_bound_receipts(),
+        );
+        assert_eq!(report.outcome.unwrap().durability(), DurabilityState::Synced);
+        assert_eq!(report.written.len(), 1);
+        if substitute {
+            assert!(binding.is_none());
+            assert_eq!(fs::read(archive).unwrap(), b"foreign");
+        } else {
+            let binding = binding.unwrap();
+            assert!(binding.matches(&fs::symlink_metadata(archive).unwrap()));
+        }
+    }
+}
+
+#[test]
 fn directory_sync_failure_reports_verified_published_output() {
     let (root, archive, old) = old_archive();
     let mut options = options();

@@ -240,7 +240,7 @@ impl CreatePlan {
         Ok(ordinal)
     }
 
-    fn preflight(&mut self) -> Result<Vec<EntryWritten>> {
+    fn preflight(&mut self, encrypted: bool) -> Result<Vec<EntryWritten>> {
         work(&self.options, &mut self.usage.plan, 0)?;
         let limits = self.options.limits;
         let mut indices = Vec::new();
@@ -257,11 +257,11 @@ impl CreatePlan {
         if self.options.collisions == CollisionPolicy::CallerKeys {
             check_hierarchy(&self.entries, &mut indices, &self.options, &mut self.usage.plan, true)?;
         }
-        self.check_feasibility()?;
+        self.check_feasibility(encrypted)?;
         Ok(receipts)
     }
 
-    fn check_feasibility(&mut self) -> Result<()> {
+    fn check_feasibility(&mut self, encrypted: bool) -> Result<()> {
         use crate::zip::write::Limit as W;
         let options = &self.options;
         let limits = options.limits;
@@ -276,14 +276,21 @@ impl CreatePlan {
         let mut names = 0;
         let mut comments = options.archive_comment.len() as u64;
         let mut extra = 0;
-        // Parent recheck, exclusive stage open, initial stage stat and
-        // the writer's three sink probes. Further work is charged live.
-        let mut minimum_attempts = add(7, directory_check_attempts(&self.entries, &self.parent)?)?;
+        // Parent recheck, exclusive stage open and initial stage stat.
+        // The clear writer probes the sink three times. The encrypted
+        // writer needs one cursor operation. Further work is charged live.
+        let mut minimum_attempts =
+            add(if encrypted { 5 } else { 7 }, directory_check_attempts(&self.entries, &self.parent)?)?;
+        let mut minimum_writer_attempts = 0;
         for entry in &self.entries {
             work(options, &mut self.usage.plan, 1)?;
-            let size = entry.payload_source().map_or(0, |s| s.stamp.len);
-            let deflate = size != 0 && matches!(entry.method, Method::Deflate(_));
-            if entry.payload_source().is_some() {
+            let payload = entry.payload_source();
+            let size = payload.map_or(0, |source| source.stamp.len);
+            let name = entry.name.len() as u64;
+            let comment = entry.comment.len() as u64;
+            names = add(names, name)?;
+            comments = add(comments, comment)?;
+            if payload.is_some() {
                 // Exact readers need a probe slot, but a successful EOF probe
                 // returns zero and leaves that slot available for the next file.
                 source_bytes = add(source_bytes, size)?;
@@ -296,16 +303,30 @@ impl CreatePlan {
                 // before and after the stream, including its EOF probe.
                 minimum_attempts = add(minimum_attempts, 10 + size.div_ceil(64 << 10))?;
             }
+            if encrypted {
+                let (local_bytes, central_bytes, member_wide, writes) = if payload.is_some() {
+                    crate::zip::write::exact_zipcrypto_geometry(entry.options(), size, local)?
+                } else {
+                    let geometry = crate::zip::write::exact_member_geometry(entry.options(), 0, true, local)?;
+                    let writes = 2 + u64::from(entry.extended_mtime.is_some());
+                    (geometry.local_bytes, geometry.central_bytes, geometry.wide, writes)
+                };
+                let reads = if payload.is_some() { 1 + size.div_ceil(64 << 10) } else { 0 };
+                minimum_attempts = add(minimum_attempts, writes)?;
+                minimum_writer_attempts = add(minimum_writer_attempts, add(writes, reads)?)?;
+                wide |= member_wide;
+                extra = add(extra, central_bytes - 46 - name - comment)?;
+                central = add(central, central_bytes)?;
+                local = add(local, local_bytes)?;
+                continue;
+            }
+            let deflate = size != 0 && matches!(entry.method, Method::Deflate(_));
             let sizes = deflate || size >= u32::MAX as u64;
             let offset = local >= u32::MAX as u64;
             wide |= sizes || offset;
             let ut = 9 * u64::from(entry.extended_mtime.is_some());
             let zip64 = 16 * u64::from(sizes) + 8 * u64::from(offset);
             let central_extra = ut + zip64 + 4 * u64::from(zip64 != 0);
-            let name = entry.name.len() as u64;
-            let comment = entry.comment.len() as u64;
-            names = add(names, name)?;
-            comments = add(comments, comment)?;
             extra = add(extra, central_extra)?;
             central = add(central, 46 + name + comment + central_extra)?;
             local = add(local, 30 + name + ut + 20 * u64::from(sizes))?;
@@ -318,6 +339,11 @@ impl CreatePlan {
         let wide_end =
             wide || self.entries.len() >= u16::MAX as usize || central >= u32::MAX as u64 || local >= u32::MAX as u64;
         let extent = add(add(local, central)?, eocd + 76 * u64::from(wide_end))?;
+        if encrypted {
+            let finish = central.div_ceil(64 << 10) + 2 + u64::from(!options.archive_comment.is_empty());
+            minimum_attempts = add(minimum_attempts, finish)?;
+            writer_limit(add(minimum_writer_attempts, finish)?, limits.writer.io_attempts, W::IoAttempts)?;
+        }
         writer_limit(central, limits.writer.central_bytes, W::CentralBytes)?;
         writer_limit(
             add(central, options.archive_comment.len() as u64)?,
