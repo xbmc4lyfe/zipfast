@@ -164,3 +164,37 @@ encryption header and descriptor. The 12-byte encryption header counts
 toward the packed size and can force ZIP64 framing for exact-length
 Stored data. The descriptor counts toward physical extent and output
 bytes. After admission, a source or sink failure poisons the writer.
+
+## Split volumes
+
+`ZipSplitWriter` writes clear Stored and Deflate members through
+`write::split::VolumeProvider`. Set the per-volume capacity, volume-count
+ceiling and physical attempt ceiling in `write::split::Options`. The
+ordinary `WriterOptions` supplies source, encoding, metadata and byte
+limits. Each provider call opens a fresh numbered sink after its predecessor
+has been flushed and dropped. Provider calls, physical writes and flushes
+consume the transport attempt allowance. Source reads, encoder steps and
+logical payload writes consume the ordinary writer attempt allowance.
+
+A split receipt uses a `Location` with a zero-based disk and relative byte
+offset. `Finished` reports the central start in the same coordinates and
+cumulative actual output bytes. Unused disk capacity contributes no bytes.
+Local headers, signed descriptors, central records and the final end group
+remain intact. The last central record shares a disk with the end group
+when both fit together. Each record and the end group must fit individually.
+A separate final disk can contain only the end group and archive comment.
+The first disk begins with the spanning marker, including one-disk output.
+
+The sinks hold provisional bytes until `finish` succeeds. A failure after
+member admission or rotation preserves the first error and prevents further
+members or successful finalization. Inspect the failure's disk, offset,
+transport usage and writer usage. The caller owns sink storage, naming,
+cleanup and publication.
+
+Pinned 7-Zip verifies split Stored and Deflate payloads spanning three disks.
+Pinned Info-ZIP joins the qualified one- and two-disk cases, central-directory
+rollover and ZIP64 end-only output. Its join can truncate a member after an
+exactly full intermediate volume, including archives that Info-ZIP itself
+created. A classic end-only disk also has a join refusal. A classic end-only
+disk with a large archive comment can be rejected by pinned 7-Zip. The split
+fixture parser checks the encoded ranges independently of these readers.
