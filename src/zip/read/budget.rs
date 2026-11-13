@@ -163,6 +163,7 @@ impl EncryptedReadLedger {
     pub(super) fn work(&mut self, bytes: u64) -> Result<(), ReadFault> {
         charge(&mut self.usage.work_bytes, bytes.into(), self.limits.work_bytes, ReadResource::WorkBytes)
     }
+    #[cfg(test)] // Original Task1/2 admission controls; production supplies the now-known CRC policy.
     pub(super) fn begin_member(
         &mut self,
         packed: u64,
@@ -170,6 +171,17 @@ impl EncryptedReadLedger {
         ciphertext: u64,
         password: u64,
         aes: bool,
+    ) -> Result<(), ReadFault> {
+        self.begin_member_with_crc(packed, decoded, ciphertext, password, aes, false)
+    }
+    pub(super) fn begin_member_with_crc(
+        &mut self,
+        packed: u64,
+        decoded: u64,
+        ciphertext: u64,
+        password: u64,
+        aes: bool,
+        crc: bool,
     ) -> Result<(), ReadFault> {
         // Attempts and declared P are spent even when later policy/framing rejects the member.
         self.charge_member_attempt(packed)?;
@@ -215,6 +227,7 @@ impl EncryptedReadLedger {
                 checked_sum(self.usage.live_spool_bytes, ciphertext.into())?,
             )?;
         }
+        let work = if crc { checked_sum(work, decoded.into())? } else { work };
         admit(ReadResource::WorkBytes, self.limits.work_bytes, checked_sum(self.usage.work_bytes, work)?)?;
         if aes {
             charge64(&mut self.usage.kdf_calls, 1, self.limits.kdf_calls, ReadResource::KdfCalls)?;

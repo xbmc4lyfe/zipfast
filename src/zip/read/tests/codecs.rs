@@ -636,8 +636,27 @@ fn stored_aes_work_and_codec_step_limits_are_exact() {
             plan,
             Some("password"),
             cipher::InputKind::Aes { strength: 1, version: 1 },
-        )
-        .unwrap();
+        );
+        if attempt == 1 {
+            assert!(matches!(
+                admitted.err().unwrap().operation(),
+                Some(ReadFault::Limit { resource: ReadResource::WorkBytes, .. })
+            ));
+            ledger.with_state(|s| {
+                assert_eq!(s.encrypted.usage.allocation_attempts, 0);
+                assert_eq!(s.encrypted.usage.source_bytes, 0);
+                assert_eq!(s.encrypted.usage.kdf_calls, 0);
+                assert_eq!(s.encrypted.usage.work_bytes, 0);
+                assert_eq!(s.encrypted.usage.io_bytes, 0);
+                assert_eq!(s.encrypted.usage.codec_steps, 0);
+                assert_eq!(s.encrypted.usage.live_spool_bytes, 0);
+                assert_eq!(s.live_fds, 1);
+                assert_eq!(s.encrypted.usage.members, 1);
+                assert_eq!(s.encrypted.usage.packed_bytes, plan.packed as u128);
+            });
+            continue;
+        }
+        let admitted = admitted.unwrap();
         let (admitted, mut workspace) = admitted.workspace().unwrap();
         let pending = cipher::PendingAes::copy_admitted(admitted, None, &mut workspace.input, &cancel).unwrap();
         let input = codecs::PlainInput::Aes(pending.authenticate(&mut workspace.input, &cancel).unwrap());

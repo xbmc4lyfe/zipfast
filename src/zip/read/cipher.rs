@@ -173,12 +173,13 @@ impl<'a, 's, 'p> Admission<'a, 's, 'p> {
                 return Err(view.with_state(|s| s.encrypted.reject_member(plan.packed, rejection)));
             }
             view.with_state(|s| {
-                s.encrypted.begin_member(
+                s.encrypted.begin_member_with_crc(
                     plan.packed,
                     plan.decoded,
                     plan.ciphertext,
                     password.unwrap().len() as u64,
                     cipher == Some(CipherKind::Aes),
+                    plan.crc.is_some() && !matches!(kind, InputKind::Aes { version: 2, .. }),
                 )
             })?;
             Ok(key_len)
