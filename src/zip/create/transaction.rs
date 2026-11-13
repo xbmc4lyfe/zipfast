@@ -74,7 +74,9 @@ impl CreatePlan {
 
         let reserve_count = Cell::new(0);
         let reserve = Attempts::finalization(&reserve_count);
-        let result = self.execute(&mut stage, &mut receipts, binding.as_ref().map(|_| &reserve));
+        let binding_count = Cell::new(0);
+        let binding_budget = Attempts::finalization(&binding_count);
+        let result = self.execute(&mut stage, &mut receipts, binding.as_ref().map(|_| &binding_budget));
         if result.is_ok()
             && let Some(written) = written
         {
@@ -91,10 +93,10 @@ impl CreatePlan {
                 Ok(())
             };
         if let (Some(binding), Ok(Some(stamp)), Ok(()), Aftermath::Clean) = (binding, &result, &sync, &aftermath) {
-            *binding = unix::bound_publication(&self.parent, &stage, *stamp, &reserve);
+            *binding = unix::bound_publication(&self.parent, &stage, *stamp, &binding_budget);
         }
         let cleanup = aftermath.into_public(stage);
-        self.usage.finalization_attempts = reserve_count.get();
+        self.usage.finalization_attempts = reserve_count.get() + binding_count.get();
         let summary = self.usage();
         if let Err(stopped) = result {
             return Err(self.failure(stopped, cleanup));

@@ -457,7 +457,9 @@ impl RewritePlan {
         };
         let final_count = Cell::new(0);
         let finalization = Attempts::finalization(&final_count);
-        let result = self.execute(&mut stage, &mut prepared, binding.as_ref().map(|_| &finalization));
+        let binding_count = Cell::new(0);
+        let binding_budget = Attempts::finalization(&binding_count);
+        let result = self.execute(&mut stage, &mut prepared, binding.as_ref().map(|_| &binding_budget));
         let publication = result.as_ref().map_or_else(|stopped| stopped.publication, |_| Publication::Published);
         let recovery = match &result {
             Err(stop) if publication == Publication::Unknown => stop.stage_identity.map(|identity| {
@@ -477,7 +479,7 @@ impl RewritePlan {
         };
         let aftermath = cleanup(&self.parent, &stage, publication, &finalization);
         let clean = matches!(aftermath, Aftermath::Clean);
-        self.usage.common.finalization_attempts = final_count.get();
+        self.usage.common.finalization_attempts = final_count.get() + binding_count.get();
         let (verification, publication_stamp) = match result {
             Ok(verified) => verified,
             Err(stop) => {
@@ -495,7 +497,7 @@ impl RewritePlan {
         }
         let durability = if self.options.durability == Durability::SyncFileAndDirectory {
             let synced = after_commit_sync(&self.parent.file, &finalization);
-            self.usage.common.finalization_attempts = final_count.get();
+            self.usage.common.finalization_attempts = final_count.get() + binding_count.get();
             if let Err(error) = synced {
                 let cleanup = aftermath.into_public(stage);
                 let mut failure =
@@ -516,8 +518,8 @@ impl RewritePlan {
             return Err(failure);
         }
         if let (Some(binding), Some(stamp)) = (binding, publication_stamp) {
-            *binding = unix::bound_publication(&self.parent, &stage, stamp, &finalization);
-            self.usage.common.finalization_attempts = final_count.get();
+            *binding = unix::bound_publication(&self.parent, &stage, stamp, &binding_budget);
+            self.usage.common.finalization_attempts = final_count.get() + binding_count.get();
         }
         let cleanup = aftermath.into_public(stage);
         let usage = self.usage();
