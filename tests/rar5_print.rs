@@ -263,3 +263,55 @@ fn only_selected_solid_members_use_the_spool() {
         assert_eq!((summary.files, summary.failed), (u64::from(good), u64::from(!good)));
     }
 }
+
+#[test]
+fn output_identity_rejects_first_and_later_volume_hard_links_without_writing() {
+    let temp = tempfile::tempdir().unwrap();
+    let first = temp.path().join("set.part1.rar");
+    let second = temp.path().join("set.part2.rar");
+    let mut bytes = archive(&[FileSpec::new("first", b"one")]);
+    bytes.truncate(bytes.len() - end_block(false).len());
+    bytes.extend(end_block(true));
+    fs::write(&first, &bytes).unwrap();
+    fs::write(&second, archive(&[FileSpec::new("second", b"two")])).unwrap();
+    let mut aliases = Vec::new();
+    for (index, path) in [&first, &second].into_iter().enumerate() {
+        let alias = temp.path().join(format!("alias-{index}"));
+        fs::hard_link(path, &alias).unwrap();
+        aliases.push(fs::OpenOptions::new().append(true).open(alias).unwrap());
+    }
+    let before = [fs::read(&first).unwrap(), fs::read(&second).unwrap()];
+    let mut session = RarSession::open(&first, None, RarSessionOptions::default()).unwrap();
+    assert_eq!(session.archive().volume_count(), 2);
+    for output in aliases {
+        let error = session.check_output_file(&output).unwrap_err();
+        assert!(matches!(error.failure.as_ref(), RarFailure::OutputAliasesInput));
+        assert_eq!(error.partial.bytes, 0);
+        assert_eq!(error.partial_member_bytes, 0);
+    }
+    assert_eq!(fs::read(&first).unwrap(), before[0]);
+    assert_eq!(fs::read(&second).unwrap(), before[1]);
+}
+
+#[test]
+fn output_identity_accepts_distinct_files_and_sockets_and_preserves_changes() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::net::UnixStream;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("archive.rar");
+    fs::write(&path, archive(&[FileSpec::new("file", b"bytes")])).unwrap();
+    let output = temp.path().join("output");
+    fs::write(&output, b"keep").unwrap();
+    let output = fs::OpenOptions::new().append(true).open(&output).unwrap();
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    session.check_output_file(&output).unwrap();
+    let (socket, _peer) = UnixStream::pair().unwrap();
+    let socket = fs::File::from(OwnedFd::from(socket));
+    session.check_output_file(&socket).unwrap();
+    fs::write(&path, b"changed source").unwrap();
+    let error = session.check_output_file(&output).unwrap_err();
+    assert!(matches!(error.failure.as_ref(), RarFailure::SourceChanged { .. }));
+    assert_eq!(error.partial.bytes, 0);
+    assert_eq!(fs::read(temp.path().join("output")).unwrap(), b"keep");
+    assert!(session.check_output_file(&output).is_err());
+}
