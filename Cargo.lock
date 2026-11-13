@@ -240,6 +240,7 @@ dependencies = [
  "bzip2",
  "crc32fast",
  "flate2",
+ "getrandom",
  "libc",
  "liblzma",
  "subtle",
