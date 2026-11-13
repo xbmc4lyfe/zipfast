@@ -31,6 +31,11 @@ impl CreatePlan {
         Err(CreateError::UnsupportedPlatform)
     }
 
+    /// Borrowing a native output directory is unavailable on this platform.
+    pub fn output_parent_file(&self) -> &File {
+        match self.0 {}
+    }
+
     /// Native output/source binding checks are unavailable on this platform.
     pub fn check_output_file(&mut self, _output: &File) -> Result<()> {
         match self.0 {}

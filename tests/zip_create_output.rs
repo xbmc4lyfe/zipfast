@@ -221,3 +221,58 @@ fn create_output_known_alias_precedes_parent_binding_failure() {
     assert!(matches!(plan.check_output_file(&tempfile::tempfile().unwrap()), Err(CreateError::ParentChanged)));
     assert_eq!(fs::read(source).unwrap(), b"source");
 }
+
+#[test]
+#[allow(clippy::unnecessary_cast, reason = "native stat field widths vary across supported platforms")]
+fn create_output_parent_capability_survives_consumption_and_parent_rebinding() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    let source = root.path().join("source");
+    fs::write(&source, b"source bytes").unwrap();
+    let mut plan = CreatePlan::new(&parent.join("out.zip"), CreateOptions::default()).unwrap();
+    plan.add_file(&source, entry("data"), None).unwrap();
+    let before = format!("{:?}", plan.usage());
+    let held_parent = plan.output_parent_file().try_clone().unwrap();
+    assert!(held_parent.metadata().unwrap().is_dir());
+    assert_eq!(format!("{:?}", plan.usage()), before);
+    let sink = tempfile::tempfile().unwrap();
+    let before = plan.usage();
+    plan.check_output_file(&sink).unwrap();
+    let first = plan.usage();
+    let _borrow = plan.output_parent_file();
+    plan.check_output_file(&sink).unwrap();
+    let second = plan.usage();
+    assert_eq!(
+        first.transaction_attempts - before.transaction_attempts,
+        second.transaction_attempts - first.transaction_attempts
+    );
+    assert_eq!(first.plan.work - before.plan.work, second.plan.work - first.plan.work);
+    plan.publish().unwrap();
+    let saved = root.path().join("moved-parent");
+    fs::rename(&parent, &saved).unwrap();
+    fs::create_dir(&parent).unwrap();
+    fs::write(parent.join("out.zip"), b"foreign winner").unwrap();
+    let identity = |name: &std::ffi::CStr| {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: the retained directory and NUL-terminated leaf remain live;
+        // fstatat initializes stat on success. Zero flags follows leaf symlinks.
+        assert_eq!(unsafe { libc::fstatat(held_parent.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr(), 0) }, 0);
+        let stat = unsafe { stat.assume_init() };
+        (stat.st_dev as u64, stat.st_ino as u64)
+    };
+    let archive = fs::metadata(saved.join("out.zip")).unwrap();
+    assert_eq!(identity(c"out.zip"), (archive.dev(), archive.ino()));
+    let foreign = fs::metadata(parent.join("out.zip")).unwrap();
+    assert_ne!(identity(c"out.zip"), (foreign.dev(), foreign.ino()));
+    fs::remove_file(saved.join("out.zip")).unwrap();
+    let console = root.path().join("console");
+    fs::write(&console, b"preserve console").unwrap();
+    symlink(&console, saved.join("out.zip")).unwrap();
+    let expected = fs::metadata(&console).unwrap();
+    assert_eq!(identity(c"out.zip"), (expected.dev(), expected.ino()));
+    assert_eq!(fs::read(console).unwrap(), b"preserve console");
+    assert_eq!(fs::read(source).unwrap(), b"source bytes");
+}

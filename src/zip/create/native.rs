@@ -194,6 +194,13 @@ impl CreatePlan {
         CreateUsage { transaction_attempts: self.attempts.get(), ..self.usage }
     }
 
+    /// Borrow the actual held destination directory. Clone it before consuming
+    /// the plan if needed afterward. This accessor performs no I/O or binding
+    /// check; callers bound and account for their own descriptor operations.
+    pub fn output_parent_file(&self) -> &File {
+        &self.parent.file
+    }
+
     /// Check this output descriptor against every currently admitted source.
     /// Identity aliases are rejected before source/parent binding failures where
     /// a captured source identity is already known. No bytes are read or written.
