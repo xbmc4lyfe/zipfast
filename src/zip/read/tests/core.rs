@@ -262,15 +262,8 @@ fn interrupted_reset_short_success_failed_syscall_and_cancel_are_charged() {
     assert_eq!(writer.calls, 6);
     assert_eq!(owner.usage().io_attempts, 6);
     assert_eq!(owner.usage().io_bytes, 3);
-    let result = io::operation(
-        &token,
-        true,
-        RunCategory::TemporaryGroups,
-        IoStage::Ciphertext,
-        ReadIoOperation::Create,
-        Some(&cancel),
-        || Err::<(), _>(std::io::ErrorKind::AlreadyExists.into()),
-    );
+    let mut group = io::CreationGroup::new(&token, true, IoStage::Ciphertext, &cancel).unwrap();
+    let result = group.create(&cancel, || Err::<(), _>(std::io::ErrorKind::AlreadyExists.into()));
     assert!(result.is_err());
     assert_eq!(owner.usage().io_attempts, 7);
     cancel.cancel();
@@ -1023,4 +1016,313 @@ fn malformed_and_unsupported_terminal_attempts_share_finite_admission_without_kd
     assert_eq!(state.encrypted.usage.live_spool_bytes, 0);
     assert_eq!(state.live_fds, 0);
     assert_eq!(state.encrypted.usage.allocation_attempts, 0);
+}
+
+#[test]
+fn r1_generic_create_cannot_bypass_per_namespace_admission() {
+    use std::cell::Cell;
+    let mut context = bound_context(true, 1, 1);
+    context.ledger.with_state(|s| s.encrypted.limits.create_attempts = 0);
+    let token = context.ledger.mint_reservation().unwrap();
+    let cancel = crate::extract::Cancellation::default();
+    let calls = Cell::new(0);
+    let result = io::operation(
+        &token,
+        true,
+        RunCategory::TemporaryGroups,
+        IoStage::Ciphertext,
+        ReadIoOperation::Create,
+        Some(&cancel),
+        || {
+            calls.set(calls.get() + 1);
+            Ok(())
+        },
+    );
+    assert!(result.is_err(), "generic create must require the finite namespace admission seam");
+    assert_eq!(calls.get(), 0);
+}
+
+fn r1_namespace_context(creates: u64, retries: u64) -> EncryptedReadContext {
+    let context = EncryptedReadContext::new(Default::default()).unwrap();
+    context.ledger.with_state(|s| {
+        bind_plan(
+            s,
+            budget::ActionPlan::derive(
+                budget::PlanGeometry { records: 1, regular: 1, packed: 1, ..Default::default() },
+                creates,
+                retries,
+            )
+            .unwrap(),
+        )
+    });
+    context
+}
+
+#[test]
+fn r1_creation_groups_bound_zero_one_exact_one_under_and_collisions() {
+    let cancel = crate::extract::Cancellation::default();
+    for cap in [0, 1, 2, 3] {
+        let mut context = r1_namespace_context(3, 16);
+        context.ledger.with_state(|s| s.encrypted.limits.create_attempts = cap);
+        let token = context.ledger.mint_reservation().unwrap();
+        let mut group = io::CreationGroup::new(&token, true, IoStage::Ciphertext, &cancel).unwrap();
+        let mut calls = 0;
+        for _ in 0..cap {
+            let fault = group
+                .create(&cancel, || {
+                    calls += 1;
+                    Err::<(), _>(std::io::ErrorKind::AlreadyExists.into())
+                })
+                .unwrap_err();
+            assert!(matches!(fault, ReadFault::Io { error, .. } if error.kind() == std::io::ErrorKind::AlreadyExists));
+        }
+        REFUSE_ALLOCATIONS.with(|flag| flag.set(true));
+        let result = group.create(&cancel, || {
+            calls += 1;
+            Ok(())
+        });
+        REFUSE_ALLOCATIONS.with(|flag| flag.set(false));
+        let fault = result.unwrap_err();
+        assert!(
+            matches!(fault, ReadFault::Limit { resource: ReadResource::CreateAttempts, limit, attempted } if limit == cap.into() && attempted == u128::from(cap)+1)
+        );
+        assert_eq!(calls, cap);
+        assert_eq!(context.run_usage().temporary_groups, 1);
+        assert_eq!(context.run_usage().io_attempts, cap.into());
+        assert_eq!(context.usage().io_attempts, cap.into());
+        assert_eq!(context.usage().create_attempts, cap);
+        assert!(matches!(
+            io::CreationGroup::new(&token, true, IoStage::Ciphertext, &cancel),
+            Err(ReadFault::Limit { resource: ReadResource::Run(RunCategory::TemporaryGroups), limit: 1, attempted: 2 })
+        ));
+        assert_eq!(context.run_usage().temporary_groups, 1);
+    }
+    let mut context = r1_namespace_context(3, 16);
+    let token = context.ledger.mint_reservation().unwrap();
+    let mut group = io::CreationGroup::new(&token, true, IoStage::Ciphertext, &cancel).unwrap();
+    let mut calls = 0;
+    for _ in 0..2 {
+        assert!(
+            group
+                .create(&cancel, || {
+                    calls += 1;
+                    Err::<(), _>(std::io::ErrorKind::AlreadyExists.into())
+                })
+                .is_err()
+        );
+    }
+    group
+        .create(&cancel, || {
+            calls += 1;
+            assert_eq!(context.run_usage().temporary_groups, 1);
+            Ok(())
+        })
+        .unwrap();
+    assert!(matches!(
+        group.create(&cancel, || {
+            calls += 1;
+            Ok(())
+        }),
+        Err(ReadFault::InvalidPlan)
+    ));
+    assert_eq!(calls, 3);
+    assert_eq!(context.usage().create_attempts, 3);
+    assert_eq!(context.run_usage().temporary_groups, 1);
+    assert!(matches!(budget::next_creation_attempt(u64::MAX, u64::MAX), Err(ReadFault::CounterOverflow)));
+    assert_eq!(budget::next_creation_attempt(1, 2).unwrap(), 2);
+    assert!(
+        budget::ActionPlan::derive(
+            budget::PlanGeometry { records: 1, regular: 1, ..Default::default() },
+            u64::MAX,
+            u64::MAX
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn r1_creation_clear_policy_is_immutable_and_independent_of_encrypted_caps() {
+    let cancel = crate::extract::Cancellation::default();
+    for encrypted in [false, true] {
+        let mut context = r1_namespace_context(2, 1);
+        context.ledger.with_state(|s| {
+            s.encrypted.limits.create_attempts = 0;
+            s.encrypted.limits.interrupted_retries = 0;
+            s.encrypted.limits.io_attempts = 0;
+        });
+        let token = context.ledger.mint_reservation().unwrap();
+        let mut group = io::CreationGroup::new(&token, encrypted, IoStage::Output, &cancel).unwrap();
+        let mut calls = 0;
+        let result = group.create(&cancel, || {
+            calls += 1;
+            if calls == 1 { Err(std::io::ErrorKind::Interrupted.into()) } else { Ok(()) }
+        });
+        assert_eq!(result.is_ok(), !encrypted);
+        assert_eq!(calls, if encrypted { 0 } else { 2 });
+        assert_eq!(context.run_usage().io_attempts, calls as u128);
+        assert_eq!(context.usage().create_attempts, 0);
+        assert_eq!(context.usage().io_attempts, 0);
+    }
+    // A finite zero run policy also refuses clear acquisition, without consulting encrypted quotas.
+    let mut context = r1_namespace_context(0, 16);
+    let token = context.ledger.mint_reservation().unwrap();
+    let mut group = io::CreationGroup::new(&token, false, IoStage::Output, &cancel).unwrap();
+    let mut calls = 0;
+    assert!(matches!(
+        group.create(&cancel, || {
+            calls += 1;
+            Ok(())
+        }),
+        Err(ReadFault::Limit { resource: ReadResource::CreateAttempts, limit: 0, attempted: 1 })
+    ));
+    assert_eq!(calls, 0);
+    assert_eq!(context.run_usage().io_attempts, 0);
+}
+
+#[test]
+fn r1_creation_interrupted_exhaustion_reset_and_cancellation_are_charged() {
+    for (creates, retries, expected_calls, resource) in
+        [(5, 1, 2, ReadResource::InterruptedRetries), (1, 16, 1, ReadResource::CreateAttempts)]
+    {
+        let mut context = r1_namespace_context(creates, retries);
+        let token = context.ledger.mint_reservation().unwrap();
+        let cancel = crate::extract::Cancellation::default();
+        let mut group = io::CreationGroup::new(&token, true, IoStage::Ciphertext, &cancel).unwrap();
+        let mut calls = 0;
+        let fault = group
+            .create(&cancel, || {
+                calls += 1;
+                Err::<(), _>(std::io::ErrorKind::Interrupted.into())
+            })
+            .unwrap_err();
+        assert!(matches!(fault, ReadFault::Limit { resource: actual, .. } if actual == resource));
+        assert_eq!(calls, expected_calls);
+        assert_eq!(context.usage().create_attempts, expected_calls);
+        assert_eq!(context.run_usage().io_attempts, expected_calls.into());
+    }
+    let mut context = r1_namespace_context(5, 1);
+    let token = context.ledger.mint_reservation().unwrap();
+    let cancel = crate::extract::Cancellation::default();
+    let mut group = io::CreationGroup::new(&token, true, IoStage::Ciphertext, &cancel).unwrap();
+    let mut calls = 0;
+    assert!(
+        group
+            .create(&cancel, || {
+                calls += 1;
+                Err::<(), _>(
+                    if calls == 1 { std::io::ErrorKind::Interrupted } else { std::io::ErrorKind::AlreadyExists }.into(),
+                )
+            })
+            .is_err()
+    );
+    group
+        .create(&cancel, || {
+            calls += 1;
+            if calls == 3 { Err(std::io::ErrorKind::Interrupted.into()) } else { Ok(()) }
+        })
+        .unwrap();
+    assert_eq!(calls, 4);
+    assert_eq!(context.run_usage().temporary_groups, 1);
+    assert_eq!(context.usage().create_attempts, 4);
+    let mut context = r1_namespace_context(3, 1);
+    let token = context.ledger.mint_reservation().unwrap();
+    let cancel = crate::extract::Cancellation::default();
+    let mut group = io::CreationGroup::new(&token, true, IoStage::Ciphertext, &cancel).unwrap();
+    let mut calls = 0;
+    assert!(
+        group
+            .create(&cancel, || {
+                calls += 1;
+                Err::<(), _>(std::io::ErrorKind::AlreadyExists.into())
+            })
+            .is_err()
+    );
+    cancel.cancel();
+    assert!(matches!(
+        group.create(&cancel, || {
+            calls += 1;
+            Ok(())
+        }),
+        Err(ReadFault::Cancelled)
+    ));
+    assert_eq!(calls, 1);
+    assert_eq!(context.run_usage().io_attempts, 1);
+    assert_eq!(context.usage().create_attempts, 1);
+    assert!(matches!(io::CreationGroup::new(&token, true, IoStage::Ciphertext, &cancel), Err(ReadFault::Cancelled)));
+    assert_eq!(context.run_usage().temporary_groups, 1);
+}
+
+#[test]
+fn r1_actual_zero_write_is_typed_and_spends_one_attempt_without_bytes() {
+    struct Zero(usize);
+    impl std::io::Write for Zero {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            self.0 += 1;
+            Ok(0)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut context = bound_context(true, 3, 3);
+    let token = context.ledger.mint_reservation().unwrap();
+    let mut writer = Zero(0);
+    let cancel = crate::extract::Cancellation::default();
+    let fault = io::write(&token, true, &mut writer, IoStage::ExternalOutput, 7, b"abc", &cancel).unwrap_err();
+    assert!(
+        matches!(fault, ReadFault::Io { stage: IoStage::ExternalOutput, operation: ReadIoOperation::Write, offset: 7, error } if error.kind() == std::io::ErrorKind::WriteZero)
+    );
+    assert_eq!(writer.0, 1);
+    assert_eq!(context.run_usage().io_attempts, 1);
+    assert_eq!(context.usage().io_attempts, 1);
+    assert_eq!(context.run_usage().io_bytes, 0);
+    assert_eq!(context.usage().io_bytes, 0);
+    assert_eq!(context.run_usage().positive_transfers, 0);
+}
+
+#[test]
+fn r1_copy_prefix_then_failure_reports_actual_accepted_bytes_and_releases_scratch() {
+    struct Prefix {
+        calls: usize,
+        accepted: [u8; 2],
+    }
+    impl std::io::Write for Prefix {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 {
+                self.accepted.copy_from_slice(&bytes[..2]);
+                Ok(2)
+            } else {
+                Err(std::io::ErrorKind::BrokenPipe.into())
+            }
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut context = bound_context(true, 6, 3);
+    let mut file = tempfile::tempfile().unwrap();
+    let mut token = context.reserve_output(&file, None, 6).unwrap();
+    let cancel = crate::extract::Cancellation::default();
+    token.write_all(&mut file, b"abcdef", &cancel).unwrap();
+    let before = context.usage();
+    let run_before = context.run_usage();
+    let mut writer = Prefix { calls: 0, accepted: [0; 2] };
+    let error = token.copy_to(&mut file, &mut writer, &cancel).unwrap_err();
+    assert_eq!(writer.calls, 2);
+    assert_eq!(writer.accepted, *b"ab");
+    assert_eq!(error.accepted_output_bytes(), 2);
+    assert!(
+        matches!(error.operation(), Some(ReadFault::Io { stage: IoStage::ExternalOutput, operation: ReadIoOperation::Write, offset: 2, error }) if error.kind() == std::io::ErrorKind::BrokenPipe)
+    );
+    assert!(error.partial_run().is_none(), "a raw token copy has no runner/report");
+    assert_eq!(error.publication_state(), PublicationState::NotPublished);
+    assert_eq!(context.usage().reader_capacity, before.reader_capacity);
+    assert_eq!(error.usage().reader_capacity, before.reader_capacity);
+    assert_eq!(context.usage().io_attempts - before.io_attempts, 5);
+    assert_eq!(context.run_usage().io_attempts - run_before.io_attempts, 5);
+    assert_eq!(context.usage().io_bytes - before.io_bytes, 8);
+    assert_eq!(context.run_usage().io_bytes - run_before.io_bytes, 8);
+    assert_eq!(error.usage(), context.usage());
+    assert_eq!(error.run_usage(), context.run_usage());
 }

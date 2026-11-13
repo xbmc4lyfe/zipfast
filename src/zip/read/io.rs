@@ -113,6 +113,89 @@ pub(super) fn write(
         }
     }
 }
+/// One finite namespace acquisition group, independently of name collisions.
+/// Each callback performs exactly one create syscall, outside any shared borrow.
+/// Every actual call, including EINTR, spends one creation attempt and ordinary
+/// I/O attempt. AlreadyExists permits another name in this same group; success
+/// or any other terminal outcome forbids further acquisition through the group.
+/// Tasks2/5 separately meter their bounded auxiliary namespace operations and
+/// prove their fixed per-try count fits the plan's twelve-operation envelope.
+pub(super) struct CreationGroup<'a> {
+    ledger: &'a ReservationLedger,
+    encrypted: bool,
+    stage: IoStage,
+    limit: u64,
+    retry_limit: u64,
+    attempts: u64,
+    terminal: bool,
+}
+impl<'a> CreationGroup<'a> {
+    #[allow(dead_code)] // Task2 spool / Task5 stage acquisition consumes one namespace group.
+    pub(super) fn new(
+        ledger: &'a ReservationLedger,
+        encrypted: bool,
+        stage: IoStage,
+        cancel: &Cancellation,
+    ) -> Result<Self, ReadFault> {
+        canceled(Some(cancel))?;
+        let (limit, retry_limit) = ledger.with_state(|s| {
+            let policy = s.creation_policy(encrypted)?;
+            s.charge_category(RunCategory::TemporaryGroups, 1)?;
+            if encrypted {
+                s.encrypted.usage.create_attempts = 0;
+            }
+            Ok(policy)
+        })?;
+        Ok(Self { ledger, encrypted, stage, limit, retry_limit, attempts: 0, terminal: false })
+    }
+    #[allow(dead_code)] // Task2/5 supply one actual create syscall per callback; no hidden retries.
+    pub(super) fn create<T>(
+        &mut self,
+        cancel: &Cancellation,
+        mut call: impl FnMut() -> io::Result<T>,
+    ) -> Result<T, ReadFault> {
+        if self.terminal {
+            return Err(ReadFault::InvalidPlan);
+        }
+        let result = (|| {
+            let mut interrupted = 0u64;
+            loop {
+                canceled(Some(cancel))?;
+                let next = budget::next_creation_attempt(self.attempts, self.limit)?;
+                self.ledger.with_state(|s| {
+                    if s.poisoned {
+                        return Err(ReadFault::InvalidPlan);
+                    }
+                    s.attempt(self.encrypted)?;
+                    if self.encrypted {
+                        s.encrypted.usage.create_attempts = next;
+                    }
+                    Ok(())
+                })?;
+                self.attempts = next;
+                match call() {
+                    Ok(value) => return Ok(value),
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                        interrupted = interrupted.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+                        budget::admit(ReadResource::InterruptedRetries, self.retry_limit.into(), interrupted.into())?;
+                    }
+                    Err(error) => {
+                        return Err(ReadFault::Io {
+                            stage: self.stage,
+                            operation: ReadIoOperation::Create,
+                            offset: 0,
+                            error,
+                        });
+                    }
+                }
+            }
+        })();
+        self.terminal =
+            !matches!(&result, Err(ReadFault::Io { error, .. }) if error.kind() == io::ErrorKind::AlreadyExists);
+        result
+    }
+}
+
 /// One finite metadata/seek/namespace operation. Callers select and consume the
 /// concrete category before entering; Interrupted consumes another ordinary attempt.
 pub(super) fn operation<T>(
@@ -124,6 +207,11 @@ pub(super) fn operation<T>(
     cancel: Option<&Cancellation>,
     mut call: impl FnMut() -> io::Result<T>,
 ) -> Result<T, ReadFault> {
+    // Creation must use CreationGroup so callers cannot accidentally bypass its
+    // per-namespace limit or charge one object group per collision.
+    if operation == ReadIoOperation::Create {
+        return Err(ReadFault::InvalidPlan);
+    }
     ledger.with_state(|s| s.charge_category(category, 1))?;
     let mut retries = 0;
     loop {

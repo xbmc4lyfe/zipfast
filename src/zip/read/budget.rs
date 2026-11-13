@@ -143,6 +143,11 @@ fn charge(counter: &mut u128, amount: u128, limit: u128, resource: ReadResource)
     *counter = next;
     Ok(())
 }
+pub(super) fn next_creation_attempt(current: u64, limit: u64) -> Result<u64, ReadFault> {
+    let next = current.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+    admit(ReadResource::CreateAttempts, limit.into(), next.into())?;
+    Ok(next)
+}
 fn charge64(counter: &mut u64, amount: u64, limit: u64, resource: ReadResource) -> Result<(), ReadFault> {
     let next = counter.checked_add(amount).ok_or(ReadFault::CounterOverflow)?;
     admit(resource, u128::from(limit), u128::from(next))?;
@@ -248,6 +253,8 @@ pub(super) struct ActionPlan {
     output_encrypted: bool,
     binding: Option<PlanBinding>,
     pub(super) output_passes: u128,
+    namespace_creates: u64,
+    namespace_retries: u64,
 }
 #[derive(Debug)]
 pub(super) struct PlanBinding {
@@ -346,6 +353,8 @@ impl ActionPlan {
             output_encrypted: g.output_encrypted,
             binding: None,
             output_passes: g.output_passes,
+            namespace_creates: creates,
+            namespace_retries: retries,
         })
     }
 }
@@ -406,6 +415,21 @@ impl LedgerState {
     }
     pub(super) fn charge_category(&mut self, category: RunCategory, count: u128) -> Result<(), ReadFault> {
         self.run.charge(category, count)
+    }
+    pub(super) fn creation_policy(&self, encrypted: bool) -> Result<(u64, u64), ReadFault> {
+        if self.poisoned {
+            return Err(ReadFault::InvalidPlan);
+        }
+        let plan = self.run.plan.as_ref().ok_or(ReadFault::InvalidPlan)?;
+        let (creates, retries) = (plan.namespace_creates, plan.namespace_retries);
+        if encrypted {
+            Ok((
+                creates.min(self.encrypted.limits.create_attempts),
+                retries.min(self.encrypted.limits.interrupted_retries),
+            ))
+        } else {
+            Ok((creates, retries))
+        }
     }
     pub(super) fn verify_source(&self, source: SourceStamp) -> Result<(), ReadFault> {
         let binding = self.run.plan.as_ref().and_then(|plan| plan.binding.as_ref()).ok_or(ReadFault::InvalidPlan)?;
