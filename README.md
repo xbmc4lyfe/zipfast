@@ -11,7 +11,8 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
 ## What works
 
 - RAR4 archives: bounded header listing and verification, extraction, and selected
-  printing of unencrypted, unsplit Stored regular files. The catalogue retains
+  printing of unencrypted, unsplit Stored regular files and non-solid version-29
+  LZ compressed regular files. PPM and VM/filter commands remain excluded. The catalogue retains
   unsupported member metadata and reports typed payload exclusions.
 - RAR 5.0 archives: listing, testing and extracting stored and compressed files (every method, solid archives,
   filters), including files split across `name.partNN.rar` or `name.rar`/`name.r00` volume sets, self-extracting
@@ -25,7 +26,7 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
   refused.
 
-Encrypted archives, links, RAR 4.x, 7z and the rarer ZIP methods (Deflate64, PPMd) are next.
+Encrypted archives, links, remaining RAR4 capabilities, 7z and the rarer ZIP methods (Deflate64, PPMd) are next.
 
 ## Usage
 
@@ -82,7 +83,7 @@ See section 6 for source availability, notices, and attribution for
 deployed extensions. Dependencies retain their own licenses.
 See [Contributing](CONTRIBUTING.md) for sending changes upstream.
 
-### RAR4 metadata and Stored reads
+### RAR4 metadata, Stored and version-29 LZ reads
 
 RAR sessions identify the archive, volume, and member format. RAR4 metadata
 retains the raw name, host, method, unpack version, flags, and DOS time bits.
@@ -96,9 +97,18 @@ DOS timestamps have no time zone. RAR4 uses the existing ZIP UTC projection
 for valid civil dates and preserves the original bits for callers choosing
 another policy. Extended times retain the odd second and subsecond fields.
 
-Stored reads verify size and CRC before publication. Compressed, solid,
-encrypted and split payloads, symbolic links, special files, old file revisions,
-and unsupported host attributes report explicit exclusions. Encrypted headers,
+Stored and version-29 non-solid LZ reads verify exact size and CRC before
+publication or verified selected printing. LZ methods 0x31 through 0x35 use
+64 KiB through 4 MiB dictionaries and reset state for each independent member.
+Decoding is serial and retains bounded incremental input state. Real decoded
+bits are required. Once the declared output is complete, remaining declared
+packed bytes are charged and drained without claiming canonical tail encoding.
+Empty compressed members use the same logical-completion policy and verify the
+empty CRC. PPM and VM/filter commands encountered before completion report typed
+unsupported outcomes. No unsupported command can be skipped into CRC success.
+Compressed versions 15, 20 and 26, solid, encrypted and split payloads, symbolic
+links, special files, old file revisions, and unsupported host attributes retain
+explicit exclusions. Encrypted headers,
 old embedded comments and legacy service layouts stop catalogue construction.
 The existing catalogue, selected decode and spool limits apply to RAR4.
 Catalogue opening reserves a conservative temporary capacity allowance of

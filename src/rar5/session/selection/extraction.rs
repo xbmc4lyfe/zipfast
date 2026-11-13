@@ -155,7 +155,11 @@ impl<'a> Extraction<'a> {
 
         check_cancel(&session.options.cancel).map_err(own_fault)?;
         let mut sources =
-            if session.members[index].header.method != 0 { run.history_volumes } else { [0; VOLUME_WORDS] };
+            if session.members[index].header.format == RarFormat::Rar5 && session.members[index].header.method != 0 {
+                run.history_volumes
+            } else {
+                [0; VOLUME_WORDS]
+            };
         mark_volumes(&mut sources, &session.parts[session.members[index].parts.clone()]);
         check_volumes(session, &sources)?;
         if self.inspect_target(session, &target)? != initial {
@@ -520,5 +524,40 @@ mod tests {
             assert_eq!(fs::read(&second).unwrap(), b"original");
             assert_eq!(fs::read_dir(&dest).unwrap().count(), 2);
         }
+    }
+    #[test]
+    fn rar4_late_output_alias_is_refused_before_publication() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("source.rar");
+        let original = crate::rar5::unpack::rar4::fixed_fixture();
+        fs::write(&first, &original).unwrap();
+        let dest = dir.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        let target = dest.join("x");
+        fs::write(&target, b"keep").unwrap();
+        let mut session = RarSession::open(&first, None, RarSessionOptions::default()).unwrap();
+        let all = session.select(|_| true).unwrap();
+        let alias = first.clone();
+        let result = with_hook(
+            move |event, target| {
+                if event == Event::BeforePublish {
+                    fs::remove_file(target)?;
+                    fs::hard_link(&alias, target)?;
+                }
+                Ok(())
+            },
+            || {
+                session.extract_selected(&all,&options(&dest),RarDecodeLimits::default(),|event| {
+            assert!(matches!(&event.outcome,RarOutcome::Failed(failure) if matches!(failure.as_ref(),RarFailure::SourceChanged{..})));
+        }).unwrap_err()
+            },
+        );
+        assert_eq!((result.partial.files, result.partial.failed), (0, 1));
+        assert!(matches!(result.failure.as_ref(), RarFailure::SourceChanged { .. }));
+        assert_eq!(fs::read(&first).unwrap(), original);
+        assert_eq!(fs::read(&target).unwrap(), original);
+        assert_eq!(fs::metadata(&first).unwrap().ino(), fs::metadata(&target).unwrap().ino());
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 1);
     }
 }

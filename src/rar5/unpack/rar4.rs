@@ -14,7 +14,7 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-//! Private RAR4 version-29 LZ checkpoint. Compiled only for unit tests.
+//! Bounded, serial RAR4 version-29 non-solid LZ decoding.
 //! Original implementation from the SDD factual worksheet and independent vectors.
 //! No external decoder implementation was copied or translated.
 
@@ -22,17 +22,17 @@ use super::Sink;
 use crate::extract::Cancellation;
 
 #[derive(Debug, PartialEq)]
-enum Rar4FeedState {
+pub(crate) enum Rar4FeedState {
     NeedInput,
     Complete,
 }
 #[derive(Debug, PartialEq)]
-enum Rar4UnsupportedMode {
+pub(crate) enum Rar4UnsupportedMode {
     Ppm,
     VmFilter,
 }
 #[derive(Debug)]
-enum Rar4DecodeError {
+pub(crate) enum Rar4DecodeError {
     Unsupported(Rar4UnsupportedMode),
     Malformed(&'static str),
     DecodedSize { expected: u64, actual: u64 },
@@ -48,24 +48,87 @@ enum Rar4DecodeError {
 const CHUNK: usize = 65536;
 const OUTPUT: usize = 32768;
 
+impl Rar4DecodeError {
+    pub(crate) fn detailed(self, scope: crate::error::RarScope) -> crate::error::RarFault {
+        use crate::error::{
+            Error, IoOperation, RarFailure, RarFault, RarIntegrityReason, RarPasswordEvidence, RarResource,
+            RarUnsupported,
+        };
+        let integrity = |reason| RarFailure::integrity(scope.clone(), reason, RarPasswordEvidence::NotEncrypted, false);
+        let (failure, legacy) = match self {
+            Self::Unsupported(mode) => {
+                let label = match mode {
+                    Rar4UnsupportedMode::Ppm => "PPM payload",
+                    Rar4UnsupportedMode::VmFilter => "VM/filter payload",
+                };
+                (RarFailure::Unsupported(RarUnsupported::Rar4Feature(label)), Error::Corrupt(label))
+            }
+            Self::Malformed(reason) => (integrity(RarIntegrityReason::Decoder(reason)), Error::Corrupt(reason)),
+            Self::DecodedSize { expected, actual } => {
+                (integrity(RarIntegrityReason::DecodedSize { expected, actual }), Error::Corrupt("RAR4 decoded size"))
+            }
+            Self::PackedSize { expected, actual } if actual < expected => {
+                (integrity(RarIntegrityReason::TruncatedData), Error::Truncated)
+            }
+            Self::PackedSize { .. } => (
+                integrity(RarIntegrityReason::Decoder("RAR4 packed extent exceeded")),
+                Error::Corrupt("RAR4 packed extent exceeded"),
+            ),
+            Self::InvalidDictionary { requested } => {
+                (integrity(RarIntegrityReason::InvalidDictionary { requested }), Error::Corrupt("RAR4 dictionary"))
+            }
+            Self::WindowLimit { requested, allowed } => (
+                RarFailure::Limit {
+                    resource: RarResource::DictionarySize,
+                    requested: Some(requested),
+                    allowed: Some(allowed),
+                },
+                Error::Corrupt("RAR4 dictionary limit"),
+            ),
+            Self::Allocation { requested } => (
+                RarFailure::Limit {
+                    resource: RarResource::DictionaryAllocation,
+                    requested: Some(requested),
+                    allowed: None,
+                },
+                Error::Corrupt("RAR4 dictionary allocation"),
+            ),
+            Self::CounterOverflow => (
+                RarFailure::Limit { resource: RarResource::Counter, requested: None, allowed: Some(u64::MAX) },
+                Error::Corrupt("RAR4 work counter overflow"),
+            ),
+            Self::Canceled => (RarFailure::Canceled, Error::Io(std::io::Error::from(std::io::ErrorKind::Interrupted))),
+            Self::Sink(Error::Io(source)) => return RarFault::output(IoOperation::Write, None, None, source, true),
+            Self::Sink(error) => return crate::batch::decoder_failure(error, scope, RarPasswordEvidence::NotEncrypted),
+        };
+        RarFault::new(failure, legacy)
+    }
+}
+
 type DecodeResult<T> = Result<T, Rar4DecodeError>;
 
 struct Work {
     operations: u64,
-    cancel: Cancellation,
+    cancel: Option<Cancellation>,
     #[cfg(test)]
     cancel_at: Option<u64>,
 }
 impl Work {
     fn check(&self) -> DecodeResult<()> {
-        if self.cancel.is_canceled() { Err(Rar4DecodeError::Canceled) } else { Ok(()) }
+        if self.cancel.as_ref().is_some_and(Cancellation::is_canceled) {
+            Err(Rar4DecodeError::Canceled)
+        } else {
+            Ok(())
+        }
     }
     fn tick(&mut self, amount: u64) -> DecodeResult<()> {
         let before = self.operations;
         self.operations = self.operations.checked_add(amount).ok_or(Rar4DecodeError::CounterOverflow)?;
         #[cfg(test)]
         if self.cancel_at.is_some_and(|at| self.operations >= at) {
-            self.cancel.cancel();
+            if let Some(cancel) = &self.cancel {
+                cancel.cancel();
+            }
             self.cancel_at = None;
         }
         if self.operations / 256 != before / 256 {
@@ -174,7 +237,7 @@ enum Phase {
     Complete,
 }
 
-struct Rar4Decoder {
+pub(crate) struct Rar4Decoder {
     work: Work,
     dictionary: Vec<u8>,
     packed: u64,
@@ -201,7 +264,22 @@ struct Rar4Decoder {
 }
 
 impl Rar4Decoder {
-    fn new(dictionary: u64, packed: u64, unpacked: u64, window_limit: u64, cancel: Cancellation) -> DecodeResult<Self> {
+    pub(crate) fn new(
+        dictionary: u64,
+        packed: u64,
+        unpacked: u64,
+        window_limit: u64,
+        cancel: Cancellation,
+    ) -> DecodeResult<Self> {
+        Self::new_with_cancel(dictionary, packed, unpacked, window_limit, Some(cancel))
+    }
+    pub(crate) fn new_with_cancel(
+        dictionary: u64,
+        packed: u64,
+        unpacked: u64,
+        window_limit: u64,
+        cancel: Option<Cancellation>,
+    ) -> DecodeResult<Self> {
         let mut work = Work {
             operations: 0,
             cancel,
@@ -260,7 +338,7 @@ impl Rar4Decoder {
         decoder.work.check()?;
         Ok(decoder)
     }
-    fn feed(&mut self, bytes: &[u8], sink: &mut dyn Sink) -> DecodeResult<Rar4FeedState> {
+    pub(crate) fn feed(&mut self, bytes: &[u8], sink: &mut dyn Sink) -> DecodeResult<Rar4FeedState> {
         if self.poisoned || self.finished {
             return Err(Rar4DecodeError::Malformed("decoder is no longer usable"));
         }
@@ -280,7 +358,7 @@ impl Rar4Decoder {
         }
         result
     }
-    fn finish(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
+    pub(crate) fn finish(&mut self, sink: &mut dyn Sink) -> DecodeResult<()> {
         if self.poisoned || self.finished {
             return Err(Rar4DecodeError::Malformed("decoder is no longer usable"));
         }
@@ -595,3 +673,37 @@ impl Rar4Decoder {
 
 #[cfg(test)]
 mod tests;
+
+/// Wrap the immutable literal vector for source/output ownership unit tests.
+/// This helper cannot compress data and is absent from normal builds.
+#[cfg(test)]
+pub(crate) fn fixed_fixture() -> Vec<u8> {
+    fn block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0, 0, kind];
+        bytes.extend(flags.to_le_bytes());
+        bytes.extend(((body.len() + 7) as u16).to_le_bytes());
+        bytes.extend(body);
+        let crc = crate::crc32::hash(&bytes[2..]) as u16;
+        bytes[..2].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+    let packed = include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rar4-lz/literal-a.packed"));
+    let mut body = Vec::new();
+    body.extend((packed.len() as u32).to_le_bytes());
+    body.extend(1u32.to_le_bytes());
+    body.push(3);
+    body.extend(crate::crc32::hash(b"A").to_le_bytes());
+    body.extend(0x50221884u32.to_le_bytes());
+    body.extend([29, 0x33]);
+    body.extend(1u16.to_le_bytes());
+    body.extend(0o100644u32.to_le_bytes());
+    body.push(b'x');
+    [
+        b"Rar!\x1a\x07\0".as_slice(),
+        &block(0x73, 0, &[0; 6]),
+        &block(0x74, 0x8000, &body),
+        packed,
+        &block(0x7b, 0x4000, &[]),
+    ]
+    .concat()
+}

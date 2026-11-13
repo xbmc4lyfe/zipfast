@@ -11,7 +11,9 @@ PPM/VM streams. Their exact status/output is recorded in `reference.json`.
 
 The test harness wraps only these immutable bytes with ordinary RAR4
 container headers and a known expected CRC. It cannot encode input data.
-This is a local RED checkpoint. Production decoding remains unchanged.
+The original checkpoint kept the public tests RED. The connected branch
+now uses these same vectors through normal selected and ordinary consumers.
+Full connected qualification is recorded separately in the shared SDD report.
 
 `official-lz-m3.packed` is the payload region of the locally generated
 RARLAB 6.24 `-ma4 -m3 -mc- -s- -md64k` archive documented in

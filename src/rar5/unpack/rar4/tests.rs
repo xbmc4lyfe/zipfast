@@ -435,7 +435,7 @@ fn cancellation_interrupts_table_build_copy_and_physical_tail() {
     assert!(d.produced > 0 && d.produced < 302400);
     let mut d = decoder(2, 0);
     d.feed(&[0], &mut collect(&mut Vec::new())).unwrap();
-    d.work.cancel.cancel();
+    d.work.cancel.as_ref().unwrap().cancel();
     assert!(matches!(d.feed(&[0], &mut collect(&mut Vec::new())), Err(Rar4DecodeError::Canceled)));
 }
 
