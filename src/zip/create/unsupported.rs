@@ -31,6 +31,11 @@ impl CreatePlan {
         Err(CreateError::UnsupportedPlatform)
     }
 
+    /// Native output/source binding checks are unavailable on this platform.
+    pub fn check_output_file(&mut self, _output: &File) -> Result<()> {
+        match self.0 {}
+    }
+
     /// Admit a regular path source.
     pub fn add_file(
         &mut self,
