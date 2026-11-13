@@ -367,6 +367,50 @@ fn unicode(version: u8, crc: u32, name: &[u8]) -> Vec<u8> {
 }
 
 #[test]
+fn anchored_central_ut_projection_uses_the_last_complete_ut_field() {
+    let ut = field(0x5455, &[1, 0xfe, 0xff, 0xff, 0xff]);
+    let later_ut = field(0x5455, &[1, 0, 0, 0, 0]);
+    let ntfs = field(
+        0x000a,
+        &[0, 0, 0, 0, 1, 0, 24, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    );
+    let unix = Some(ExtraMtime::UnixSeconds(-2));
+    let filetime = Some(ExtraMtime::NtfsFiletime(9));
+    let cases = [
+        ("UT then NTFS", [&ut[..], &ntfs].concat(), unix, filetime),
+        ("NTFS then UT", [&ntfs[..], &ut].concat(), unix, unix),
+        ("NTFS only", ntfs.clone(), None, filetime),
+        (
+            "later UT at the epoch",
+            [&ut[..], &later_ut].concat(),
+            Some(ExtraMtime::UnixSeconds(0)),
+            Some(ExtraMtime::UnixSeconds(0)),
+        ),
+        ("later UT without mtime", [&ut[..], &field(0x5455, &[2])].concat(), None, unix),
+        ("later UT with truncated mtime", [&ut[..], &field(0x5455, &[1, 2])].concat(), None, unix),
+        ("later empty UT", [&ut[..], &field(0x5455, &[])].concat(), None, unix),
+        ("later UT overruns framing", [&ut[..], &[0x55, 0x54, 0xff, 0xff], &later_ut].concat(), unix, unix),
+    ];
+    for (case, extra, central_ut, wire_order) in cases {
+        let central = record(b"file", &extra, b"");
+        let bytes = archive(&central, 1, b"");
+        let len = bytes.len() as u64;
+        let eocd = central.len() as u64;
+        let limits = Limits::default();
+        let schedule = [1, 7, 31];
+        let ordinary =
+            drive(&bytes, DirectoryParser::at_eocd_with_scratch_limit(len, eocd, limits, 1 << 20).unwrap(), &schedule)
+                .unwrap();
+        let projected =
+            drive(&bytes, DirectoryParser::at_eocd_with_central_ut(len, eocd, limits, 1 << 20).unwrap(), &schedule)
+                .unwrap();
+        assert_eq!(ordinary.entries[0].known.mtime_override, wire_order, "{case}");
+        assert_eq!(projected.entries[0].known.mtime_override, central_ut, "{case}");
+        assert_eq!(projected.usage, ordinary.usage, "{case}");
+    }
+}
+
+#[test]
 fn known_extras_reduce_once_in_wire_order_inside_their_advertised_bounds() {
     let crc = 0xcbf4_3926; // IEEE CRC-32 of the standard "123456789" vector.
     let unknown = field(0xdada, b"opaque");

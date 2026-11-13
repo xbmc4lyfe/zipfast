@@ -94,6 +94,7 @@ pub(super) fn directory(
     reader: &mut Reader<'_, '_, '_>,
     len: u64,
     expected_eocd: Option<u64>,
+    central_ut_only: bool,
     budget: DirectoryBudget,
     usage: &mut VerificationUsage,
 ) -> Result<Directory> {
@@ -155,7 +156,12 @@ pub(super) fn directory(
     core.extra_bytes = core
         .extra_bytes
         .min(budget.metadata.checked_sub(wire_metadata).ok_or(RewriteError::Limit(RewriteLimit::SourceMetadata))?);
-    let parser = DirectoryParser::at_eocd_with_scratch_limit(len, eocd, core, scratch).map_err(layout_error)?;
+    let parser = if central_ut_only {
+        DirectoryParser::at_eocd_with_central_ut(len, eocd, core, scratch)
+    } else {
+        DirectoryParser::at_eocd_with_scratch_limit(len, eocd, core, scratch)
+    }
+    .map_err(layout_error)?;
     let parsed = read_anchored(reader, len, parser, usage, &mut buffer)?;
     ensure(usage.record_capacity <= budget.records, "central record capacity")?;
     if !zipfast.agrees(&parsed) || (expected_eocd.is_some() && parsed.prefix_shift != 0) {

@@ -67,6 +67,25 @@ impl RewritePlan {
     /// Open an existing regular archive through its held parent, without
     /// following a symlink in the destination's final component.
     pub fn open(path: &Path, options: RewriteOptions) -> Result<Self> {
+        Self::open_source(path, options, false)
+    }
+
+    /// Opens a rewrite plan with central extended Unix timestamps (UT) for
+    /// callers comparing source freshness.
+    ///
+    /// [`EntryMetadata::raw_mtime_override()`](crate::zip::EntryMetadata::raw_mtime_override)
+    /// reports the mtime from the last complete central UT field, if that
+    /// field contains a usable mtime. Local extras and NTFS are ignored.
+    /// If an extra overruns its block, the scan stops before that field.
+    /// [`EntryMetadata::modified()`](crate::zip::EntryMetadata::modified)
+    /// uses that UTC timestamp or interprets the DOS timestamp as UTC.
+    /// Use [`EntryMetadata::header()`](crate::zip::EntryMetadata::header)
+    /// to read the raw DOS fields for local wall-clock comparisons.
+    pub fn open_with_central_ut(path: &Path, options: RewriteOptions) -> Result<Self> {
+        Self::open_source(path, options, true)
+    }
+
+    fn open_source(path: &Path, options: RewriteOptions, central_ut_only: bool) -> Result<Self> {
         if options.output_permissions.is_some_and(|mode| mode > 0o777) {
             return Err(CreateError::InvalidOptions("invalid output permission bits").into());
         }
@@ -89,6 +108,7 @@ impl RewritePlan {
             },
             stamp.len,
             None,
+            central_ut_only,
             DirectoryBudget {
                 core: limits.source_directory,
                 scratch: limits.source_scratch,
