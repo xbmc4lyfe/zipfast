@@ -42,8 +42,8 @@ pub(in crate::zip) struct Identity(pub(in crate::zip) u64, pub(in crate::zip) u6
 pub(in crate::zip) struct Stamp {
     pub(in crate::zip) identity: Identity,
     pub(in crate::zip) len: u64,
-    modified: (i64, i64),
-    changed: (i64, i64),
+    pub(super) modified: (i64, i64),
+    pub(super) changed: (i64, i64),
     pub(in crate::zip) mode: u16,
 }
 
@@ -446,6 +446,15 @@ impl Parent {
         stage: &CStr,
         budget: &Attempts<'_>,
     ) -> std::result::Result<(), PublishError> {
+        self.publish_noreplace_leaf(stage, &self.leaf, budget)
+    }
+
+    pub(super) fn publish_noreplace_leaf(
+        &self,
+        stage: &CStr,
+        leaf: &CStr,
+        budget: &Attempts<'_>,
+    ) -> std::result::Result<(), PublishError> {
         budget.charge().map_err(PublishError::Definite)?;
         #[cfg(test)]
         super::tests::event_io(super::tests::Event::NativePublish, None).map_err(PublishError::from_syscall)?;
@@ -454,10 +463,10 @@ impl Parent {
         // directory. The syscall is the only publication operation.
         #[cfg(target_os = "linux")]
         let status = unsafe {
-            libc::syscall(libc::SYS_renameat2, fd, stage.as_ptr(), fd, self.leaf.as_ptr(), libc::RENAME_NOREPLACE)
+            libc::syscall(libc::SYS_renameat2, fd, stage.as_ptr(), fd, leaf.as_ptr(), libc::RENAME_NOREPLACE)
         };
         #[cfg(target_os = "macos")]
-        let status = unsafe { libc::renameatx_np(fd, stage.as_ptr(), fd, self.leaf.as_ptr(), libc::RENAME_EXCL) };
+        let status = unsafe { libc::renameatx_np(fd, stage.as_ptr(), fd, leaf.as_ptr(), libc::RENAME_EXCL) };
         if status == 0 { Ok(()) } else { Err(PublishError::from_syscall(io::Error::last_os_error())) }
     }
 
@@ -520,3 +529,6 @@ pub(in crate::zip) fn sync_directory(file: &File, budget: &Attempts<'_>) -> Resu
 fn status(result: libc::c_int) -> io::Result<()> {
     if result == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
+
+#[path = "unix_split.rs"]
+pub(super) mod split;

@@ -26,6 +26,16 @@ use crate::zip::write::{EntryName, EntryOptions, EntryWritten, Method, WinZipAes
 
 use super::*;
 
+#[path = "split_native.rs"]
+pub(super) mod split;
+#[cfg(test)]
+#[path = "split_create_tests.rs"]
+mod split_create_tests;
+#[path = "split_verify.rs"]
+mod split_verify;
+#[cfg(test)]
+#[path = "split_verify_tests.rs"]
+mod split_verify_tests;
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
@@ -842,6 +852,10 @@ impl<'a> Attempts<'a> {
 
     pub(in crate::zip) fn with_limits(cancel: &'a Cancellation, max: u64, count: &'a Cell<u64>) -> Self {
         Self { count, max, cancel: Some(cancel), limit: CreateLimit::TransactionAttempts }
+    }
+
+    fn split_finalization(count: &'a Cell<u64>, max: u64) -> Self {
+        Self { count, max, cancel: None, limit: CreateLimit::FinalizationAttempts }
     }
 
     pub(in crate::zip) fn finalization(count: &'a Cell<u64>) -> Self {

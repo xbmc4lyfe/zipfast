@@ -51,6 +51,26 @@
 //! ```
 //
 
+//! # Physical split creation
+//!
+//! [`CreatePlan::publish_split_with_receipts`] accepts [`SplitCreateOptions`] for
+//! clear Stored/Deflate output. It verifies held physical volumes and publishes
+//! lowercase `.z01` through `.z99`, then `.z100` and higher, with the bound `.zip`
+//! leaf last. Its original extension bytes and case are preserved. Every actual
+//! destination must be absent. Publication is per-name, not atomic for the set.
+//!
+//! Inspect [`SplitCreateReport`] on both success and failure. Commit records
+//! native operation history; visibility records later pointwise observations.
+//! Unknown remains sticky. Completed receipts are exposed only for confirmed
+//! Complete history. Any unresolved ownership is retained in closing-only
+//! [`SplitReconciliation`], whose Drop never retries or removes a name.
+//!
+//! Split limits separately bound prepared metadata, live engine-owned descriptors,
+//! physical volumes, transport attempts and verifier scratch. Existing source,
+//! writer, verification and cancellation limits still apply. Only actual volumes
+//! consume descriptor allowance. Directory synchronization brackets final ZIP
+//! publication when requested. This API does not encrypt, rewrite or delete sources.
+//!
 use std::collections::TryReserveError;
 use std::fmt;
 use std::io;
@@ -68,6 +88,9 @@ pub use native::CreatePlan;
 mod unsupported;
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub use unsupported::CreatePlan;
+
+mod split;
+pub use split::*;
 
 const MIB: u64 = 1 << 20;
 const TIB: u64 = 1 << 40;

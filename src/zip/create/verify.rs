@@ -791,50 +791,21 @@ impl<'a, 'b> Reader<'a, 'b> {
         } else {
             None
         };
-        let mut decoded = 0;
-        let mut crc = Hasher::new();
-        if receipt.method == METHOD_STORED {
-            while remaining != 0 {
-                let len = remaining.min(buffer.len() as u64) as usize;
-                self.read_packed(&mut buffer[..len], &mut cipher)?;
-                self.decoded(&mut crc, &mut decoded, receipt, &buffer[..len])?;
-                remaining -= len as u64;
-            }
-        } else {
-            ensure(receipt.method == METHOD_DEFLATE, "unsupported strict payload verification method")?;
-            let mut inflate = Decompress::new(false);
-            let mut output = [0; BUFFER];
-            let mut current = 0..0;
-            loop {
-                if current.is_empty() && remaining != 0 {
-                    let len = remaining.min(buffer.len() as u64) as usize;
-                    self.read_packed(&mut buffer[..len], &mut cipher)?;
-                    remaining -= len as u64;
-                    current = 0..len;
-                }
-                self.attempts.charge()?;
-                let (before_in, before_out) = (inflate.total_in(), inflate.total_out());
-                let status = inflate
-                    .decompress(&buffer[current.clone()], &mut output, FlushDecompress::None)
-                    .map_err(|_| CreateError::Verification("invalid raw Deflate payload"))?;
-                let used = codec_delta(inflate.total_in(), before_in, current.len())?;
-                let made = codec_delta(inflate.total_out(), before_out, output.len())?;
-                current.start += used;
-                self.decoded(&mut crc, &mut decoded, receipt, &output[..made])?;
-                if status == Status::StreamEnd {
-                    ensure(current.is_empty() && remaining == 0, "trailing bytes in packed Deflate range")?;
-                    break;
-                }
-                ensure(used != 0 || made != 0, "truncated or stalled raw Deflate payload")?;
-            }
-        }
+        let mut output = [0; BUFFER];
+        let (decoded, crc32) = pump_payload(
+            &mut CipherInput { reader: self, cipher: &mut cipher },
+            receipt,
+            remaining,
+            buffer,
+            &mut output,
+        )?;
         if let Some(PayloadCipher::Aes(cipher)) = cipher {
             let mut tag = [0; 10];
             self.read_exact(&mut tag)?;
             use subtle::ConstantTimeEq;
             ensure(bool::from(cipher.tag().ct_eq(&tag)), "AES authentication tag differs")?;
         }
-        ensure(decoded == receipt.decoded_size && crc.finalize() == receipt.crc32, "decoded length or CRC differs")
+        ensure(decoded == receipt.decoded_size && crc32 == receipt.crc32, "decoded length or CRC differs")
     }
 
     fn read_packed(&mut self, buffer: &mut [u8], cipher: &mut Option<PayloadCipher>) -> Result<()> {
@@ -862,6 +833,107 @@ impl<'a, 'b> Reader<'a, 'b> {
     }
 }
 
+// Physical framing and authentication stay in the caller. The pump only
+// consumes the exact packed range and reports fully decoded bytes and CRC.
+#[derive(Clone, Copy)]
+pub(super) enum PayloadProblem {
+    Method,
+    Codec,
+    Counters,
+    Trailing,
+    Stalled,
+}
+impl PayloadProblem {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Method => "unsupported strict payload verification method",
+            Self::Codec => "invalid raw Deflate payload",
+            Self::Counters => "invalid decoder progress counters",
+            Self::Trailing => "trailing bytes in packed Deflate range",
+            Self::Stalled => "truncated or stalled raw Deflate payload",
+        }
+    }
+}
+pub(super) trait PayloadInput {
+    // The split adapter records this exact failure origin; ordinary diagnostics stay unchanged.
+    fn failure(&mut self, problem: PayloadProblem) -> CreateError {
+        CreateError::Verification(problem.message())
+    }
+    fn read_chunk(&mut self, bytes: &mut [u8]) -> Result<()>;
+    fn step(&mut self) -> Result<()>;
+    fn decoded(&mut self, crc: &mut Hasher, member: &mut u64, receipt: Payload, bytes: &[u8]) -> Result<()>;
+}
+
+struct CipherInput<'a, 'b, 'c> {
+    reader: &'a mut Reader<'b, 'c>,
+    cipher: &'a mut Option<PayloadCipher>,
+}
+impl PayloadInput for CipherInput<'_, '_, '_> {
+    fn read_chunk(&mut self, bytes: &mut [u8]) -> Result<()> {
+        self.reader.read_packed(bytes, self.cipher)
+    }
+    fn step(&mut self) -> Result<()> {
+        self.reader.attempts.charge()
+    }
+    fn decoded(&mut self, crc: &mut Hasher, member: &mut u64, receipt: Payload, bytes: &[u8]) -> Result<()> {
+        self.reader.decoded(crc, member, receipt, bytes)
+    }
+}
+
+pub(super) fn pump_payload(
+    reader: &mut impl PayloadInput,
+    receipt: Payload,
+    mut remaining: u64,
+    buffer: &mut [u8],
+    output: &mut [u8],
+) -> Result<(u64, u32)> {
+    let mut decoded = 0;
+    let mut crc = Hasher::new();
+    if receipt.method == METHOD_STORED {
+        while remaining != 0 {
+            let len = remaining.min(buffer.len() as u64) as usize;
+            reader.read_chunk(&mut buffer[..len])?;
+            reader.decoded(&mut crc, &mut decoded, receipt, &buffer[..len])?;
+            remaining -= len as u64;
+        }
+    } else {
+        if receipt.method != METHOD_DEFLATE {
+            return Err(reader.failure(PayloadProblem::Method));
+        }
+        let mut inflate = Decompress::new(false);
+        let mut current = 0..0;
+        loop {
+            if current.is_empty() && remaining != 0 {
+                let len = remaining.min(buffer.len() as u64) as usize;
+                reader.read_chunk(&mut buffer[..len])?;
+                remaining -= len as u64;
+                current = 0..len;
+            }
+            reader.step()?;
+            let (before_in, before_out) = (inflate.total_in(), inflate.total_out());
+            let status = inflate
+                .decompress(&buffer[current.clone()], output, FlushDecompress::None)
+                .map_err(|_| reader.failure(PayloadProblem::Codec))?;
+            let used = codec_delta(inflate.total_in(), before_in, current.len())
+                .ok_or_else(|| reader.failure(PayloadProblem::Counters))?;
+            let made = codec_delta(inflate.total_out(), before_out, output.len())
+                .ok_or_else(|| reader.failure(PayloadProblem::Counters))?;
+            current.start += used;
+            reader.decoded(&mut crc, &mut decoded, receipt, &output[..made])?;
+            if status == Status::StreamEnd {
+                if !current.is_empty() || remaining != 0 {
+                    return Err(reader.failure(PayloadProblem::Trailing));
+                }
+                break;
+            }
+            if used == 0 && made == 0 {
+                return Err(reader.failure(PayloadProblem::Stalled));
+            }
+        }
+    }
+    Ok((decoded, crc.finalize()))
+}
+
 #[allow(clippy::large_enum_variant, reason = "fixed-size cipher state stays on the stack without an allocation")]
 enum PayloadCipher {
     ZipCrypto(ZipCrypto),
@@ -876,12 +948,8 @@ fn parser_error(error: DirectoryError) -> CreateError {
     }
 }
 
-fn codec_delta(total: u64, previous: u64, maximum: usize) -> Result<usize> {
-    total
-        .checked_sub(previous)
-        .filter(|&delta| delta <= maximum as u64)
-        .map(|delta| delta as usize)
-        .ok_or(CreateError::Verification("invalid decoder progress counters"))
+fn codec_delta(total: u64, previous: u64, maximum: usize) -> Option<usize> {
+    total.checked_sub(previous).filter(|&delta| delta <= maximum as u64).map(|delta| delta as usize)
 }
 
 fn ensure(condition: bool, reason: &'static str) -> Result<()> {

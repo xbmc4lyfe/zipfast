@@ -26,6 +26,11 @@ use super::*;
 pub struct CreatePlan(Infallible);
 
 impl CreatePlan {
+    /// Native split creation is unavailable on this platform.
+    pub fn publish_split_with_receipts(self, _: SplitCreateOptions) -> SplitCreateReport {
+        match self.0 {}
+    }
+
     /// Returns UnsupportedPlatform before opening a file.
     pub fn new(_destination: &Path, _options: CreateOptions) -> Result<Self> {
         Err(CreateError::UnsupportedPlatform)
