@@ -21,7 +21,10 @@ use crate::extract::Cancellation;
 
 const MARKER: &[u8; 4] = b"PK\x07\x08";
 
-trait VolumeProvider {
+/// Opens fresh numbered sinks. The previous sink has been flushed and dropped.
+/// A failed provider call is terminal, including an interrupted call.
+pub trait VolumeProvider {
+    /// A provisional forward-only volume.
     type Sink: Write;
 
     // Provide a fresh sink for this disk. A failed open is terminal because
@@ -38,48 +41,64 @@ struct Limits {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Location {
-    disk: u32,
-    offset: u64,
+pub struct Location {
+    /// Zero-based volume number.
+    pub disk: u32,
+    /// Byte offset within that volume.
+    pub offset: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct Usage {
-    disks: u32,
-    bytes: u64,
-    attempts: u64,
+pub struct Usage {
+    /// Successfully opened volumes.
+    pub disks: u32,
+    /// Bytes accepted across all volumes, excluding unused capacity.
+    pub bytes: u64,
+    /// Provider calls and physical write and flush attempts.
+    pub attempts: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Stage {
+pub enum Stage {
     Open,
     Reserve,
     Write,
     Flush,
+    /// Member validation, source reading or payload encoding.
+    Member,
+    /// Central directory and end geometry.
+    Finish,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Limit {
+pub enum Limit {
     Disks,
     OutputBytes,
     Attempts,
 }
 
-#[derive(Debug)]
-enum ErrorKind {
-    Io(io::Error),
+#[derive(Clone, Debug)]
+pub enum ErrorKind {
+    Io(Arc<io::Error>),
+    Writer(super::WriteError),
     Limit(Limit),
     Canceled,
     RecordTooLarge { requested: u64, capacity: u64 },
     IncompleteRecord { remaining: u64 },
 }
 
-#[derive(Debug)]
-struct Error {
-    stage: Stage,
-    at: Location,
-    kind: ErrorKind,
-    usage: Usage,
+#[derive(Clone, Debug)]
+pub struct Error {
+    /// Operation that stopped.
+    pub stage: Stage,
+    /// Physical location where the operation stopped or would start.
+    pub at: Location,
+    /// Original failure cause.
+    pub kind: ErrorKind,
+    /// Physical transport accounting at failure.
+    pub usage: Usage,
+    /// Writer accounting at failure, including provisional payload bytes.
+    pub writer: super::WriteUsage,
 }
 
 type Result<T> = std::result::Result<T, Arc<Error>>;
@@ -119,6 +138,18 @@ impl<P: VolumeProvider> Transport<P> {
 
     fn position(&self) -> Location {
         self.position
+    }
+
+    fn placement(&mut self, size: u64) -> Result<Location> {
+        self.check_unreserved(Stage::Reserve)?;
+        self.check_record_size(size)?;
+        self.check_output(size, Stage::Reserve)?;
+        if size > self.remaining() {
+            self.check_next()?;
+            Ok(self.next_location())
+        } else {
+            Ok(self.position)
+        }
     }
 
     fn reserve_record(&mut self, size: u64) -> Result<Record<'_, P>> {
@@ -179,7 +210,8 @@ impl<P: VolumeProvider> Transport<P> {
         self.check_next()?;
         let at = self.next_location();
         self.charge(Stage::Open, at)?;
-        let sink = self.provider.open(at.disk).map_err(|cause| self.fail(Stage::Open, at, ErrorKind::Io(cause)))?;
+        let sink =
+            self.provider.open(at.disk).map_err(|cause| self.fail(Stage::Open, at, ErrorKind::Io(Arc::new(cause))))?;
         self.sink = Some(sink);
         self.position = at;
         self.usage.disks += 1;
@@ -200,7 +232,7 @@ impl<P: VolumeProvider> Transport<P> {
                 } else {
                     io::Error::new(io::ErrorKind::InvalidData, "invalid split sink write count")
                 };
-                return Err(self.fail(Stage::Write, self.position, ErrorKind::Io(cause)));
+                return Err(self.fail(Stage::Write, self.position, ErrorKind::Io(Arc::new(cause))));
             }
             // Callers checked the whole slice against both byte ceilings.
             self.position.offset += count as u64;
@@ -216,7 +248,7 @@ impl<P: VolumeProvider> Transport<P> {
             match operation(self.sink.as_mut().expect("active volume")) {
                 Ok(value) => return Ok(value),
                 Err(cause) if cause.kind() == io::ErrorKind::Interrupted => {}
-                Err(cause) => return Err(self.fail(stage, self.position, ErrorKind::Io(cause))),
+                Err(cause) => return Err(self.fail(stage, self.position, ErrorKind::Io(Arc::new(cause)))),
             }
         }
     }
@@ -275,7 +307,9 @@ impl<P: VolumeProvider> Transport<P> {
     }
 
     fn fail(&mut self, stage: Stage, at: Location, kind: ErrorKind) -> Arc<Error> {
-        Arc::clone(self.failed.get_or_insert_with(|| Arc::new(Error { stage, at, kind, usage: self.usage })))
+        Arc::clone(self.failed.get_or_insert_with(|| {
+            Arc::new(Error { stage, at, kind, usage: self.usage, writer: super::WriteUsage::default() })
+        }))
     }
 }
 
@@ -308,6 +342,25 @@ impl<P: VolumeProvider> Record<'_, P> {
         Ok(())
     }
 }
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(out, "split ZIP {:?} on disk {} at {}: {:?}", self.stage, self.at.disk, self.at.offset, self.kind)
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            ErrorKind::Io(error) => Some(error.as_ref()),
+            ErrorKind::Writer(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+mod writer;
+pub use writer::{EntryWritten, Finished, Options, ZipSplitWriter};
 
 #[cfg(test)]
 mod tests;
