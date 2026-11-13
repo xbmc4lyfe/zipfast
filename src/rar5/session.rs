@@ -328,6 +328,35 @@ impl RarSession {
     /// payloads are neither decoded nor checked by catalogue construction.
     #[allow(clippy::result_large_err, reason = "reuse the typed RAR error with partial counts")]
     pub fn open(first: &Path, password: Option<&str>, options: RarSessionOptions) -> Result<Self, RarRunError> {
+        Self::open_inner(first, password, options, None)
+    }
+
+    /// Open a catalogue while rejecting an output alias of each input file
+    /// actually opened, before parsing that file's headers. Output identity is
+    /// captured once from this descriptor; no output bytes are written.
+    ///
+    /// Keep the descriptor open and use that same file for output. A successful
+    /// session can recheck its held source bindings and output identity with
+    /// [`Self::check_output_file`] before writing. This check does not cover
+    /// archive paths that catalogue construction never opens.
+    #[cfg(unix)]
+    #[allow(clippy::result_large_err, reason = "reuse the typed RAR error with partial counts")]
+    pub fn open_with_output_file(
+        first: &Path,
+        password: Option<&str>,
+        options: RarSessionOptions,
+        output: &File,
+    ) -> Result<Self, RarRunError> {
+        Self::open_inner(first, password, options, Some(output))
+    }
+
+    #[allow(clippy::result_large_err, reason = "reuse the typed RAR error with partial counts")]
+    fn open_inner(
+        first: &Path,
+        password: Option<&str>,
+        options: RarSessionOptions,
+        _output: Option<&File>,
+    ) -> Result<Self, RarRunError> {
         let mut catalogue = Catalogue {
             session: Self {
                 archive: RarArchiveMetadata::default(),
@@ -343,6 +372,7 @@ impl RarSession {
             },
             options,
             owned_capacity: 0,
+            output_identity: None,
             pending: false,
             history_barrier: false,
             chain: None,
@@ -350,6 +380,14 @@ impl RarSession {
         };
         let result = (|| {
             check_cancel(&catalogue.options.cancel)?;
+            #[cfg(unix)]
+            if let Some(output) = _output {
+                use std::os::unix::fs::MetadataExt;
+                let metadata = output
+                    .metadata()
+                    .map_err(|source| RarFault::output(IoOperation::Metadata, None, None, source, false))?;
+                catalogue.output_identity = Some((metadata.dev(), metadata.ino()));
+            }
             let password = password.unwrap_or_default();
             limit(password.len() as u64, catalogue.options.limits.capacity, RarResource::CatalogueCapacity)?;
             catalogue.session.password.try_reserve_exact(password.len()).map_err(|_| allocation())?;
@@ -400,6 +438,7 @@ struct Catalogue {
     session: RarSession,
     options: RarSessionOptions,
     owned_capacity: u64,
+    output_identity: Option<(u64, u64)>,
     pending: bool,
     history_barrier: bool,
     chain: Option<usize>,
@@ -441,7 +480,7 @@ impl Catalogue {
                 Err(error) if error.kind() == io::ErrorKind::NotFound && required == Some(false) => break,
                 Err(error) => return Err(RarFault::input(IoOperation::Open, Some(path), None, error)),
             };
-            let stamp = SourceStamp::capture(&file, &path)?;
+            let stamp = SourceStamp::capture_for_output(&file, &path, self.output_identity)?;
             if self.session.volumes.iter().any(|v| (v.stamp.device, v.stamp.inode) == (stamp.device, stamp.inode)) {
                 return Err(volume_framing(&path, "RAR volume identity repeats"));
             }
@@ -861,8 +900,22 @@ struct SourceStamp {
 
 impl SourceStamp {
     fn capture(file: &File, path: &Path) -> RarResult<Self> {
+        Self::capture_for_output(file, path, None)
+    }
+
+    fn capture_for_output(file: &File, path: &Path, _output_identity: Option<(u64, u64)>) -> RarResult<Self> {
         let metadata_error = |error| RarFault::input(IoOperation::Metadata, Some(path.to_path_buf()), None, error);
-        let before = Self::from_metadata(file.metadata().map_err(metadata_error)?).map_err(metadata_error)?;
+        let metadata = file.metadata().map_err(metadata_error)?;
+        // Reject aliases before a binding or framing error could be reported
+        // through that same descriptor. This performs no extra metadata read.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if _output_identity == Some((metadata.dev(), metadata.ino())) {
+                return Err(RarFault::new(RarFailure::OutputAliasesInput, Error::Corrupt("RAR output aliases input")));
+            }
+        }
+        let before = Self::from_metadata(metadata).map_err(metadata_error)?;
         let bound = Self::from_metadata(fs::metadata(path).map_err(metadata_error)?).map_err(metadata_error)?;
         let after = Self::from_metadata(file.metadata().map_err(metadata_error)?).map_err(metadata_error)?;
         if before != bound || before != after {
@@ -909,6 +962,120 @@ impl SourceStamp {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+
+    #[test]
+    fn output_open_rejects_direct_and_hardlink_aliases_before_first_header_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("malformed.rar");
+        let bytes = b"not a RAR header";
+        fs::write(&path, bytes).unwrap();
+        let alias = dir.path().join("alias");
+        fs::hard_link(&path, &alias).unwrap();
+        for output_path in [&path, &alias] {
+            let output = OpenOptions::new().append(true).open(output_path).unwrap();
+            let error =
+                RarSession::open_with_output_file(&path, None, RarSessionOptions::default(), &output).err().unwrap();
+            assert!(matches!(error.failure.as_ref(), RarFailure::OutputAliasesInput));
+            assert_eq!(error.partial.volumes, 0);
+            assert_eq!(error.partial.encountered, 0);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert!(matches!(
+                RarSession::open(&path, None, RarSessionOptions::default()).err().unwrap().failure.as_ref(),
+                RarFailure::NotRar
+            ));
+        }
+    }
+
+    #[test]
+    fn output_open_rejects_later_alias_before_its_header_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("set.part1.rar");
+        let second = dir.path().join("set.part2.rar");
+        let main = [0xc5, 0x1a, 0x33, 0x32, 3, 1, 0, 0];
+        let more = [0x8f, 0x82, 0x3d, 0x42, 3, 5, 0, 1];
+        let first_bytes = [super::super::SIGNATURE.as_slice(), &main, &more].concat();
+        fs::write(&first, &first_bytes).unwrap();
+        fs::write(&second, b"malformed later input").unwrap();
+        let alias = dir.path().join("alias");
+        fs::hard_link(&second, &alias).unwrap();
+        let output = OpenOptions::new().append(true).open(alias).unwrap();
+        let error =
+            RarSession::open_with_output_file(&first, None, RarSessionOptions::default(), &output).err().unwrap();
+        assert!(matches!(error.failure.as_ref(), RarFailure::OutputAliasesInput));
+        assert_eq!(error.partial.volumes, 1);
+        assert_eq!(fs::read(first).unwrap(), first_bytes);
+        assert_eq!(fs::read(second).unwrap(), b"malformed later input");
+    }
+
+    #[test]
+    fn output_open_alias_check_precedes_a_source_path_binding_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("volume.rar");
+        fs::write(&path, b"original").unwrap();
+        let held = File::open(&path).unwrap();
+        let stamp = SourceStamp::capture(&held, &path).unwrap();
+        fs::rename(&path, dir.path().join("held-input")).unwrap();
+        fs::write(&path, b"replacement").unwrap();
+        let fault = SourceStamp::capture_for_output(&held, &path, Some((stamp.device, stamp.inode))).err().unwrap();
+        assert!(matches!(fault.failure.as_ref(), RarFailure::OutputAliasesInput));
+        assert!(matches!(
+            SourceStamp::capture(&held, &path).err().unwrap().failure.as_ref(),
+            RarFailure::SourceChanged { .. }
+        ));
+    }
+
+    #[test]
+    fn output_open_keeps_safe_errors_and_existing_open_behavior() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let malformed = dir.path().join("malformed.rar");
+        fs::write(&malformed, b"bad").unwrap();
+        let mut output = tempfile::tempfile().unwrap();
+        let failure =
+            RarSession::open_with_output_file(&malformed, None, RarSessionOptions::default(), &output).err().unwrap();
+        assert!(matches!(failure.failure.as_ref(), RarFailure::NotRar));
+        // A safe descriptor can carry the caller's normal early diagnostic.
+        writeln!(output, "safe diagnostic").unwrap();
+        assert_eq!(output.metadata().unwrap().len(), 16);
+        let missing = dir.path().join("missing.rar");
+        let failure =
+            RarSession::open_with_output_file(&missing, None, RarSessionOptions::default(), &output).err().unwrap();
+        assert!(
+            matches!(failure.failure.as_ref(), RarFailure::Input { operation: IoOperation::Open, source, .. } if source.kind() == io::ErrorKind::NotFound)
+        );
+        let cancel = Cancellation::default();
+        cancel.cancel();
+        let failure = RarSession::open_with_output_file(
+            &malformed,
+            None,
+            RarSessionOptions { cancel, ..RarSessionOptions::default() },
+            &output,
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(failure.failure.as_ref(), RarFailure::Canceled));
+    }
+
+    #[test]
+    fn output_open_accepts_distinct_regular_and_pipe_like_descriptors() {
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.rar");
+        let main = [0xc5, 0x1a, 0x33, 0x32, 3, 1, 0, 0];
+        let end = [0x19, 0xb2, 0x3a, 0x35, 3, 5, 0, 0];
+        let bytes = [super::super::SIGNATURE.as_slice(), &main, &end].concat();
+        fs::write(&path, &bytes).unwrap();
+        let (_reader, writer) = UnixStream::pair().unwrap();
+        for output in [tempfile::tempfile().unwrap(), File::from(OwnedFd::from(writer))] {
+            let mut session =
+                RarSession::open_with_output_file(&path, None, RarSessionOptions::default(), &output).unwrap();
+            session.check_output_file(&output).unwrap();
+            assert_eq!(session.entries().len(), 0);
+            assert_eq!(session.archive().volume_count(), 1);
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
 
     #[test]
     fn opens_each_volume_once_and_keeps_it_until_drop() {
