@@ -145,6 +145,7 @@ pub type RecordProjection<T> = for<'a> fn(ReducedCentralRecord<'a>) -> Result<T,
 pub struct DirectoryParser<T = CentralRecord> {
     state: State<T>,
     profile: Profile,
+    central_ut_only: bool,
     name_crc32: fn(&[u8]) -> u32,
     projection: RecordProjection<T>,
 }
@@ -207,6 +208,23 @@ impl DirectoryParser<CentralRecord> {
         Self::anchored(archive_len, end_offset, limits, scratch_bytes, true, materialize_record)
     }
 
+    /// Creates an anchored strict parser whose timestamp override uses only
+    /// the last complete central extended timestamp field (UT, ID 0x5455).
+    ///
+    /// A complete field without a usable mtime clears any earlier UT mtime.
+    /// An overrun ends the extra scan without processing that field.
+    /// See [`Self::at_eocd_with_scratch_limit`] for the scratch ceiling.
+    pub fn at_eocd_with_central_ut(
+        archive_len: u64,
+        end_offset: u64,
+        limits: Limits,
+        scratch_bytes: usize,
+    ) -> Result<Self, DirectoryError> {
+        let mut parser = Self::at_eocd_with_scratch_limit(archive_len, end_offset, limits, scratch_bytes)?;
+        parser.central_ut_only = true;
+        Ok(parser)
+    }
+
     /// Creates a parser using the supplied IEEE CRC-32 function for raw names.
     ///
     /// The function is used at most once per raw name with an eligible Unicode
@@ -259,6 +277,7 @@ impl<T> DirectoryParser<T> {
                 retain_comment,
             )?),
             profile,
+            central_ut_only: false,
             name_crc32: reducers::ieee_crc32,
             projection,
         })
@@ -290,6 +309,7 @@ impl<T> DirectoryParser<T> {
         Ok(Self {
             state: State::Discovery(EndDiscovery::new(archive_len, profile, limits)?),
             profile,
+            central_ut_only: false,
             name_crc32,
             projection,
         })
@@ -305,7 +325,8 @@ impl<T> DirectoryParser<T> {
             }
             let location = discovery.location.take().expect("completed discovery has a location");
             let usage = location.usage();
-            self.state = match Walk::new(location, self.profile, self.name_crc32, self.projection) {
+            self.state = match Walk::new(location, self.profile, self.central_ut_only, self.name_crc32, self.projection)
+            {
                 Ok(walk) => State::Walk(walk),
                 Err(error) => State::HandoffFailure(error, usage),
             };
@@ -408,6 +429,7 @@ struct Walk<T> {
     directory: Directory<T>,
     accounting: Accounting,
     ownership: OwnershipBudget,
+    central_ut_only: bool,
     name_crc32: fn(&[u8]) -> u32,
     projection: RecordProjection<T>,
     phase: Phase,
@@ -428,6 +450,7 @@ impl<T: Clone> Clone for Walk<T> {
             directory: self.directory.clone(),
             accounting: self.accounting,
             ownership: self.ownership.clone(),
+            central_ut_only: self.central_ut_only,
             name_crc32: self.name_crc32,
             projection: self.projection,
             phase: self.phase,
@@ -444,6 +467,7 @@ impl<T> Walk<T> {
     fn new(
         location: DirectoryLocation,
         profile: Profile,
+        central_ut_only: bool,
         name_crc32: fn(&[u8]) -> u32,
         projection: RecordProjection<T>,
     ) -> Result<Self, DirectoryError> {
@@ -481,6 +505,7 @@ impl<T> Walk<T> {
             },
             accounting,
             ownership,
+            central_ut_only,
             name_crc32,
             projection,
             phase: first_header.map_or(Phase::Signature, Phase::First),
@@ -806,7 +831,8 @@ impl<T> Walk<T> {
 
     fn project_record(&mut self, view: CentralView<'_>) -> Result<(), DirectoryError> {
         let profile = self.directory.profile;
-        let (resolved, known) = reducers::reduce(&view, profile, self.name_crc32, &mut self.accounting)?;
+        let (resolved, known) =
+            reducers::reduce(&view, profile, self.central_ut_only, self.name_crc32, &mut self.accounting)?;
         if profile == Profile::Zipfast {
             if !matches!(view.header().disk_start, 0 | u16::MAX) {
                 return Err(DirectoryError::UnsupportedDisk);

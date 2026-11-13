@@ -30,6 +30,7 @@ use super::Accounting;
 pub(super) fn reduce<'a>(
     view: &CentralView<'a>,
     profile: Profile,
+    central_ut_only: bool,
     name_crc32: fn(&[u8]) -> u32,
     accounting: &mut Accounting,
 ) -> Result<(ResolvedFields, KnownExtrasView<'a>), DirectoryError> {
@@ -67,17 +68,24 @@ pub(super) fn reduce<'a>(
                 if ntfs.first_tag() == 1 && ntfs.declared_attribute_len() >= 24 {
                     accounting.charge(8)?;
                     let ticks = le64(ntfs.attribute_bytes(), 0);
-                    if ticks != 0 {
+                    if ticks != 0 && !central_ut_only {
                         known.mtime_override = Some(ExtraMtime::NtfsFiletime(ticks));
                     }
                 }
             }
-            0x5455 if !body.is_empty() => {
-                let timestamp = ExtendedMtimeView::parse(body)?;
-                accounting.charge(1)?;
-                if timestamp.flags() & 1 != 0 && body.len() >= 5 {
-                    accounting.charge(4)?;
-                    known.mtime_override = Some(ExtraMtime::UnixSeconds(le32(timestamp.timestamp_data(), 0) as i32));
+            0x5455 => {
+                if central_ut_only {
+                    // Each framed UT field supersedes the previous one, even without mtime.
+                    known.mtime_override = None;
+                }
+                if !body.is_empty() {
+                    let timestamp = ExtendedMtimeView::parse(body)?;
+                    accounting.charge(1)?;
+                    if timestamp.flags() & 1 != 0 && body.len() >= 5 {
+                        accounting.charge(4)?;
+                        known.mtime_override =
+                            Some(ExtraMtime::UnixSeconds(le32(timestamp.timestamp_data(), 0) as i32));
+                    }
                 }
             }
             0x7075 if profile == Profile::Zipfast && body.len() >= 5 => {

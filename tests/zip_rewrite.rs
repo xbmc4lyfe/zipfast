@@ -31,6 +31,7 @@ use zipfast::zip::write::{
     DeflateLevel, DosDateTime, EntryName, EntryOptions, InputLength, Method, Permissions, WriterOptions,
     ZipStreamWriter, ZipWriter,
 };
+use zipfast::zip::{Archive, ExtraMtime, ReadSession};
 
 fn u16le(out: &mut Vec<u8>, val: u16) {
     out.extend(val.to_le_bytes());
@@ -45,6 +46,7 @@ struct Fixture<'a> {
     descriptor: &'a [u8],
     flags: u16,
     extra: &'a [u8],
+    central_extra: Option<&'a [u8]>,
     gap: &'a [u8],
     crc: u32,
     method: u16,
@@ -78,7 +80,7 @@ fn archive(f: Fixture<'_>) -> Vec<u8> {
         }
     };
     let extra = |local: bool, placeholder: bool| {
-        let mut extra = f.extra.to_vec();
+        let mut extra = if local { f.extra } else { f.central_extra.unwrap_or(f.extra) }.to_vec();
         let offset = f.wide_offset && !local;
         if f.wide_sizes || offset {
             u16le(&mut extra, 1);
@@ -169,6 +171,50 @@ fn run(bytes: &[u8], options: RewriteOptions) -> Result<RewriteOutcome, RewriteE
     assert_eq!(fs::read(path).unwrap(), bytes);
     assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
     result
+}
+
+#[test]
+fn rewrite_can_opt_into_central_ut_without_changing_ordinary_timestamps() {
+    let ut = [0x55, 0x54, 5, 0, 1, 0x00, 0xf1, 0x53, 0x65]; // 1_700_000_000 UTC.
+    let ntfs_ticks = 133_444_736_021_234_567_u64;
+    let mut ntfs = vec![0x0a, 0, 32, 0, 0, 0, 0, 0, 1, 0, 24, 0];
+    ntfs.extend(ntfs_ticks.to_le_bytes());
+    ntfs.extend([0; 16]);
+    let unix = Some(ExtraMtime::UnixSeconds(1_700_000_000));
+    let filetime = Some(ExtraMtime::NtfsFiletime(ntfs_ticks));
+    let ut_time = Some((1_700_000_000, 0));
+    let ntfs_time = Some((1_700_000_002, 123_456_700));
+    let dos_time = Some((315_532_800, 0)); // 1980-01-01 UTC.
+    let cases = [
+        ("UT then NTFS", [&ut[..], &ntfs].concat(), filetime, ntfs_time, unix, ut_time),
+        ("NTFS then UT", [&ntfs[..], &ut].concat(), unix, ut_time, unix, ut_time),
+        ("central NTFS with local UT", ntfs, filetime, ntfs_time, None, dos_time),
+        ("local UT only", Vec::new(), None, dos_time, None, dos_time),
+    ];
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("archive.zip");
+    for (case, extra, ordinary_raw, ordinary_modified, opted_in_raw, opted_in_modified) in cases {
+        let bytes = archive(Fixture { extra: &ut, central_extra: Some(&extra), ..Fixture::default() });
+        fs::write(&path, &bytes).unwrap();
+        let read = ReadSession::open(&path).unwrap().metadata();
+        let ordinary = RewritePlan::open(&path, opts()).unwrap().metadata();
+        for metadata in [read, ordinary] {
+            let entry = metadata.entries().next().unwrap();
+            assert_eq!(entry.raw_mtime_override(), ordinary_raw, "{case}");
+            assert_eq!(entry.modified(), ordinary_modified, "{case}");
+        }
+        let archive = Archive::open(&path).unwrap();
+        let expected = ordinary_modified.unwrap();
+        assert_eq!((archive.entries[0].mtime, archive.entries[0].nanos), (Some(expected.0), expected.1), "{case}");
+
+        let plan = RewritePlan::open_with_central_ut(&path, opts()).unwrap();
+        let metadata = plan.metadata();
+        let entry = metadata.entry(&metadata.entry_id(0).unwrap()).unwrap();
+        assert_eq!(entry.raw_mtime_override(), opted_in_raw, "{case}");
+        assert_eq!(entry.modified(), opted_in_modified, "{case}");
+        assert!(matches!(plan.publish().unwrap(), RewriteOutcome::Unchanged { .. }));
+        assert_eq!(fs::read(&path).unwrap(), bytes, "{case}");
+    }
 }
 
 #[test]

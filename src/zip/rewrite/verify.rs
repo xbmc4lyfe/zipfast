@@ -88,6 +88,7 @@ impl Manifest<'_> {
             },
             stage_stamp.len,
             Some(expected_eocd),
+            false,
             DirectoryBudget {
                 core: limits.directory,
                 scratch: limits.verification_scratch,

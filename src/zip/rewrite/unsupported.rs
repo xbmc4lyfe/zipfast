@@ -33,6 +33,11 @@ impl RewritePlan {
         Err(CreateError::UnsupportedPlatform.into())
     }
 
+    /// Returns the unsupported platform error.
+    pub fn open_with_central_ut(path: &Path, options: RewriteOptions) -> Result<Self, RewriteError> {
+        Self::open(path, options)
+    }
+
     pub fn metadata(&self) -> Arc<Metadata> {
         match self.unavailable {}
     }

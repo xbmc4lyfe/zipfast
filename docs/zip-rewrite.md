@@ -17,6 +17,17 @@ preserved. The collision policy checks introduced raw-name conflicts.
 Caller keys are applied only to the new and replacement entries that
 supply them.
 
+By default, `RewritePlan::open` selects the last valid central modification
+time from an extended Unix timestamp or an NTFS timestamp in wire order.
+Call `RewritePlan::open_with_central_ut` to compare freshness using only
+central extended Unix timestamps. In this mode, `raw_mtime_override()`
+returns the modification time from the last complete central UT field
+when it contains a usable value. An extra that overruns the block ends
+the scan before that field. `modified()` uses the selected UT value or
+interprets the DOS fields as UTC. Use `header()` for raw DOS fields
+when applying a local time zone. This option only affects the plan's
+source metadata projection.
+
 `publish()` first validates the complete source layout, including records
 that will be removed. The source must have contiguous disjoint local spans,
 a contiguous complete directory and a single supported end chain at EOF.
