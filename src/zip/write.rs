@@ -64,6 +64,9 @@ use records::{End, Member, Width};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) mod raw;
 mod records;
+// The split framing milestone will use the transport in production.
+#[cfg(test)]
+mod split;
 mod stream;
 pub use stream::ZipStreamWriter;
 #[cfg(test)]
