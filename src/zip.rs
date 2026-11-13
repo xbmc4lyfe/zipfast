@@ -671,7 +671,7 @@ fn project_aes(aes: Option<AesFields>) -> Option<(u8, u16, u16)> {
 }
 
 /// MS-DOS date and time, which carry no time zone: read as UTC.
-fn dos_time(time: u16, date: u16) -> Option<i64> {
+pub(crate) fn dos_time(time: u16, date: u16) -> Option<i64> {
     let (year, month, day) = (1980 + i64::from(date >> 9), i64::from((date >> 5) & 15), i64::from(date & 31));
     let (hour, min, sec) = (i64::from(time >> 11), i64::from((time >> 5) & 63), i64::from(time & 31) * 2);
     if !(1..=12).contains(&month) || day == 0 || hour > 23 || min > 59 || sec > 59 {

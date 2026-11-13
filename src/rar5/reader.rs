@@ -16,6 +16,8 @@
 
 //! Walks one RAR 5.0 volume block by block.
 
+mod rar4;
+
 use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -322,6 +324,8 @@ pub struct Volume {
     pub main: MainHeader,
     password: Option<String>,
     header_key: Option<crate::crypto::Rar5Keys>,
+    format: RarFormat,
+    rar4_main_seen: bool,
 }
 
 pub(crate) const SIGNATURE_PROBE_BYTES: u64 = MAX_SFX + SIGNATURE.len() as u64;
@@ -333,16 +337,20 @@ fn volume_length(path: &Path, metadata: impl FnOnce() -> std::io::Result<std::fs
 }
 
 pub(crate) fn signature_end(head: &[u8]) -> Result<u64> {
-    if head.starts_with(SIGNATURE) {
-        return Ok(SIGNATURE.len() as u64);
+    signature_location(head).map(|(offset, _)| offset)
+}
+
+fn signature_location(head: &[u8]) -> Result<(u64, RarFormat)> {
+    for at in 0..head.len().min(MAX_SFX as usize + 1) {
+        let tail = &head[at..];
+        if tail.starts_with(SIGNATURE) {
+            return Ok(((at + SIGNATURE.len()) as u64, RarFormat::Rar5));
+        }
+        if tail.starts_with(SIGNATURE_V4) {
+            return Ok(((at + SIGNATURE_V4.len()) as u64, RarFormat::Rar4));
+        }
     }
-    if head.starts_with(SIGNATURE_V4) {
-        return Err(Error::Unsupported("RAR 4.x archive".into()));
-    }
-    head.windows(SIGNATURE.len())
-        .position(|w| w == SIGNATURE)
-        .map(|at| (at + SIGNATURE.len()) as u64)
-        .ok_or(Error::NotAnArchive)
+    Err(Error::NotAnArchive)
 }
 
 #[cfg(all(test, unix))]
@@ -398,10 +406,14 @@ impl Volume {
         } else {
             None
         };
-        let next = if let Some((first, _)) = first
+        let (next, format) = if let Some((first, _)) = first
             && first == *SIGNATURE
         {
-            SIGNATURE.len() as u64
+            (SIGNATURE.len() as u64, RarFormat::Rar5)
+        } else if let Some((first, _)) = first
+            && first.starts_with(SIGNATURE_V4)
+        {
+            (SIGNATURE_V4.len() as u64, RarFormat::Rar4)
         } else {
             Self::probe_signature(path, &file, len, first, budget.as_deref_mut())?
         };
@@ -413,6 +425,8 @@ impl Volume {
             main: MainHeader::default(),
             password: password.filter(|s| !s.is_empty()).map(str::to_owned),
             header_key: None,
+            format,
+            rar4_main_seen: false,
         };
         match vol.next_block_impl(detailed, budget, true)? {
             Some((Block::Main(m), _, _)) => vol.main = m,
@@ -434,7 +448,7 @@ impl Volume {
         len: u64,
         first: Option<([u8; SIGNATURE.len()], usize)>,
         budget: Option<&mut ScanBudget<'_>>,
-    ) -> RarResult<u64> {
+    ) -> RarResult<(u64, RarFormat)> {
         let len = len.min(SIGNATURE_PROBE_BYTES) as usize;
         if let (Some(budget), Some((_, used))) = (&budget, first) {
             budget.check_read(len - used)?;
@@ -448,7 +462,7 @@ impl Volume {
             read_at_detailed(file, &mut head, 0)
                 .map_err(|e| read_failure(e, Some(path.to_path_buf()), RarIntegrityReason::TruncatedHeader))?;
         }
-        signature_end(&head).map_err(|e| {
+        signature_location(&head).map_err(|e| {
             let failure = match e {
                 Error::NotAnArchive => RarFailure::NotRar,
                 _ => RarFailure::Unsupported(RarUnsupported::ArchiveVersion(4)),
@@ -470,6 +484,10 @@ impl Volume {
 
     pub(super) fn next_catalogue(&mut self, budget: &mut ScanBudget<'_>) -> RarResult<Option<ParsedBlock>> {
         self.next_block_impl(true, Some(budget), false)
+    }
+
+    pub fn format(&self) -> RarFormat {
+        self.format
     }
 
     pub(super) fn encrypted_headers(&self) -> bool {
@@ -511,6 +529,9 @@ impl Volume {
         mut budget: Option<&mut ScanBudget<'_>>,
         catalogue_main: bool,
     ) -> RarResult<Option<ParsedBlock>> {
+        if self.format == RarFormat::Rar4 {
+            return self.next_rar4(budget);
+        }
         loop {
             if self.next >= self.len {
                 return Ok(None);
@@ -836,6 +857,8 @@ mod tests {
             main: MainHeader::default(),
             password: None,
             header_key: None,
+            format: RarFormat::Rar5,
+            rar4_main_seen: false,
         };
         let (send, recv) = sync_channel(1);
         let (spare, _) = channel();
@@ -870,6 +893,8 @@ mod tests {
             main: MainHeader::default(),
             password: None,
             header_key: None,
+            format: RarFormat::Rar5,
+            rar4_main_seen: false,
         };
         let Err(ReadDataError::Input(fault)) = volume.read_data_detailed::<()>(0, 2, |_, _| panic!("out of bounds"))
         else {
