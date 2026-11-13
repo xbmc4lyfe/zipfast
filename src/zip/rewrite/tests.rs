@@ -51,7 +51,7 @@ use std::{
 
 use crate::zip::create::{CleanupState, Durability, DurabilityState, Publication};
 use crate::zip::write::{
-    DosDateTime, EntryName, EntryOptions, InputLength, Method, Permissions, WriterOptions, ZipWriter,
+    DosDateTime, EntryName, EntryOptions, EntryWritten, InputLength, Method, Permissions, WriterOptions, ZipWriter,
 };
 
 use super::{
@@ -328,6 +328,58 @@ fn directory_sync_failure_reports_verified_published_output() {
     assert_eq!(failure.verification.unwrap().new_verified, 1);
     assert_ne!(fs::read(archive).unwrap(), old);
     assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn write_receipts_require_known_publication_even_when_finalization_fails() {
+    for (event, publication) in [
+        (Event::BeforeFinalCheck, Publication::NotPublished),
+        (Event::NativePublish, Publication::Unknown),
+        (Event::AfterCommit, Publication::Published),
+        (Event::DirectorySync, Publication::Published),
+    ] {
+        let (root, archive, old) = old_archive();
+        let before = fs::metadata(&archive).unwrap();
+        let mut options = options();
+        options.durability = Durability::SyncFileAndDirectory;
+        let cancel = options.cancel.clone();
+        let plan = edited(&archive, options, "new/");
+        let report = with_hook(
+            move |observed, _| {
+                if observed == event {
+                    if observed == Event::AfterCommit {
+                        cancel.cancel();
+                    } else {
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                    }
+                }
+                Ok(())
+            },
+            || plan.publish_with_receipts(),
+        );
+        let failure = report.outcome.unwrap_err();
+        assert_eq!(failure.publication, publication);
+        if publication == Publication::Published {
+            assert_eq!(failure.verification.unwrap().new_verified, 1);
+            assert_eq!(
+                report.written,
+                [EntryWritten {
+                    ordinal: 1,
+                    method: Method::Stored,
+                    crc32: 0,
+                    decoded_size: 0,
+                    packed_size: 0,
+                    local_offset: 41,
+                }]
+            );
+            assert_ne!(fs::read(&archive).unwrap(), old);
+        } else {
+            assert!(report.written.is_empty());
+            unchanged(&archive, &old, &before);
+        }
+        let files = if publication == Publication::Unknown { 2 } else { 1 };
+        assert_eq!(fs::read_dir(root.path()).unwrap().count(), files);
+    }
 }
 
 #[test]

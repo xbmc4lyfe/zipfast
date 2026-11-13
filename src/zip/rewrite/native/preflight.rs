@@ -26,7 +26,7 @@ pub(super) struct Prepared {
 }
 
 impl RewritePlan {
-    pub(super) fn preflight(&mut self) -> Result<Prepared> {
+    pub(super) fn preflight(&mut self, receipts: Option<&mut Vec<EntryWritten>>) -> Result<Prepared> {
         let options = &self.options;
         let limits = options.limits;
         let changed = !self.inputs.is_empty() || self.actions.iter().any(|action| matches!(action, Action::Remove));
@@ -43,8 +43,9 @@ impl RewritePlan {
         let fixed = self.fixed_capacity()?;
         let overhead = add(bytes_for::<Member>(old)?, bytes_for::<usize>(index_count)?)?;
         let outcome_bytes = bytes_for::<EntryVerification>(count)?;
-        let receipt_bytes = if changed { bytes_for::<WrittenEntry>(count)? } else { 0 };
-        let total = add(add(fixed, overhead)?, add(outcome_bytes, receipt_bytes)?)?;
+        let manifest_bytes = if changed { bytes_for::<WrittenEntry>(count)? } else { 0 };
+        let receipt_bytes = if receipts.is_some() { bytes_for::<EntryWritten>(self.inputs.len())? } else { 0 };
+        let total = add(add(fixed, overhead)?, add(outcome_bytes, add(manifest_bytes, receipt_bytes)?)?)?;
         limit(total, limits.common.plan_capacity, CreateLimit::PlanCapacity)?;
         members.try_reserve_exact(old)?;
         members.resize(old, Member::default());
@@ -52,13 +53,19 @@ impl RewritePlan {
         if changed {
             written.try_reserve_exact(count)?
         }
+        let receipt_bytes = if let Some(receipts) = receipts {
+            receipts.try_reserve_exact(self.inputs.len())?;
+            bytes_for::<EntryWritten>(receipts.capacity())?
+        } else {
+            0
+        };
         let outcomes = VerificationSummary::reserve(count)?;
         let overhead = add(bytes_for::<Member>(members.capacity())?, bytes_for::<usize>(order.capacity())?)?;
         let actual = add(
             add(fixed, overhead)?,
             add(
                 bytes_for::<EntryVerification>(outcomes.entries.capacity())?,
-                bytes_for::<WrittenEntry>(written.capacity())?,
+                add(bytes_for::<WrittenEntry>(written.capacity())?, receipt_bytes)?,
             )?,
         )?;
         limit(actual, limits.common.plan_capacity, CreateLimit::PlanCapacity)?;

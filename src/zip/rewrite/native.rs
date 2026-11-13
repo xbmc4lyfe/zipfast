@@ -276,8 +276,24 @@ impl RewritePlan {
     /// Verify and publish the plan. All layout and known feasibility checks
     /// run before stage creation. An empty edit plan checks the original
     /// in place and returns without publication or synchronization.
-    pub fn publish(mut self) -> std::result::Result<RewriteOutcome, RewriteFailure> {
-        let plan = self.preflight().map_err(|cause| {
+    pub fn publish(self) -> std::result::Result<RewriteOutcome, RewriteFailure> {
+        self.publish_inner(None)
+    }
+
+    /// Publish with actual write receipts for new and replaced members.
+    /// Receipt capacity is charged to the plan budget before staging.
+    /// See [`RewriteReport`] for when receipts are available.
+    pub fn publish_with_receipts(self) -> RewriteReport {
+        let mut written = Vec::new();
+        let outcome = self.publish_inner(Some(&mut written));
+        RewriteReport { outcome, written }
+    }
+
+    fn publish_inner(
+        mut self,
+        mut receipts: Option<&mut Vec<EntryWritten>>,
+    ) -> std::result::Result<RewriteOutcome, RewriteFailure> {
+        let plan = self.preflight(receipts.as_deref_mut()).map_err(|cause| {
             self.failure(RewriteStage::Planning, cause, Publication::NotPublished, CleanupState::Clean)
         })?;
         if self.inputs.is_empty()
@@ -290,7 +306,7 @@ impl RewritePlan {
             let usage = self.usage();
             return Ok(RewriteOutcome::Unchanged { source: self.parent.destination, verification, usage });
         }
-        self.publish_staged(plan)
+        self.publish_staged(plan, receipts)
     }
 
     fn failure(
@@ -351,6 +367,7 @@ impl RewritePlan {
     fn publish_staged(
         mut self,
         mut prepared: preflight::Prepared,
+        receipts: Option<&mut Vec<EntryWritten>>,
     ) -> std::result::Result<RewriteOutcome, RewriteFailure> {
         let attempts = Attempts::with_limits(
             &self.options.cancel,
@@ -400,6 +417,12 @@ impl RewritePlan {
                 return Err(failure);
             }
         };
+        if let Some(receipts) = receipts {
+            receipts.extend(prepared.written.iter().filter_map(|entry| match entry {
+                WrittenEntry::New { receipt, .. } => Some(*receipt),
+                WrittenEntry::Preserved(_) => None,
+            }));
+        }
         let durability = if self.options.durability == Durability::SyncFileAndDirectory {
             let synced = after_commit_sync(&self.parent.file, &finalization);
             self.usage.common.finalization_attempts = final_count.get();

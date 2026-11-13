@@ -41,7 +41,7 @@ use super::create::{
     CleanupState, CollisionPolicy, CreateError, CreateLimits, CreateUsage, Durability, DurabilityState, Publication,
     VerificationUsage,
 };
-use super::write::WriteError;
+use super::write::{EntryWritten, WriteError};
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 mod layout;
@@ -277,6 +277,20 @@ pub struct VerificationSummary {
 pub enum RewriteOutcome {
     Unchanged { source: PathBuf, verification: VerificationSummary, usage: RewriteUsage },
     Replaced(RewrittenArchive),
+}
+
+/// Rewrite result with opt-in member write receipts.
+#[derive(Debug)]
+#[must_use]
+pub struct RewriteReport {
+    pub outcome: std::result::Result<RewriteOutcome, RewriteFailure>,
+    /// Newly written members in output central-directory order, including
+    /// replacements and appends. Each ordinal refers to the output after
+    /// removals. Raw retained entries have no write receipt.
+    ///
+    /// Receipts require confirmed publication. They are also available when
+    /// publication succeeded and finalization returned an error.
+    pub written: Vec<EntryWritten>,
 }
 
 /// Receipt for a completed replacement.
