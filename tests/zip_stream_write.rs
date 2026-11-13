@@ -1100,6 +1100,28 @@ impl Write for InterruptingSink {
 }
 
 #[test]
+fn zipcrypto_entry_attempt_bound_accounts_for_an_empty_name() {
+    let options =
+        WriterOptions { limits: WriteLimits { io_attempts: 5, ..WriteLimits::default() }, ..WriterOptions::default() };
+    let mut writer = ZipStreamWriter::new(io::sink(), options).unwrap();
+    let result = writer
+        .add_zipcrypto_file(
+            entry("", Method::Stored),
+            &mut io::empty(),
+            InputLength::Exact(0),
+            "zipfast-test-only",
+            |random| {
+                random.fill(9);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!((result.decoded_size, result.packed_size), (0, 12));
+    assert_eq!(writer.usage().io_attempts, 5);
+    assert!(matches!(writer.finish(), Err(WriteError::Limit(Limit::IoAttempts))));
+}
+
+#[test]
 fn retries_and_codec_iterations_consume_the_finite_attempt_budget() {
     let options = |io_attempts| WriterOptions {
         limits: WriteLimits { io_attempts, ..WriteLimits::default() },

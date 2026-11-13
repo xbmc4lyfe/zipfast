@@ -233,7 +233,7 @@ pub struct WriteLimits {
     pub archive_extent: u64,
     /// Cumulative bytes written, including backpatches.
     pub output_bytes: u64,
-    /// Read, write, seek, flush and codec attempts, including retries.
+    /// Read, write, seek, flush, codec and entropy attempts, including retries.
     pub io_attempts: u64,
 }
 

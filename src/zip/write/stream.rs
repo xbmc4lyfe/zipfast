@@ -196,9 +196,10 @@ impl<W: Write> ZipStreamWriter<W> {
         let end = End::new(entries, central, central_at, self.wide_member || member.width.is_wide(), self.comment_len);
         self.output.check_tail(end, before_tail)?;
         if encrypted {
-            // Entropy, an input read, the fixed local record and name, the
+            // Entropy, an input read, the fixed local record, the
             // encryption header and a descriptor are mandatory.
-            bound(add(work.usage.io_attempts, 6)?, limits.io_attempts, Limit::IoAttempts)?;
+            let minimum = 5 + u64::from(!options.name.bytes().is_empty());
+            bound(add(work.usage.io_attempts, minimum)?, limits.io_attempts, Limit::IoAttempts)?;
         }
         work.check_canceled()?;
         let max_capacity = limits.metadata_capacity - self.comment.capacity() as u64;
