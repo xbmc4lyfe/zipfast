@@ -102,4 +102,9 @@ impl RewritePlan {
     pub fn publish_with_receipts(self) -> RewriteReport {
         match self.unavailable {}
     }
+
+    /// Publishes with write receipts and a verified destination binding.
+    pub fn publish_with_bound_receipts(self) -> (RewriteReport, Option<PublishedArchiveBinding>) {
+        match self.unavailable {}
+    }
 }

@@ -48,7 +48,7 @@ pub(in crate::zip) struct Stamp {
 }
 
 impl Stamp {
-    fn regular(meta: &Metadata) -> Result<Self> {
+    pub(in crate::zip) fn regular(meta: &Metadata) -> Result<Self> {
         if !meta.is_file() {
             return Err(CreateError::SourceNotRegular);
         }
@@ -375,6 +375,28 @@ impl Stage {
         // before creating the path, including on this error branch.
         self.path.keep().unwrap_or_else(|error| error.path.to_path_buf())
     }
+}
+
+pub(in crate::zip) fn publication_stamp(stage: &Stage, verified: Stamp, budget: &Attempts<'_>) -> Option<Stamp> {
+    let held = file_stamp(&stage.file, budget).ok()?;
+    // Native publication can change ctime. Keep the already verified
+    // payload geometry, identity and permissions as the baseline.
+    (held.same_payload(verified) && held.mode == verified.mode).then_some(held)
+}
+
+pub(in crate::zip) fn bound_publication(
+    parent: &Parent,
+    stage: &Stage,
+    expected: Stamp,
+    budget: &Attempts<'_>,
+) -> Option<super::PublishedArchiveBinding> {
+    parent.check(budget).ok()?;
+    let Some(NameState::Regular(named)) = parent.lookup(&parent.leaf, budget).ok()? else { return None };
+    if named != expected || file_stamp(&stage.file, budget).ok()? != expected {
+        return None;
+    }
+    let file = budget.run(|| stage.file.try_clone()).ok()?;
+    Some(super::PublishedArchiveBinding { file, stamp: expected })
 }
 
 pub(in crate::zip) enum PublishError {
