@@ -71,4 +71,9 @@ impl CreatePlan {
     pub fn publish(self) -> std::result::Result<CreatedArchive, CreateFailure> {
         match self.0 {}
     }
+
+    /// Publishes with write receipts on supported platforms.
+    pub fn publish_with_receipts(self) -> CreateReport {
+        match self.0 {}
+    }
 }

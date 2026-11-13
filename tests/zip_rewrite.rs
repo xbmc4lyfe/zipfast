@@ -174,6 +174,113 @@ fn run(bytes: &[u8], options: RewriteOptions) -> Result<RewriteOutcome, RewriteE
 }
 
 #[test]
+fn write_receipts_follow_output_order_and_exclude_retained_entries() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("archive.zip");
+    let mut writer = ZipWriter::new(File::create(&path).unwrap(), WriterOptions::default()).unwrap();
+    for name in ["removed", "retained", "replaced"] {
+        writer
+            .add_file(entry(EntryName::Utf8(name), Method::Stored), &mut b"old".as_slice(), InputLength::Exact(3))
+            .unwrap();
+    }
+    writer.finish().unwrap();
+    let data = [b'a'; 4096];
+    let source = root.path().join("payload");
+    fs::write(&source, data).unwrap();
+    let mut plan = RewritePlan::open(&path, opts()).unwrap();
+    let metadata = plan.metadata();
+    let deflate = Method::Deflate(DeflateLevel::new(6).unwrap());
+    plan.add_file(Placement::Append, &source, entry(EntryName::Utf8("appended"), Method::Stored), None).unwrap();
+    plan.add_file(
+        Placement::Replace(metadata.entry_id(2).unwrap()),
+        &source,
+        entry(EntryName::Utf8("replaced"), deflate),
+        None,
+    )
+    .unwrap();
+    plan.remove(&metadata.entry_id(0).unwrap()).unwrap();
+    let report = plan.publish_with_receipts();
+    assert!(matches!(report.outcome, Ok(RewriteOutcome::Replaced(_))));
+    assert_eq!(report.written.iter().map(|receipt| receipt.ordinal).collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(report.written[0].method, deflate);
+    assert!(report.written[0].packed_size < 4096);
+    assert_eq!(report.written[1].method, Method::Stored);
+    assert_eq!(report.written[1].packed_size, 4096);
+
+    let output = RewritePlan::open(&path, opts()).unwrap().metadata();
+    assert_eq!(
+        output.entries().map(|entry| entry.raw_name()).collect::<Vec<_>>(),
+        [b"retained".as_slice(), b"replaced", b"appended"]
+    );
+    for (receipt, output) in report.written.iter().zip(output.entries().skip(1)) {
+        assert_eq!(receipt.decoded_size, 4096);
+        assert_eq!(receipt.crc32, crc32fast::hash(&data));
+        assert_eq!(receipt.packed_size, output.packed_size());
+        assert_eq!(receipt.local_offset, output.physical_local_header_offset());
+    }
+}
+
+#[test]
+fn no_op_and_deletion_only_rewrites_have_no_write_receipts() {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("archive.zip");
+    let bytes = archive(Fixture::default());
+    fs::write(&path, &bytes).unwrap();
+    let inode = fs::metadata(&path).unwrap().ino();
+    let report = RewritePlan::open(&path, opts()).unwrap().publish_with_receipts();
+    let Ok(RewriteOutcome::Unchanged { usage, .. }) = report.outcome else { panic!("expected unchanged archive") };
+    assert_eq!(usage.common.stage_attempts, 0);
+    assert!(report.written.is_empty());
+    assert_eq!(fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+
+    let mut plan = RewritePlan::open(&path, opts()).unwrap();
+    plan.remove(&plan.metadata().entry_id(0).unwrap()).unwrap();
+    let report = plan.publish_with_receipts();
+    assert!(matches!(report.outcome, Ok(RewriteOutcome::Replaced(_))));
+    assert!(report.written.is_empty());
+    assert_ne!(fs::metadata(&path).unwrap().ino(), inode);
+    assert_eq!(RewritePlan::open(&path, opts()).unwrap().metadata().len(), 0);
+}
+
+#[test]
+fn receipt_capacity_is_charged_before_staging_only_when_requested() {
+    use zipfast::zip::create::{CreateError, CreateLimit};
+    use zipfast::zip::rewrite::RewriteStage;
+    use zipfast::zip::write::EntryWritten;
+
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("archive.zip");
+    let bytes = archive(Fixture::default());
+    let plan = |options| {
+        fs::write(&path, &bytes).unwrap();
+        let mut plan = RewritePlan::open(&path, options).unwrap();
+        plan.add_directory(Placement::Append, entry(EntryName::Utf8("appended/"), Method::Stored), None).unwrap();
+        plan
+    };
+    let RewriteOutcome::Replaced(baseline) = plan(opts()).publish().unwrap() else { panic!("expected replacement") };
+    let mut options = opts();
+    options.limits.common.plan_capacity = baseline.usage.common.plan.capacity;
+    assert!(matches!(plan(options.clone()).publish(), Ok(RewriteOutcome::Replaced(_))));
+    let report = plan(options.clone()).publish_with_receipts();
+    let failure = report.outcome.unwrap_err();
+    assert!(matches!(failure.cause, RewriteError::Infrastructure(CreateError::Limit(CreateLimit::PlanCapacity))));
+    assert_eq!(failure.stage, RewriteStage::Planning);
+    assert_eq!(failure.usage.common.stage_attempts, 0);
+    assert!(report.written.is_empty());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(fs::read_dir(root.path()).unwrap().count(), 1);
+
+    options.limits.common.plan_capacity += size_of::<EntryWritten>() as u64;
+    let report = plan(options.clone()).publish_with_receipts();
+    let Ok(RewriteOutcome::Replaced(output)) = report.outcome else { panic!("expected replacement") };
+    assert_eq!(output.usage.common.plan.capacity, options.limits.common.plan_capacity);
+    assert_eq!(report.written.len(), 1);
+}
+
+#[test]
 fn rewrite_can_opt_into_central_ut_without_changing_ordinary_timestamps() {
     let ut = [0x55, 0x54, 5, 0, 1, 0x00, 0xf1, 0x53, 0x65]; // 1_700_000_000 UTC.
     let ntfs_ticks = 133_444_736_021_234_567_u64;

@@ -101,6 +101,13 @@ name, or a failure checking or removing the owned stage. An uncertain
 ownership check preserves the stage and reports the last known path. A
 published archive remains in place after cleanup or synchronization errors.
 
+Call `publish_with_receipts()` to get the ordinary creation result in
+`CreateReport::outcome` and actual writer results in `CreateReport::written`.
+Each receipt's central-directory ordinal equals its `CreateEntryId::ordinal()`.
+Once publication succeeds, the report includes receipts even if cleanup
+or directory synchronization fails. It reuses the receipts the plan
+budgets for verification.
+
 `VisibilityOnly` publishes complete verified bytes atomically.
 `SyncFileAndDirectory` also calls native `fsync` on the stage before
 publication and the held parent afterward. `Synced` records successful

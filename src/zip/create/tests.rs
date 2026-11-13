@@ -252,6 +252,59 @@ fn simple_plan(options: CreateOptions) -> (tempfile::TempDir, PathBuf, PathBuf, 
 }
 
 #[test]
+fn creation_receipts_require_confirmed_publication() {
+    for (fault, stage, publication) in [
+        (Event::BeforeCommit, CreateStage::Precommit, Publication::NotPublished),
+        (Event::NativePublish, CreateStage::Publish, Publication::Unknown),
+        (Event::AfterCommit, CreateStage::Cleanup, Publication::Published),
+        (Event::DirectorySync, CreateStage::DirectorySync, Publication::Published),
+    ] {
+        let (_dir, _source, output, plan) =
+            simple_plan(CreateOptions { durability: Durability::SyncFileAndDirectory, ..CreateOptions::default() });
+        let report = with_hook(
+            move |event, path| {
+                if event == fault {
+                    if event == Event::AfterCommit {
+                        std::fs::write(path.unwrap(), b"foreign after commit")?;
+                    } else {
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                    }
+                }
+                Ok(())
+            },
+            || plan.publish_with_receipts(),
+        );
+        let failure = report.outcome.unwrap_err();
+        assert_eq!((failure.stage, failure.publication), (stage, publication));
+        if publication == Publication::Published {
+            assert_eq!(
+                report.written,
+                [EntryWritten {
+                    ordinal: 0,
+                    method: Method::Stored,
+                    crc32: crate::crc32::hash(b"source data"),
+                    decoded_size: 11,
+                    packed_size: 11,
+                    local_offset: 0,
+                }]
+            );
+            let mut bytes = Vec::new();
+            crate::zip::Archive::open(&output)
+                .unwrap()
+                .read_at(0, None, 64, |chunk| {
+                    bytes.extend_from_slice(chunk);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(bytes, b"source data");
+        } else {
+            assert!(report.written.is_empty());
+            assert!(!output.exists());
+        }
+    }
+}
+
+#[test]
 fn each_precommit_failure_is_definite_and_cleans_the_stage() {
     let sync = || CreateOptions { durability: Durability::SyncFileAndDirectory, ..CreateOptions::default() };
     for (fault, expected) in [

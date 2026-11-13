@@ -22,11 +22,11 @@ use std::os::unix::fs::{FileExt, PermissionsExt};
 use std::path::Path;
 use std::process::Command;
 
-use zipfast::zip::Archive;
 use zipfast::zip::create::{
     CleanupState, CreateError, CreateOptions, CreatePlan, Durability, DurabilityState, Publication,
 };
 use zipfast::zip::write::{DeflateLevel, DosDateTime, EntryName, EntryOptions, Method, Permissions};
+use zipfast::zip::{Archive, ReadSession};
 
 fn options(name: EntryName<'_>, method: Method, mode: u16) -> EntryOptions<'_> {
     EntryOptions {
@@ -52,6 +52,48 @@ fn bytes_at(archive: &mut Archive, index: usize, max: u64) -> Vec<u8> {
         })
         .unwrap();
     bytes
+}
+
+#[test]
+fn creation_receipts_match_published_output_with_the_existing_plan_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("archive.zip");
+    let source = dir.path().join("source");
+    let data = [b'a'; 4096];
+    fs::write(&source, data).unwrap();
+    let plan = |create_options| {
+        let mut plan = CreatePlan::new(&path, create_options).unwrap();
+        let dir = plan.add_directory(options(EntryName::Utf8("dir/"), Method::Stored, 0o755), None).unwrap();
+        let file = plan.add_file(&source, options(EntryName::Utf8("dir/file"), deflate(6), 0o640), None).unwrap();
+        assert_eq!((dir.ordinal(), file.ordinal()), (0, 1));
+        plan
+    };
+    let ordinary = plan(CreateOptions::default()).publish().unwrap();
+    let old = fs::read(&path).unwrap();
+    fs::remove_file(&path).unwrap();
+    let mut create_options = CreateOptions::default();
+    create_options.limits.plan_capacity = ordinary.summary.plan.capacity;
+    let report = plan(create_options).publish_with_receipts();
+    let summary = report.outcome.unwrap().summary;
+    assert_eq!(summary.plan, ordinary.summary.plan);
+    assert_eq!(summary.writer, ordinary.summary.writer);
+    assert_eq!(fs::read(&path).unwrap(), old);
+    assert_eq!(report.written.len(), 2);
+    let [directory, file] = report.written.as_slice() else { panic!("expected directory and file receipts") };
+    assert_eq!(
+        (directory.ordinal, directory.method, directory.decoded_size, directory.packed_size),
+        (0, Method::Stored, 0, 0)
+    );
+    assert_eq!(
+        (file.ordinal, file.method, file.decoded_size, file.crc32),
+        (1, deflate(6), 4096, crc32fast::hash(&data))
+    );
+    assert!(file.packed_size < 4096);
+    let metadata = ReadSession::open(&path).unwrap().metadata();
+    for (receipt, entry) in report.written.iter().zip(metadata.entries()) {
+        assert_eq!(receipt.packed_size, entry.packed_size());
+        assert_eq!(receipt.local_offset, entry.physical_local_header_offset());
+    }
 }
 
 #[test]

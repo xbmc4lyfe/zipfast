@@ -86,6 +86,17 @@ After a successful rename, cleanup, cancellation and directory-sync errors
 retain the `Published` outcome and the verified archive. Requested file
 and directory synchronization uses the existing counted `fsync` contract.
 
+Use `publish_with_receipts()` to get the ordinary publication result in
+`RewriteReport::outcome` and actual writer results in `RewriteReport::written`.
+Each receipt describes a replacement or append, including its method, sizes
+and zero-based output central-directory ordinal. Walk the original central
+order skipping removed slots, then the appends in admission order, to map
+the ordinals to planned edits. Retained members still occupy output slots.
+Receipts are empty for unchanged or deletion-only plans and for unconfirmed
+publication. A known publication also returns receipts when cleanup or
+directory synchronization fails. The plan accounts for the opt-in receipt
+allocation before staging.
+
 The source directory, parser scratch, raw metadata, canonical projection,
 plan, layout reads, raw copy, retained comparison, stage verification and
 decoded verification each have bounded accounting. Ordinary source paths

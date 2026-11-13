@@ -77,4 +77,8 @@ impl RewritePlan {
     pub fn publish(self) -> Result<RewriteOutcome, RewriteFailure> {
         match self.unavailable {}
     }
+    /// Publishes with write receipts on supported platforms.
+    pub fn publish_with_receipts(self) -> RewriteReport {
+        match self.unavailable {}
+    }
 }
