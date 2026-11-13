@@ -263,7 +263,7 @@ impl<'a> OwnedCiphertext<'a> {
             Self::File(f) => f.rewind(cancel),
         }
     }
-    #[allow(clippy::result_large_err)] // Eight inline cleanup slots (328 bytes), including allocator refusal.
+    #[allow(clippy::result_large_err)] // Eight inline cleanup slots (656 bytes), including allocator refusal.
     pub(super) fn finish(self) -> Result<(), ObjectCleanupReport> {
         match self {
             Self::Memory(_) => Ok(()),
@@ -457,20 +457,19 @@ impl<'a> PrivateCiphertextFile<'a> {
         // A named partial file is removed only after validating all observable identities.
         if named {
             let mut report = ObjectCleanupReport::new(OwnedObject::Ciphertext);
-            let cleanup = (|| -> Result<(), CleanupCause> {
+            let cleanup = (|| -> Result<(), (ReadIoOperation, CleanupCause)> {
                 let parent = directory.as_ref().unwrap();
                 let held = file.as_ref().unwrap();
                 let mut calls = 0;
-                let mut checked = |op, call: &mut dyn FnMut() -> std::io::Result<()>| -> Result<(), CleanupCause> {
+                let mut checked = |op,
+                                   call: &mut dyn FnMut() -> std::io::Result<()>|
+                 -> Result<(), (ReadIoOperation, CleanupCause)> {
                     calls += 1;
                     assert!(calls <= 5);
                     ledger
                         .with_state(|s| s.charge_category(RunCategory::EmergencyCleanup, 1))
-                        .map_err(|_| CleanupCause::Policy("cleanup allowance exhausted"))?;
-                    call().map_err(|e| {
-                        let _ = op;
-                        CleanupCause::Io(e)
-                    })
+                        .map_err(|_| (op, CleanupCause::Policy("cleanup allowance exhausted")))?;
+                    syscall(op, -1, call).map_err(|e| (op, CleanupCause::Io(e)))
                 };
                 let mut parent_ok = false;
                 checked(ReadIoOperation::Stat, &mut || {
@@ -479,7 +478,7 @@ impl<'a> PrivateCiphertextFile<'a> {
                     Ok(())
                 })?;
                 if !parent_ok {
-                    return Err(CleanupCause::Policy("ciphertext parent changed"));
+                    return Err((ReadIoOperation::Stat, CleanupCause::Policy("ciphertext parent changed")));
                 }
                 let mut held_id = None;
                 checked(ReadIoOperation::Stat, &mut || {
@@ -489,9 +488,10 @@ impl<'a> PrivateCiphertextFile<'a> {
                     }
                     Ok(())
                 })?;
-                let id = held_id.ok_or(CleanupCause::Policy("ciphertext held identity changed"))?;
+                let id =
+                    held_id.ok_or((ReadIoOperation::Stat, CleanupCause::Policy("ciphertext held identity changed")))?;
                 if identity.is_some_and(|expected| expected.dev != id.dev || expected.ino != id.ino) {
-                    return Err(CleanupCause::Policy("ciphertext held identity changed"));
+                    return Err((ReadIoOperation::Stat, CleanupCause::Policy("ciphertext held identity changed")));
                 }
                 let mut same = false;
                 checked(ReadIoOperation::Stat, &mut || {
@@ -509,7 +509,7 @@ impl<'a> PrivateCiphertextFile<'a> {
                     Ok(())
                 })?;
                 if !same {
-                    return Err(CleanupCause::Policy("ciphertext name changed"));
+                    return Err((ReadIoOperation::Stat, CleanupCause::Policy("ciphertext name changed")));
                 }
                 checked(ReadIoOperation::Unlink, &mut || {
                     cvt(unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr().cast(), 0) }).map(|_| ())
@@ -522,15 +522,18 @@ impl<'a> PrivateCiphertextFile<'a> {
                     Ok(())
                 })?;
                 if !verified {
-                    return Err(CleanupCause::Policy("ciphertext post-unlink identity changed"));
+                    return Err((
+                        ReadIoOperation::Stat,
+                        CleanupCause::Policy("ciphertext post-unlink identity changed"),
+                    ));
                 }
                 unlinked_verified = true;
                 Ok(())
             })();
-            if let Err(cause) = cleanup {
+            if let Err((operation, cause)) = cleanup {
                 report.push(CleanupFault {
                     object: OwnedObject::Ciphertext,
-                    operation: ReadIoOperation::Unlink,
+                    operation,
                     offset: None,
                     cause,
                     close: CloseDisposition::NotApplicable,
@@ -646,11 +649,11 @@ impl<'a> PrivateCiphertextFile<'a> {
         self.position = 0;
         Ok(())
     }
-    #[allow(clippy::result_large_err)] // Eight inline cleanup slots (328 bytes), including allocator refusal.
+    #[allow(clippy::result_large_err)] // Eight inline cleanup slots (656 bytes), including allocator refusal.
     pub(super) fn finish(mut self) -> Result<(), ObjectCleanupReport> {
         self.finish_inner()
     }
-    #[allow(clippy::result_large_err)] // Eight inline cleanup slots (328 bytes), including allocator refusal.
+    #[allow(clippy::result_large_err)] // Eight inline cleanup slots (656 bytes), including allocator refusal.
     fn finish_inner(&mut self) -> Result<(), ObjectCleanupReport> {
         let Some(file) = self.file.take() else {
             return Ok(());

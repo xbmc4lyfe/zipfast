@@ -78,7 +78,21 @@ fn checked<T>(result: ZipReadResult<T>, source: &mut dyn CiphertextSource, ledge
         }),
         Err(io::SourceCheckError::Admission(fault)) => match result {
             Ok(_) => Err(fault.into()),
-            Err(error) => Err(error),
+            Err(error) => {
+                // A source check that could not run is not SourceChanged, but
+                // its refusal must stop continuation of a recoverable member
+                // error. The existing Source finalization slots expose this
+                // typed evidence while preserving primary/sink precedence.
+                let mut report = ObjectCleanupReport::new(OwnedObject::Source);
+                report.push(CleanupFault {
+                    object: OwnedObject::Source,
+                    operation: ReadIoOperation::Stat,
+                    offset: None,
+                    cause: CleanupCause::Admission(fault),
+                    close: CloseDisposition::NotApplicable,
+                });
+                Err(error.merge_cleanup(report))
+            }
         },
     };
     result.map_err(|error| ledger.with_state(|s| error.with_usage(s.encrypted.usage, s.run.usage)))

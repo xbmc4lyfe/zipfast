@@ -639,4 +639,267 @@ fn source_admission_does_not_invalidate_or_replace_original_auth_fault() {
     let error = p.authenticate(&mut scratch, &cancel).err().unwrap();
     assert!(!error.is_source_changed());
     assert!(matches!(error.operation(), Some(ReadFault::AuthenticationFailed)));
+    assert_eq!(error.cleanup_errors().len(), 1, "terminal source admission must remain observable");
+    let terminal = error.cleanup_errors().next().unwrap();
+    assert_eq!(terminal.object, OwnedObject::Source);
+    assert_eq!(terminal.operation, ReadIoOperation::Stat);
+    assert_eq!(terminal.close, CloseDisposition::NotApplicable);
+    assert!(matches!(terminal.cause, CleanupCause::Admission(ReadFault::InvalidPlan)));
+}
+
+#[test]
+fn source_final_admission_stops_auth_password_and_header_rejections() {
+    for earlier in 0..3 {
+        for admission in 0..3 {
+            let cancel = crate::extract::Cancellation::default();
+            let (ledger, stamp) = super::spool::ledger(0);
+            let directory = spool::ResolvedTempDirectory::resolve(&ledger, None, &cancel).unwrap();
+            let mut bytes = if earlier == 2 {
+                let mut frame = vec![0; 12];
+                frame[11] = 0x59;
+                frame.extend(b"bytes");
+                crate::crypto::ZipCrypto::new("password").encrypt(&mut frame);
+                frame
+            } else {
+                framed(1, "password", b"bytes")
+            };
+            if earlier == 0 {
+                *bytes.last_mut().unwrap() ^= 1;
+            }
+            let packed = bytes.len() as u64;
+            let mut callbacks = 0;
+            let terminal_at = if earlier == 0 { 3 } else { 2 };
+            let mut source = cipher::CheckedInput {
+                reader: std::io::Cursor::new(bytes),
+                check: |view: shared::LedgerView<'_>| {
+                    callbacks += 1;
+                    if callbacks != terminal_at {
+                        return Ok(());
+                    }
+                    let fault = match admission {
+                        0 => view.with_state(|s| {
+                            s.encrypted.limits.io_attempts = s.encrypted.usage.io_attempts;
+                            s.attempt(true).unwrap_err()
+                        }),
+                        1 => view.with_state(|s| s.charge_category(RunCategory::SourceCheckGroups, 17).unwrap_err()),
+                        _ => {
+                            cancel.cancel();
+                            io::canceled(Some(&cancel)).unwrap_err()
+                        }
+                    };
+                    Err(io::SourceCheckError::Admission(fault))
+                },
+            };
+            let mut scratch = [0; 65536];
+            let error = if earlier == 2 {
+                cipher::ZipCryptoInput::open(
+                    &ledger,
+                    &mut source,
+                    Some("wrong"),
+                    member(stamp, packed, 5, CipherKind::ZipCrypto),
+                    true,
+                    0x59,
+                    &cancel,
+                )
+                .err()
+                .unwrap()
+            } else {
+                match cipher::PendingAes::copy(
+                    &ledger,
+                    &directory,
+                    &mut source,
+                    1,
+                    2,
+                    member(stamp, packed, 5, CipherKind::Aes),
+                    Some(if earlier == 1 { "wrong" } else { "password" }),
+                    &mut scratch,
+                    &cancel,
+                ) {
+                    Ok(p) => p.authenticate(&mut scratch, &cancel).err().unwrap(),
+                    Err(error) => error,
+                }
+            };
+            assert!(!error.is_source_changed());
+            assert!(error.source_change().is_none());
+            match earlier {
+                0 => assert!(matches!(error.operation(), Some(ReadFault::AuthenticationFailed))),
+                1 => assert!(matches!(
+                    error.operation(),
+                    Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::Aes })
+                )),
+                _ => assert!(matches!(
+                    error.operation(),
+                    Some(ReadFault::PasswordCheckFailed { cipher: CipherKind::ZipCrypto })
+                )),
+            }
+            assert_eq!(error.cleanup_errors().len(), 1, "earlier={earlier} admission={admission} must stop");
+            let terminal = error.cleanup_errors().next().unwrap();
+            assert_eq!(terminal.object, OwnedObject::Source);
+            assert_eq!(terminal.operation, ReadIoOperation::Stat);
+            assert_eq!(terminal.close, CloseDisposition::NotApplicable);
+            match admission {
+                0 => assert!(
+                    matches!(&terminal.cause, CleanupCause::Admission(ReadFault::Limit { resource: ReadResource::IoAttempts, limit, attempted }) if *limit == error.usage().io_attempts && *attempted == limit + 1)
+                ),
+                1 => assert!(matches!(
+                    terminal.cause,
+                    CleanupCause::Admission(ReadFault::Limit {
+                        resource: ReadResource::Run(RunCategory::SourceCheckGroups),
+                        limit: 16,
+                        attempted: 17
+                    })
+                )),
+                _ => assert!(matches!(terminal.cause, CleanupCause::Admission(ReadFault::Cancelled))),
+            }
+            assert!(!ledger.with_state(|s| s.poisoned));
+            assert_eq!(error.usage(), ledger.with_state(|s| s.encrypted.usage));
+            assert_eq!(error.run_usage(), ledger.with_state(|s| s.run.usage));
+            assert_eq!(cancel.is_canceled(), admission == 2);
+        }
+    }
+}
+
+#[test]
+fn successful_authentication_returns_source_admission_as_primary() {
+    for admission in 0..3 {
+        let cancel = crate::extract::Cancellation::default();
+        let frame = framed(1, "password", b"bytes");
+        let (ledger, stamp) = super::spool::ledger(0);
+        let directory = spool::ResolvedTempDirectory::resolve(&ledger, None, &cancel).unwrap();
+        let mut calls = 0;
+        let mut source = cipher::CheckedInput {
+            reader: std::io::Cursor::new(frame.clone()),
+            check: |_: shared::LedgerView<'_>| {
+                calls += 1;
+                if calls != 3 {
+                    return Ok(());
+                }
+                Err(io::SourceCheckError::Admission(match admission {
+                    0 => ReadFault::Limit { resource: ReadResource::IoAttempts, limit: 4, attempted: 5 },
+                    1 => ReadFault::Limit {
+                        resource: ReadResource::Run(RunCategory::SourceCheckGroups),
+                        limit: 7,
+                        attempted: 8,
+                    },
+                    _ => ReadFault::Cancelled,
+                }))
+            },
+        };
+        let mut scratch = [0; 65536];
+        let pending = cipher::PendingAes::copy(
+            &ledger,
+            &directory,
+            &mut source,
+            1,
+            2,
+            member(stamp, frame.len() as u64, 5, CipherKind::Aes),
+            Some("password"),
+            &mut scratch,
+            &cancel,
+        )
+        .unwrap();
+        let error = pending.authenticate(&mut scratch, &cancel).err().unwrap();
+        assert_eq!(error.kind(), ZipReadErrorKind::Operation);
+        assert!(!error.is_source_changed());
+        assert_eq!(error.cleanup_errors().len(), 0);
+        match admission {
+            0 => assert!(matches!(
+                error.operation(),
+                Some(ReadFault::Limit { resource: ReadResource::IoAttempts, limit: 4, attempted: 5 })
+            )),
+            1 => assert!(matches!(
+                error.operation(),
+                Some(ReadFault::Limit {
+                    resource: ReadResource::Run(RunCategory::SourceCheckGroups),
+                    limit: 7,
+                    attempted: 8
+                })
+            )),
+            _ => assert!(matches!(error.operation(), Some(ReadFault::Cancelled))),
+        }
+        assert_eq!(error.usage(), ledger.with_state(|s| s.encrypted.usage));
+    }
+}
+
+#[test]
+fn allocator_denied_source_admission_keeps_sink_diagnostic_cleanup_and_later_source() {
+    for operation_present in [false, true] {
+        let cancel = crate::extract::Cancellation::default();
+        let frame = framed(1, "password", b"bytes");
+        let (ledger, stamp) = super::spool::ledger(65536);
+        let directory = spool::ResolvedTempDirectory::resolve(&ledger, None, &cancel).unwrap();
+        let mut calls = 0;
+        let mut source = cipher::CheckedInput {
+            reader: std::io::Cursor::new(frame.clone()),
+            check: |_: shared::LedgerView<'_>| {
+                calls += 1;
+                if calls == 3 { Err(io::SourceCheckError::Admission(ReadFault::Cancelled)) } else { Ok(()) }
+            },
+        };
+        let pending = cipher::PendingAes::copy(
+            &ledger,
+            &directory,
+            &mut source,
+            1,
+            2,
+            member(stamp, frame.len() as u64, 5, CipherKind::Aes),
+            Some("password"),
+            &mut [0; 65536],
+            &cancel,
+        )
+        .unwrap();
+        let mut previous_cleanup = ObjectCleanupReport::new(OwnedObject::Output);
+        previous_cleanup.push(CleanupFault {
+            object: OwnedObject::Output,
+            operation: ReadIoOperation::Flush,
+            offset: Some(9),
+            cause: CleanupCause::Policy("earlier output cleanup"),
+            close: CloseDisposition::NotApplicable,
+        });
+        let prior = if operation_present {
+            ZipReadError::from(ReadFault::AuthenticationFailed).merge_sink(ZipSinkFault::Cancelled)
+        } else {
+            ZipReadError::from(ZipSinkFault::Cancelled)
+        };
+        let prior = prior
+            .merge_diagnostic(ZipSinkFault::Allocation { capacity: 7 })
+            .merge_cleanup(previous_cleanup)
+            .with_publication(PublicationState::Published, 9);
+        crate::test_alloc::REFUSE_ALLOCATIONS.with(|v| v.set(true));
+        let error = pending.finish(Err(prior)).unwrap_err();
+        crate::test_alloc::REFUSE_ALLOCATIONS.with(|v| v.set(false));
+        assert_eq!(error.kind(), ZipReadErrorKind::Diagnostic);
+        assert_eq!(error.operation().is_some(), operation_present);
+        if operation_present {
+            assert!(matches!(error.operation(), Some(ReadFault::AuthenticationFailed)));
+        }
+        assert!(matches!(error.sink_fault(), Some(ZipSinkFault::Cancelled)));
+        assert!(matches!(error.diagnostic_fault(), Some(ZipSinkFault::Allocation { capacity: 7 })));
+        assert!(!error.is_source_changed());
+        assert_eq!(error.cleanup_errors().len(), 2);
+        {
+            let mut cleanup = error.cleanup_errors();
+            let original = cleanup.next().unwrap();
+            assert_eq!(original.object, OwnedObject::Output);
+            assert_eq!(original.operation, ReadIoOperation::Flush);
+            assert_eq!(original.offset, Some(9));
+            assert!(matches!(original.cause, CleanupCause::Policy("earlier output cleanup")));
+            let source = cleanup.next().unwrap();
+            assert_eq!(source.object, OwnedObject::Source);
+            assert_eq!(source.operation, ReadIoOperation::Stat);
+            assert!(matches!(source.cause, CleanupCause::Admission(ReadFault::Cancelled)));
+        }
+        assert_eq!(error.publication_state(), PublicationState::Published);
+        assert_eq!(error.accepted_output_bytes(), 9);
+        crate::test_alloc::REFUSE_ALLOCATIONS.with(|v| v.set(true));
+        let error = error.merge_source(CheckedSourceFault::StampMismatch);
+        crate::test_alloc::REFUSE_ALLOCATIONS.with(|v| v.set(false));
+        assert_eq!(error.kind(), ZipReadErrorKind::SourceChanged);
+        assert!(error.is_source_changed());
+        assert_eq!(error.cleanup_errors().len(), 2);
+        assert!(matches!(error.cleanup_errors().nth(1).unwrap().cause, CleanupCause::Admission(ReadFault::Cancelled)));
+        assert_eq!(error.operation().is_some(), operation_present);
+        assert!(matches!(error.sink_fault(), Some(ZipSinkFault::Cancelled)));
+        assert!(matches!(error.diagnostic_fault(), Some(ZipSinkFault::Allocation { capacity: 7 })));
+    }
 }

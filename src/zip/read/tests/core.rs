@@ -1348,3 +1348,52 @@ fn checked_ledger_identity_exhaustion_and_concurrent_uniqueness() {
     ids.dedup();
     assert_eq!(ids.len(), 4000);
 }
+
+#[test]
+fn source_admission_retains_eight_typed_slots_without_allocation() {
+    let mut error = ZipReadError::from(ReadFault::AuthenticationFailed);
+    let mut source = ObjectCleanupReport::new(OwnedObject::Source);
+    REFUSE_ALLOCATIONS.with(|v| v.set(true));
+    for index in 0..8 {
+        source.push(CleanupFault {
+            object: OwnedObject::Source,
+            operation: ReadIoOperation::Stat,
+            offset: None,
+            cause: CleanupCause::Admission(ReadFault::Limit {
+                resource: ReadResource::Run(RunCategory::SourceCheckGroups),
+                limit: 16,
+                attempted: 17 + index,
+            }),
+            close: CloseDisposition::NotApplicable,
+        });
+    }
+    error = error.merge_cleanup(source);
+    REFUSE_ALLOCATIONS.with(|v| v.set(false));
+    assert_eq!(error.cleanup_errors().len(), 8);
+    for (index, fault) in error.cleanup_errors().enumerate() {
+        assert_eq!(fault.object, OwnedObject::Source);
+        assert!(
+            matches!(fault.cause, CleanupCause::Admission(ReadFault::Limit { resource: ReadResource::Run(RunCategory::SourceCheckGroups), limit: 16, attempted }) if attempted == 17 + index as u128)
+        );
+    }
+    assert!(!error.is_source_changed());
+    let mut excess = ObjectCleanupReport::new(OwnedObject::Source);
+    excess.push(CleanupFault {
+        object: OwnedObject::Source,
+        operation: ReadIoOperation::Stat,
+        offset: None,
+        cause: CleanupCause::Admission(ReadFault::Cancelled),
+        close: CloseDisposition::NotApplicable,
+    });
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| error.merge_cleanup(excess))).is_err());
+    println!(
+        "R1 ReadFault={} CleanupCause={} CleanupFault={} ObjectCleanupReport={} ZipReadError={} Result<()>={} SharedHeader={}",
+        std::mem::size_of::<ReadFault>(),
+        std::mem::size_of::<CleanupCause>(),
+        std::mem::size_of::<CleanupFault>(),
+        std::mem::size_of::<ObjectCleanupReport>(),
+        std::mem::size_of::<ZipReadError>(),
+        std::mem::size_of::<ZipReadResult<()>>(),
+        shared::SHARED_LEDGER_CAPACITY
+    );
+}

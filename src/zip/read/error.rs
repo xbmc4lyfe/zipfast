@@ -195,6 +195,9 @@ pub enum OwnedObject {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum CleanupCause {
+    /// Required final source observation could not be admitted. This records
+    /// terminal evidence without claiming a physical observation/invalidation.
+    Admission(ReadFault),
     Io(io::Error),
     Policy(&'static str),
 }

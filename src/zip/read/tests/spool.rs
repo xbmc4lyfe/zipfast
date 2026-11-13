@@ -537,3 +537,99 @@ fn zero_creates_refuses_before_namespace_calls_and_preserves_memory() {
         owned.finish().unwrap();
     }
 }
+
+#[test]
+fn partial_named_cleanup_preserves_stat_and_unlink_operation_labels() {
+    use std::{cell::Cell, rc::Rc};
+    for fail_stat in [true, false] {
+        let cancel = crate::extract::Cancellation::default();
+        let (ledger, _) = ledger(0);
+        let temp = tempfile::tempdir().unwrap();
+        let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(temp.path()), &cancel).unwrap();
+        let unlinks = Rc::new(Cell::new(0));
+        let seen_unlinks = unlinks.clone();
+        let stats_after_unlink = Rc::new(Cell::new(0));
+        let seen_stats = stats_after_unlink.clone();
+        let closes = Rc::new(Cell::new(0));
+        let seen_closes = closes.clone();
+        spool::hooks::HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |op, fd| {
+                if op == ReadIoOperation::Unlink {
+                    seen_unlinks.set(seen_unlinks.get() + 1);
+                    return Some(std::io::Error::from_raw_os_error(libc::EACCES));
+                }
+                if op == ReadIoOperation::Stat && fd >= 0 && seen_unlinks.get() > 0 {
+                    seen_stats.set(seen_stats.get() + 1);
+                    if fail_stat && seen_stats.get() == 1 {
+                        return Some(std::io::Error::from_raw_os_error(libc::EIO));
+                    }
+                }
+                if op == ReadIoOperation::Close {
+                    seen_closes.set(seen_closes.get() + 1);
+                }
+                None
+            }))
+        });
+        let error =
+            spool::OwnedCiphertext::copy(&ledger, &directory, &mut std::io::repeat(1), 1, &mut [0; 64], &cancel)
+                .err()
+                .unwrap();
+        spool::hooks::HOOK.with(|h| *h.borrow_mut() = None);
+        assert!(
+            matches!(error.operation(), Some(ReadFault::Io { operation: ReadIoOperation::Unlink, error, .. }) if error.raw_os_error() == Some(libc::EACCES))
+        );
+        let cleanup = error.cleanup_errors().find(|f| f.object == OwnedObject::Ciphertext).unwrap();
+        assert_eq!(cleanup.operation, if fail_stat { ReadIoOperation::Stat } else { ReadIoOperation::Unlink });
+        assert!(
+            matches!(&cleanup.cause, CleanupCause::Io(error) if error.raw_os_error() == Some(if fail_stat { libc::EIO } else { libc::EACCES }))
+        );
+        assert_eq!(unlinks.get(), if fail_stat { 1 } else { 2 });
+        assert_eq!(stats_after_unlink.get(), if fail_stat { 2 } else { 3 });
+        assert_eq!(closes.get(), 2);
+        ledger.with_state(|s| {
+            assert!(s.poisoned);
+            assert_eq!(s.live_fds, 1);
+            assert_eq!(s.encrypted.usage.live_spool_bytes, 1);
+            assert_eq!(s.run.usage.emergency_cleanup, if fail_stat { 2 } else { 5 });
+        });
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn partial_cleanup_policy_refusal_is_a_stat_without_an_unlink_retry() {
+    use std::{cell::Cell, os::unix::fs::PermissionsExt, rc::Rc};
+    let cancel = crate::extract::Cancellation::default();
+    let (ledger, _) = ledger(0);
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().to_owned();
+    let directory = spool::ResolvedTempDirectory::resolve(&ledger, Some(temp.path()), &cancel).unwrap();
+    let unlinks = Rc::new(Cell::new(0));
+    let seen = unlinks.clone();
+    spool::hooks::HOOK.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move |op, _| {
+            if op == ReadIoOperation::Unlink {
+                seen.set(seen.get() + 1);
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o777)).unwrap();
+                Some(std::io::Error::from_raw_os_error(libc::EACCES))
+            } else {
+                None
+            }
+        }))
+    });
+    let error = spool::OwnedCiphertext::copy(&ledger, &directory, &mut std::io::repeat(1), 1, &mut [0; 64], &cancel)
+        .err()
+        .unwrap();
+    spool::hooks::HOOK.with(|h| *h.borrow_mut() = None);
+    std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let cleanup = error.cleanup_errors().find(|f| f.object == OwnedObject::Ciphertext).unwrap();
+    assert_eq!(cleanup.operation, ReadIoOperation::Stat);
+    assert!(matches!(cleanup.cause, CleanupCause::Policy("ciphertext parent changed")));
+    assert_eq!(unlinks.get(), 1);
+    ledger.with_state(|s| {
+        assert!(s.poisoned);
+        assert_eq!(s.live_fds, 1);
+        assert_eq!(s.encrypted.usage.live_spool_bytes, 1);
+        assert_eq!(s.run.usage.emergency_cleanup, 2);
+    });
+}
