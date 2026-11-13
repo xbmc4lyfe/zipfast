@@ -59,12 +59,23 @@ pub(super) enum Problem {
     Descriptor,
     EndGroup,
     Checksum,
+    PackedExtent,
+    CodecCompletion,
+    DecodedLength,
 }
 
 #[derive(Debug)]
 pub(super) enum Error {
     Native(CreateError),
-    Invalid { at: Location, kind: Problem },
+    Invalid { at: Location, kind: Problem, member: Option<u64> },
+}
+impl Error {
+    fn member(mut self, ordinal: u64) -> Self {
+        if let Self::Invalid { member, .. } = &mut self {
+            *member = Some(ordinal);
+        }
+        self
+    }
 }
 impl From<CreateError> for Error {
     fn from(error: CreateError) -> Self {
@@ -79,8 +90,11 @@ pub(super) struct Scratch {
     fixed: [u8; FIXED],
 }
 impl Scratch {
+    pub(super) const fn minimum_capacity() -> u64 {
+        (2 * BUFFER + FIXED) as u64
+    }
     pub(super) fn new(maximum: u64) -> Result<Self> {
-        limit((2 * BUFFER + FIXED) as u64, maximum, CreateLimit::VerificationScratch)?;
+        limit(Self::minimum_capacity(), maximum, CreateLimit::VerificationScratch)?;
         let mut input = Vec::new();
         let mut output = Vec::new();
         input.try_reserve_exact(BUFFER)?;
@@ -94,7 +108,7 @@ impl Scratch {
         output.resize(BUFFER, 0);
         Ok(Self { input, output, fixed: [0; FIXED] })
     }
-    fn capacity(&self) -> u64 {
+    pub(super) fn capacity(&self) -> u64 {
         self.input.capacity() as u64 + self.output.capacity() as u64 + FIXED as u64
     }
 }
@@ -166,14 +180,15 @@ pub(super) fn verify(
         Problem::Receipt,
     )?;
     limit(entries.len() as u64, options.limits.directory_entries(), CreateLimit::VerificationRecords)?;
-    limit(scratch.capacity(), options.limits.verification_scratch, CreateLimit::VerificationScratch)?;
     usage.scratch_capacity = scratch.capacity();
     let mut physical = 0;
     for disk in 0..held.len() {
         attempts.check_cancel()?;
-        let (file, stamp) = held
-            .get(disk)
-            .ok_or(Error::Invalid { at: Location { disk: disk as u32, offset: 0 }, kind: Problem::VolumeCount })?;
+        let (file, stamp) = held.get(disk).ok_or(Error::Invalid {
+            member: None,
+            at: Location { disk: disk as u32, offset: 0 },
+            kind: Problem::VolumeCount,
+        })?;
         if unix::file_stamp(file, attempts)? != stamp {
             return Err(CreateError::StageChanged.into());
         }
@@ -191,7 +206,15 @@ pub(super) fn verify(
         Location::default(),
         Problem::VolumeLength,
     )?;
-    let mut reader = Reader { held, capacity: layout.volume_bytes, at: Location::default(), options, attempts, usage };
+    let mut reader = Reader {
+        held,
+        capacity: layout.volume_bytes,
+        at: Location::default(),
+        options,
+        attempts,
+        usage,
+        payload_failure: None,
+    };
     reader.place(4)?;
     reader.bytes(&mut scratch.fixed[..4], true)?;
     check(scratch.fixed[..4] == [0x50, 0x4b, 7, 8], Location::default(), Problem::Marker)?;
@@ -204,7 +227,7 @@ pub(super) fn verify(
         check(receipt.ordinal == ordinal as u64, reader.at, Problem::Receipt)?;
         let framing = Framing::new(entry, receipt)?;
         wide |= framing.version == 45;
-        reader.local(entry, receipt, framing, scratch)?;
+        reader.local(entry, receipt, framing, scratch).map_err(|e| e.member(ordinal as u64))?;
         central_bytes = add(
             central_bytes,
             46 + entry.name.len() as u64 + entry.comment.len() as u64 + framing.extra_len(entry, true),
@@ -246,7 +269,7 @@ pub(super) fn verify(
         }
         on_disk = add(on_disk, 1)?;
         start.get_or_insert(placement);
-        reader.central(entry, receipt, framing, scratch)?;
+        reader.central(entry, receipt, framing, scratch).map_err(|e| e.member(receipt.ordinal))?;
         reader.usage.directory.directory_bytes = add(reader.usage.directory.directory_bytes, len)?;
         reader.usage.directory.owned.entries += 1;
         reader.usage.entries = add(reader.usage.entries, 1)?;
@@ -275,7 +298,8 @@ pub(super) fn verify(
         Problem::VolumeLength,
     )?;
     for disk in 0..held.len() {
-        let (file, stamp) = held.get(disk).ok_or(Error::Invalid { at: reader.at, kind: Problem::VolumeCount })?;
+        let (file, stamp) =
+            held.get(disk).ok_or(Error::Invalid { member: None, at: reader.at, kind: Problem::VolumeCount })?;
         if unix::file_stamp(file, attempts)? != stamp {
             return Err(CreateError::StageChanged.into());
         }
@@ -290,13 +314,15 @@ struct Reader<'a, 'b, V> {
     options: &'a CreateOptions,
     attempts: &'a Attempts<'b>,
     usage: &'a mut VerificationUsage,
+    payload_failure: Option<Error>,
 }
 impl<V: HeldVolumes> Reader<'_, '_, V> {
     fn stamp(&self) -> Checked<Stamp> {
-        self.held
-            .get(self.at.disk as usize)
-            .map(|(_, stamp)| stamp)
-            .ok_or(Error::Invalid { at: self.at, kind: Problem::VolumeCount })
+        self.held.get(self.at.disk as usize).map(|(_, stamp)| stamp).ok_or(Error::Invalid {
+            member: None,
+            at: self.at,
+            kind: Problem::VolumeCount,
+        })
     }
     fn preview(&self, len: u64) -> Checked<Location> {
         check(len <= self.capacity && self.at.offset <= self.capacity, self.at, Problem::Placement)?;
@@ -335,13 +361,11 @@ impl<V: HeldVolumes> Reader<'_, '_, V> {
         )?;
         check(add(self.at.offset, bytes.len() as u64)? <= self.stamp()?.len, self.at, Problem::Placement)?;
         while !bytes.is_empty() {
-            let mut size =
+            let size =
                 bytes.len().min(usize::try_from(self.options.limits.directory.range_bytes).unwrap_or(usize::MAX));
             directory_limit(1, size as u64, LimitKind::RangeBytes)?;
             #[cfg(test)]
-            {
-                size = size.min(super::tests::verify_read_cap());
-            }
+            let size = size.min(super::tests::verify_read_cap());
             if metadata {
                 self.work(size as u64)?;
                 directory_limit(
@@ -350,10 +374,11 @@ impl<V: HeldVolumes> Reader<'_, '_, V> {
                     LimitKind::FetchedBytes,
                 )?;
             }
-            let (file, _) = self
-                .held
-                .get(self.at.disk as usize)
-                .ok_or(Error::Invalid { at: self.at, kind: Problem::VolumeCount })?;
+            let (file, _) = self.held.get(self.at.disk as usize).ok_or(Error::Invalid {
+                member: None,
+                at: self.at,
+                kind: Problem::VolumeCount,
+            })?;
             let count = self.attempts.run(|| {
                 #[cfg(test)]
                 super::tests::event_io(super::tests::Event::VerifyRead, None)?;
@@ -394,16 +419,19 @@ impl<V: HeldVolumes> Reader<'_, '_, V> {
         limit(total, self.options.limits.verification_metadata, CreateLimit::VerificationMetadata)?;
         let at = self.at;
         self.bytes(&mut scratch.fixed[..len], true)?;
-        let mut fields = ExtraIter::new(&scratch.fixed[..len], at.offset)
-            .map_err(|_| Error::Invalid { at, kind: Problem::Extras })?;
+        let mut fields = ExtraIter::new(&scratch.fixed[..len], at.offset).map_err(|_| Error::Invalid {
+            member: None,
+            at,
+            kind: Problem::Extras,
+        })?;
         let offset = central && framing.wide_offset;
         let disk = central && framing.wide_disk;
         if framing.wide_sizes || offset || disk {
             let field = fields
                 .next()
                 .transpose()
-                .map_err(|_| Error::Invalid { at, kind: Problem::Extras })?
-                .ok_or(Error::Invalid { at, kind: Problem::Extras })?;
+                .map_err(|_| Error::Invalid { member: None, at, kind: Problem::Extras })?
+                .ok_or(Error::Invalid { member: None, at, kind: Problem::Extras })?;
             check(field.id == 1, at, Problem::Extras)?;
             let mut body = field.body;
             if framing.wide_sizes {
@@ -422,8 +450,8 @@ impl<V: HeldVolumes> Reader<'_, '_, V> {
             let field = fields
                 .next()
                 .transpose()
-                .map_err(|_| Error::Invalid { at, kind: Problem::Extras })?
-                .ok_or(Error::Invalid { at, kind: Problem::Extras })?;
+                .map_err(|_| Error::Invalid { member: None, at, kind: Problem::Extras })?
+                .ok_or(Error::Invalid { member: None, at, kind: Problem::Extras })?;
             check(
                 field.id == 0x5455
                     && field.body.len() == 5
@@ -448,8 +476,11 @@ impl<V: HeldVolumes> Reader<'_, '_, V> {
         let at = self.place(30 + entry.name.len() as u64 + f.extra_len(entry, false))?;
         check(at == receipt.local, at, Problem::Receipt)?;
         self.bytes(&mut scratch.fixed[..30], true)?;
-        let header =
-            LocalHeader::parse(&scratch.fixed[..30]).map_err(|_| Error::Invalid { at, kind: Problem::LocalHeader })?;
+        let header = LocalHeader::parse(&scratch.fixed[..30]).map_err(|_| Error::Invalid {
+            member: None,
+            at,
+            kind: Problem::LocalHeader,
+        })?;
         check(
             header.version_needed == f.version
                 && header.flags == f.flags
@@ -472,9 +503,12 @@ impl<V: HeldVolumes> Reader<'_, '_, V> {
                 decoded_size: receipt.decoded_size,
                 crc32: receipt.crc32,
             };
+            self.payload_failure = None;
             let (decoded, crc) =
-                verify::pump_payload(self, payload, receipt.packed_size, &mut scratch.input, &mut scratch.output)?;
-            check(decoded == receipt.decoded_size && crc == receipt.crc32, self.at, Problem::Checksum)?;
+                verify::pump_payload(self, payload, receipt.packed_size, &mut scratch.input, &mut scratch.output)
+                    .map_err(|e| self.payload_failure.take().unwrap_or(Error::Native(e)))?;
+            check(decoded == receipt.decoded_size, self.at, Problem::DecodedLength)?;
+            check(crc == receipt.crc32, self.at, Problem::Checksum)?;
             self.usage.payloads = add(self.usage.payloads, 1)?;
         }
         if f.descriptor {
@@ -506,8 +540,11 @@ impl<V: HeldVolumes> Reader<'_, '_, V> {
         self.work(1)?;
         let at = self.at;
         self.bytes(&mut scratch.fixed[..46], true)?;
-        let header = CentralHeader::parse(&scratch.fixed[..46])
-            .map_err(|_| Error::Invalid { at, kind: Problem::CentralHeader })?;
+        let header = CentralHeader::parse(&scratch.fixed[..46]).map_err(|_| Error::Invalid {
+            member: None,
+            at,
+            kind: Problem::CentralHeader,
+        })?;
         let (kind, dos) = if entry.payload_source().is_some() { (0o100000, 0) } else { (S_IFDIR, 0x10) };
         check(
             header.version_made_by == (u16::from(HOST_UNIX) << 8 | f.version)
@@ -553,15 +590,27 @@ impl<V: HeldVolumes> Reader<'_, '_, V> {
 }
 
 impl<V: HeldVolumes> verify::PayloadInput for Reader<'_, '_, V> {
+    fn failure(&mut self, problem: verify::PayloadProblem) -> CreateError {
+        self.payload_failure = Some(Error::Invalid {
+            member: None,
+            at: self.at,
+            kind: if matches!(problem, verify::PayloadProblem::Trailing) {
+                Problem::PackedExtent
+            } else {
+                Problem::CodecCompletion
+            },
+        });
+        CreateError::Verification("split payload codec failure")
+    }
     fn read_chunk(&mut self, mut bytes: &mut [u8]) -> Result<()> {
         while !bytes.is_empty() {
             if self.at.offset == self.capacity {
-                self.next().map_err(native_payload_error)?;
+                self.next().map_err(|e| self.payload_error(e))?;
             }
             // Bound in u64 first. The result is at most bytes.len(), so the
             // final conversion fits usize even when capacity exceeds 4 GiB.
             let size = (self.capacity - self.at.offset).min(bytes.len() as u64) as usize;
-            self.bytes(&mut bytes[..size], false).map_err(native_payload_error)?;
+            self.bytes(&mut bytes[..size], false).map_err(|e| self.payload_error(e))?;
             bytes = &mut bytes[size..];
         }
         Ok(())
@@ -575,6 +624,7 @@ impl<V: HeldVolumes> verify::PayloadInput for Reader<'_, '_, V> {
         limit(*member, self.options.limits.verification_entry_bytes, CreateLimit::VerificationEntryBytes)?;
         limit(aggregate, self.options.limits.verification_decoded_bytes, CreateLimit::VerificationDecodedBytes)?;
         if *member > receipt.decoded_size {
+            self.payload_failure = Some(Error::Invalid { member: None, at: self.at, kind: Problem::DecodedLength });
             return Err(CreateError::Verification("payload exceeds the declared decoded length"));
         }
         self.usage.decoded_bytes = aggregate;
@@ -582,10 +632,15 @@ impl<V: HeldVolumes> verify::PayloadInput for Reader<'_, '_, V> {
         Ok(())
     }
 }
-fn native_payload_error(error: Error) -> CreateError {
-    match error {
-        Error::Native(error) => error,
-        Error::Invalid { .. } => CreateError::Verification("split payload crosses an invalid physical boundary"),
+impl<V: HeldVolumes> Reader<'_, '_, V> {
+    fn payload_error(&mut self, error: Error) -> CreateError {
+        match error {
+            Error::Native(error) => error,
+            invalid @ Error::Invalid { .. } => {
+                self.payload_failure = Some(invalid);
+                CreateError::Verification("split payload crosses an invalid physical boundary")
+            }
+        }
     }
 }
 
@@ -641,19 +696,19 @@ fn end_len(wide: bool, comment: usize) -> Result<u64> {
     add(if wide { 98 } else { 22 }, comment as u64)
 }
 fn check(valid: bool, at: Location, kind: Problem) -> Checked<()> {
-    if valid { Ok(()) } else { Err(Error::Invalid { at, kind }) }
+    if valid { Ok(()) } else { Err(Error::Invalid { member: None, at, kind }) }
 }
 fn directory_limit(value: u64, maximum: u64, kind: LimitKind) -> Result<()> {
     if value > maximum { Err(CreateError::Directory(zip_container::DirectoryError::Limit(kind))) } else { Ok(()) }
 }
 fn qword(bytes: &mut &[u8], value: u64, at: Location) -> Checked<()> {
-    let (field, rest) = bytes.split_at_checked(8).ok_or(Error::Invalid { at, kind: Problem::Extras })?;
+    let (field, rest) = bytes.split_at_checked(8).ok_or(Error::Invalid { member: None, at, kind: Problem::Extras })?;
     check(field == value.to_le_bytes(), at, Problem::Extras)?;
     *bytes = rest;
     Ok(())
 }
 fn dword(bytes: &mut &[u8], value: u32, at: Location) -> Checked<()> {
-    let (field, rest) = bytes.split_at_checked(4).ok_or(Error::Invalid { at, kind: Problem::Extras })?;
+    let (field, rest) = bytes.split_at_checked(4).ok_or(Error::Invalid { member: None, at, kind: Problem::Extras })?;
     check(field == value.to_le_bytes(), at, Problem::Extras)?;
     *bytes = rest;
     Ok(())
@@ -773,6 +828,7 @@ mod geometry_tests {
                 options: &plan.options,
                 attempts: &attempts,
                 usage: &mut usage,
+                payload_failure: None,
             };
             assert_eq!(reader.extras(entry, &receipt, framing, true, &mut scratch).is_ok(), mutation.is_none());
         }

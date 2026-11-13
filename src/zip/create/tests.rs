@@ -254,6 +254,8 @@ pub(super) enum Event {
     AfterSourceClose,
     BeforeFinalSourceCheck,
     StageOpen,
+    SplitStageStat,
+    SplitStageClone,
     SinkWrite { at: u64, signature: Option<[u8; 4]> },
     SinkSeek,
     EncryptionEntropy,

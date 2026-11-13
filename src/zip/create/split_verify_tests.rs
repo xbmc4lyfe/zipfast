@@ -54,6 +54,10 @@ unsafe impl std::alloc::GlobalAlloc for AllocationControl {
         unsafe { std::alloc::GlobalAlloc::dealloc(&std::alloc::System, pointer, layout) }
     }
 }
+pub(super) fn set_allocations_refused(value: bool) {
+    REFUSE_ALLOCATIONS.set(value);
+}
+
 fn refusing_allocations<T>(run: impl FnOnce() -> T) -> T {
     struct Reset;
     impl Drop for Reset {
@@ -242,7 +246,7 @@ fn split_verifier_rejects_plan_receipt_and_paired_header_forgery() {
     let central = f.layout.central_start;
     patch(&mut f, Location { offset: local.offset + 30, ..local }, b"xx");
     patch(&mut f, Location { offset: central.offset + 46, ..central }, b"xx");
-    assert!(matches!(run(&f), Err(Error::Invalid { at, kind: Problem::LocalHeader }) if at.disk == 0));
+    assert!(matches!(run(&f), Err(Error::Invalid { at, kind: Problem::LocalHeader, member:Some(0) }) if at.disk == 0));
     for field in [0, 1, 2, 3] {
         let mut f = fixture(256, b"", &[(Method::Stored, b"payload")]);
         match field {
@@ -584,8 +588,12 @@ fn split_verifier_requires_exact_raw_deflate_completion_and_actual_crc() {
     // Raw Deflate 73 74 04 01 00 decodes to six ASCII A bytes.
     let f = manual_deflate(&[0x73, 0x74, 4, 1, 0]);
     assert_eq!(run(&f).unwrap().decoded_bytes, 6);
-    for packed in [&[0x73, 0x74, 4, 1][..], &[0x73, 0x74, 4, 1, 0, 0][..], &[0xff, 0xff, 0xff][..]] {
-        assert!(matches!(run(&manual_deflate(packed)), Err(Error::Native(CreateError::Verification(_)))));
+    for (packed, want) in [
+        (&[0x73, 0x74, 4, 1][..], Problem::CodecCompletion),
+        (&[0x73, 0x74, 4, 1, 0, 0][..], Problem::PackedExtent),
+        (&[0xff, 0xff, 0xff][..], Problem::CodecCompletion),
+    ] {
+        assert!(matches!(run(&manual_deflate(packed)),Err(Error::Invalid {kind,member:Some(0),..}) if kind==want));
     }
     let mut f = manual_deflate(&[0x73, 0x74, 4, 1, 0]);
     // Even paired descriptor/central CRC and receipt forgery cannot replace
