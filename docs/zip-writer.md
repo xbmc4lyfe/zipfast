@@ -165,6 +165,31 @@ toward the packed size and can force ZIP64 framing for exact-length
 Stored data. The descriptor counts toward physical extent and output
 bytes. After admission, a source or sink failure poisons the writer.
 
+### Authenticated encryption
+
+Use `ZipStreamWriter::add_winzip_aes_file` with a borrowed
+`WinZipAesRequest::new(password, strength, variant)`. Select AES-128,
+AES-192 or AES-256 and AE-1 or AE-2 explicitly. Passwords contain
+1–65,535 UTF-8 bytes without NUL. Request formatting redacts the password.
+The call retains neither the password nor cipher state.
+
+The entropy callback fills exactly 8, 12 or 16 salt bytes for the chosen
+strength. Supply fresh operating-system cryptographic randomness for each
+member. Metadata, size and budget preflight precedes this single callback.
+An entropy failure charges one attempt and leaves the writer reusable.
+After entropy succeeds, cancellation or an input, encoding, or output error
+poisons the writer. The low-level writer does not publish files.
+
+AES members use method 99 with the actual Stored or Deflate method in the
+AES extra field. Empty regular files use Stored while retaining encryption.
+Salt, password verifier, ciphertext and the ten-byte authentication tag all
+count toward packed size. The signed descriptor follows the tag. AE-1
+records carry the plaintext CRC32; AE-2 records carry zero. The public
+`AesEntryWritten.entry.crc32` matches that wire value. Its engine-private
+plaintext CRC is retained for later verification and omitted from Debug.
+Existing clear and ZipCrypto receipts keep their CRC semantics. Explicit
+directories remain clear through `add_directory`.
+
 ## Split volumes
 
 `ZipSplitWriter` writes clear Stored and Deflate members through

@@ -43,6 +43,7 @@ fn stored_size_boundaries_saturate_both_size_fields() {
             mtime: None,
             local_at: 0,
             local_disk: 0,
+            aes: None,
         };
         let central = member.central(0x12345678, size, size).unwrap();
         let header = central.as_bytes();
@@ -79,6 +80,7 @@ fn offset_only_widening_keeps_local_sizes_narrow() {
             mtime: None,
             local_at: offset,
             local_disk: 0,
+            aes: None,
         };
         let central = member.central(0, 3, 3).unwrap();
         assert_eq!(n32(central.as_bytes(), 20), 3);
@@ -95,6 +97,34 @@ fn offset_only_widening_keeps_local_sizes_narrow() {
             assert!(extra.as_bytes().is_empty());
         }
     }
+}
+
+#[test]
+fn aes_extra_fits_with_every_zip64_coordinate_and_extended_timestamp() {
+    let mut member = Member {
+        width: Width::new(Method::Stored, InputLength::Unknown, u32::MAX as u64, false),
+        method: Method::Stored,
+        flags: crate::zip::FLAG_DESCRIPTOR | crate::zip::FLAG_ENCRYPTED,
+        dos: DosDateTime::default(),
+        name_len: 1,
+        comment_len: 0,
+        external: 0,
+        mtime: Some(1),
+        local_at: u32::MAX as u64,
+        local_disk: u16::MAX as u32,
+        aes: Some((AesStrength::Aes256, AesVariant::Ae2)),
+    };
+    member.relocate(u16::MAX as u32, u32::MAX as u64);
+    let extra = member.central_extra(3, 31);
+    let bytes = extra.as_bytes();
+    assert_eq!(bytes.len(), 52);
+    assert_eq!(&bytes[..4], b"\x01\x00\x1c\x00");
+    assert_eq!(n64(bytes, 4), 3);
+    assert_eq!(n64(bytes, 12), 31);
+    assert_eq!(n64(bytes, 20), u32::MAX as u64);
+    assert_eq!(n32(bytes, 28), u16::MAX as u32);
+    assert_eq!(&bytes[32..41], b"\x55\x54\x05\x00\x01\x01\x00\x00\x00");
+    assert_eq!(&bytes[41..], b"\x01\x99\x07\x00\x02\x00AE\x03\x00\x00");
 }
 
 #[test]

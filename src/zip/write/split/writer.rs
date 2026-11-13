@@ -244,7 +244,7 @@ impl<P: VolumeProvider> ZipSplitWriter<P> {
         let mut output = Output { sink: Payload(&mut self.transport), work: self.work.clone(), position: at };
         output.work.usage.output_bytes = at;
         output.work.usage.archive_extent = at;
-        let result = output.write_payload(member.method, &mut file, &mut input, first, None);
+        let result = output.write_payload(member.method, &mut file, &mut input, first, &mut None);
         self.work = output.work;
         let (crc, packed) = result.map_err(|cause| self.error(Stage::Member, cause))?;
         let decoded = file.decoded;

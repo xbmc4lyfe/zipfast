@@ -140,6 +140,114 @@ pub enum WriteError {
     Failed(Arc<WriteError>),
 }
 
+/// WinZip AES key and salt size.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AesStrength {
+    Aes128,
+    Aes192,
+    Aes256,
+}
+
+impl AesStrength {
+    fn key_bytes(self) -> usize {
+        match self {
+            Self::Aes128 => 16,
+            Self::Aes192 => 24,
+            Self::Aes256 => 32,
+        }
+    }
+    fn salt_bytes(self) -> usize {
+        self.key_bytes() / 2
+    }
+    fn wire(self) -> u8 {
+        match self {
+            Self::Aes128 => 1,
+            Self::Aes192 => 2,
+            Self::Aes256 => 3,
+        }
+    }
+    fn overhead(self) -> u64 {
+        self.salt_bytes() as u64 + 12
+    }
+}
+
+/// WinZip AES wire CRC policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AesVariant {
+    Ae1,
+    Ae2,
+}
+
+impl AesVariant {
+    fn wire(self) -> u16 {
+        match self {
+            Self::Ae1 => 1,
+            Self::Ae2 => 2,
+        }
+    }
+    fn wire_crc(self, plaintext: u32) -> u32 {
+        match self {
+            Self::Ae1 => plaintext,
+            Self::Ae2 => 0,
+        }
+    }
+}
+
+/// A borrowed explicit WinZip AES request with redacted formatting.
+pub struct WinZipAesRequest<'a> {
+    password: &'a str,
+    strength: AesStrength,
+    variant: AesVariant,
+}
+
+impl<'a> WinZipAesRequest<'a> {
+    /// Validates 1–65,535 UTF-8 bytes without NUL. Strength and variant are explicit.
+    pub fn new(password: &'a str, strength: AesStrength, variant: AesVariant) -> Result<Self, WriteError> {
+        if password.is_empty() || password.len() > u16::MAX as usize || password.as_bytes().contains(&0) {
+            return Err(WriteError::InvalidMetadata("AES password must be 1 to 65,535 UTF-8 bytes without NUL"));
+        }
+        Ok(Self { password, strength, variant })
+    }
+}
+
+impl fmt::Debug for WinZipAesRequest<'_> {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.debug_struct("WinZipAesRequest")
+            .field("password", &"[REDACTED]")
+            .field("strength", &self.strength)
+            .field("variant", &self.variant)
+            .finish()
+    }
+}
+
+/// An AES member receipt. The common CRC equals its wire value, including
+/// zero for AE-2. The engine retains the plaintext CRC for later verification.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct AesEntryWritten {
+    pub entry: EntryWritten,
+    pub strength: AesStrength,
+    pub variant: AesVariant,
+    pub(crate) plaintext_crc32: u32,
+}
+
+impl AesEntryWritten {
+    fn from_plain(entry: EntryWritten, strength: AesStrength, variant: AesVariant) -> Self {
+        let mut result = Self { plaintext_crc32: entry.crc32, entry, strength, variant };
+        result.entry.crc32 = variant.wire_crc(result.plaintext_crc32);
+        result
+    }
+}
+
+impl fmt::Debug for AesEntryWritten {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.debug_struct("AesEntryWritten")
+            .field("entry", &self.entry)
+            .field("strength", &self.strength)
+            .field("variant", &self.variant)
+            .finish()
+    }
+}
+
 /// A length-delimited member name of up to 65,535 bytes.
 #[derive(Clone, Copy, Debug)]
 pub enum EntryName<'a> {
@@ -306,6 +414,8 @@ pub enum IoStage {
     SourceRead,
     EncryptionEntropy,
     EncryptionHeader,
+    /// WinZip AES authentication tag output.
+    AuthenticationTag,
     LocalHeader,
     Payload,
     DataDescriptor,
@@ -524,7 +634,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         }
 
         self.output.write_local(&member, options.name.bytes())?;
-        let (crc, packed) = self.output.write_payload(member.method, &mut file, &mut input, first, None)?;
+        let (crc, packed) = self.output.write_payload(member.method, &mut file, &mut input, first, &mut None)?;
         let payload_end = self.output.position;
         let decoded = file.decoded;
 
@@ -626,6 +736,7 @@ fn prepare_member(
         mtime: options.extended_mtime,
         local_at,
         local_disk: 0,
+        aes: None,
     })
 }
 
@@ -780,6 +891,23 @@ impl<R: Read + ?Sized> FileInput<'_, R> {
     }
 }
 
+trait PayloadCipher {
+    fn encrypt(&mut self, bytes: &mut [u8]) -> Result<(), WriteError>;
+}
+
+impl PayloadCipher for crate::crypto::ZipCrypto {
+    fn encrypt(&mut self, bytes: &mut [u8]) -> Result<(), WriteError> {
+        self.encrypt(bytes);
+        Ok(())
+    }
+}
+
+impl PayloadCipher for crate::crypto::WinZipAesEncryptor {
+    fn encrypt(&mut self, bytes: &mut [u8]) -> Result<(), WriteError> {
+        self.encrypt(bytes).ok_or(WriteError::Overflow)
+    }
+}
+
 struct Output<W> {
     sink: W,
     work: Work,
@@ -825,7 +953,7 @@ impl<W: Write> Output<W> {
         mut input: &[u8],
         output: &mut [u8; BUFFER],
         flush: FlushCompress,
-        cipher: &mut Option<crate::crypto::ZipCrypto>,
+        cipher: &mut Option<&mut dyn PayloadCipher>,
     ) -> Result<(), WriteError> {
         loop {
             self.work.checkpoint()?;
@@ -835,7 +963,7 @@ impl<W: Write> Output<W> {
             let consumed = encoder_delta(previous_in, encoder.total_in(), input.len())?;
             let produced = encoder_delta(previous_out, encoder.total_out(), output.len())?;
             if let Some(cipher) = cipher {
-                cipher.encrypt(&mut output[..produced]);
+                cipher.encrypt(&mut output[..produced])?;
             }
             self.write(&output[..produced], IoStage::Payload)?;
             input = &input[consumed..];
@@ -861,7 +989,7 @@ impl<W: Write> Output<W> {
         file: &mut FileInput<'_, R>,
         input: &mut [u8; BUFFER],
         first: usize,
-        mut cipher: Option<crate::crypto::ZipCrypto>,
+        cipher: &mut Option<&mut dyn PayloadCipher>,
     ) -> Result<(u32, u64), WriteError> {
         let payload_at = self.position;
         let mut crc = Hasher::new();
@@ -875,17 +1003,17 @@ impl<W: Write> Output<W> {
             let bytes = &mut input[..chunk];
             crc.update(bytes);
             if let Some(encoder) = &mut encoder {
-                self.deflate(encoder, bytes, &mut compressed, FlushCompress::None, &mut cipher)?;
+                self.deflate(encoder, bytes, &mut compressed, FlushCompress::None, cipher)?;
             } else {
-                if let Some(cipher) = &mut cipher {
-                    cipher.encrypt(bytes);
+                if let Some(cipher) = cipher.as_mut() {
+                    cipher.encrypt(bytes)?;
                 }
                 self.write(bytes, IoStage::Payload)?;
             }
             chunk = file.read(&mut self.work, input)?;
         }
         if let Some(encoder) = &mut encoder {
-            self.deflate(encoder, &[], &mut compressed, FlushCompress::Finish, &mut cipher)?;
+            self.deflate(encoder, &[], &mut compressed, FlushCompress::Finish, cipher)?;
         }
         let payload_end = self.position;
         let packed = payload_end.checked_sub(payload_at).ok_or(WriteError::Overflow)?;
