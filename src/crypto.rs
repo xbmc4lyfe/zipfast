@@ -1051,6 +1051,137 @@ fn hmac_sha1(ipad: &[u8; 64], opad: &[u8; 64], data: &[u8]) -> [u8; 20] {
     outer.finalize_bytes()
 }
 
+struct HmacSha1 {
+    inner: Sha1,
+    outer: Sha1,
+}
+
+impl HmacSha1 {
+    fn new(key: &[u8]) -> Self {
+        let mut block = [0; 64];
+        if key.len() > block.len() {
+            let mut hash = Sha1::new();
+            hash.update(key);
+            block[..20].copy_from_slice(&hash.finalize_bytes());
+        } else {
+            block[..key.len()].copy_from_slice(key);
+        }
+        let mut inner_pad = [0x36; 64];
+        let mut outer_pad = [0x5c; 64];
+        for ((inside, outside), key) in inner_pad.iter_mut().zip(&mut outer_pad).zip(block) {
+            *inside ^= key;
+            *outside ^= key;
+        }
+        let mut inner = Sha1::new();
+        inner.update(&inner_pad);
+        let mut outer = Sha1::new();
+        outer.update(&outer_pad);
+        Self { inner, outer }
+    }
+
+    fn update(&mut self, bytes: &[u8]) -> Option<()> {
+        self.inner.total_len.checked_add(bytes.len() as u64)?.checked_mul(8)?;
+        self.inner.update(bytes);
+        Some(())
+    }
+
+    fn finish(&self) -> [u8; 20] {
+        let mut outer = self.outer.clone();
+        outer.update(&self.inner.finalize_bytes());
+        outer.finalize_bytes()
+    }
+
+    fn mac(&self, bytes: &[u8]) -> [u8; 20] {
+        let mut inner = self.inner.clone();
+        inner.update(bytes);
+        let mut outer = self.outer.clone();
+        outer.update(&inner.finalize_bytes());
+        outer.finalize_bytes()
+    }
+}
+
+// The fixed output covers all supported strengths. The buffered public reader
+// helpers retain their existing allocation and return-value contracts.
+fn derive_winzip_fixed(password: &[u8], salt: &[u8], key_len: usize) -> Option<[u8; 66]> {
+    if ![16, 24, 32].contains(&key_len) || salt.len() != key_len / 2 {
+        return None;
+    }
+    let keyed = HmacSha1::new(password);
+    let wanted = 2 * key_len + 2;
+    let mut result = [0; 66];
+    let mut salt_block = [0; 20];
+    salt_block[..salt.len()].copy_from_slice(salt);
+    for (index, target) in result[..wanted].chunks_mut(20).enumerate() {
+        salt_block[salt.len()..salt.len() + 4].copy_from_slice(&((index + 1) as u32).to_be_bytes());
+        let mut u = keyed.mac(&salt_block[..salt.len() + 4]);
+        let mut combined = u;
+        for _ in 1..1000 {
+            u = keyed.mac(&u);
+            for (byte, next) in combined.iter_mut().zip(u) {
+                *byte ^= next;
+            }
+        }
+        target.copy_from_slice(&combined[..target.len()]);
+    }
+    Some(result)
+}
+
+pub(crate) struct WinZipAesEncryptor {
+    key: AesKey,
+    counter: [u8; 16],
+    stream: [u8; 16],
+    used: usize,
+    hmac: HmacSha1,
+    verifier: [u8; 2],
+}
+
+impl WinZipAesEncryptor {
+    pub(crate) fn new(password: &[u8], salt: &[u8], key_len: usize) -> Option<Self> {
+        let derived = derive_winzip_fixed(password, salt, key_len)?;
+        Some(Self {
+            key: AesKey::new(&derived[..key_len])?,
+            counter: [0; 16],
+            stream: [0; 16],
+            used: 16,
+            hmac: HmacSha1::new(&derived[key_len..2 * key_len]),
+            verifier: derived[2 * key_len..2 * key_len + 2].try_into().ok()?,
+        })
+    }
+
+    pub(crate) fn verifier(&self) -> [u8; 2] {
+        self.verifier
+    }
+
+    pub(crate) fn encrypt(&mut self, bytes: &mut [u8]) -> Option<()> {
+        self.hmac.inner.total_len.checked_add(bytes.len() as u64)?.checked_mul(8)?;
+        for byte in bytes.iter_mut() {
+            if self.used == self.stream.len() {
+                let mut carry = true;
+                for counter in &mut self.counter {
+                    let (next, overflow) = counter.overflowing_add(1);
+                    *counter = next;
+                    if !overflow {
+                        carry = false;
+                        break;
+                    }
+                }
+                if carry {
+                    return None;
+                }
+                self.stream = self.key.encrypt_block(&self.counter);
+                self.used = 0;
+            }
+            *byte ^= self.stream[self.used];
+            self.used += 1;
+        }
+        self.hmac.update(bytes)
+    }
+
+    pub(crate) fn tag(&self) -> [u8; 10] {
+        self.hmac.finish()[..10].try_into().expect("fixed tag length")
+    }
+}
+
 /// PBKDF2-HMAC-SHA1 (1000 rounds) for WinZip AES: derives `2 * key_len + 2` bytes.
 pub fn aes_derive(password: &[u8], salt: &[u8], key_len: usize) -> Option<Vec<u8>> {
     let mut k = [0u8; 64];
@@ -1194,6 +1325,61 @@ mod tests {
             b"WinZip AES fixture across CTR blocks",
         ),
     ];
+
+    #[test]
+    fn incremental_winzip_aes_matches_independent_vectors_at_chunk_boundaries() {
+        let password = format!("a native AES fixture password with UTF-8 雪 {}", "p".repeat(67));
+        let vectors = include_str!("../tests/fixtures/winzip-aes-stream.tsv");
+        fn hex(bytes: &[u8]) -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        }
+        for line in vectors.lines().filter(|line| !line.starts_with('#')) {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            let strength = fields[0].parse::<usize>().unwrap();
+            let len = fields[1].parse::<usize>().unwrap();
+            let key_len = (strength + 1) * 8;
+            let salt = (1..=strength * 4 + 4).map(|byte| byte as u8).collect::<Vec<_>>();
+            let plain = (0..len).map(|i| (i * 73 + (i >> 8) + 19) as u8).collect::<Vec<_>>();
+            for chunk in [1, 15, 16, 17, 63, 64, 65, 65536] {
+                let mut cipher = WinZipAesEncryptor::new(password.as_bytes(), &salt, key_len).unwrap();
+                assert_eq!(hex(&cipher.verifier()), fields[2]);
+                let mut ciphertext = plain.clone();
+                for block in ciphertext.chunks_mut(chunk) {
+                    cipher.encrypt(block).unwrap();
+                }
+                let mut sha = Sha1::new();
+                sha.update(&ciphertext);
+                assert_eq!(hex(&sha.finalize_bytes()), fields[3], "{strength} {len} {chunk}");
+                assert_eq!(hex(&cipher.tag()), fields[4], "{strength} {len} {chunk}");
+            }
+        }
+    }
+
+    #[test]
+    fn incremental_winzip_aes_reproduces_original_ciphertext_and_tags() {
+        for (strength, expected, plaintext) in AES_FIXTURES {
+            let key_len = (usize::from(strength) + 1) * 8;
+            let salt_len = key_len / 2;
+            let mut cipher = WinZipAesEncryptor::new(AES_PASSWORD.as_bytes(), &expected[..salt_len], key_len).unwrap();
+            assert_eq!(cipher.verifier(), expected[salt_len..salt_len + 2]);
+            let mut bytes = plaintext.to_vec();
+            for chunk in bytes.chunks_mut(3) {
+                cipher.encrypt(chunk).unwrap();
+            }
+            assert_eq!(bytes, &expected[salt_len + 2..expected.len() - 10]);
+            assert_eq!(cipher.tag(), expected[expected.len() - 10..]);
+        }
+    }
+
+    #[test]
+    fn incremental_winzip_aes_rejects_counter_and_hmac_length_overflow() {
+        let mut cipher = WinZipAesEncryptor::new(b"password", &[1; 8], 16).unwrap();
+        cipher.counter = [255; 16];
+        assert!(cipher.encrypt(&mut [1]).is_none());
+        let mut cipher = WinZipAesEncryptor::new(b"password", &[1; 8], 16).unwrap();
+        cipher.hmac.inner.total_len = u64::MAX / 8;
+        assert!(cipher.encrypt(&mut [1]).is_none());
+    }
 
     #[test]
     fn authenticates_full_winzip_aes_payload() {

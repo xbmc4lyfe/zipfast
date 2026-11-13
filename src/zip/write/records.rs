@@ -14,7 +14,7 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-use super::{DosDateTime, InputLength, Method, WriteError, add};
+use super::{AesStrength, AesVariant, DosDateTime, InputLength, Method, WriteError, add};
 use crate::zip::{HOST_UNIX, METHOD_DEFLATE, METHOD_STORED};
 
 const SIZE_SENTINEL: u64 = u32::MAX as u64;
@@ -106,6 +106,7 @@ pub(super) struct Member {
     pub mtime: Option<i32>,
     pub local_at: u64,
     pub local_disk: u32,
+    pub aes: Option<(AesStrength, AesVariant)>,
 }
 
 impl Member {
@@ -135,7 +136,7 @@ impl Member {
     pub(super) fn descriptor(&self, crc: u32, decoded: u64, packed: u64) -> Result<Record<24>, WriteError> {
         let mut r = Record::new();
         r.u32(0x0807_4b50);
-        r.u32(crc);
+        r.u32(self.aes.map_or(crc, |(_, variant)| variant.wire_crc(crc)));
         if self.width.sizes {
             r.u64(packed);
             r.u64(decoded);
@@ -154,19 +155,16 @@ impl Member {
 
     fn extra_len(&self, central: bool) -> u16 {
         let zip64 = self.zip64_len(central);
-        zip64 + 4 * u16::from(zip64 != 0) + 9 * u16::from(self.mtime.is_some())
+        zip64 + 4 * u16::from(zip64 != 0) + 9 * u16::from(self.mtime.is_some()) + 11 * u16::from(self.aes.is_some())
     }
 
     fn common<const N: usize>(&self, r: &mut Record<N>, crc: u32, decoded: u32, packed: u32) {
         r.u16(self.width.version());
         r.u16(self.flags);
-        r.u16(match self.method {
-            Method::Stored => METHOD_STORED,
-            Method::Deflate(_) => METHOD_DEFLATE,
-        });
+        r.u16(if self.aes.is_some() { 99 } else { self.compression_method() });
         r.u16(self.dos.time);
         r.u16(self.dos.date);
-        r.u32(crc);
+        r.u32(self.aes.map_or(crc, |(_, variant)| variant.wire_crc(crc)));
         r.u32(packed);
         r.u32(decoded);
         r.u16(self.name_len);
@@ -195,7 +193,7 @@ impl Member {
         Ok(r)
     }
 
-    fn extras(&self, central: bool, decoded: u64, packed: u64) -> Record<41> {
+    fn extras(&self, central: bool, decoded: u64, packed: u64) -> Record<52> {
         let mut r = Record::new();
         let zip64 = self.zip64_len(central);
         if zip64 != 0 {
@@ -218,20 +216,35 @@ impl Member {
             r.put(&[1]); // mtime only
             r.put(&mtime.to_le_bytes());
         }
+        if let Some((strength, variant)) = self.aes {
+            r.u16(0x9901);
+            r.u16(7);
+            r.u16(variant.wire());
+            r.put(b"AE");
+            r.put(&[strength.wire()]);
+            r.u16(self.compression_method());
+        }
         r
     }
 
-    pub(super) fn local_extra(&self) -> Record<41> {
+    fn compression_method(&self) -> u16 {
+        match self.method {
+            Method::Stored => METHOD_STORED,
+            Method::Deflate(_) => METHOD_DEFLATE,
+        }
+    }
+
+    pub(super) fn local_extra(&self) -> Record<52> {
         self.extras(false, 0, 0)
     }
 
-    pub(super) fn central_extra(&self, decoded: u64, packed: u64) -> Record<41> {
+    pub(super) fn central_extra(&self, decoded: u64, packed: u64) -> Record<52> {
         self.extras(true, decoded, packed)
     }
 
     pub(super) fn patch(&self, crc: u32, decoded: u64, packed: u64) -> Result<Record<12>, WriteError> {
         let mut r = Record::new();
-        r.u32(crc);
+        r.u32(self.aes.map_or(crc, |(_, variant)| variant.wire_crc(crc)));
         if !self.width.sizes {
             r.u32(self.width.size32(packed)?);
             r.u32(self.width.size32(decoded)?);
