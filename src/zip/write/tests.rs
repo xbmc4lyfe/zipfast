@@ -139,7 +139,7 @@ fn stalled_encoder_returns_without_emitting_payload() {
     let sink = io::Cursor::new(Vec::new());
     let mut output = Output::new(sink, WriteLimits::default(), None);
     let mut encoder = Compress::new(Compression::new(6), false);
-    let result = output.deflate(&mut encoder, b"", &mut [0; BUFFER], FlushCompress::None);
+    let result = output.deflate(&mut encoder, b"", &mut [0; BUFFER], FlushCompress::None, &mut None);
     assert!(matches!(result, Err(WriteError::EncoderStalled)));
     assert!(output.sink.into_inner().is_empty());
 }
@@ -152,9 +152,9 @@ fn encoder_failure_does_not_emit_more_bytes() {
     let mut buffer = [0; BUFFER];
     // Feed a nonempty slice to an already finished native stream. zlib-rs
     // reports a stream error, while miniz reports a non-progress status.
-    output.deflate(&mut encoder, b"", &mut buffer, FlushCompress::Finish).unwrap();
+    output.deflate(&mut encoder, b"", &mut buffer, FlushCompress::Finish, &mut None).unwrap();
     let extent = output.work.usage.archive_extent;
-    let result = output.deflate(&mut encoder, b"x", &mut buffer, FlushCompress::None);
+    let result = output.deflate(&mut encoder, b"x", &mut buffer, FlushCompress::None, &mut None);
     assert!(matches!(result, Err(WriteError::Compression(_) | WriteError::EncoderStalled)));
     assert_eq!(output.work.usage.archive_extent, extent);
 }

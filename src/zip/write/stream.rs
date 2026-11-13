@@ -14,8 +14,11 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::sync::Arc;
+
+use crate::crypto::ZipCrypto;
+use crate::zip::FLAG_ENCRYPTED;
 
 use super::records::{End, Member, Width};
 use super::{
@@ -24,11 +27,12 @@ use super::{
 };
 
 const FLAG_DESCRIPTOR: u16 = 1 << 3;
+const ZIPCRYPTO_HEADER: u64 = 12;
 
 /// A fresh ZIP archive written forward to an owned or borrowed sink.
 ///
-/// Nonempty files have a signed data descriptor after the payload. Empty
-/// files and explicit directories use Stored without a descriptor. Call
+/// Nonempty files and ZipCrypto files have a signed data descriptor after
+/// the payload. Clear empty files and directories use Stored without a descriptor. Call
 /// [Self::finish] to write the central directory and flush the sink. Dropping
 /// this writer leaves any provisional bytes in place.
 pub struct ZipStreamWriter<W> {
@@ -71,14 +75,49 @@ impl<W: Write> ZipStreamWriter<W> {
         input: &mut R,
         length: InputLength,
     ) -> Result<EntryWritten, WriteError> {
-        let (member, entries) = self.prepare(options, length, false)?;
-        let result = self.write_file(options, member, entries, FileInput { input, length, decoded: 0 });
+        let (member, entries) = self.prepare(options, length, false, false)?;
+        let result = self.write_file(options, member, entries, FileInput { input, length, decoded: 0 }, None);
+        self.remember_failure(result)
+    }
+
+    /// Streams a regular file using traditional ZIP encryption for legacy
+    /// interoperability. ZipCrypto does not authenticate content.
+    ///
+    /// The password uses its UTF-8 bytes and must be nonempty and contain
+    /// no NUL bytes. Supply fresh operating-system cryptographic randomness
+    /// for all eleven bytes on each call. A failed entropy callback leaves
+    /// the writer reusable, with the attempt charged to the I/O budget.
+    /// An error after entropy succeeds and the entry is admitted poisons
+    /// the writer. Password and cipher state live only for this call.
+    pub fn add_zipcrypto_file<R: Read + ?Sized>(
+        &mut self,
+        options: EntryOptions<'_>,
+        input: &mut R,
+        length: InputLength,
+        password: &str,
+        entropy: impl FnOnce(&mut [u8; 11]) -> io::Result<()>,
+    ) -> Result<EntryWritten, WriteError> {
+        self.check_failed()?;
+        if password.is_empty() || password.as_bytes().contains(&0) {
+            return Err(WriteError::InvalidMetadata("ZIP password must be nonempty and contain no NUL bytes"));
+        }
+        let (member, entries) = self.prepare(options, length, false, true)?;
+        let mut random = [0; 11];
+        self.output.work.checkpoint()?;
+        entropy(&mut random).map_err(|error| WriteError::io(IoStage::EncryptionEntropy, error))?;
+        let result = self.write_file(
+            options,
+            member,
+            entries,
+            FileInput { input, length, decoded: 0 },
+            Some((ZipCrypto::new(password), random)),
+        );
         self.remember_failure(result)
     }
 
     /// Appends an explicit Stored directory whose name has one trailing slash.
     pub fn add_directory(&mut self, options: EntryOptions<'_>) -> Result<EntryWritten, WriteError> {
-        let (member, entries) = self.prepare(options, InputLength::Exact(0), true)?;
+        let (member, entries) = self.prepare(options, InputLength::Exact(0), true, false)?;
         let result = self
             .output
             .write_local(&member, options.name.bytes())
@@ -130,22 +169,38 @@ impl<W: Write> ZipStreamWriter<W> {
         options: EntryOptions<'_>,
         length: InputLength,
         directory: bool,
+        encrypted: bool,
     ) -> Result<(Member, u64), WriteError> {
         self.check_failed()?;
         let local_at = self.output.position;
-        let member = prepare_member(options, length, directory, local_at)?;
+        let mut member = prepare_member(options, length, directory, local_at)?;
+        let overhead = if encrypted { ZIPCRYPTO_HEADER } else { 0 };
+        if encrypted {
+            member.flags |= FLAG_DESCRIPTOR | FLAG_ENCRYPTED;
+            if member.method == Method::Stored
+                && let InputLength::Exact(size) = length
+            {
+                member.width = Width::new(Method::Stored, InputLength::Exact(add(size, overhead)?), local_at, false);
+            }
+        }
         let work = &self.output.work;
         let limits = work.limits;
         let entries = add(work.usage.entries, 1)?;
         bound(entries, limits.entries, Limit::Entries)?;
         let central = add(self.central.len() as u64, member.central_len())?;
         bound(central, limits.central_bytes, Limit::CentralBytes)?;
-        let payload_min = if directory { 0 } else { work.payload_min(length, member.method)? };
-        let descriptor = if length == InputLength::Exact(0) { 0 } else { member.descriptor_len() };
+        let payload_min = if directory { 0 } else { add(work.payload_min(length, member.method)?, overhead)? };
+        let descriptor = if encrypted || length != InputLength::Exact(0) { member.descriptor_len() } else { 0 };
         let before_tail = add(add(member.local_len(), payload_min)?, descriptor)?;
         let central_at = add(local_at, before_tail)?;
         let end = End::new(entries, central, central_at, self.wide_member || member.width.is_wide(), self.comment_len);
         self.output.check_tail(end, before_tail)?;
+        if encrypted {
+            // Entropy, an input read, the fixed local record, the
+            // encryption header and a descriptor are mandatory.
+            let minimum = 5 + u64::from(!options.name.bytes().is_empty());
+            bound(add(work.usage.io_attempts, minimum)?, limits.io_attempts, Limit::IoAttempts)?;
+        }
         work.check_canceled()?;
         let max_capacity = limits.metadata_capacity - self.comment.capacity() as u64;
         reserve_central(&mut self.central, central, max_capacity)?;
@@ -158,19 +213,33 @@ impl<W: Write> ZipStreamWriter<W> {
         mut member: Member,
         entries: u64,
         mut file: FileInput<'_, R>,
+        encryption: Option<(ZipCrypto, [u8; 11])>,
     ) -> Result<EntryWritten, WriteError> {
         let mut input = [0; BUFFER];
         let first = file.read(&mut self.output.work, &mut input)?;
         if first == 0 {
             member.method = Method::Stored;
             member.width = Width::new(Method::Stored, InputLength::Exact(0), member.local_at, true);
-            self.output.write_local(&member, options.name.bytes())?;
-            return self.complete(options, &member, entries, 0, 0, 0);
+            if encryption.is_none() {
+                self.output.write_local(&member, options.name.bytes())?;
+                return self.complete(options, &member, entries, 0, 0, 0);
+            }
         }
 
         member.flags |= FLAG_DESCRIPTOR;
         self.output.write_local(&member, options.name.bytes())?;
-        let (crc, packed) = self.output.write_payload(member.method, &mut file, &mut input, first)?;
+        let (cipher, overhead) = if let Some((mut cipher, random)) = encryption {
+            let mut header = [0; ZIPCRYPTO_HEADER as usize];
+            header[..11].copy_from_slice(&random);
+            header[11] = (member.dos.time >> 8) as u8;
+            cipher.encrypt(&mut header);
+            self.output.write(&header, IoStage::EncryptionHeader)?;
+            (Some(cipher), ZIPCRYPTO_HEADER)
+        } else {
+            (None, 0)
+        };
+        let (crc, payload) = self.output.write_payload(member.method, &mut file, &mut input, first, cipher)?;
+        let packed = add(payload, overhead)?;
         let decoded = file.decoded;
 
         let descriptor_len = member.descriptor_len();
@@ -287,6 +356,32 @@ mod tests {
             let tail = if central_at >= sentinel { 98 } else { 22 };
             assert_eq!(summary.usage.archive_extent, central_at + 47 + tail);
             assert_eq!(summary.usage.output_bytes, summary.usage.archive_extent);
+        }
+    }
+
+    #[test]
+    fn zipcrypto_header_crosses_size_and_offset_sentinels() {
+        let sentinel = u64::from(u32::MAX);
+        for (size, wide) in [(sentinel - 13, false), (sentinel - 12, true)] {
+            let mut writer = ZipStreamWriter::new(io::sink(), WriterOptions::default()).unwrap();
+            let (member, _) = writer.prepare(stored(), InputLength::Exact(size), false, true).unwrap();
+            assert_eq!(member.width.sizes, wide);
+            let descriptor = member.descriptor(0, size, size + ZIPCRYPTO_HEADER).unwrap();
+            assert_eq!(descriptor.as_bytes().len(), if wide { 24 } else { 16 });
+        }
+        for central_at in [sentinel - 1, sentinel] {
+            let mut writer = ZipStreamWriter::new(io::sink(), WriterOptions::default()).unwrap();
+            writer.output.position = central_at - 60;
+            let receipt = writer
+                .add_zipcrypto_file(stored(), &mut b"x".as_slice(), InputLength::Exact(1), "pass", |random| {
+                    *random = [1; 11];
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(receipt.packed_size, 13);
+            let summary = writer.finish().unwrap().summary;
+            assert_eq!(summary.central_offset, central_at);
+            assert_eq!(summary.zip64, central_at == sentinel);
         }
     }
 

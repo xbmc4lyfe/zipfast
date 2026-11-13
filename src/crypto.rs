@@ -988,10 +988,30 @@ fn crypto_update(keys: &mut [u32; 3], b: u8) {
 }
 
 fn crypto_step(keys: &mut [u32; 3], cipher: u8) -> u8 {
-    let t = keys[2] | 2;
-    let plain = cipher ^ (t.wrapping_mul(t ^ 1) >> 8) as u8;
+    let plain = cipher ^ crypto_mask(keys);
     crypto_update(keys, plain);
     plain
+}
+
+fn crypto_mask(keys: &[u32; 3]) -> u8 {
+    let t = keys[2] | 2;
+    (t.wrapping_mul(t ^ 1) >> 8) as u8
+}
+
+pub(crate) struct ZipCrypto([u32; 3]);
+
+impl ZipCrypto {
+    pub(crate) fn new(password: &str) -> Self {
+        Self(crypto_keys(password.as_bytes()))
+    }
+
+    pub(crate) fn encrypt(&mut self, data: &mut [u8]) {
+        for byte in data {
+            let plaintext = *byte;
+            *byte ^= crypto_mask(&self.0);
+            crypto_update(&mut self.0, plaintext);
+        }
+    }
 }
 
 /// Decrypts a ZipCrypto entry starting at `data` (12-byte encryption header + payload) if `check` matches.
