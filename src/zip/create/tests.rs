@@ -1710,3 +1710,68 @@ fn zipcrypto_publication_refuses_destination_source_and_stage_substitutions() {
         assert!(stages(dir.path()).is_empty());
     }
 }
+
+#[test]
+fn zipcrypto_stage_cursor_retries_interruption_with_one_native_charge() {
+    let (_dir, _, _, plan) = simple_plan(CreateOptions::default());
+    let baseline = plan.publish_zipcrypto_with_receipts("test-password").outcome.unwrap().summary;
+    let (dir, _, output, plan) = simple_plan(CreateOptions::default());
+    let mut interrupted = false;
+    let report = with_hook(
+        move |event, _| {
+            if event == Event::SinkSeek && !std::mem::replace(&mut interrupted, true) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            Ok(())
+        },
+        || plan.publish_zipcrypto_with_receipts("test-password"),
+    );
+    let usage = report.outcome.unwrap().summary;
+    assert_eq!(usage.transaction_attempts, baseline.transaction_attempts + 1);
+    assert_eq!(usage.writer, baseline.writer);
+    assert_eq!(report.written.len(), 1);
+    assert!(output.exists() && stages(dir.path()).is_empty());
+}
+
+#[test]
+fn zipcrypto_stage_cursor_retries_respect_typed_transaction_stops() {
+    let (_dir, _, _, plan) = simple_plan(CreateOptions::default());
+    let budget = plan.usage().transaction_attempts + 25;
+    for canceled in [false, true] {
+        let mut options = CreateOptions::default();
+        options.limits.transaction_attempts = budget;
+        let cancel = options.cancel.clone();
+        let (dir, _, output, plan) = simple_plan(options);
+        let admission = plan.usage().transaction_attempts;
+        let seeks = std::rc::Rc::new(Cell::new(0));
+        let attempted = seeks.clone();
+        let report = with_hook(
+            move |event, _| {
+                if event == Event::SinkSeek {
+                    attempted.set(attempted.get() + 1);
+                    if canceled {
+                        cancel.cancel();
+                    }
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                Ok(())
+            },
+            || plan.publish_zipcrypto_with_receipts("test-password"),
+        );
+        let failure = report.outcome.unwrap_err();
+        assert_eq!((failure.stage, failure.publication), (CreateStage::Write, Publication::NotPublished));
+        if canceled {
+            assert!(matches!(failure.cause, CreateError::Canceled));
+            assert_eq!(seeks.get(), 1);
+        } else {
+            assert!(matches!(failure.cause, CreateError::Limit(CreateLimit::TransactionAttempts)));
+            assert_eq!(failure.summary.transaction_attempts, budget);
+        }
+        // The stage setup uses four native attempts before its first seek.
+        assert_eq!(failure.summary.transaction_attempts, admission + 4 + seeks.get());
+        assert_eq!(failure.summary.writer, WriteUsage::default());
+        assert!(report.written.is_empty());
+        assert!(matches!(failure.cleanup, CleanupState::Clean));
+        assert!(!output.exists() && stages(dir.path()).is_empty());
+    }
+}

@@ -258,7 +258,7 @@ impl CreatePlan {
             if original.len != 0 {
                 return Err(Stopped::at(CreateStage::StageCreate, CreateError::StageChanged));
             }
-            if sink.seek(SeekFrom::Start(0)).map_err(CreateError::from).at(CreateStage::Write)? != 0 {
+            if attempts.run(|| sink.seek_once(SeekFrom::Start(0))).at(CreateStage::Write)? != 0 {
                 return Err(Stopped::at(CreateStage::Write, CreateError::StageChanged));
             }
             StageWriter::Encrypted(
@@ -583,9 +583,9 @@ impl Write for RawIo<'_> {
     }
 }
 
-impl Seek for RawIo<'_> {
-    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
-        self.charge()?;
+impl RawIo<'_> {
+    // The seek caller owns attempt accounting and retry policy.
+    fn seek_once(&mut self, position: SeekFrom) -> io::Result<u64> {
         #[cfg(test)]
         tests::event_io(tests::Event::SinkSeek, None)?;
         let result = self.file.seek(position)?;
@@ -594,5 +594,12 @@ impl Seek for RawIo<'_> {
             self.position = result;
         }
         Ok(result)
+    }
+}
+
+impl Seek for RawIo<'_> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        self.charge()?;
+        self.seek_once(position)
     }
 }
