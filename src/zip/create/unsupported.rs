@@ -18,7 +18,7 @@ use std::convert::Infallible;
 use std::fs::File;
 use std::path::Path;
 
-use crate::zip::write::EntryOptions;
+use crate::zip::write::{EntryOptions, WinZipAesRequest};
 
 use super::*;
 
@@ -93,6 +93,17 @@ impl CreatePlan {
 
     /// Publishes using ZipCrypto for regular files on supported platforms.
     pub fn publish_zipcrypto_with_receipts(self, _password: &str) -> CreateReport {
+        match self.0 {}
+    }
+
+    pub fn publish_winzip_aes_with_receipts(self, _request: WinZipAesRequest<'_>) -> AesCreateReport {
+        match self.0 {}
+    }
+
+    pub fn publish_winzip_aes_with_bound_receipts(
+        self,
+        _request: WinZipAesRequest<'_>,
+    ) -> (AesCreateReport, Option<PublishedArchiveBinding>) {
         match self.0 {}
     }
 

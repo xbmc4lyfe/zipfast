@@ -56,7 +56,7 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 
-use super::write::{EntryWritten, WriteError, WriteLimits, WriteUsage};
+use super::write::{AesStrength, AesVariant, EntryWritten, WriteError, WriteLimits, WriteUsage};
 use crate::extract::Cancellation;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -497,6 +497,20 @@ pub struct CreateReport {
     /// Receipts require confirmed publication. They are also available when
     /// publication succeeded and finalization returned an error.
     pub written: Vec<EntryWritten>,
+}
+
+/// Native AES creation with common wire receipts and the requested regular-file
+/// policy. Explicit directories remain clear. No credentials or private
+/// plaintext CRCs are retained in this report.
+#[derive(Debug)]
+#[must_use]
+pub struct AesCreateReport {
+    pub outcome: std::result::Result<CreatedArchive, CreateFailure>,
+    /// Actual common write receipts with the same publication rules and output
+    /// ordinals as [`CreateReport::written`]. AE-2 wire CRCs are zero.
+    pub written: Vec<EntryWritten>,
+    pub strength: AesStrength,
+    pub variant: AesVariant,
 }
 
 /// Binding to a verified archive captured through its held publication file.
