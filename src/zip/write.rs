@@ -233,7 +233,7 @@ pub struct WriteLimits {
     pub archive_extent: u64,
     /// Cumulative bytes written, including backpatches.
     pub output_bytes: u64,
-    /// Read, write, seek, flush and codec attempts, including retries.
+    /// Read, write, seek, flush, codec and entropy attempts, including retries.
     pub io_attempts: u64,
 }
 
@@ -299,6 +299,8 @@ pub enum IoStage {
     SinkExtent,
     SinkRestore,
     SourceRead,
+    EncryptionEntropy,
+    EncryptionHeader,
     LocalHeader,
     Payload,
     DataDescriptor,
@@ -517,7 +519,7 @@ impl<W: Write + Seek> ZipWriter<W> {
         }
 
         self.output.write_local(&member, options.name.bytes())?;
-        let (crc, packed) = self.output.write_payload(member.method, &mut file, &mut input, first)?;
+        let (crc, packed) = self.output.write_payload(member.method, &mut file, &mut input, first, None)?;
         let payload_end = self.output.position;
         let decoded = file.decoded;
 
@@ -816,6 +818,7 @@ impl<W: Write> Output<W> {
         mut input: &[u8],
         output: &mut [u8; BUFFER],
         flush: FlushCompress,
+        cipher: &mut Option<crate::crypto::ZipCrypto>,
     ) -> Result<(), WriteError> {
         loop {
             self.work.checkpoint()?;
@@ -824,6 +827,9 @@ impl<W: Write> Output<W> {
             let status = encoder.compress(input, output, flush).map_err(WriteError::Compression)?;
             let consumed = encoder_delta(previous_in, encoder.total_in(), input.len())?;
             let produced = encoder_delta(previous_out, encoder.total_out(), output.len())?;
+            if let Some(cipher) = cipher {
+                cipher.encrypt(&mut output[..produced]);
+            }
             self.write(&output[..produced], IoStage::Payload)?;
             input = &input[consumed..];
             match status {
@@ -848,6 +854,7 @@ impl<W: Write> Output<W> {
         file: &mut FileInput<'_, R>,
         input: &mut [u8; BUFFER],
         first: usize,
+        mut cipher: Option<crate::crypto::ZipCrypto>,
     ) -> Result<(u32, u64), WriteError> {
         let payload_at = self.position;
         let mut crc = Hasher::new();
@@ -858,17 +865,20 @@ impl<W: Write> Output<W> {
         };
         let mut compressed = [0; BUFFER];
         while chunk != 0 {
-            let bytes = &input[..chunk];
+            let bytes = &mut input[..chunk];
             crc.update(bytes);
             if let Some(encoder) = &mut encoder {
-                self.deflate(encoder, bytes, &mut compressed, FlushCompress::None)?;
+                self.deflate(encoder, bytes, &mut compressed, FlushCompress::None, &mut cipher)?;
             } else {
+                if let Some(cipher) = &mut cipher {
+                    cipher.encrypt(bytes);
+                }
                 self.write(bytes, IoStage::Payload)?;
             }
             chunk = file.read(&mut self.work, input)?;
         }
         if let Some(encoder) = &mut encoder {
-            self.deflate(encoder, &[], &mut compressed, FlushCompress::Finish)?;
+            self.deflate(encoder, &[], &mut compressed, FlushCompress::Finish, &mut cipher)?;
         }
         let payload_end = self.position;
         let packed = payload_end.checked_sub(payload_at).ok_or(WriteError::Overflow)?;

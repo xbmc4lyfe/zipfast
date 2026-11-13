@@ -1100,6 +1100,28 @@ impl Write for InterruptingSink {
 }
 
 #[test]
+fn zipcrypto_entry_attempt_bound_accounts_for_an_empty_name() {
+    let options =
+        WriterOptions { limits: WriteLimits { io_attempts: 5, ..WriteLimits::default() }, ..WriterOptions::default() };
+    let mut writer = ZipStreamWriter::new(io::sink(), options).unwrap();
+    let result = writer
+        .add_zipcrypto_file(
+            entry("", Method::Stored),
+            &mut io::empty(),
+            InputLength::Exact(0),
+            "zipfast-test-only",
+            |random| {
+                random.fill(9);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!((result.decoded_size, result.packed_size), (0, 12));
+    assert_eq!(writer.usage().io_attempts, 5);
+    assert!(matches!(writer.finish(), Err(WriteError::Limit(Limit::IoAttempts))));
+}
+
+#[test]
 fn retries_and_codec_iterations_consume_the_finite_attempt_budget() {
     let options = |io_attempts| WriterOptions {
         limits: WriteLimits { io_attempts, ..WriteLimits::default() },
@@ -1257,4 +1279,226 @@ fn oversized_metadata_and_impossible_lengths_are_recoverable_preflight_failures(
     let bytes = writer.finish().unwrap().sink.0;
     let expected = WireMember { name: maximum, comment: maximum, utf8: false, ..WireMember::new("", b"y", 0, 16) };
     assert!(check_wire(&mut Cursor::new(bytes), b"", &[expected]));
+}
+
+#[test]
+fn zipcrypto_stream_uses_time_checked_signed_descriptors_for_all_lengths() {
+    const PASSWORD: &str = "zipfast-test-only";
+    let payload: Vec<_> = (0..=255).cycle().take(65_792).collect();
+    let mut writer = ZipStreamWriter::new(WriteOnly(Vec::new()), WriterOptions::default()).unwrap();
+    let mut receipts = Vec::new();
+    for (name, method, length, bytes) in [
+        ("stored", Method::Stored, InputLength::Exact(payload.len() as u64), payload.as_slice()),
+        ("deflated", deflate(6), InputLength::Unknown, payload.as_slice()),
+        ("empty", deflate(9), InputLength::Exact(0), b"".as_slice()),
+        ("empty-unknown", deflate(1), InputLength::Unknown, b"".as_slice()),
+    ] {
+        let mut options = entry(name, method);
+        options.modified = DosDateTime::new(2024, 11, 12, 20, 32, 40).unwrap();
+        options.extended_mtime = Some(1_700_000_000);
+        options.comment = b"member";
+        let mut input = bytes;
+        let written = writer
+            .add_zipcrypto_file(options, &mut input, length, PASSWORD, |random| {
+                *random = [0x5a; 11];
+                Ok(())
+            })
+            .unwrap();
+        receipts.push((written, bytes));
+    }
+    writer.add_directory(entry("clear/", Method::Stored)).unwrap();
+    writer.add_file(entry("clear/data", Method::Stored), &mut b"clear".as_slice(), InputLength::Exact(5)).unwrap();
+    let finished = writer.finish().unwrap();
+    let bytes = finished.sink.0;
+    let reader = ZipReader::new(&bytes).unwrap();
+    let mut expected_packed = 5;
+    for (receipt, plain) in receipts {
+        let at = receipt.local_offset as usize;
+        assert_eq!(n16(&bytes, at + 6), 0x0809);
+        assert_eq!(n32(&bytes, at + 14), 0);
+        let data = at + 30 + usize::from(n16(&bytes, at + 26)) + usize::from(n16(&bytes, at + 28));
+        let end = data + receipt.packed_size as usize;
+        assert_eq!(n32(&bytes, end), 0x0807_4b50);
+        assert_eq!(n32(&bytes, end + 4), crc32fast::hash(plain));
+        let time_check = bytes[at + 11];
+        assert_ne!(time_check, (receipt.crc32 >> 24) as u8);
+        let decrypted = zipfast::crypto::decrypt_zipcrypto(PASSWORD, time_check, &bytes[data..end]).unwrap();
+        assert_eq!(decrypted.len() as u64 + 12, receipt.packed_size);
+        if receipt.method == Method::Stored {
+            assert_eq!(decrypted, plain);
+            assert_eq!(n32(&bytes, end + 8) as u64, receipt.packed_size);
+            assert_eq!(n32(&bytes, end + 12) as u64, receipt.decoded_size);
+        } else {
+            assert_eq!(n64(&bytes, end + 8), receipt.packed_size);
+            assert_eq!(n64(&bytes, end + 16), receipt.decoded_size);
+        }
+        assert_eq!(
+            reader.read_entry_with_password(&reader.entries()[receipt.ordinal as usize], Some(PASSWORD)).unwrap(),
+            plain
+        );
+        expected_packed += receipt.packed_size;
+    }
+    assert_eq!(finished.summary.usage.packed_bytes, expected_packed);
+    assert_eq!(reader.read_by_name("clear/data").unwrap(), b"clear");
+}
+
+#[test]
+fn zipcrypto_preflight_and_entropy_failure_leave_writer_reusable() {
+    let mut writer = ZipStreamWriter::new(Vec::new(), WriterOptions::default()).unwrap();
+    for invalid in ["", "password\0tail"] {
+        let error = writer
+            .add_zipcrypto_file(
+                entry("secret", Method::Stored),
+                &mut io::empty(),
+                InputLength::Exact(0),
+                invalid,
+                |_| panic!("invalid password requested entropy"),
+            )
+            .unwrap_err();
+        assert!(matches!(error, WriteError::InvalidMetadata(_)));
+    }
+    let error = writer
+        .add_zipcrypto_file(entry("secret", Method::Stored), &mut io::empty(), InputLength::Exact(0), "pass", |_| {
+            Err(io::Error::other("entropy source"))
+        })
+        .unwrap_err();
+    assert!(
+        matches!(&error, WriteError::Io { stage: IoStage::EncryptionEntropy, source } if source.to_string() == "entropy source")
+    );
+    assert_eq!(writer.usage().output_bytes, 0);
+    assert_eq!(writer.usage().source_bytes, 0);
+    writer.add_file(entry("clear", Method::Stored), &mut io::empty(), InputLength::Exact(0)).unwrap();
+    assert_eq!(writer.finish().unwrap().summary.usage.entries, 1);
+}
+
+#[test]
+fn encrypted_empty_preflight_accounts_for_header_and_descriptor() {
+    for (maximum, expected) in [(128, true), (127, false)] {
+        let options = WriterOptions {
+            limits: WriteLimits { archive_extent: maximum, output_bytes: maximum, ..WriteLimits::default() },
+            ..WriterOptions::default()
+        };
+        let mut writer = ZipStreamWriter::new(Vec::new(), options).unwrap();
+        let mut entropy = 0;
+        let result = writer.add_zipcrypto_file(
+            entry("x", Method::Stored),
+            &mut io::empty(),
+            InputLength::Exact(0),
+            "pass",
+            |random| {
+                entropy += 1;
+                *random = [7; 11];
+                Ok(())
+            },
+        );
+        if expected {
+            assert_eq!(result.unwrap().packed_size, 12);
+            assert_eq!(writer.finish().unwrap().sink.len(), 128);
+        } else {
+            assert!(matches!(result, Err(WriteError::Limit(Limit::ArchiveExtent))));
+            assert_eq!(entropy, 0);
+            assert_eq!(writer.usage().output_bytes, 0);
+        }
+    }
+}
+
+#[test]
+fn zipcrypto_short_writes_do_not_encrypt_ciphertext_twice() {
+    let plain = b"streamed compression".repeat(4000);
+    let write = |chunk| {
+        let script = Script::default();
+        let sink = ScriptSink { script: &script, bytes: Vec::new(), chunk };
+        let mut writer = ZipStreamWriter::new(sink, WriterOptions::default()).unwrap();
+        for (name, method) in [("stored", Method::Stored), ("deflate", deflate(6))] {
+            writer
+                .add_zipcrypto_file(
+                    entry(name, method),
+                    &mut plain.as_slice(),
+                    InputLength::Exact(plain.len() as u64),
+                    "pass",
+                    |bytes| {
+                        *bytes = [1; 11];
+                        Ok(())
+                    },
+                )
+                .unwrap();
+        }
+        writer.finish().unwrap().sink.bytes
+    };
+    assert_eq!(write(usize::MAX), write(7));
+}
+
+#[test]
+fn zipcrypto_admitted_input_and_header_failures_poison_the_writer() {
+    for (fault, stage) in [(1, IoStage::SourceRead), (4, IoStage::EncryptionHeader)] {
+        let script = Script { fault: Some((fault - 1, Fault::Fail)), ..Script::default() };
+        let sink = ScriptSink { script: &script, bytes: Vec::new(), chunk: usize::MAX };
+        let mut source = ScriptSource { script: &script, data: b"x", chunk: usize::MAX };
+        let mut writer = ZipStreamWriter::new(sink, WriterOptions::default()).unwrap();
+        let result = writer.add_zipcrypto_file(
+            entry("x", Method::Stored),
+            &mut source,
+            InputLength::Exact(1),
+            "pass",
+            |bytes| {
+                *bytes = [1; 11];
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(WriteError::Io { stage: actual, .. }) if actual == stage), "{result:?}");
+        assert!(matches!(
+            writer.add_file(entry("later", Method::Stored), &mut io::empty(), InputLength::Exact(0)),
+            Err(WriteError::Failed(_))
+        ));
+        assert!(matches!(writer.finish(), Err(WriteError::Failed(_))));
+    }
+}
+
+#[test]
+#[ignore = "exports generated ZipCrypto streams for checksum-pinned reference readers"]
+fn export_zipcrypto_reference_fixtures() {
+    let folder = std::path::PathBuf::from(std::env::var_os("ZIPFAST_ZIPCRYPTO_REFERENCE_DIR").unwrap());
+    let expected = folder.join("expected");
+    std::fs::create_dir_all(&expected).unwrap();
+    let cross: Vec<_> = (0..=255).cycle().take(65_792).collect();
+    let text = b"line of text\n".repeat(6_000);
+    let mut writer = ZipStreamWriter::new(
+        std::fs::File::create(folder.join("mixed.zip")).unwrap(),
+        WriterOptions { comment: b"zipcrypto fixtures", ..WriterOptions::default() },
+    )
+    .unwrap();
+    for (index, (name, method, length, contents)) in [
+        ("empty", deflate(1), InputLength::Exact(0), b"".as_slice()),
+        ("empty-unknown", deflate(6), InputLength::Unknown, b"".as_slice()),
+        ("one", Method::Stored, InputLength::Exact(1), b"x".as_slice()),
+        ("cross", Method::Stored, InputLength::Unknown, cross.as_slice()),
+        ("deflate1", deflate(1), InputLength::Exact(text.len() as u64), text.as_slice()),
+        ("deflate6", deflate(6), InputLength::Unknown, text.as_slice()),
+        ("deflate9", deflate(9), InputLength::Unknown, text.as_slice()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut options = entry(name, method);
+        options.modified = DosDateTime::new(2023, 11, 14, 22, 13, 20).unwrap();
+        options.extended_mtime = Some(1_700_000_000);
+        options.comment = b"member comment";
+        if index == 3 {
+            options.name = EntryName::Raw(b"cross");
+        }
+        let mut input = contents;
+        writer
+            .add_zipcrypto_file(options, &mut input, length, "zipfast-test-only", |random| {
+                // Deterministic bytes are for interoperability fixtures only.
+                random.fill(index as u8);
+                Ok(())
+            })
+            .unwrap();
+        std::fs::write(expected.join(name), contents).unwrap();
+    }
+    writer.add_directory(entry("dir/", Method::Stored)).unwrap();
+    writer.add_file(entry("dir/clear", Method::Stored), &mut b"clear".as_slice(), InputLength::Exact(5)).unwrap();
+    std::fs::create_dir(expected.join("dir")).unwrap();
+    std::fs::write(expected.join("dir/clear"), b"clear").unwrap();
+    writer.finish().unwrap();
 }
