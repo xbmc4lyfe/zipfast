@@ -36,6 +36,9 @@ use crate::volume::next_volume;
 use super::reader::{Block, Volume, read_failure};
 use super::{FileHeader, FileWire, MHFL_VOLNUMBER, MainHeader, MemberCrypt, Redirection};
 
+mod selection;
+pub use selection::{RarDecodeLimits, RarSelection};
+
 const MAX_VOLUMES: u64 = 4_096;
 
 /// Independent limits on catalogue work and storage.
@@ -159,7 +162,7 @@ struct Part {
     data_offset: u64,
     packed_size: u64,
     checks: RarChecks,
-    _crypt: MemberCrypt,
+    crypt: MemberCrypt,
 }
 
 /// Borrowed metadata for one logical member, in archive order.
@@ -265,7 +268,8 @@ struct Member {
     unpacked_size: Option<u64>,
     complete: bool,
     issue: Option<usize>,
-    _history_barrier: bool,
+    chain: Option<usize>,
+    has_successor: bool,
 }
 
 struct HeldVolume {
@@ -283,6 +287,10 @@ pub struct RarSession {
     parts: Vec<Part>,
     issues: Vec<RarFailure>,
     usage: RarCatalogueUsage,
+    password: String,
+    options: RarSessionOptions,
+    token: Arc<selection::SessionToken>,
+    invalid_binding: Option<Arc<RarFailure>>,
 }
 
 impl RarSession {
@@ -298,13 +306,29 @@ impl RarSession {
                 parts: Vec::new(),
                 issues: Vec::new(),
                 usage: RarCatalogueUsage::default(),
+                password: String::new(),
+                options: options.clone(),
+                token: Arc::new(selection::SessionToken { _private: 0 }),
+                invalid_binding: None,
             },
             options,
             owned_capacity: 0,
             pending: false,
             history_barrier: false,
+            chain: None,
+            last_compressed: None,
         };
-        if let Err(fault) = catalogue.scan(first, password) {
+        let result = (|| {
+            check_cancel(&catalogue.options.cancel)?;
+            let password = password.unwrap_or_default();
+            limit(password.len() as u64, catalogue.options.limits.capacity, RarResource::CatalogueCapacity)?;
+            catalogue.session.password.try_reserve_exact(password.len()).map_err(|_| allocation())?;
+            catalogue.session.password.push_str(password);
+            catalogue.owned_capacity = catalogue.session.password.capacity() as u64;
+            catalogue.update_capacity()?;
+            catalogue.scan(first, Some(password))
+        })();
+        if let Err(fault) = result {
             let partial = RarRunSummary {
                 encountered: catalogue.session.usage.entries,
                 volumes: catalogue.session.usage.volumes,
@@ -343,6 +367,8 @@ struct Catalogue {
     owned_capacity: u64,
     pending: bool,
     history_barrier: bool,
+    chain: Option<usize>,
+    last_compressed: Option<usize>,
 }
 
 impl Catalogue {
@@ -473,7 +499,7 @@ impl Catalogue {
                 blake2sp: header.blake2sp,
                 keyed: header.crypt.as_ref().is_some_and(|params| params.tweaked_crc),
             },
-            _crypt: crypt,
+            crypt,
         };
         let ordinal = if associated { self.session.members.len() - 1 } else { self.session.members.len() } as u64;
         let size = (!header.size_unknown()).then_some(header.unpacked_size);
@@ -542,10 +568,24 @@ impl Catalogue {
             let issue = self.retain_issue(issue)?;
             self.session.usage.entries = entries;
             self.session.usage.name_bytes = names;
-            let history_barrier = header.method != 0
-                && !header.is_dir()
-                && header.redirection.is_none()
-                && std::mem::take(&mut self.history_barrier);
+            let compressed = header.method != 0 && !header.is_dir() && header.redirection.is_none();
+            let chain = if compressed {
+                let index = self.session.members.len();
+                if !header.solid {
+                    self.chain = Some(index);
+                } else if self.history_barrier {
+                    self.chain = None;
+                } else if let Some(previous) = self.last_compressed
+                    && self.chain.is_some()
+                {
+                    self.session.members[previous].has_successor = true;
+                }
+                self.history_barrier = false;
+                self.last_compressed = Some(index);
+                self.chain
+            } else {
+                None
+            };
             self.session.members.push(Member {
                 header,
                 wire,
@@ -554,7 +594,8 @@ impl Catalogue {
                 unpacked_size: size,
                 complete: final_part,
                 issue,
-                _history_barrier: history_barrier,
+                chain,
+                has_successor: false,
             });
         }
         self.session.parts.push(part);
