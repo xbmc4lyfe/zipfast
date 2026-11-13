@@ -378,7 +378,12 @@ impl Stage {
 }
 
 pub(in crate::zip) fn publication_stamp(stage: &Stage, verified: Stamp, budget: &Attempts<'_>) -> Option<Stamp> {
-    let held = file_stamp(&stage.file, budget).ok()?;
+    // This optional probe runs before required cleanup and synchronization.
+    // Never retry it against the reserve used by those operations.
+    budget.charge().ok()?;
+    #[cfg(test)]
+    super::tests::event_io(super::tests::Event::PublicationStamp, None).ok()?;
+    let held = Stamp::regular(&stage.file.metadata().ok()?).ok()?;
     // Native publication can change ctime. Keep the already verified
     // payload geometry, identity and permissions as the baseline.
     (held.same_payload(verified) && held.mode == verified.mode).then_some(held)

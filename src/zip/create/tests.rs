@@ -79,6 +79,23 @@ fn bound_receipt_detects_later_mutation_of_the_published_inode() {
 }
 
 #[test]
+fn optional_binding_probe_does_not_starve_directory_sync() {
+    let options = CreateOptions { durability: Durability::SyncFileAndDirectory, ..CreateOptions::default() };
+    let (_dir, _, _, plan) = simple_plan(options);
+    let (report, binding) = with_hook(
+        |event, _| {
+            if event == Event::PublicationStamp {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            Ok(())
+        },
+        || plan.publish_with_bound_receipts(),
+    );
+    assert_eq!(report.outcome.unwrap().durability, DurabilityState::Synced);
+    assert!(binding.is_none());
+}
+
+#[test]
 fn names_and_caller_keys_are_checked_as_paths() {
     for bad in ["", "/", "../x", "x/./y", "x//y", "C:foo", "c:/foo", "a\\b", "x\u{80}"] {
         assert!(validate_name(metadata(bad), false).is_err(), "{bad:?}");
@@ -246,6 +263,7 @@ pub(super) enum Event {
     BeforeCommit,
     NativePublish,
     AfterCommit,
+    PublicationStamp,
     BeforeCleanup,
     Unlink,
     DirectorySync,
