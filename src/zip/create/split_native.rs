@@ -227,7 +227,7 @@ fn path_buffer(n: usize) -> Checked<PathBuf> {
 fn capacity<T>(v: &Vec<T>) -> u64 {
     v.capacity() as u64 * size_of::<T>() as u64
 }
-fn empty_row(disk: u32) -> SplitVolumeReport {
+fn empty_row(disk: u32, data_sync: SplitBarrierState) -> SplitVolumeReport {
     let name = SplitNameObservation { state: SplitNameState::NotChecked, identity: None, regular: None };
     SplitVolumeReport {
         disk,
@@ -244,26 +244,26 @@ fn empty_row(disk: u32) -> SplitVolumeReport {
         final_name: name,
         publication: SplitVolumePublication::NotAttempted,
         cleanup: SplitVolumeCleanup::NotNeeded,
-        data_sync: SplitBarrierState::NotRequested,
+        data_sync,
     }
 }
 impl CreatePlan {
     /// Write and independently verify clear split volumes, then publish numbered parts before the final ZIP.
     /// Publication is per-name and no-clobber. Inspect commit, visibility and durability separately on failure.
     pub fn publish_split_with_receipts(mut self, options: SplitCreateOptions) -> SplitCreateReport {
+        let (durability, pending_sync) = match self.options.durability {
+            Durability::VisibilityOnly => (DurabilityState::NotRequested, SplitBarrierState::NotRequested),
+            Durability::SyncFileAndDirectory => (DurabilityState::Unconfirmed, SplitBarrierState::NotAttempted),
+        };
         let mut report = SplitCreateReport {
             outcome: Ok(SplitCreatedArchive { volume_count: 0, physical_bytes: 0 }),
             destination: PathBuf::new(),
             commit: SplitCommitState::NonePublished,
             visibility: SplitVisibility::NotChecked,
-            durability: if self.options.durability == Durability::VisibilityOnly {
-                DurabilityState::NotRequested
-            } else {
-                DurabilityState::Unconfirmed
-            },
+            durability,
             barriers: SplitBarrierReport {
-                prefix_parent: SplitBarrierState::NotRequested,
-                final_parent: SplitBarrierState::NotRequested,
+                prefix_parent: pending_sync,
+                final_parent: pending_sync,
                 aftermath_parent: SplitBarrierState::NotRequested,
             },
             volumes: Vec::new(),
@@ -488,7 +488,7 @@ impl CreatePlan {
                 stage_path,
             });
             counters.push(Counters::default());
-            report.volumes.push(empty_row(disk as u32));
+            report.volumes.push(empty_row(disk as u32, report.barriers.prefix_parent));
         }
         report.destination = path_buffer(self.parent.destination.as_os_str().len())?;
         report.destination.push(&self.parent.destination);

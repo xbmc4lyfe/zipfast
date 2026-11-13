@@ -211,9 +211,13 @@ pub enum SplitVolumeCleanup {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum SplitBarrierState {
+    /// This barrier wasn't requested, including an inapplicable cleanup barrier.
     NotRequested,
+    /// Requested synchronization hasn't been attempted.
     NotAttempted,
+    /// The synchronization call completed successfully.
     Complete,
+    /// The synchronization attempt failed with the referenced problem.
     Failed(SplitProblemRef),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

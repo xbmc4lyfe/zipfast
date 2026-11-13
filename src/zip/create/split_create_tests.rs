@@ -105,6 +105,19 @@ fn split_create_all_file_and_parent_barriers_preserve_commit_history() {
             );
             assert!(r.outcome.is_err());
             assert_eq!(r.durability, DurabilityState::Unconfirmed);
+            if file_sync {
+                assert_eq!(r.barriers.prefix_parent, SplitBarrierState::NotAttempted);
+                assert_eq!(r.barriers.final_parent, SplitBarrierState::NotAttempted);
+                for (index, row) in r.volumes.iter().enumerate() {
+                    if index + 1 < fail {
+                        assert_eq!(row.data_sync, SplitBarrierState::Complete);
+                    } else if index + 1 == fail {
+                        assert!(matches!(row.data_sync, SplitBarrierState::Failed(_)));
+                    } else {
+                        assert_eq!(row.data_sync, SplitBarrierState::NotAttempted);
+                    }
+                }
+            }
             if !file_sync && fail == 2 {
                 assert_eq!(r.commit, SplitCommitState::Complete);
                 assert_eq!(r.written.len(), 1);
@@ -113,6 +126,56 @@ fn split_create_all_file_and_parent_barriers_preserve_commit_history() {
                 assert!(r.written.is_empty());
                 assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "{r:?}");
             }
+        }
+    }
+}
+#[test]
+fn split_create_reports_requested_barriers_before_attempts() {
+    for durability in [Durability::VisibilityOnly, Durability::SyncFileAndDirectory] {
+        let pending = if durability == Durability::SyncFileAndDirectory {
+            SplitBarrierState::NotAttempted
+        } else {
+            SplitBarrierState::NotRequested
+        };
+        for failure in ["planning", "after_verify", "conflict"] {
+            let (dir, p) = plan(durability);
+            let mut opts = options();
+            if failure == "planning" {
+                opts.limits.volumes = 0;
+            }
+            if failure == "conflict" {
+                std::fs::write(dir.path().join("out.z01"), b"foreign").unwrap();
+            }
+            let r = with_hook(
+                move |event, _| {
+                    if failure == "after_verify" && event == Event::AfterVerify {
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                    }
+                    Ok(())
+                },
+                || p.publish_split_with_receipts(opts),
+            );
+            assert!(r.outcome.is_err(), "{failure}");
+            assert_eq!(r.barriers.prefix_parent, pending, "{failure}");
+            assert_eq!(r.barriers.final_parent, pending, "{failure}");
+            let data_sync = if failure == "conflict" && durability == Durability::SyncFileAndDirectory {
+                SplitBarrierState::Complete
+            } else {
+                pending
+            };
+            assert!(r.volumes.iter().all(|v| v.data_sync == data_sync), "{failure}: {r:?}");
+            let aftermath = if failure != "planning" && durability == Durability::SyncFileAndDirectory {
+                SplitBarrierState::Complete
+            } else {
+                SplitBarrierState::NotRequested
+            };
+            assert_eq!(r.barriers.aftermath_parent, aftermath, "{failure}");
+            assert_eq!(r.commit, SplitCommitState::NonePublished);
+            assert!(r.written.is_empty());
+            if failure == "conflict" {
+                assert_eq!(std::fs::read(dir.path().join("out.z01")).unwrap(), b"foreign");
+            }
+            assert_eq!(std::fs::read(dir.path().join("input")).unwrap(), [b'A'; 2000]);
         }
     }
 }
