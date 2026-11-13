@@ -558,7 +558,9 @@ impl<V: HeldVolumes> verify::PayloadInput for Reader<'_, '_, V> {
             if self.at.offset == self.capacity {
                 self.next().map_err(native_payload_error)?;
             }
-            let size = bytes.len().min((self.capacity - self.at.offset) as usize);
+            // Bound in u64 first. The result is at most bytes.len(), so the
+            // final conversion fits usize even when capacity exceeds 4 GiB.
+            let size = (self.capacity - self.at.offset).min(bytes.len() as u64) as usize;
             self.bytes(&mut bytes[..size], false).map_err(native_payload_error)?;
             bytes = &mut bytes[size..];
         }

@@ -777,3 +777,25 @@ fn split_verifier_handles_105_physical_volumes() {
     assert_eq!(usage.read_bytes, f.layout.transport.bytes);
     assert_eq!(usage.record_capacity, 0);
 }
+
+#[test]
+fn split_verifier_large_volume_capacity_keeps_small_payload_progress() {
+    // The local record ends at 4 + 30 + 2 + 9 = 45. At payload entry the
+    // remaining capacity is exactly 2^32; narrowing it first becomes zero
+    // on a 32-bit target even though seven physical payload bytes remain.
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let f = fixture((1_u64 << 32) + 45, b"", &[(Method::Stored, b"payload")]);
+        assert_eq!(f.files.len(), 1);
+        assert_eq!(f.stamps[0].len, 151);
+        let before = f.plan.attempts.get();
+        let usage = run(&f).unwrap();
+        assert_eq!(usage.decoded_bytes, 7);
+        assert_eq!(usage.read_bytes, 151);
+        assert!(f.plan.attempts.get() > before);
+        send.send(()).unwrap();
+    });
+    // A regressed 32-bit loop must fail this test rather than hang the suite.
+    receive.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+    worker.join().unwrap();
+}
