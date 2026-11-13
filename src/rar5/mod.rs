@@ -18,6 +18,7 @@
 //! headers with their extra records, and the end of archive header.
 
 pub mod reader;
+pub mod session;
 #[doc(hidden)]
 pub mod testenc;
 pub mod unpack;
@@ -220,6 +221,21 @@ pub(crate) type MemberCrypt =
     Option<std::result::Result<crate::crypto::Rar5CryptParams, crate::crypto::Rar5CryptError>>;
 
 pub(crate) fn parse_file_detailed(head: &BlockHead, body: &[u8], extra: &[u8]) -> Result<(FileHeader, MemberCrypt)> {
+    let (file, crypt, _) = parse_file_impl(head, body, extra, false)?;
+    Ok((file, crypt))
+}
+
+pub(super) struct FileWire {
+    pub(super) name: Vec<u8>,
+    pub(super) compression: u64,
+}
+
+fn parse_file_impl(
+    head: &BlockHead,
+    body: &[u8],
+    extra: &[u8],
+    keep_wire: bool,
+) -> Result<(FileHeader, MemberCrypt, Option<FileWire>)> {
     let mut c = Cursor::new(body);
     let mut f = FileHeader {
         service: head.kind == HEAD_SERVICE,
@@ -254,9 +270,11 @@ pub(crate) fn parse_file_detailed(head: &BlockHead, body: &[u8], extra: &[u8]) -
     f.dictionary = dictionary;
     f.host_os = c.vint()?;
     let name_len = c.vsize()?;
-    f.name = String::from_utf8_lossy(c.bytes(name_len)?).into_owned();
+    let name = c.bytes(name_len)?;
+    f.name = String::from_utf8_lossy(name).into_owned();
     let crypt = parse_file_extra(&mut f, extra)?;
-    Ok((f, crypt))
+    let wire = keep_wire.then(|| FileWire { name: name.to_vec(), compression: info });
+    Ok((f, crypt, wire))
 }
 
 fn parse_file_extra(f: &mut FileHeader, extra: &[u8]) -> Result<MemberCrypt> {
