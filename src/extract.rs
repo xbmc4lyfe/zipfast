@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::batch::{self, Batch, Done, Job, JobData, Outcome};
 use crate::blake2sp::Blake2sp;
-use crate::error::{Error, Result};
+use crate::error::{Error, RarPasswordEvidence, RarScope, Result};
 use crate::output::{Output, temporary};
 use crate::path::sanitize;
 use crate::rar5::reader::{Block, ReadDataError, SIGNATURE_PROBE_BYTES, Volume, signature_end};
@@ -325,6 +325,7 @@ fn walk_until(
     cancel: Option<&Cancellation>,
     mut on_block: impl FnMut(&mut Volume, Block) -> Result<bool>,
 ) -> Result<u64> {
+    let format = vol.format();
     let mut volumes = 0;
     loop {
         volumes += 1;
@@ -370,10 +371,14 @@ fn walk_until(
             return Ok(volumes);
         }
         vol = Volume::open_with_password(&next, password)?;
+        if vol.format() != format {
+            return Err(Error::Corrupt("RAR volume format changed"));
+        }
     }
 }
 
 fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
+    let format = vol.format();
     loop {
         run.reports.volume()?;
         let mut more = vol.main.is_volume();
@@ -408,6 +413,18 @@ fn walk_rar(mut vol: Volume, run: &mut Run<'_, '_, '_>) -> RunResult<()> {
             };
         }
         vol = Volume::open_detailed(&next, run.password)?;
+        if vol.format() != format {
+            return Err(RarFault::new(
+                RarFailure::integrity(
+                    RarScope::Header { volume: next },
+                    RarIntegrityReason::HeaderFraming("RAR volume format changed"),
+                    RarPasswordEvidence::NotEncrypted,
+                    false,
+                ),
+                Error::Corrupt("RAR volume format changed"),
+            )
+            .into());
+        }
     }
 }
 
@@ -1740,6 +1757,10 @@ impl Run<'_, '_, '_> {
         }
         let name = std::mem::take(&mut h.name);
         let ctx = self.reports.encounter(!continuation, &mut self.order, name, h.method)?;
+        if let Some(reason) = h.rar4_unsupported() {
+            self.fail_in_order(&ctx, RarFailure::Unsupported(reason), "unsupported RAR4 payload feature")?;
+            return Ok(());
+        }
         if !self.goes_to_batch(vol, &h) && !self.queueable(vol, &h) && !self.beside_batch(vol, &h) {
             self.drain_batch()?;
         }
@@ -1853,7 +1874,9 @@ impl Run<'_, '_, '_> {
             }
             return self.reports.directory(&ctx);
         }
-        let refuse = if let Some(Err(e)) = crypt {
+        let refuse = if let Some(reason) = h.rar4_unsupported() {
+            Some((RarFailure::Unsupported(reason), "unsupported RAR4 payload feature"))
+        } else if let Some(Err(e)) = crypt {
             Some((RarFailure::crypt(e, ctx.scope()), "encrypted (password required)"))
         } else if h.encrypted && (self.password.is_none() || h.crypt.is_none()) {
             Some((RarFailure::PasswordRequired { scope: ctx.scope() }, "encrypted (password required)"))

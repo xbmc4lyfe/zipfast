@@ -138,6 +138,7 @@ pub enum RarIntegrityReason {
 #[non_exhaustive]
 pub enum RarUnsupported {
     ArchiveVersion(u8),
+    Rar4Feature(&'static str),
     SourceIdentity,
     CompressionAlgorithm { algorithm: u8, method: u8 },
     EncryptionVersion(u64),
@@ -222,6 +223,7 @@ pub enum RarFailure {
     MissingVolume { path: PathBuf },
     UnnamedVolume { path: PathBuf },
     SourceChanged { path: PathBuf },
+    OutputAliasesInput,
     ForeignSelection,
     Canceled,
     NotRar,
@@ -261,6 +263,7 @@ impl fmt::Display for RarFailure {
             Self::MissingVolume { path } => write!(f, "missing volume {}", path.display()),
             Self::UnnamedVolume { path } => write!(f, "cannot determine the next volume after {}", path.display()),
             Self::SourceChanged { path } => write!(f, "RAR source changed: {}", path.display()),
+            Self::OutputAliasesInput => write!(f, "RAR output aliases an archive input"),
             Self::ForeignSelection => f.write_str("RAR selection belongs to a different session"),
             Self::Canceled => f.write_str("RAR operation canceled"),
             Self::NotRar => f.write_str("not a RAR archive"),

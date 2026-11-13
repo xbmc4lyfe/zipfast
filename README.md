@@ -10,6 +10,9 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
 
 ## What works
 
+- RAR4 archives: bounded header listing and verification, extraction, and selected
+  printing of unencrypted, unsplit Stored regular files. The catalogue retains
+  unsupported member metadata and reports typed payload exclusions.
 - RAR 5.0 archives: listing, testing and extracting stored and compressed files (every method, solid archives,
   filters), including files split across `name.partNN.rar` or `name.rar`/`name.r00` volume sets, self-extracting
   stubs, CRC32 and BLAKE2sp checks, modification times and Unix permissions. Big files decode on several cores.
@@ -78,3 +81,25 @@ Zipview's [license and Exhibit B](crates/zipview/LICENSE) accompany its source.
 See section 6 for source availability, notices, and attribution for
 deployed extensions. Dependencies retain their own licenses.
 See [Contributing](CONTRIBUTING.md) for sending changes upstream.
+
+### RAR4 metadata and Stored reads
+
+RAR sessions identify the archive, volume, and member format. RAR4 metadata
+retains the raw name, host, method, unpack version, flags, and DOS time bits.
+The normalized member fields map Unix host attributes to the existing Unix
+category. Names use strict UTF-8 or the bounded RAR4 Unicode representation.
+Legacy codepage names that cannot be decoded as UTF-8 stop with an unsupported
+encoding error. Control-character escaping remains the display caller's
+responsibility.
+
+DOS timestamps have no time zone. RAR4 uses the existing ZIP UTC projection
+for valid civil dates and preserves the original bits for callers choosing
+another policy. Extended times retain the odd second and subsecond fields.
+
+Stored reads verify size and CRC before publication. Compressed, solid,
+encrypted and split payloads, symbolic links, special files, old file revisions,
+and unsupported host attributes report explicit exclusions. Encrypted headers,
+old embedded comments and legacy service layouts stop catalogue construction.
+The existing catalogue, selected decode and spool limits apply to RAR4.
+Catalogue opening reserves a conservative temporary capacity allowance of
+12 times each header length before allocating header and name scratch.
