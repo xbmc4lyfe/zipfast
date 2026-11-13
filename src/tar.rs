@@ -285,15 +285,15 @@ impl Member {
         Meta { mtime: self.mtime, nanos: self.nanos, mode: Some(self.mode) }
     }
 
-    fn entry(&self) -> Entry {
+    fn into_entry(self) -> Entry {
         let link = match self.kind {
-            Kind::Symlink => Some(Redirection::UnixSymlink(self.link.clone())),
-            Kind::HardLink => Some(Redirection::HardLink(self.link.clone())),
+            Kind::Symlink => Some(Redirection::UnixSymlink(self.link)),
+            Kind::HardLink => Some(Redirection::HardLink(self.link)),
             _ => None,
         };
         let data = self.kind == Kind::File;
         Entry {
-            name: self.name.clone(),
+            name: self.name,
             size: if data { self.size } else { 0 },
             packed: if data { self.size } else { 0 },
             mtime: self.mtime,
@@ -716,7 +716,7 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
     while let Some(m) = reader.next()? {
         if m.kind != Kind::Other(b'V') {
             budget.record(&m.name)?;
-            out.push(m.entry());
+            out.push(m.into_entry());
         }
     }
     if reader.src.codec().is_some() {

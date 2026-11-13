@@ -410,22 +410,24 @@ fn read_entry(
             file.read_exact(&mut raw)?;
         }
         let mut skip_crc = false;
-        let decrypted = if e.method == 99 || e.aes_info.is_some() {
+        let payload = if e.method == 99 || e.aes_info.is_some() {
             let (strength, vendor, _) = e.aes_info.ok_or(Error::Corrupt("missing WinZip AES extra field"))?;
             if vendor == 2 {
                 skip_crc = true;
             }
-            crate::crypto::decrypt_winzip_aes(pw, strength, &raw, Some(e.packed))
+            crate::crypto::decrypt_winzip_aes_in_place(pw, strength, &mut raw, check)?
                 .ok_or(Error::Corrupt("wrong password or damaged AES stream"))?
         } else {
-            let check = if e.flags & 0x0008 != 0 {
+            let password_check = if e.flags & 0x0008 != 0 {
                 let head = read_local_header(file, e.local_at)?;
                 head[11]
             } else {
                 (e.crc32 >> 24) as u8
             };
-            crate::crypto::decrypt_zipcrypto(pw, check, &raw).ok_or(Error::Corrupt("wrong password"))?
+            crate::crypto::decrypt_zipcrypto_in_place(pw, password_check, &mut raw, check)?
+                .ok_or(Error::Corrupt("wrong password"))?
         };
+        let decrypted = &raw[payload];
         let method = e.effective_method();
         match method {
             METHOD_STORED => {
@@ -438,13 +440,13 @@ fn read_entry(
                         emit(chunk)?;
                     }
                 } else {
-                    emit(&decrypted)?;
+                    emit(decrypted)?;
                 }
             }
             METHOD_DEFLATE => {
                 let mut z = Decompress::new(false);
                 let mut out = vec![0u8; BUF];
-                let mut input = decrypted.as_slice();
+                let mut input = decrypted;
                 loop {
                     check()?;
                     let (before_in, before_out) = (z.total_in(), z.total_out());
@@ -467,7 +469,7 @@ fn read_entry(
                 }
             }
             METHOD_BZIP2 | METHOD_LZMA | METHOD_ZSTD | METHOD_XZ => {
-                let mut dec = stream_decoder(e, method, BufReader::new(Cursor::new(&decrypted)))?;
+                let mut dec = stream_decoder(e, method, BufReader::new(Cursor::new(decrypted)))?;
                 loop {
                     check()?;
                     let n = dec.read(buf).map_err(|_| Error::Corrupt("compressed data is damaged"))?;
@@ -746,18 +748,23 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
     let archive = Archive::open(path)?;
     Ok(archive
         .entries
-        .iter()
-        .map(|e| Entry {
-            name: e.name.clone(),
-            size: e.size,
-            packed: e.packed,
-            mtime: e.mtime,
-            crc32: (!e.is_dir()).then_some(e.crc32),
-            method: e.method.min(255) as u8,
-            dir: e.is_dir(),
-            encrypted: e.encrypted(),
-            solid: false,
-            link: e.is_link().then(|| Redirection::UnixSymlink(String::new())),
+        .into_iter()
+        .map(|e| {
+            let dir = e.is_dir();
+            let encrypted = e.encrypted();
+            let link = e.is_link().then(|| Redirection::UnixSymlink(String::new()));
+            Entry {
+                name: e.name,
+                size: e.size,
+                packed: e.packed,
+                mtime: e.mtime,
+                crc32: (!dir).then_some(e.crc32),
+                method: e.method.min(255) as u8,
+                dir,
+                encrypted,
+                solid: false,
+                link,
+            }
         })
         .collect())
 }

@@ -765,17 +765,19 @@ fn rar_list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
             return Ok(());
         }
         budget.record(&h.name)?;
+        let crc32 = if h.split_after() { None } else { h.crc32 };
+        let dir = h.is_dir();
         out.push(Entry {
-            name: h.name.clone(),
+            name: h.name,
             size: h.unpacked_size,
             packed: h.packed_size,
             mtime: h.mtime,
-            crc32: if h.split_after() { None } else { h.crc32 },
+            crc32,
             method: h.method,
-            dir: h.is_dir(),
+            dir,
             encrypted: h.encrypted,
             solid: h.solid,
-            link: h.redirection.clone(),
+            link: h.redirection,
         });
         Ok(())
     })?;
