@@ -1,3 +1,19 @@
+// Copyright (C) 2026 xbmc4lyfe
+// SPDX-License-Identifier: RPL-1.5
+//
+// Unless explicitly acquired and licensed from Licensor under another license,
+// the contents of this file are subject to the Reciprocal Public License
+// ("RPL") Version 1.5, or subsequent versions as allowed by the RPL, and You
+// may not copy or use this file in either source code or executable form,
+// except in compliance with the terms and conditions of the RPL.
+//
+// All software distributed under the RPL is provided strictly on an "AS IS"
+// basis, WITHOUT WARRANTY OF ANY KIND, EITHER EXPRESS OR IMPLIED, AND LICENSOR
+// HEREBY DISCLAIMS ALL SUCH WARRANTIES, INCLUDING WITHOUT LIMITATION, ANY
+// WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, QUIET
+// ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
+// rights and limitations under the RPL.
+
 use std::io::{self, Read, Write};
 use std::sync::Arc;
 
@@ -91,6 +107,24 @@ impl<P: VolumeProvider> ZipSplitWriter<P> {
                 writer: WriteUsage::default(),
             })
         })?;
+        let end = end_len(false, comment.len());
+        let output_limit = writer.limits.archive_extent.min(writer.limits.output_bytes);
+        let refusal = if end > options.volume_bytes {
+            Some(ErrorKind::RecordTooLarge { requested: end, capacity: options.volume_bytes })
+        } else if 4 + end > output_limit {
+            Some(ErrorKind::Limit(super::Limit::OutputBytes))
+        } else {
+            None
+        };
+        if let Some(kind) = refusal {
+            return Err(Arc::new(Error {
+                stage: Stage::Reserve,
+                at: Location::default(),
+                kind,
+                usage: Usage::default(),
+                writer: WriteUsage::default(),
+            }));
+        }
         let transport = Transport::new(
             provider,
             Limits {
@@ -165,9 +199,9 @@ impl<P: VolumeProvider> ZipSplitWriter<P> {
             let wide = self.wide || member.width.is_wide() || entries >= u16::MAX as u64 || central >= u32::MAX as u64;
             let tail = end_len(wide, self.comment.len());
             let minimum = add(add(add(add(member.local_len(), payload)?, descriptor)?, central)?, tail)?;
-            self.transport.check_output(minimum, Stage::Reserve).map_err(transport_io)?;
-            self.transport.check_record_size(member.central_len()).map_err(transport_io)?;
-            self.transport.check_record_size(tail).map_err(transport_io)?;
+            self.transport.validate_output(minimum, Stage::Reserve).map_err(transport_io)?;
+            self.transport.validate_record(member.central_len()).map_err(transport_io)?;
+            self.transport.validate_record(tail).map_err(transport_io)?;
             let index = add(self.lengths.len() as u64, 1)?
                 .checked_mul(std::mem::size_of::<usize>() as u64)
                 .ok_or(WriteError::Overflow)?;
@@ -278,8 +312,8 @@ impl<P: VolumeProvider> ZipSplitWriter<P> {
 
     fn check_tail_size(&mut self, wide: bool, central: u64) -> Result<()> {
         let tail = end_len(wide, self.comment.len());
-        self.transport.check_record_size(central).map_err(|error| self.enrich(error))?;
-        self.transport.check_record_size(tail).map_err(|error| self.enrich(error))
+        self.transport.validate_record(central).map_err(|error| self.enrich(error))?;
+        self.transport.validate_record(tail).map_err(|error| self.enrich(error))
     }
 
     fn active(&self) -> Result<()> {
@@ -296,6 +330,12 @@ impl<P: VolumeProvider> ZipSplitWriter<P> {
     }
 
     fn error(&self, stage: Stage, cause: WriteError) -> Arc<Error> {
+        // A read-only preflight may carry a transport refusal without poisoning it.
+        if let WriteError::Io { source, .. } = &cause
+            && let Some(error) = source.get_ref().and_then(|error| error.downcast_ref::<Arc<Error>>())
+        {
+            return self.enrich(Arc::clone(error));
+        }
         // Unwrap a transport failure carried through the shared encoder sink.
         if let Some(error) = &self.transport.failed {
             return self.enrich(Arc::clone(error));

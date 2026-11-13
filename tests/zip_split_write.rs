@@ -523,3 +523,59 @@ fn source_failure_and_metadata_limits_keep_their_typed_causes() {
     assert!(matches!(error.kind, ErrorKind::Writer(WriteError::SizeUnderrun { expected: 2, actual: 1 })));
     assert!(std::sync::Arc::ptr_eq(&error, &writer.finish().err().unwrap()));
 }
+
+#[test]
+fn refused_member_preflight_keeps_the_split_writer_reusable() {
+    use zipfast::zip::write::{WriteLimits, WriterOptions};
+    for oversized in [false, true] {
+        let volumes = Volumes::default();
+        let mut writer = ZipSplitWriter::new(
+            volumes.clone(),
+            Options {
+                volume_bytes: 256,
+                writer: WriterOptions {
+                    limits: WriteLimits { output_bytes: 200, ..Default::default() },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let name = if oversized { "n".repeat(300) } else { "too-large".to_string() };
+        assert!(
+            writer
+                .add_file(options(&name, Method::Stored), &mut [42; 1000].as_slice(), InputLength::Exact(1000))
+                .is_err()
+        );
+        assert_eq!(*volumes.0.borrow(), [b"PK\x07\x08"]);
+        writer.add_file(options("a", Method::Stored), &mut b"x".as_slice(), InputLength::Exact(1)).unwrap();
+        writer.finish().unwrap();
+        parse(&volumes.0.borrow(), &[("a", b"x".to_vec())]);
+    }
+}
+
+#[test]
+fn impossible_initial_end_geometry_never_opens_a_volume() {
+    use zipfast::zip::write::{WriteLimits, WriterOptions};
+    for (capacity, comment, output) in [
+        (16, b"".as_slice(), 1000),
+        (64, b"large archive comment".as_slice(), 25),
+        (32, b"large archive comment".as_slice(), 1000),
+    ] {
+        let volumes = Volumes::default();
+        let result = ZipSplitWriter::new(
+            volumes.clone(),
+            Options {
+                volume_bytes: capacity,
+                writer: WriterOptions {
+                    comment,
+                    limits: WriteLimits { output_bytes: output, ..Default::default() },
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        assert!(result.is_err());
+        assert!(volumes.0.borrow().is_empty());
+    }
+}

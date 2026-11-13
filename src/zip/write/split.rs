@@ -140,12 +140,26 @@ impl<P: VolumeProvider> Transport<P> {
         self.position
     }
 
-    fn placement(&mut self, size: u64) -> Result<Location> {
-        self.check_unreserved(Stage::Reserve)?;
-        self.check_record_size(size)?;
-        self.check_output(size, Stage::Reserve)?;
+    fn placement(&self, size: u64) -> Result<Location> {
+        if let Some(error) = &self.failed {
+            return Err(Arc::clone(error));
+        }
+        if self.cancel.as_ref().is_some_and(Cancellation::is_canceled) {
+            return Err(self.snapshot(Stage::Reserve, self.position, ErrorKind::Canceled));
+        }
+        if self.record_remaining != 0 {
+            return Err(self.snapshot(
+                Stage::Reserve,
+                self.position,
+                ErrorKind::IncompleteRecord { remaining: self.record_remaining },
+            ));
+        }
+        self.validate_record(size)?;
+        self.validate_output(size, Stage::Reserve)?;
         if size > self.remaining() {
-            self.check_next()?;
+            if self.usage.disks == self.limits.disks {
+                return Err(self.snapshot(Stage::Open, self.next_location(), ErrorKind::Limit(Limit::Disks)));
+            }
             Ok(self.next_location())
         } else {
             Ok(self.position)
@@ -257,10 +271,10 @@ impl<P: VolumeProvider> Transport<P> {
         self.limits.disk_bytes - self.position.offset
     }
 
-    fn check_record_size(&mut self, size: u64) -> Result<()> {
+    fn validate_record(&self, size: u64) -> Result<()> {
         let capacity = self.limits.disk_bytes;
         if size > capacity {
-            return Err(self.fail(
+            return Err(self.snapshot(
                 Stage::Reserve,
                 self.position,
                 ErrorKind::RecordTooLarge { requested: size, capacity },
@@ -269,11 +283,28 @@ impl<P: VolumeProvider> Transport<P> {
         Ok(())
     }
 
-    fn check_output(&mut self, bytes: u64, stage: Stage) -> Result<()> {
+    fn check_record_size(&mut self, size: u64) -> Result<()> {
+        let result = self.validate_record(size);
+        self.remember(result)
+    }
+
+    fn validate_output(&self, bytes: u64, stage: Stage) -> Result<()> {
         if bytes > self.limits.output_bytes - self.usage.bytes {
-            return Err(self.fail(stage, self.position, ErrorKind::Limit(Limit::OutputBytes)));
+            return Err(self.snapshot(stage, self.position, ErrorKind::Limit(Limit::OutputBytes)));
         }
         Ok(())
+    }
+
+    fn check_output(&mut self, bytes: u64, stage: Stage) -> Result<()> {
+        let result = self.validate_output(bytes, stage);
+        self.remember(result)
+    }
+
+    fn remember<T>(&mut self, result: Result<T>) -> Result<T> {
+        if let Err(error) = &result {
+            self.failed.get_or_insert_with(|| Arc::clone(error));
+        }
+        result
     }
 
     fn check_unreserved(&mut self, stage: Stage) -> Result<()> {
@@ -306,10 +337,17 @@ impl<P: VolumeProvider> Transport<P> {
         Ok(())
     }
 
+    fn snapshot(&self, stage: Stage, at: Location, kind: ErrorKind) -> Arc<Error> {
+        Arc::new(Error { stage, at, kind, usage: self.usage, writer: super::WriteUsage::default() })
+    }
+
     fn fail(&mut self, stage: Stage, at: Location, kind: ErrorKind) -> Arc<Error> {
-        Arc::clone(self.failed.get_or_insert_with(|| {
-            Arc::new(Error { stage, at, kind, usage: self.usage, writer: super::WriteUsage::default() })
-        }))
+        if let Some(error) = &self.failed {
+            return Arc::clone(error);
+        }
+        let error = self.snapshot(stage, at, kind);
+        self.failed = Some(Arc::clone(&error));
+        error
     }
 }
 
