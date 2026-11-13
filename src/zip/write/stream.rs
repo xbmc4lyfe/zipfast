@@ -22,8 +22,9 @@ use crate::zip::{FLAG_DESCRIPTOR, FLAG_ENCRYPTED};
 
 use super::records::{End, Member, Width};
 use super::{
-    BUFFER, EntryOptions, EntryWritten, FileInput, Finished, InputLength, IoStage, Limit, Method, Output, WriteError,
-    WriteSummary, WriteUsage, WriterOptions, add, archive_comment_len, bound, prepare_member, reserve_central,
+    AesEntryWritten, AesStrength, AesVariant, BUFFER, EntryOptions, EntryWritten, FileInput, Finished, InputLength,
+    IoStage, Limit, Method, Output, PayloadCipher, WinZipAesRequest, WriteError, WriteSummary, WriteUsage,
+    WriterOptions, add, archive_comment_len, bound, prepare_member, reserve_central,
 };
 
 const ZIPCRYPTO_HEADER: u64 = 12;
@@ -114,6 +115,41 @@ impl<W: Write> ZipStreamWriter<W> {
         self.remember_failure(result)
     }
 
+    /// Streams a regular file with explicit WinZip AES strength and variant.
+    ///
+    /// Supply fresh cryptographic entropy for the requested salt slice. An
+    /// entropy refusal leaves the writer reusable and charges one attempt.
+    /// Once admitted, a failure poisons the writer. Empty regular files still
+    /// carry the salt, verifier and authentication tag. Directories use
+    /// [`Self::add_directory`]. The returned common CRC is the wire CRC.
+    pub fn add_winzip_aes_file<R: Read + ?Sized>(
+        &mut self,
+        options: EntryOptions<'_>,
+        input: &mut R,
+        length: InputLength,
+        request: WinZipAesRequest<'_>,
+        entropy: impl FnOnce(&mut [u8]) -> io::Result<()>,
+    ) -> Result<AesEntryWritten, WriteError> {
+        let format = (request.strength, request.variant);
+        let (member, entries) = self.prepare_format(options, length, false, false, Some(format))?;
+        let mut salt = [0; 16];
+        let salt_len = request.strength.salt_bytes();
+        self.output.work.checkpoint()?;
+        entropy(&mut salt[..salt_len]).map_err(|error| WriteError::io(IoStage::EncryptionEntropy, error))?;
+        let result = (|| {
+            self.output.work.check_canceled()?;
+            let cipher = crate::crypto::WinZipAesEncryptor::new(
+                request.password.as_bytes(),
+                &salt[..salt_len],
+                request.strength.key_bytes(),
+            )
+            .ok_or(WriteError::InvalidMetadata("invalid AES parameters"))?;
+            self.write_aes_file(options, member, entries, FileInput { input, length, decoded: 0 }, (cipher, salt))
+        })();
+        let receipt = self.remember_failure(result)?;
+        Ok(AesEntryWritten::from_plain(receipt, request.strength, request.variant))
+    }
+
     /// Appends an explicit Stored directory whose name has one trailing slash.
     pub fn add_directory(&mut self, options: EntryOptions<'_>) -> Result<EntryWritten, WriteError> {
         let (member, entries) = self.prepare(options, InputLength::Exact(0), true, false)?;
@@ -180,14 +216,40 @@ impl<W: Write> ZipStreamWriter<W> {
         directory: bool,
         encrypted: bool,
     ) -> Result<(Member, u64), WriteError> {
+        self.prepare_format(options, length, directory, encrypted, None)
+    }
+
+    fn prepare_format(
+        &mut self,
+        options: EntryOptions<'_>,
+        length: InputLength,
+        directory: bool,
+        zipcrypto: bool,
+        aes: Option<(AesStrength, AesVariant)>,
+    ) -> Result<(Member, u64), WriteError> {
         self.check_failed()?;
+        let encrypted = zipcrypto || aes.is_some();
         let local_at = self.output.position;
-        let member = if encrypted {
+        let mut member = if zipcrypto {
             encrypted_member(options, length, local_at)?
         } else {
             prepare_member(options, length, directory, local_at)?
         };
-        let overhead = if encrypted { ZIPCRYPTO_HEADER } else { 0 };
+        let overhead = if let Some((strength, variant)) = aes {
+            member.aes = Some((strength, variant));
+            member.flags |= FLAG_DESCRIPTOR | FLAG_ENCRYPTED;
+            if member.method == Method::Stored
+                && let InputLength::Exact(size) = length
+            {
+                member.width =
+                    Width::new(Method::Stored, InputLength::Exact(add(size, strength.overhead())?), local_at, false);
+            }
+            strength.overhead()
+        } else if zipcrypto {
+            ZIPCRYPTO_HEADER
+        } else {
+            0
+        };
         let work = &self.output.work;
         let limits = work.limits;
         let entries = add(work.usage.entries, 1)?;
@@ -203,7 +265,7 @@ impl<W: Write> ZipStreamWriter<W> {
         if encrypted {
             // Entropy, an input read, the fixed local record, the
             // encryption header and a descriptor are mandatory.
-            let minimum = 5 + u64::from(!options.name.bytes().is_empty());
+            let minimum = 5 + u64::from(!options.name.bytes().is_empty()) + 2 * u64::from(aes.is_some());
             bound(add(work.usage.io_attempts, minimum)?, limits.io_attempts, Limit::IoAttempts)?;
         }
         work.check_canceled()?;
@@ -233,7 +295,7 @@ impl<W: Write> ZipStreamWriter<W> {
 
         member.flags |= FLAG_DESCRIPTOR;
         self.output.write_local(&member, options.name.bytes())?;
-        let (cipher, overhead) = if let Some((mut cipher, random)) = encryption {
+        let (mut cipher, overhead) = if let Some((mut cipher, random)) = encryption {
             let mut header = [0; ZIPCRYPTO_HEADER as usize];
             header[..11].copy_from_slice(&random);
             header[11] = (member.dos.time >> 8) as u8;
@@ -243,7 +305,8 @@ impl<W: Write> ZipStreamWriter<W> {
         } else {
             (None, 0)
         };
-        let (crc, payload) = self.output.write_payload(member.method, &mut file, &mut input, first, cipher)?;
+        let mut borrowed = cipher.as_mut().map(|cipher| cipher as &mut dyn PayloadCipher);
+        let (crc, payload) = self.output.write_payload(member.method, &mut file, &mut input, first, &mut borrowed)?;
         let packed = add(payload, overhead)?;
         let decoded = file.decoded;
 
@@ -253,6 +316,44 @@ impl<W: Write> ZipStreamWriter<W> {
         let end = End::new(entries, central, central_at, self.wide_member || member.width.is_wide(), self.comment_len);
         self.output.check_tail(end, descriptor_len)?;
 
+        let descriptor = member.descriptor(crc, decoded, packed)?;
+        self.output.write(descriptor.as_bytes(), IoStage::DataDescriptor)?;
+        self.complete(options, &member, entries, crc, decoded, packed)
+    }
+
+    fn write_aes_file<R: Read + ?Sized>(
+        &mut self,
+        options: EntryOptions<'_>,
+        mut member: Member,
+        entries: u64,
+        mut file: FileInput<'_, R>,
+        encryption: (crate::crypto::WinZipAesEncryptor, [u8; 16]),
+    ) -> Result<EntryWritten, WriteError> {
+        let (mut cipher, salt) = encryption;
+        let strength = member.aes.expect("AES prepared member").0;
+        let mut input = [0; BUFFER];
+        let first = file.read(&mut self.output.work, &mut input)?;
+        if first == 0 {
+            member.method = Method::Stored;
+            member.width = Width::new(Method::Stored, InputLength::Exact(0), member.local_at, true);
+        }
+        self.output.write_local(&member, options.name.bytes())?;
+        let mut header = [0; 18];
+        let salt_len = strength.salt_bytes();
+        header[..salt_len].copy_from_slice(&salt[..salt_len]);
+        header[salt_len..salt_len + 2].copy_from_slice(&cipher.verifier());
+        self.output.write(&header[..salt_len + 2], IoStage::EncryptionHeader)?;
+        let (crc, payload) =
+            self.output.write_payload(member.method, &mut file, &mut input, first, &mut Some(&mut cipher))?;
+        let packed = add(payload, strength.overhead())?;
+        let decoded = file.decoded;
+        let tag = cipher.tag();
+        let before_tail = add(tag.len() as u64, member.descriptor_len())?;
+        let central_at = add(self.output.position, before_tail)?;
+        let central = add(self.central.len() as u64, member.central_len())?;
+        let end = End::new(entries, central, central_at, self.wide_member || member.width.is_wide(), self.comment_len);
+        self.output.check_tail(end, before_tail)?;
+        self.output.write(&tag, IoStage::AuthenticationTag)?;
         let descriptor = member.descriptor(crc, decoded, packed)?;
         self.output.write(descriptor.as_bytes(), IoStage::DataDescriptor)?;
         self.complete(options, &member, entries, crc, decoded, packed)
@@ -370,6 +471,74 @@ mod tests {
             let exact = prepare_member(stored(), InputLength::Exact(size), false, 0).unwrap();
             assert_eq!(exact.descriptor_len(), if size >= sentinel { 24 } else { 16 });
         }
+    }
+
+    #[test]
+    fn aes_sizes_and_offsets_promote_without_losing_private_plaintext_crc() {
+        for strength in [AesStrength::Aes128, AesStrength::Aes192, AesStrength::Aes256] {
+            let overhead = strength.overhead();
+            for size in [u32::MAX as u64 - overhead - 1, u32::MAX as u64 - overhead] {
+                let limits = WriteLimits {
+                    source_bytes: u64::MAX,
+                    output_bytes: u64::MAX,
+                    archive_extent: u64::MAX,
+                    ..Default::default()
+                };
+                let mut writer =
+                    ZipStreamWriter::new(io::sink(), WriterOptions { limits, ..Default::default() }).unwrap();
+                let (member, _) = writer
+                    .prepare_format(stored(), InputLength::Exact(size), false, false, Some((strength, AesVariant::Ae2)))
+                    .unwrap();
+                assert_eq!(member.width.sizes, size + overhead >= u32::MAX as u64);
+                assert_eq!(member.descriptor_len(), if member.width.sizes { 24 } else { 16 });
+                assert_eq!(writer.usage().io_attempts, 0);
+            }
+            let mut writer = ZipStreamWriter::new(Vec::new(), WriterOptions::default()).unwrap();
+            let request = WinZipAesRequest::new("private-test", strength, AesVariant::Ae2).unwrap();
+            let receipt = writer
+                .add_winzip_aes_file(stored(), &mut b"xyz".as_slice(), InputLength::Exact(3), request, |salt| {
+                    salt.fill(1);
+                    Ok(())
+                })
+                .unwrap();
+            assert_eq!(receipt.entry.crc32, 0);
+            assert_eq!(receipt.plaintext_crc32, crate::crc32::hash(b"xyz"));
+        }
+        let mut writer = ZipStreamWriter::new(io::sink(), WriterOptions::default()).unwrap();
+        writer.output.position = u32::MAX as u64;
+        writer.output.work.usage.output_bytes = writer.output.position;
+        let (member, _) = writer
+            .prepare_format(stored(), InputLength::Exact(1), false, false, Some((AesStrength::Aes128, AesVariant::Ae1)))
+            .unwrap();
+        assert!(!member.width.sizes);
+        assert_eq!(member.descriptor_len(), 16);
+        assert!(member.width.is_wide());
+    }
+
+    #[test]
+    fn aes_accounted_finish_preserves_full_extent_on_flush_failure() {
+        #[derive(Debug, Default)]
+        struct FlushFailure(Vec<u8>);
+        impl Write for FlushFailure {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Err(io::ErrorKind::PermissionDenied.into())
+            }
+        }
+        let mut writer = ZipStreamWriter::new(FlushFailure::default(), WriterOptions::default()).unwrap();
+        let request = WinZipAesRequest::new("test-password", AesStrength::Aes128, AesVariant::Ae2).unwrap();
+        writer
+            .add_winzip_aes_file(stored(), &mut b"xyz".as_slice(), InputLength::Exact(3), request, |salt| {
+                salt.fill(1);
+                Ok(())
+            })
+            .unwrap();
+        let (error, usage) = writer.finish_accounted().unwrap_err();
+        assert!(matches!(error, WriteError::Io { stage: IoStage::Flush, .. }));
+        assert_eq!((usage.entries, usage.output_bytes, usage.archive_extent, usage.io_attempts), (1, 161, 161, 13));
     }
 
     // This harness checks arithmetic without constructing a physical archive.
