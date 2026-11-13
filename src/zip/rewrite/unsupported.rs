@@ -68,6 +68,27 @@ impl RewritePlan {
     ) -> Result<(), RewriteError> {
         match self.unavailable {}
     }
+    pub fn add_directory_from_path(
+        &mut self,
+        _: Placement,
+        _: &Path,
+        _: EntryOptions<'_>,
+        _: Option<&CollisionPath>,
+    ) -> Result<(), RewriteError> {
+        match self.unavailable {}
+    }
+
+    pub fn add_open_directory(
+        &mut self,
+        _: Placement,
+        _: &Path,
+        _: File,
+        _: EntryOptions<'_>,
+        _: Option<&CollisionPath>,
+    ) -> Result<(), RewriteError> {
+        match self.unavailable {}
+    }
+
     pub fn remove(&mut self, _: &EntryId) -> Result<(), RewriteError> {
         match self.unavailable {}
     }

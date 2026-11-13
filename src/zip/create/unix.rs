@@ -52,13 +52,17 @@ impl Stamp {
         if !meta.is_file() {
             return Err(CreateError::SourceNotRegular);
         }
-        Ok(Self {
+        Ok(Self::from_metadata(meta))
+    }
+
+    fn from_metadata(meta: &Metadata) -> Self {
+        Self {
             identity: identity(meta),
             len: meta.len(),
             modified: (meta.mtime(), meta.mtime_nsec()),
             changed: (meta.ctime(), meta.ctime_nsec()),
             mode: (meta.mode() & 0o7777) as u16,
-        })
+        }
     }
 
     pub(in crate::zip) fn same_payload(self, other: Self) -> bool {
@@ -107,6 +111,13 @@ pub(in crate::zip) fn file_stamp(file: &File, budget: &Attempts<'_>) -> Result<S
 
 pub(in crate::zip) fn path_stamp(path: &Path, budget: &Attempts<'_>) -> Result<Stamp> {
     Stamp::regular(&budget.run(|| fs::symlink_metadata(path))?)
+}
+
+pub(in crate::zip) fn directory_stamp(meta: &Metadata) -> Result<Stamp> {
+    if !meta.is_dir() {
+        return Err(CreateError::InvalidOptions("directory source is not a directory"));
+    }
+    Ok(Stamp::from_metadata(meta))
 }
 
 pub(in crate::zip) struct Parent {

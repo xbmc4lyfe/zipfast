@@ -866,6 +866,48 @@ fn precommit_cancellation_and_unsupported_native_errors_are_definite() {
 }
 
 #[test]
+fn tracked_directory_source_is_checked_after_staging() {
+    let root = test_dir();
+    let source = root.path().join("source");
+    let moved = root.path().join("moved");
+    let output = root.path().join("archive.zip");
+    std::fs::create_dir(&source).unwrap();
+    let mut plan = CreatePlan::new(&output, CreateOptions::default()).unwrap();
+    plan.add_directory_from_path(&source, metadata("source/"), None).unwrap();
+    let changed = source.clone();
+    let failure = with_hook(
+        move |event, _| {
+            if event == Event::BeforeFinalSourceCheck {
+                std::fs::rename(&changed, &moved)?;
+                std::os::unix::fs::symlink(&moved, &changed)?;
+            }
+            Ok(())
+        },
+        || plan.publish().unwrap_err(),
+    );
+    assert_eq!(failure.stage, CreateStage::Precommit);
+    assert_eq!(failure.publication, Publication::NotPublished);
+    assert!(matches!(failure.cause, CreateError::SourceChanged(_)));
+    assert!(stages(root.path()).is_empty());
+    assert!(!output.exists());
+}
+
+#[test]
+fn tracked_output_parent_allows_its_owned_stage_in_create_and_rewrite() {
+    use crate::zip::rewrite::{Placement, Replacement, RewriteOptions, RewritePlan};
+
+    let root = test_dir();
+    let output = root.path().join("archive.zip");
+    let mut plan = CreatePlan::new(&output, CreateOptions::default()).unwrap();
+    plan.add_directory_from_path(root.path(), metadata("parent/"), None).unwrap();
+    assert!(plan.publish().is_ok());
+    let mut plan = RewritePlan::open(&output, RewriteOptions::new(Replacement::LastWriterWins)).unwrap();
+    plan.add_directory_from_path(Placement::Append, root.path(), metadata("other/"), None).unwrap();
+    assert!(plan.publish().is_ok());
+    assert!(stages(root.path()).is_empty());
+}
+
+#[test]
 fn changed_destination_parent_retains_the_unpublished_stage() {
     let dir = test_dir();
     let parent = dir.path().join("parent");
