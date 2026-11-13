@@ -70,6 +70,70 @@ fn selection_is_session_bound_and_reports_archive_order() {
 }
 
 #[test]
+fn selected_directory_preserves_the_catalogue_issue() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("directory.rar");
+    let good = FileSpec { dir: true, ..FileSpec::new("good", b"") };
+    let incomplete = FileSpec { dir: true, ..FileSpec::new("incomplete", b"") };
+    let mut contents = SIG.to_vec();
+    contents.extend(main_block(false, None));
+    contents.extend(file_block(&good, b"", 0, false, false));
+    contents.extend(file_block(&incomplete, b"", 0, false, true));
+    contents.extend(end_block(false));
+    fs::write(&path, contents).unwrap();
+
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    assert!(matches!(
+        session.entries().nth(1).unwrap().payload_issue(),
+        Some(RarFailure::Integrity { reason: RarIntegrityReason::MissingSplitContinuation, .. })
+    ));
+    let selected = session.select(|_| true).unwrap();
+    let summary = session
+        .test_selected(&selected, RarDecodeLimits::default(), |event| match event.entry.order {
+            0 => assert!(matches!(event.outcome, RarOutcome::Directory)),
+            1 => assert!(matches!(
+                &event.outcome,
+                RarOutcome::Failed(failure) if matches!(
+                    failure.as_ref(),
+                    RarFailure::Integrity { reason: RarIntegrityReason::MissingSplitContinuation, .. }
+                )
+            )),
+            ordinal => panic!("unexpected ordinal {ordinal}"),
+        })
+        .unwrap();
+    assert_eq!((summary.dirs, summary.failed), (1, 1));
+}
+
+#[test]
+fn known_packed_and_decoded_limits_precede_decoder_setup() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("limits.rar");
+    let packed = tuned_blocks(&[&[Op::Lit(b'a'), Op::Lit(b'b')]], true);
+    let spec = FileSpec { method: 3, size: Some(2), ..FileSpec::new("item", &packed) };
+    fs::write(&path, archive_with(&[(spec, crc32fast::hash(b"ab"))], false)).unwrap();
+
+    let mut session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    for (limits, expected_resource) in [
+        (
+            RarDecodeLimits { packed_bytes: 0, window_bytes: 0, ..RarDecodeLimits::default() },
+            RarResource::SelectedPackedBytes,
+        ),
+        (
+            RarDecodeLimits { decoded_bytes: 1, window_bytes: 0, ..RarDecodeLimits::default() },
+            RarResource::SelectedDecodedBytes,
+        ),
+    ] {
+        let failure = session.test_selected(&selected, limits, |_| {}).unwrap_err();
+        assert!(matches!(
+            failure.failure.as_ref(),
+            RarFailure::Limit { resource, .. } if std::mem::discriminant(resource) == std::mem::discriminant(&expected_resource)
+        ));
+        assert_eq!((failure.partial.files, failure.partial.failed, failure.partial.bytes), (0, 1, 0));
+    }
+}
+
+#[test]
 fn uses_held_split_volumes_and_permanently_rejects_changed_binding() {
     let dir = tempfile::tempdir().unwrap();
     let first = dir.path().join("set.part1.rar");

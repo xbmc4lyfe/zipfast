@@ -229,21 +229,26 @@ impl SelectedRun {
     fn test(&mut self, session: &mut RarSession, index: usize) -> Result<RarOutcome, Arc<RarFailure>> {
         check_cancel(&session.options.cancel).map_err(|fault| Arc::from(fault.failure))?;
         let member = &session.members[index];
-        if member.header.is_dir() {
-            let volume = session.parts[member.parts.start].volume;
-            session.check_volume(volume)?;
-            return Ok(RarOutcome::Directory);
-        }
-        if let Some(link) = &member.header.redirection {
-            let kind = match link {
-                Redirection::UnixSymlink(_) => 1,
-                Redirection::WindowsSymlink(_) => 2,
-                Redirection::Junction(_) => 3,
-                Redirection::HardLink(_) => 4,
-                Redirection::FileCopy(_) => 5,
-                Redirection::Unknown(kind) => *kind,
+        if member.header.is_dir() || member.header.redirection.is_some() {
+            let outcome = match (member.issue, &member.header.redirection) {
+                (Some(issue), _) => RarOutcome::Failed(Arc::new(copy_catalogue_issue(&session.issues[issue]))),
+                (None, Some(link)) => {
+                    let kind = match link {
+                        Redirection::UnixSymlink(_) => 1,
+                        Redirection::WindowsSymlink(_) => 2,
+                        Redirection::Junction(_) => 3,
+                        Redirection::HardLink(_) => 4,
+                        Redirection::FileCopy(_) => 5,
+                        Redirection::Unknown(kind) => *kind,
+                    };
+                    RarOutcome::Failed(Arc::new(RarFailure::Unsupported(RarUnsupported::Redirection { kind })))
+                }
+                (None, None) => RarOutcome::Directory,
             };
-            return Ok(RarOutcome::Failed(Arc::new(RarFailure::Unsupported(RarUnsupported::Redirection { kind }))));
+            let mut volumes = [0; VOLUME_WORDS];
+            mark_volumes(&mut volumes, &session.parts[member.parts.clone()]);
+            check_volumes(session, &volumes)?;
+            return Ok(outcome);
         }
         let compressed = member.header.method != 0;
         if compressed {
@@ -295,11 +300,8 @@ impl SelectedRun {
     ) -> Result<(u64, RarVerification), Arc<RarFailure>> {
         check_cancel(&session.options.cancel).map_err(|fault| Arc::from(fault.failure))?;
         let member = &session.members[index];
-        let parts = member.parts.clone();
         let mut used_volumes = if compressed { self.history_volumes } else { [0; VOLUME_WORDS] };
-        for part in &session.parts[parts.clone()] {
-            used_volumes[part.volume / 64] |= 1 << (part.volume % 64);
-        }
+        mark_volumes(&mut used_volumes, &session.parts[member.parts.clone()]);
         check_volumes(session, &used_volumes)?;
         let result = self.decode_bound(session, index).map_err(Arc::new);
         #[cfg(test)]
@@ -320,6 +322,12 @@ impl SelectedRun {
         let member = &session.members[index];
         if let Some(issue) = member.issue {
             return Err(copy_catalogue_issue(&session.issues[issue]));
+        }
+        // Check known totals before key derivation or dictionary allocation.
+        // Actual work is still charged at each part and decoded chunk.
+        charge(self.packed, member.packed_size, self.limits.packed_bytes, RarResource::SelectedPackedBytes)?;
+        if let Some(size) = member.unpacked_size {
+            charge(self.decoded, size, self.limits.decoded_bytes, RarResource::SelectedDecodedBytes)?;
         }
         let header = &member.header;
         let parts = &session.parts[member.parts.clone()];
@@ -488,6 +496,12 @@ impl SelectedRun {
 
 const VOLUME_WORDS: usize = (MAX_VOLUMES as usize).div_ceil(64);
 type VolumeSet = [u64; VOLUME_WORDS];
+
+fn mark_volumes(words: &mut VolumeSet, parts: &[Part]) {
+    for part in parts {
+        words[part.volume / 64] |= 1 << (part.volume % 64);
+    }
+}
 
 fn check_volumes(session: &mut RarSession, words: &VolumeSet) -> Result<(), Arc<RarFailure>> {
     for (word, mut bits) in words.iter().copied().enumerate() {
