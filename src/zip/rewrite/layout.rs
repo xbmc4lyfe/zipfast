@@ -23,7 +23,7 @@ use zip_container::{
 
 use crate::zip::create::native::{Attempts, add};
 use crate::zip::create::{CreateError, CreateLimit, VerificationUsage};
-use crate::zip::{FLAG_ENCRYPTED, Metadata};
+use crate::zip::{FLAG_DESCRIPTOR, FLAG_ENCRYPTED, Metadata, descriptor_matches};
 
 use super::{Result, RewriteError, RewriteLimit};
 
@@ -31,8 +31,6 @@ pub(super) const BUFFER: usize = 64 << 10;
 const EOCD_WINDOW: usize = 22 + u16::MAX as usize;
 const LOCATOR_LEN: usize = 20;
 pub(super) const CLASSIC_SENTINEL: u32 = u32::MAX;
-const DESC_SIGNATURE: u32 = 0x0807_4b50;
-const DESCRIPTOR: u16 = 8;
 // Bit 4 denotes enhanced deflation. Bits 5, 6 and 13 denote patching,
 // strong encryption and masked local fields. Reserved flags fail closed.
 const ALLOWED_FLAGS: u16 = 0x080f;
@@ -448,28 +446,11 @@ fn descriptor(
     let body = if wide { 20 } else { 12 };
     ensure(length == body || length == body + 4, "descriptor does not end at the next boundary")?;
     reader.read(at, &mut bytes[..length as usize])?;
-    let mut matches = 0;
-    for signed in [false, true] {
-        let prefix = if signed { 4 } else { 0 };
-        if length != body + prefix || (signed && le32(&bytes, 0) != DESC_SIGNATURE) {
-            continue;
-        }
-        let at = prefix as usize;
-        let packed = if wide {
-            u64::from_le_bytes(bytes[at + 4..at + 12].try_into().expect("ZIP64 packed descriptor size"))
-        } else {
-            u64::from(le32(&bytes, at + 4))
-        };
-        let decoded = if wide {
-            u64::from_le_bytes(bytes[at + 12..at + 20].try_into().expect("ZIP64 decoded descriptor size"))
-        } else {
-            u64::from(le32(&bytes, at + 8))
-        };
-        if le32(&bytes, at) == central.crc32 && (packed, decoded) == sizes {
-            matches += 1;
-        }
-    }
-    ensure(matches == 1, "no unique matching data descriptor")
+    let signed = length == body + 4;
+    ensure(
+        descriptor_matches(&bytes[..length as usize], wide, signed, central.crc32, sizes),
+        "no unique matching data descriptor",
+    )
 }
 
 pub(super) fn member(
@@ -530,7 +511,7 @@ pub(super) fn member(
         )?;
     }
     encryption(header, local_extras.aes, central_extras.aes, sizes.0)?;
-    let has_descriptor = header.flags & DESCRIPTOR != 0;
+    let has_descriptor = header.flags & FLAG_DESCRIPTOR != 0;
     let local_sizes =
         (u32_size(local.packed_size, local_extras.packed), u32_size(local.unpacked_size, local_extras.decoded));
     let consistent = |local, central| local == central || (has_descriptor && local == 0);
