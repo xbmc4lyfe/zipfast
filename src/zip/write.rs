@@ -64,6 +64,9 @@ use records::{End, Member, Width};
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 pub(super) mod raw;
 mod records;
+/// Forward-only split volumes with disk-relative record locations.
+pub mod split;
+pub use split::ZipSplitWriter;
 mod stream;
 pub use stream::ZipStreamWriter;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
@@ -622,6 +625,7 @@ fn prepare_member(
         external: ((type_bits | u32::from(options.permissions.0)) << 16) | dos_attributes,
         mtime: options.extended_mtime,
         local_at,
+        local_disk: 0,
     })
 }
 
@@ -686,6 +690,7 @@ fn bound(value: u64, max: u64, limit: Limit) -> Result<(), WriteError> {
     if value > max { Err(WriteError::Limit(limit)) } else { Ok(()) }
 }
 
+#[derive(Clone)]
 struct Work {
     limits: WriteLimits,
     usage: WriteUsage,

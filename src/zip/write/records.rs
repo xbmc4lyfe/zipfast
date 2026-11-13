@@ -28,6 +28,7 @@ const ZIP64_TAIL_LEN: u64 = 76;
 pub(super) struct Width {
     pub sizes: bool,
     offset: bool,
+    disk: bool,
 }
 
 impl Width {
@@ -37,11 +38,11 @@ impl Width {
                 (Method::Stored, InputLength::Exact(size)) => size >= SIZE_SENTINEL,
                 _ => true,
             };
-        Self { sizes, offset: local_at >= SIZE_SENTINEL }
+        Self { sizes, offset: local_at >= SIZE_SENTINEL, disk: false }
     }
 
     pub(super) fn is_wide(self) -> bool {
-        self.sizes || self.offset
+        self.sizes || self.offset || self.disk
     }
 
     fn version(self) -> u16 {
@@ -67,7 +68,7 @@ pub(super) struct Record<const N: usize> {
 }
 
 impl<const N: usize> Record<N> {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self { bytes: [0; N], len: 0 }
     }
 
@@ -75,21 +76,21 @@ impl<const N: usize> Record<N> {
         &self.bytes[..self.len]
     }
 
-    fn put(&mut self, bytes: &[u8]) {
+    pub(super) fn put(&mut self, bytes: &[u8]) {
         let end = self.len + bytes.len();
         self.bytes[self.len..end].copy_from_slice(bytes);
         self.len = end;
     }
 
-    fn u16(&mut self, value: u16) {
+    pub(super) fn u16(&mut self, value: u16) {
         self.put(&value.to_le_bytes());
     }
 
-    fn u32(&mut self, value: u32) {
+    pub(super) fn u32(&mut self, value: u32) {
         self.put(&value.to_le_bytes());
     }
 
-    fn u64(&mut self, value: u64) {
+    pub(super) fn u64(&mut self, value: u64) {
         self.put(&value.to_le_bytes());
     }
 }
@@ -104,9 +105,17 @@ pub(super) struct Member {
     pub external: u32,
     pub mtime: Option<i32>,
     pub local_at: u64,
+    pub local_disk: u32,
 }
 
 impl Member {
+    pub(super) fn relocate(&mut self, disk: u32, offset: u64) {
+        self.local_disk = disk;
+        self.local_at = offset;
+        self.width.offset = offset >= SIZE_SENTINEL;
+        self.width.disk = u64::from(disk) >= COUNT_SENTINEL;
+    }
+
     pub(super) fn local_len(&self) -> u64 {
         LOCAL_LEN + u64::from(self.name_len) + u64::from(self.extra_len(false))
     }
@@ -138,7 +147,9 @@ impl Member {
     }
 
     fn zip64_len(&self, central: bool) -> u16 {
-        16 * u16::from(self.width.sizes) + 8 * u16::from(central && self.width.offset)
+        16 * u16::from(self.width.sizes)
+            + 8 * u16::from(central && self.width.offset)
+            + 4 * u16::from(central && self.width.disk)
     }
 
     fn extra_len(&self, central: bool) -> u16 {
@@ -177,14 +188,14 @@ impl Member {
         self.common(&mut r, crc, self.width.size32(decoded)?, self.width.size32(packed)?);
         r.u16(self.extra_len(true));
         r.u16(self.comment_len);
-        r.u16(0); // disk start
+        r.u16(if self.width.disk { u16::MAX } else { self.local_disk as u16 }); // disk start
         r.u16(0); // internal attributes
         r.u32(self.external);
         r.u32(if self.width.offset { u32::MAX } else { self.local_at as u32 });
         Ok(r)
     }
 
-    fn extras(&self, central: bool, decoded: u64, packed: u64) -> Record<37> {
+    fn extras(&self, central: bool, decoded: u64, packed: u64) -> Record<41> {
         let mut r = Record::new();
         let zip64 = self.zip64_len(central);
         if zip64 != 0 {
@@ -197,6 +208,9 @@ impl Member {
             if central && self.width.offset {
                 r.u64(self.local_at);
             }
+            if central && self.width.disk {
+                r.u32(self.local_disk);
+            }
         }
         if let Some(mtime) = self.mtime {
             r.u16(0x5455);
@@ -207,11 +221,11 @@ impl Member {
         r
     }
 
-    pub(super) fn local_extra(&self) -> Record<37> {
+    pub(super) fn local_extra(&self) -> Record<41> {
         self.extras(false, 0, 0)
     }
 
-    pub(super) fn central_extra(&self, decoded: u64, packed: u64) -> Record<37> {
+    pub(super) fn central_extra(&self, decoded: u64, packed: u64) -> Record<41> {
         self.extras(true, decoded, packed)
     }
 

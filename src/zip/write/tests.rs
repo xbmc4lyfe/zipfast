@@ -42,6 +42,7 @@ fn stored_size_boundaries_saturate_both_size_fields() {
             external: 0,
             mtime: None,
             local_at: 0,
+            local_disk: 0,
         };
         let central = member.central(0x12345678, size, size).unwrap();
         let header = central.as_bytes();
@@ -77,6 +78,7 @@ fn offset_only_widening_keeps_local_sizes_narrow() {
             external: 0,
             mtime: None,
             local_at: offset,
+            local_disk: 0,
         };
         let central = member.central(0, 3, 3).unwrap();
         assert_eq!(n32(central.as_bytes(), 20), 3);
