@@ -61,7 +61,16 @@ impl Rar4DecodeError {
                     Rar4UnsupportedMode::Ppm => "PPM payload",
                     Rar4UnsupportedMode::VmFilter => "VM/filter payload",
                 };
-                (RarFailure::Unsupported(RarUnsupported::Rar4Feature(label)), Error::Corrupt(label))
+                // This optional legacy label is bounded (at most 17 bytes) and
+                // allocated only in the consumer adaptation, never core decoding.
+                let mut message = String::new();
+                let legacy = if message.try_reserve_exact(label.len()).is_ok() {
+                    message.push_str(label);
+                    Error::Unsupported(message)
+                } else {
+                    Error::Io(std::io::ErrorKind::OutOfMemory.into())
+                };
+                (RarFailure::Unsupported(RarUnsupported::Rar4Feature(label)), legacy)
             }
             Self::Malformed(reason) => (integrity(RarIntegrityReason::Decoder(reason)), Error::Corrupt(reason)),
             Self::DecodedSize { expected, actual } => {

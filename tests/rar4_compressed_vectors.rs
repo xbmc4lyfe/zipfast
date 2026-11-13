@@ -414,3 +414,34 @@ fn cancellation_and_protected_archive_destination_are_preserved() {
         RarFailure::Canceled
     ));
 }
+
+fn legacy_unsupported(packed: &[u8], label: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("unsupported.rar");
+    fs::write(&path, fixed_archive(packed, b"AA")).unwrap();
+    let failures = issue(&path);
+    assert_eq!(failures.len(), 1);
+    assert!(matches!(failures[0].as_ref(),
+        RarFailure::Unsupported(RarUnsupported::Rar4Feature(actual)) if *actual == label));
+    let mut provisional = Vec::new();
+    let error = extract::SelectedEntry::open(&path, 0, None, 1 << 20)
+        .unwrap()
+        .read(None, |bytes| {
+            provisional.extend_from_slice(bytes);
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(provisional.is_empty());
+    assert_eq!(error.to_string(), format!("unsupported: {label}"));
+    assert!(matches!(error, zipfast::error::Error::Unsupported(actual) if actual == label));
+}
+
+#[test]
+fn ppm_legacy_error_is_unsupported() {
+    legacy_unsupported(include_bytes!("fixtures/rar4-lz/ppm-marker.packed"), "PPM payload");
+}
+
+#[test]
+fn vm_legacy_error_is_unsupported() {
+    legacy_unsupported(include_bytes!("fixtures/rar4-lz/vm-marker-after-prefix.packed"), "VM/filter payload");
+}

@@ -23,6 +23,7 @@ thread_local! {
     pub(crate) static REFUSE_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
     pub(crate) static TRACK_ALLOC: Cell<bool> = const { Cell::new(false) };
     pub(crate) static ALLOC_REQUESTS: Cell<usize> = const { Cell::new(0) };
+    pub(crate) static DENY_LAYOUT: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
     pub(crate) static DENY_DICTIONARY: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -36,6 +37,19 @@ fn allowed(layout: Layout) -> bool {
     }
     if TRACK_ALLOC.try_with(Cell::get).unwrap_or(false) {
         let _ = ALLOC_REQUESTS.try_with(|count| count.set(count.get().saturating_add(1)));
+    }
+    if DENY_LAYOUT
+        .try_with(|control| {
+            if control.get() == Some((layout.size(), layout.align())) {
+                control.set(None);
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap_or(false)
+    {
+        return false;
     }
     !(layout.size() == 65536
         && layout.align() == 1

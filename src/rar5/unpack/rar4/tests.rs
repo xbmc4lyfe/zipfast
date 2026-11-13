@@ -15,7 +15,7 @@
 // rights and limitations under the RPL.
 
 use super::*;
-use crate::test_alloc::{ALLOC_REQUESTS, DENY_DICTIONARY, TRACK_ALLOC};
+use crate::test_alloc::{ALLOC_REQUESTS, DENY_DICTIONARY, DENY_LAYOUT, TRACK_ALLOC};
 
 macro_rules! fixture {
     ($name:literal) => {
@@ -529,4 +529,27 @@ fn each_recent_slot_copies_distinct_initialized_history() {
         assert_eq!(out, expected, "slot {slot}");
         assert_eq!(d.recent[0], slot as u64 + 1);
     }
+}
+
+// Refuse only the optional legacy String; the typed failure Box remains allowed.
+fn unsupported_label_refusal(mode: Rar4UnsupportedMode, label: &'static str) {
+    DENY_LAYOUT.with(|control| control.set(Some((label.len(), 1))));
+    let fault = Rar4DecodeError::Unsupported(mode).detailed(crate::error::RarScope::Member { index: None });
+    let unconsumed = DENY_LAYOUT.with(|control| control.replace(None));
+    let (failure, legacy) = fault.into_parts();
+    assert_eq!(unconsumed, None, "the exact small-string refusal must be consumed");
+    assert!(matches!(failure.as_ref(), crate::error::RarFailure::Unsupported(
+        crate::error::RarUnsupported::Rar4Feature(actual)) if *actual == label));
+    assert!(matches!(legacy, crate::error::Error::Io(ref error)
+        if error.kind() == std::io::ErrorKind::OutOfMemory));
+}
+
+#[test]
+fn ppm_legacy_label_allocation_refusal_preserves_typed_reason() {
+    unsupported_label_refusal(Rar4UnsupportedMode::Ppm, "PPM payload");
+}
+
+#[test]
+fn vm_legacy_label_allocation_refusal_preserves_typed_reason() {
+    unsupported_label_refusal(Rar4UnsupportedMode::VmFilter, "VM/filter payload");
 }
