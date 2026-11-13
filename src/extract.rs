@@ -765,7 +765,7 @@ fn rar_list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
     Ok(out)
 }
 
-struct PendingCipher {
+pub(crate) struct PendingCipher {
     aes: crate::crypto::AesKey,
     iv: [u8; 16],
     rem: Vec<u8>,
@@ -780,7 +780,7 @@ struct StoredCipherPadding {
 }
 
 #[derive(Default)]
-struct CipherBlocks {
+pub(crate) struct CipherBlocks {
     header: Vec<u8>,
     left: usize,
     last: bool,
@@ -789,7 +789,7 @@ struct CipherBlocks {
 }
 
 impl CipherBlocks {
-    fn feed(&mut self, mut data: &[u8], decoder: &mut Unpacker, sink: &mut dyn Sink) -> Result<()> {
+    pub(crate) fn feed(&mut self, mut data: &[u8], decoder: &mut Unpacker, sink: &mut dyn Sink) -> Result<()> {
         while !data.is_empty() {
             if self.ended {
                 if data.len() > 15 - self.padding {
@@ -819,7 +819,7 @@ impl CipherBlocks {
         Ok(())
     }
 
-    fn finish(&self) -> Result<()> {
+    pub(crate) fn finish(&self) -> Result<()> {
         if !self.ended || self.left != 0 || !self.header.is_empty() {
             return Err(Error::Truncated);
         }
@@ -828,7 +828,7 @@ impl CipherBlocks {
 }
 
 /// A file being read, whose data may run on into later volumes.
-struct Pending {
+pub(crate) struct Pending {
     context: EntryContext,
     out: Option<Output>,
     hasher: crate::crc32::Hasher,
@@ -857,7 +857,7 @@ struct Pending {
 }
 
 impl Pending {
-    fn new(h: &FileHeader, context: EntryContext) -> Self {
+    pub(crate) fn new(h: &FileHeader, context: EntryContext) -> Self {
         Pending {
             context,
             out: None,
@@ -893,7 +893,7 @@ impl Pending {
         drop(self.out.take());
     }
 
-    fn hash_key(&self, keyed: bool) -> Option<&[u8; 32]> {
+    pub(crate) fn hash_key(&self, keyed: bool) -> Option<&[u8; 32]> {
         self.cipher.as_ref().filter(|_| keyed).map(|cipher| &cipher.hash_key)
     }
 
@@ -902,7 +902,15 @@ impl Pending {
         self.take_detailed(chunk).map_err(RarFault::into_legacy)
     }
 
-    fn take_detailed(&mut self, mut chunk: &[u8]) -> crate::error::RarResult<()> {
+    fn take_detailed(&mut self, chunk: &[u8]) -> crate::error::RarResult<()> {
+        self.take_with(chunk, |_| Ok(()))
+    }
+
+    pub(crate) fn take_with(
+        &mut self,
+        mut chunk: &[u8],
+        admit: impl FnOnce(&[u8]) -> crate::error::RarResult<()>,
+    ) -> crate::error::RarResult<()> {
         if let Some(padding) = self.cipher.as_mut().and_then(|c| c.stored_padding.as_mut()) {
             let count = padding.size.saturating_sub(self.bytes).min(chunk.len() as u64) as usize;
             let skipped = chunk.len() - count;
@@ -920,6 +928,7 @@ impl Pending {
             }
         }
         let new_size = self.bytes.checked_add(chunk.len() as u64).ok_or_else(RarFault::counter_limit)?;
+        admit(chunk)?;
         if let Some(mem) = self.mem.as_mut() {
             mem.extend_from_slice(chunk);
             self.bytes = new_size;
@@ -950,6 +959,132 @@ impl Sink for Pending {
 
     fn crc(&mut self, crc: u32) {
         self.crc = Some(crc);
+    }
+}
+
+impl Pending {
+    pub(crate) fn verified_size(&self) -> u64 {
+        self.bytes
+    }
+
+    pub(crate) fn context(&self) -> &EntryContext {
+        &self.context
+    }
+
+    fn start_cipher(
+        context: &mut EntryContext,
+        compressed: bool,
+        params: crate::crypto::Rar5CryptParams,
+        password: &str,
+        size: Option<u64>,
+    ) -> std::result::Result<PendingCipher, RarFailure> {
+        let keys = crate::crypto::derive_rar5_keys(password, params.kdf_count, &params.salt, params.check)
+            .map_err(|error| RarFailure::crypt(error, context.scope()))?;
+        context.password = keys.evidence;
+        let aes = crate::crypto::AesKey::new(&keys.key)
+            .ok_or(RarFailure::Internal(RarInternal::Invariant("invalid encryption key")))?;
+        Ok(PendingCipher {
+            aes,
+            iv: params.iv,
+            rem: Vec::new(),
+            hash_key: keys.hash_key,
+            stored_padding: if compressed { None } else { size.map(|size| StoredCipherPadding { size, skipped: 0 }) },
+            blocks: compressed.then(CipherBlocks::default),
+        })
+    }
+
+    pub(crate) fn start_selected_cipher(
+        &mut self,
+        params: crate::crypto::Rar5CryptParams,
+        password: &str,
+        size: Option<u64>,
+    ) -> std::result::Result<(), RarFailure> {
+        self.cipher = Some(Self::start_cipher(&mut self.context, self.compressed, params, password, size)?);
+        Ok(())
+    }
+
+    pub(crate) fn selected_cipher(&mut self) -> Option<&mut PendingCipher> {
+        self.cipher.as_mut()
+    }
+
+    pub(crate) fn verify_selected(
+        &mut self,
+        size: Option<u64>,
+        crc32: Option<u32>,
+        blake2sp: Option<[u8; 32]>,
+        keyed: bool,
+    ) -> std::result::Result<RarVerification, RarFailure> {
+        self.verify_checks(size, crc32, blake2sp, keyed)?;
+        Ok(self.context.checks(size.is_some(), crc32.is_some(), blake2sp.is_some()))
+    }
+
+    fn verify_checks(
+        &mut self,
+        size: Option<u64>,
+        crc32: Option<u32>,
+        blake2sp: Option<[u8; 32]>,
+        keyed: bool,
+    ) -> std::result::Result<(), RarFailure> {
+        let raw_crc = if self.decoder_crc { self.crc } else { Some(self.hasher.clone().finalize()) };
+        let blake = self.blake.take();
+        let hash_key = self.hash_key(keyed);
+        let got_crc = match hash_key {
+            Some(key) => raw_crc.map(|crc| crate::crypto::rar5_tweak_crc32(crc, key)),
+            None => raw_crc,
+        };
+        let crc_bad = crc32.is_some_and(|want| got_crc != Some(want));
+        let blake_bad = match (blake2sp, blake) {
+            (Some(want), Some(got)) => {
+                let digest = got.finish();
+                hash_key.map_or(digest, |key| crate::crypto::rar5_tweak_blake2sp(&digest, key)) != want
+            }
+            (Some(_), None) => return Err(self.context.integrity(RarIntegrityReason::DeclaredHashUnavailable, false)),
+            _ => false,
+        };
+        if crc_bad || blake_bad {
+            return Err(self
+                .context
+                .integrity(RarIntegrityReason::FinalChecks { crc32: crc_bad, blake2sp: blake_bad }, true));
+        }
+        if let Some(size) = size
+            && self.bytes != size
+        {
+            return Err(self
+                .context
+                .integrity(RarIntegrityReason::DecodedSize { expected: size, actual: self.bytes }, true));
+        }
+        Ok(())
+    }
+}
+
+impl PendingCipher {
+    pub(crate) fn decrypt_selected(&mut self, chunk: &[u8], scratch: &mut Vec<u8>) {
+        scratch.clear();
+        scratch.extend_from_slice(&self.rem);
+        scratch.extend_from_slice(chunk);
+        let aligned = scratch.len() & !15;
+        self.rem.clear();
+        self.rem.extend_from_slice(&scratch[aligned..]);
+        scratch.truncate(aligned);
+        self.aes.decrypt_cbc_in_place(&mut self.iv, scratch);
+    }
+
+    pub(crate) fn take_blocks(&mut self) -> Option<CipherBlocks> {
+        self.blocks.take()
+    }
+
+    pub(crate) fn put_blocks(&mut self, blocks: Option<CipherBlocks>) {
+        self.blocks = blocks;
+    }
+
+    pub(crate) fn finish_selected(&self, context: &EntryContext) -> std::result::Result<(), RarFailure> {
+        if !self.rem.is_empty() {
+            return Err(context.integrity(RarIntegrityReason::IncompleteCipherBlock, false));
+        }
+        self.blocks
+            .as_ref()
+            .map_or(Ok(()), CipherBlocks::finish)
+            .map_err(|error| *batch::decoder_failure(error, context.scope(), context.password).failure)
     }
 }
 
@@ -1132,49 +1267,38 @@ fn check_and_finish(books: &mut Books<'_, '_>, c: &Checks, mut p: Pending) -> Ru
         };
         return batch.submit(job, &mut |done| apply_done(books.reports, books.mode, done));
     }
-    // a CRC the decoder never handed over can't match
-    let raw_crc = if p.decoder_crc { p.crc } else { Some(p.hasher.clone().finalize()) };
-    let blake = p.blake.take();
-    let hash_key = p.hash_key(c.keyed);
-    let got_crc = match hash_key {
-        Some(key) => raw_crc.map(|crc| crate::crypto::rar5_tweak_crc32(crc, key)),
-        None => raw_crc,
-    };
-    let crc_bad = c.crc32.is_some_and(|want| got_crc != Some(want));
-    let blake_bad = match (c.blake2sp, blake) {
-        (Some(want), Some(got)) => {
-            let digest = got.finish();
-            hash_key.map_or(digest, |key| crate::crypto::rar5_tweak_blake2sp(&digest, key)) != want
-        }
-        (Some(_), None) => {
-            p.discard();
-            if !p.passive {
-                books.fail(
-                    &p.context,
-                    p.context.integrity(RarIntegrityReason::DeclaredHashUnavailable, false),
-                    "its BLAKE2sp hash starts only in a later part, so it can't be checked",
-                )?;
-            }
-            return Ok(());
-        }
-        _ => false,
-    };
     if p.passive {
         return Ok(());
     }
-    if crc_bad || blake_bad {
-        p.discard();
-        let failure =
-            p.context.integrity(RarIntegrityReason::FinalChecks { crc32: crc_bad, blake2sp: blake_bad }, true);
-        return books.fail(&p.context, failure, "checksum error");
-    }
-    // a matching checksum doesn't vouch for the size the header states
-    if let Some(size) = c.size
-        && p.bytes != size
-    {
-        p.discard();
-        let failure = p.context.integrity(RarIntegrityReason::DecodedSize { expected: size, actual: p.bytes }, true);
-        return books.fail(&p.context, failure, format_args!("{} bytes where the header says {size}", p.bytes));
+    if let Err(failure) = p.verify_checks(c.size, c.crc32, c.blake2sp, c.keyed) {
+        let reason = match &failure {
+            RarFailure::Integrity { reason, .. } | RarFailure::EncryptedIntegrity { reason, .. } => reason,
+            _ => unreachable!("member checks return integrity failures"),
+        };
+        match reason {
+            RarIntegrityReason::DeclaredHashUnavailable => {
+                p.discard();
+                return books.fail(
+                    &p.context,
+                    failure,
+                    "its BLAKE2sp hash starts only in a later part, so it can't be checked",
+                );
+            }
+            RarIntegrityReason::FinalChecks { .. } => {
+                p.discard();
+                return books.fail(&p.context, failure, "checksum error");
+            }
+            RarIntegrityReason::DecodedSize { expected, actual } => {
+                let (expected, actual) = (*expected, *actual);
+                p.discard();
+                return books.fail(
+                    &p.context,
+                    failure,
+                    format_args!("{actual} bytes where the header says {expected}"),
+                );
+            }
+            _ => unreachable!("unexpected member check failure"),
+        }
     }
     if let Some(out) = p.out.take()
         && let Err(e) = out.finish_detailed(|file| finish_file(file, &c.meta))
@@ -1756,30 +1880,20 @@ impl Run<'_, '_, '_> {
             let cause = self.fail_in_order(&ctx, reason, format_args!("links are not supported yet ({link:?})"))?;
             return self.pass_over(vol, h, ctx, None, Some(cause));
         }
-        let cipher = if let (Some(cp), Some(pw)) = (&h.crypt, self.password) {
-            let keys = match crate::crypto::derive_rar5_keys(pw, cp.kdf_count, &cp.salt, cp.check) {
-                Ok(keys) => keys,
-                Err(e) => {
-                    let cause = self.fail_in_order(&ctx, RarFailure::crypt(e, ctx.scope()), "wrong password")?;
+        let cipher = if let (Some(cp), Some(pw)) = (h.crypt, self.password) {
+            match Pending::start_cipher(&mut ctx, h.method != 0, cp, pw, (!h.size_unknown()).then_some(h.unpacked_size))
+            {
+                Ok(cipher) => Some(cipher),
+                Err(failure) => {
+                    let why = if matches!(failure, RarFailure::Internal(_)) {
+                        "invalid encryption key"
+                    } else {
+                        "wrong password"
+                    };
+                    let cause = self.fail_in_order(&ctx, failure, why)?;
                     return self.pass_over(vol, h, ctx, None, Some(cause));
                 }
-            };
-            ctx.password = keys.evidence;
-            let Some(aes) = crate::crypto::AesKey::new(&keys.key) else {
-                let reason = RarFailure::Internal(RarInternal::Invariant("invalid encryption key"));
-                let cause = self.fail_in_order(&ctx, reason, "invalid encryption key")?;
-                return self.pass_over(vol, h, ctx, None, Some(cause));
-            };
-            let stored_padding = (h.method == 0 && !h.size_unknown())
-                .then_some(StoredCipherPadding { size: h.unpacked_size, skipped: 0 });
-            Some(PendingCipher {
-                aes,
-                iv: cp.iv,
-                rem: Vec::new(),
-                hash_key: keys.hash_key,
-                stored_padding,
-                blocks: (h.method != 0).then(CipherBlocks::default),
-            })
+            }
         } else {
             None
         };
