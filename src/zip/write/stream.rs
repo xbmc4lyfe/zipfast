@@ -18,7 +18,7 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 use crate::crypto::ZipCrypto;
-use crate::zip::FLAG_ENCRYPTED;
+use crate::zip::{FLAG_DESCRIPTOR, FLAG_ENCRYPTED};
 
 use super::records::{End, Member, Width};
 use super::{
@@ -26,7 +26,6 @@ use super::{
     WriteSummary, WriteUsage, WriterOptions, add, archive_comment_len, bound, prepare_member, reserve_central,
 };
 
-const FLAG_DESCRIPTOR: u16 = 1 << 3;
 const ZIPCRYPTO_HEADER: u64 = 12;
 
 /// A fresh ZIP archive written forward to an owned or borrowed sink.

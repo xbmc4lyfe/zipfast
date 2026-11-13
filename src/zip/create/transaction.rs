@@ -157,12 +157,12 @@ impl CreatePlan {
         tests::event(tests::Event::BeforeVerify, Some(stage.path())).at(CreateStage::Verify)?;
         let verified = verify::verify_created(
             &mut stage.file,
-            &self.entries,
-            receipts,
+            (&self.entries, receipts),
             &self.options,
             summary,
             &attempts,
             &mut self.usage.verification,
+            |_| None,
         )
         .at(CreateStage::Verify)?;
         #[cfg(test)]
