@@ -23,6 +23,75 @@ use crate::zip::write::{DeflateLevel, WriteUsage};
 
 const CRC: u32 = 0x3524_41c2;
 
+#[test]
+fn verifies_aes_against_explicit_requests_and_private_plaintext_crc() {
+    use crate::zip::write::{AesStrength, AesVariant, WinZipAesRequest, WriterOptions, ZipStreamWriter};
+    for strength in [AesStrength::Aes128, AesStrength::Aes192, AesStrength::Aes256] {
+        for variant in [AesVariant::Ae1, AesVariant::Ae2] {
+            for (method, length, contents) in [
+                (Method::Stored, InputLength::Exact(3), b"abc".as_slice()),
+                (Method::Stored, InputLength::Unknown, b"abc".as_slice()),
+                (Method::Deflate(DeflateLevel::new(6).unwrap()), InputLength::Unknown, b"abc".as_slice()),
+                (Method::Deflate(DeflateLevel::new(1).unwrap()), InputLength::Exact(0), b"".as_slice()),
+                (Method::Deflate(DeflateLevel::new(9).unwrap()), InputLength::Unknown, b"".as_slice()),
+            ] {
+                let temp = test_dir();
+                let path = temp.path().join("source");
+                std::fs::write(&path, contents).unwrap();
+                let mut plan = CreatePlan::new(&temp.path().join("out.zip"), CreateOptions::default()).unwrap();
+                let mut meta = metadata("a");
+                meta.method = method;
+                meta.extended_mtime = Some(1_700_000_000);
+                plan.add_file(&path, meta, None).unwrap();
+                let mut writer = ZipStreamWriter::new(tempfile::tempfile().unwrap(), WriterOptions::default()).unwrap();
+                let mut input = contents;
+                let receipt = writer
+                    .add_winzip_aes_file(
+                        meta,
+                        &mut input,
+                        length,
+                        WinZipAesRequest::new("verify-aes", strength, variant).unwrap(),
+                        |salt| {
+                            salt.fill(1);
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                let mut finished = writer.finish().unwrap();
+                let count = Cell::new(0);
+                let budget = Attempts::new(&plan.options, &count);
+                let mut usage = VerificationUsage::default();
+                let request = WinZipAesRequest::new("verify-aes", strength, variant).unwrap();
+                let expected = AesExpectation { request: &request, length, plaintext_crc32: receipt.plaintext_crc32 };
+                verify_created(
+                    &mut finished.sink,
+                    (&plan.entries, &[receipt.entry]),
+                    &plan.options,
+                    finished.summary,
+                    &budget,
+                    &mut usage,
+                    |_| Some(expected.into()),
+                )
+                .unwrap();
+                assert_eq!((usage.entries, usage.payloads, usage.decoded_bytes), (1, 1, contents.len() as u64));
+                let wrong_crc = AesExpectation { plaintext_crc32: receipt.plaintext_crc32 ^ 1, ..expected };
+                assert!(matches!(
+                    verify_created(
+                        &mut finished.sink,
+                        (&plan.entries, &[receipt.entry]),
+                        &plan.options,
+                        finished.summary,
+                        &budget,
+                        &mut VerificationUsage::default(),
+                        |_| Some(wrong_crc.into())
+                    ),
+                    Err(CreateError::Verification(_))
+                ));
+            }
+        }
+    }
+}
+
 fn words(bytes: &mut Vec<u8>, words: &[u16]) {
     for word in words {
         bytes.extend(word.to_le_bytes());
@@ -304,7 +373,7 @@ fn encrypted_descriptor_and_payload_are_verified_against_the_plan() {
     let finished = writer.finish().unwrap();
     assert_eq!(receipt.packed_size, 15);
     let encryption = ZipCryptoExpectation { password: "verify-test", length: InputLength::Exact(3) };
-    let verify = |bytes: &[u8], encryption, limit| {
+    let verify = |bytes: &[u8], encryption: Option<ZipCryptoExpectation<'_>>, limit| {
         let mut file = tempfile::tempfile().unwrap();
         file.write_all(bytes).unwrap();
         let options = CreateOptions {
@@ -321,7 +390,7 @@ fn encrypted_descriptor_and_payload_are_verified_against_the_plan() {
             finished.summary,
             &budget,
             &mut usage,
-            |_| encryption,
+            |_| encryption.map(EncryptionExpectation::ZipCrypto),
         )?;
         assert_eq!((usage.payloads, usage.decoded_bytes), (1, 3));
         Ok::<_, CreateError>(usage.read_bytes)
@@ -411,7 +480,7 @@ fn verifies_mixed_clear_and_encrypted_entries_with_canonical_empty_and_wide_fram
                 })
                 .unwrap(),
         );
-        modes.push(Some(ZipCryptoExpectation { password: "verify-test", length }));
+        modes.push(Some(ZipCryptoExpectation { password: "verify-test", length }.into()));
     }
     let mut finished = writer.finish().unwrap();
     let attempts = Cell::new(0);
@@ -488,7 +557,7 @@ fn verifies_zipcrypto_packed_range_above_the_buffered_reader_ceiling() {
         finished.summary,
         &budget,
         &mut usage,
-        |_| Some(ZipCryptoExpectation { password: "verify-test", length }),
+        |_| Some(ZipCryptoExpectation { password: "verify-test", length }.into()),
     )
     .unwrap();
     assert_eq!(receipt.packed_size, LENGTH + 12);

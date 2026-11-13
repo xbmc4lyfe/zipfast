@@ -275,15 +275,20 @@ thread_local! {
     static HOOK: std::cell::RefCell<Option<Box<Hook>>> = const { std::cell::RefCell::new(None) };
     static SINK_WRITE_CAP: Cell<usize> = const { Cell::new(usize::MAX) };
     static SOURCE_READ_CAP: Cell<usize> = const { Cell::new(usize::MAX) };
+    static VERIFY_READ_CAP: Cell<usize> = const { Cell::new(usize::MAX) };
 }
 
-fn with_hook<T>(hook: impl FnMut(Event, Option<&Path>) -> io::Result<()> + 'static, run: impl FnOnce() -> T) -> T {
+pub(super) fn with_hook<T>(
+    hook: impl FnMut(Event, Option<&Path>) -> io::Result<()> + 'static,
+    run: impl FnOnce() -> T,
+) -> T {
     struct Reset;
     impl Drop for Reset {
         fn drop(&mut self) {
             HOOK.with_borrow_mut(|cell| *cell = None);
             SINK_WRITE_CAP.set(usize::MAX);
             SOURCE_READ_CAP.set(usize::MAX);
+            VERIFY_READ_CAP.set(usize::MAX);
         }
     }
     HOOK.with_borrow_mut(|cell| {
@@ -300,6 +305,14 @@ pub(super) fn sink_write_cap() -> usize {
 
 pub(super) fn source_read_cap() -> usize {
     SOURCE_READ_CAP.get()
+}
+
+pub(super) fn verify_read_cap() -> usize {
+    VERIFY_READ_CAP.get()
+}
+
+pub(super) fn cap_verification_reads(bytes: usize) {
+    VERIFY_READ_CAP.set(bytes.max(1));
 }
 
 pub(super) fn event_io(event: Event, path: Option<&Path>) -> io::Result<()> {
