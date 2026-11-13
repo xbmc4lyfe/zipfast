@@ -51,6 +51,9 @@ impl CreatePlan {
         };
         let stage = {
             let budget = Attempts::new(&self.options, &self.attempts);
+            if let Err(error) = super::check_directories(&self.entries, None, &budget) {
+                return Err(self.failure(Stopped::at(CreateStage::Precommit, error), CleanupState::Clean));
+            }
             Stage::create(&self.parent, &budget, &mut self.usage.stage_attempts)
         };
         let mut stage = match stage {
@@ -125,6 +128,8 @@ impl CreatePlan {
         receipts: &mut Vec<EntryWritten>,
     ) -> std::result::Result<Publication, Stopped> {
         let attempts = Attempts::new(&self.options, &self.attempts);
+        let parent_stamp =
+            super::stage_parent_stamp(&self.entries, &self.parent, &attempts).at(CreateStage::Precommit)?;
         let original = unix::file_stamp(&stage.file, &attempts).at(CreateStage::StageCreate)?;
         for (ordinal, entry) in self.entries.iter().enumerate() {
             if self.options.cancel.is_canceled() {
@@ -175,8 +180,9 @@ impl CreatePlan {
         }
         #[cfg(test)]
         tests::event(tests::Event::BeforeFinalSourceCheck, None).at(CreateStage::Precommit)?;
+        super::check_directories(&self.entries, parent_stamp, &attempts).at(CreateStage::Precommit)?;
         for (ordinal, entry) in self.entries.iter().enumerate() {
-            if let Some(source) = &entry.source {
+            if let Some(source) = entry.payload_source() {
                 let id = CreateEntryId(ordinal);
                 let bound = unix::path_stamp(&source.path, &attempts).at(CreateStage::Precommit)?;
                 verify_stamp(source.stamp, bound, id).at(CreateStage::Precommit)?;
@@ -230,7 +236,7 @@ impl CreatePlan {
             }
         };
         for (ordinal, entry) in entries.iter().enumerate() {
-            let receipt = (|| match &entry.source {
+            let receipt = (|| match entry.payload_source() {
                 None => writer.add_directory(entry.options()).map_err(writer_error).at(CreateStage::Write),
                 Some(source) => {
                     let id = CreateEntryId(ordinal);

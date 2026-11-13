@@ -166,7 +166,7 @@ impl RewritePlan {
         metadata: EntryOptions<'_>,
         keys: Option<&CollisionPath>,
     ) -> Result<()> {
-        self.admit(at, metadata, keys, Some((source, None)))
+        self.admit(at, metadata, keys, Some((source, None, false)))
     }
 
     /// Admit a caller-provided file whose path binds the same regular inode.
@@ -178,7 +178,7 @@ impl RewritePlan {
         metadata: EntryOptions<'_>,
         keys: Option<&CollisionPath>,
     ) -> Result<()> {
-        self.admit(at, metadata, keys, Some((source, Some(file))))
+        self.admit(at, metadata, keys, Some((source, Some(file), false)))
     }
 
     /// Admit an explicit directory entry.
@@ -208,6 +208,36 @@ impl RewritePlan {
         usage
     }
 
+    /// Admit directory metadata bound to the source path.
+    ///
+    /// The plan snapshots the directory at admission and writes the supplied
+    /// metadata. Callers that sampled metadata earlier must ensure it still
+    /// describes the same directory when this call returns.
+    pub fn add_directory_from_path(
+        &mut self,
+        at: Placement,
+        source: &Path,
+        metadata: EntryOptions<'_>,
+        keys: Option<&CollisionPath>,
+    ) -> Result<()> {
+        self.admit(at, metadata, keys, Some((source, None, true)))
+    }
+
+    /// Admit directory metadata bound to a held handle and its path.
+    ///
+    /// The supplied metadata is used as is. See [Self::add_directory_from_path]
+    /// for the source snapshot contract.
+    pub fn add_open_directory(
+        &mut self,
+        at: Placement,
+        source: &Path,
+        file: File,
+        metadata: EntryOptions<'_>,
+        keys: Option<&CollisionPath>,
+    ) -> Result<()> {
+        self.admit(at, metadata, keys, Some((source, Some(file), true)))
+    }
+
     fn unedited(&self, id: &EntryId) -> Result<usize> {
         let ordinal = self.metadata.ordinal(id).map_err(|_| RewriteError::ForeignEntryId)?;
         if !matches!(self.actions[ordinal], Action::Keep) {
@@ -221,7 +251,7 @@ impl RewritePlan {
         at: Placement,
         metadata: EntryOptions<'_>,
         keys: Option<&CollisionPath>,
-        source: Option<(&Path, Option<File>)>,
+        source: Option<(&Path, Option<File>, bool)>,
     ) -> Result<()> {
         let ordinal = match at {
             Placement::Append => None,
@@ -229,9 +259,9 @@ impl RewritePlan {
         };
         let options = &self.options;
         let common = options.limits.common;
-        let (scan, minimum_metadata) = input_cost(metadata, keys, source.as_ref().map(|(path, _)| *path))?;
+        let (scan, minimum_metadata) = input_cost(metadata, keys, source.as_ref().map(|(path, _, _)| *path))?;
         work(options, &mut self.usage, scan)?;
-        validate_input(metadata, keys, source.is_none(), options.collisions)?;
+        validate_input(metadata, keys, source.as_ref().is_none_or(|source| source.2), options.collisions)?;
         let raw = name_bytes(metadata.name);
         if let Some(ordinal) = ordinal {
             let original = self.metadata.view(ordinal);
@@ -242,7 +272,7 @@ impl RewritePlan {
         } else {
             self.names.check_append(raw, &self.metadata, &self.inputs, options, &mut self.usage)?;
         }
-        let held = source.as_ref().is_some_and(|(_, file)| file.is_some());
+        let held = source.as_ref().is_some_and(|(_, file, _)| file.is_some());
         let retained = add(self.usage.common.plan.retained_handles, u64::from(held))?;
         limit(retained, common.retained_handles, CreateLimit::RetainedHandles)?;
         let entries = add(self.usage.common.plan.entries, u64::from(ordinal.is_none()))?;
@@ -394,6 +424,14 @@ impl RewritePlan {
             self.options.limits.common.transaction_attempts,
             &self.attempts,
         );
+        super::super::create::native::check_directories(&self.inputs, None, &attempts).map_err(|error| {
+            self.failure(
+                RewriteStage::Precommit,
+                directory_input_error(error),
+                Publication::NotPublished,
+                CleanupState::Clean,
+            )
+        })?;
         let mut stage = match Stage::create(&self.parent, &attempts, &mut self.usage.common.stage_attempts) {
             Ok(stage) => stage,
             Err(error) => {
@@ -482,6 +520,9 @@ impl RewritePlan {
         let options = &self.options;
         let attempts =
             Attempts::with_limits(&options.cancel, options.limits.common.transaction_attempts, &self.attempts);
+        let parent_stamp = super::super::create::native::stage_parent_stamp(&self.inputs, &self.parent, &attempts)
+            .map_err(directory_input_error)
+            .at(RewriteStage::Precommit)?;
         let original = unix::file_stamp(&stage.file, &attempts).at(RewriteStage::StageCreate)?;
         check_source(&self.parent, &self.file, self.stamp, &attempts).at(RewriteStage::SourceRead)?;
         let output = OutputPlan {
@@ -531,8 +572,11 @@ impl RewritePlan {
         }
         #[cfg(test)]
         super::test_event(super::Event::BeforeFinalCheck, Some(stage.path())).at(RewriteStage::Precommit)?;
+        super::super::create::native::check_directories(&self.inputs, parent_stamp, &attempts)
+            .map_err(directory_input_error)
+            .at(RewriteStage::Precommit)?;
         for (index, entry) in self.inputs.iter().enumerate() {
-            if let Some(source) = &entry.source {
+            if let Some(source) = entry.payload_source() {
                 let path = unix::path_stamp(&source.path, &attempts)
                     .map_err(|error| input_error(error, index))
                     .at(RewriteStage::Precommit)?;
@@ -760,7 +804,7 @@ impl OutputPlan<'_> {
         attempts: Attempts<'_>,
     ) -> std::result::Result<EntryWritten, Stop> {
         let entry = &self.inputs[index];
-        let Some(source) = &entry.source else {
+        let Some(source) = entry.payload_source() else {
             return writer.add_directory(entry.options()).map_err(rewrite_writer_error).at(RewriteStage::Write);
         };
         let reopened = if source.file.is_none() {
@@ -841,5 +885,12 @@ trait At<T> {
 impl<T, E: Into<RewriteError>> At<T> for std::result::Result<T, E> {
     fn at(self, stage: RewriteStage) -> std::result::Result<T, Stop> {
         self.map_err(|error| Stop::at(stage, error))
+    }
+}
+
+fn directory_input_error(error: CreateError) -> RewriteError {
+    match error {
+        CreateError::SourceChanged(id) => RewriteError::InputChanged { input: id.ordinal() },
+        other => other.into(),
     }
 }

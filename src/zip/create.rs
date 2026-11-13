@@ -20,6 +20,13 @@
 //! stable. Concurrent creation of the destination is supported. See the
 //! repository's creation guide for filesystem qualification and failure states.
 //!
+//! A tracked directory can also be the destination's parent. In that case,
+//! stage creation changes its stamp. The plan checks the original stamp
+//! before staging and takes a new baseline from the held parent immediately
+//! after creating the stage. Concurrent changes to the parent's times or
+//! size between those checks can be attributed to stage creation. Keep the
+//! directory stable throughout that interval.
+//!
 //! ```no_run
 //! use std::path::Path;
 //! use zipfast::zip::create::{CreateOptions, CreatePlan};
