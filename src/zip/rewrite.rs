@@ -42,7 +42,7 @@ use crate::extract::Cancellation;
 
 use super::create::{
     CleanupState, CollisionPolicy, CreateError, CreateLimits, CreateUsage, Durability, DurabilityState, Publication,
-    VerificationUsage,
+    PublishedArchiveBinding, VerificationUsage,
 };
 use super::write::{EntryWritten, WriteError};
 

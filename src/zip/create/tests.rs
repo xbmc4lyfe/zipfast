@@ -29,6 +29,73 @@ pub(super) fn metadata(name: &str) -> EntryOptions<'_> {
 }
 
 #[test]
+fn bound_receipt_refuses_a_destination_replaced_during_sync() {
+    use std::fs;
+
+    for substitute in [false, true] {
+        let options = CreateOptions { durability: Durability::SyncFileAndDirectory, ..CreateOptions::default() };
+        let (_dir, source, output, plan) = simple_plan(options);
+        let destination = output.clone();
+        let (report, binding) = with_hook(
+            move |event, _| {
+                if substitute && event == Event::DirectorySync {
+                    fs::rename(&destination, destination.with_extension("original"))?;
+                    fs::write(&destination, b"foreign")?;
+                }
+                Ok(())
+            },
+            || plan.publish_with_bound_receipts(),
+        );
+        assert_eq!(report.outcome.unwrap().durability, DurabilityState::Synced);
+        assert_eq!(report.written.len(), 1);
+        if substitute {
+            assert!(binding.is_none());
+            assert_eq!(fs::read(output).unwrap(), b"foreign");
+        } else {
+            let binding = binding.unwrap();
+            assert!(binding.matches(&fs::symlink_metadata(output).unwrap()));
+            assert!(!binding.matches(&fs::symlink_metadata(source).unwrap()));
+        }
+    }
+}
+
+#[test]
+fn bound_receipt_detects_later_mutation_of_the_published_inode() {
+    use std::fs;
+    use std::io::Write;
+    use std::os::unix::fs::MetadataExt;
+
+    let (_dir, _, output, plan) = simple_plan(CreateOptions::default());
+    let (report, binding) = plan.publish_with_bound_receipts();
+    report.outcome.unwrap();
+    let binding = binding.unwrap();
+    let initial = fs::symlink_metadata(&output).unwrap();
+    assert!(binding.matches(&initial));
+    fs::OpenOptions::new().append(true).open(&output).unwrap().write_all(b"changed").unwrap();
+    let changed = fs::symlink_metadata(&output).unwrap();
+    assert_eq!(initial.ino(), changed.ino());
+    assert!(!binding.matches(&changed));
+    assert!(!binding.matches(&initial));
+}
+
+#[test]
+fn optional_binding_probe_does_not_starve_directory_sync() {
+    let options = CreateOptions { durability: Durability::SyncFileAndDirectory, ..CreateOptions::default() };
+    let (_dir, _, _, plan) = simple_plan(options);
+    let (report, binding) = with_hook(
+        |event, _| {
+            if event == Event::PublicationStamp {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            Ok(())
+        },
+        || plan.publish_with_bound_receipts(),
+    );
+    assert_eq!(report.outcome.unwrap().durability, DurabilityState::Synced);
+    assert!(binding.is_none());
+}
+
+#[test]
 fn names_and_caller_keys_are_checked_as_paths() {
     for bad in ["", "/", "../x", "x/./y", "x//y", "C:foo", "c:/foo", "a\\b", "x\u{80}"] {
         assert!(validate_name(metadata(bad), false).is_err(), "{bad:?}");
@@ -196,6 +263,7 @@ pub(super) enum Event {
     BeforeCommit,
     NativePublish,
     AfterCommit,
+    PublicationStamp,
     BeforeCleanup,
     Unlink,
     DirectorySync,

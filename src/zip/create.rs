@@ -498,3 +498,36 @@ pub struct CreateReport {
     /// publication succeeded and finalization returned an error.
     pub written: Vec<EntryWritten>,
 }
+
+/// Binding to a verified archive captured through its held publication file.
+///
+/// Obtain fresh no-follow metadata from the intended destination to check
+/// it against this receipt. Namespace checks and subsequent operations
+/// remain separate.
+#[derive(Debug)]
+pub struct PublishedArchiveBinding {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    file: std::fs::File,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    stamp: native::unix::Stamp,
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    unsupported: std::convert::Infallible,
+}
+
+impl PublishedArchiveBinding {
+    /// Compare fresh metadata with the verified file's final stamp.
+    pub fn matches(&self, metadata: &std::fs::Metadata) -> bool {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            // Retain the handle to prevent inode reuse while the receipt lives.
+            native::unix::Stamp::regular(metadata).is_ok_and(|stamp| stamp == self.stamp)
+                && self.file.metadata().ok().and_then(|meta| native::unix::Stamp::regular(&meta).ok())
+                    == Some(self.stamp)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = metadata;
+            match self.unsupported {}
+        }
+    }
+}
