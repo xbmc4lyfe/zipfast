@@ -22,6 +22,7 @@ use std::{
     marker::PhantomData,
     ptr::NonNull,
     rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
 };
 struct SharedHeader {
     context_alive: Cell<bool>,
@@ -35,11 +36,34 @@ pub(super) const SHARED_LEDGER_CAPACITY: usize = std::mem::size_of::<SharedHeade
 pub(super) fn header_layout() -> (usize, usize) {
     (SHARED_LEDGER_CAPACITY, std::mem::align_of::<SharedHeader>())
 }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct LedgerIdentity(u64);
+static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
+fn issue_identity(sequence: &AtomicU64) -> Result<LedgerIdentity, ReadFault> {
+    sequence
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map(LedgerIdentity)
+        .map_err(|_| ReadFault::CounterOverflow)
+}
+#[cfg(test)]
+pub(super) fn test_issue_identity(sequence: &AtomicU64) -> Result<u64, ReadFault> {
+    issue_identity(sequence).map(|id| id.0)
+}
+#[cfg(test)]
+pub(super) fn role_sizes() -> (usize, usize, usize) {
+    (
+        std::mem::size_of::<ContextLedger>(),
+        std::mem::size_of::<ReservationLedger>(),
+        std::mem::size_of::<LedgerView<'_>>(),
+    )
+}
 pub(super) struct ContextLedger {
+    identity: LedgerIdentity,
     pointer: NonNull<SharedHeader>,
     _local: PhantomData<Rc<()>>,
 }
 pub(super) struct ReservationLedger {
+    identity: LedgerIdentity,
     pointer: NonNull<SharedHeader>,
     _local: PhantomData<Rc<()>>,
 }
@@ -56,6 +80,7 @@ pub(super) struct ReservationLedger {
 impl ContextLedger {
     #[allow(clippy::result_large_err)] // Fixed inline evidence must survive allocator refusal.
     pub(super) fn try_new(state: LedgerState) -> ZipReadResult<Self> {
+        let identity = issue_identity(&NEXT_IDENTITY)?;
         let layout = Layout::new::<SharedHeader>();
         // SAFETY: checked null before initialization; layout is nonzero and valid.
         let pointer = NonNull::new(unsafe { alloc(layout) }.cast::<SharedHeader>())
@@ -69,7 +94,7 @@ impl ContextLedger {
                 _local: PhantomData,
             });
         }
-        Ok(Self { pointer, _local: PhantomData })
+        Ok(Self { pointer, identity, _local: PhantomData })
     }
     fn header(&self) -> &SharedHeader {
         unsafe { self.pointer.as_ref() }
@@ -84,7 +109,7 @@ impl ContextLedger {
         assert_eq!(header.owners.get(), 1);
         header.token_alive.set(true);
         header.owners.set(2);
-        Ok(ReservationLedger { pointer: self.pointer, _local: PhantomData })
+        Ok(ReservationLedger { pointer: self.pointer, identity: self.identity, _local: PhantomData })
     }
     pub(super) fn with_state<T>(&self, f: impl FnOnce(&mut LedgerState) -> T) -> T {
         f(&mut self.header().state.borrow_mut())
@@ -121,5 +146,39 @@ impl Drop for ContextLedger {
 impl Drop for ReservationLedger {
     fn drop(&mut self) {
         unsafe { release(self.pointer, false) }
+    }
+}
+
+/// A lexical borrow of one of the two owners; it creates no owning role.
+#[derive(Clone, Copy)]
+pub(super) struct LedgerView<'a> {
+    identity: LedgerIdentity,
+    state: &'a RefCell<LedgerState>,
+}
+pub(super) trait LedgerAccess {
+    fn view(&self) -> LedgerView<'_>;
+    fn identity(&self) -> LedgerIdentity {
+        self.view().identity
+    }
+    fn with_state<T>(&self, f: impl FnOnce(&mut LedgerState) -> T) -> T {
+        self.view().with_state(f)
+    }
+}
+impl LedgerAccess for ContextLedger {
+    fn view(&self) -> LedgerView<'_> {
+        LedgerView { state: &self.header().state, identity: self.identity }
+    }
+}
+impl LedgerAccess for ReservationLedger {
+    fn view(&self) -> LedgerView<'_> {
+        LedgerView { state: &unsafe { self.pointer.as_ref() }.state, identity: self.identity }
+    }
+}
+impl LedgerAccess for LedgerView<'_> {
+    fn view(&self) -> LedgerView<'_> {
+        *self
+    }
+    fn with_state<T>(&self, f: impl FnOnce(&mut LedgerState) -> T) -> T {
+        f(&mut self.state.borrow_mut())
     }
 }

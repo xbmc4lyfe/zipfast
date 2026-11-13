@@ -160,8 +160,9 @@ pub(super) struct EncryptedReadLedger {
     member_expected: u64,
 }
 impl EncryptedReadLedger {
-    // Task2 consumes member admission before crypto/spool acquisition.
-    #[allow(dead_code)]
+    pub(super) fn work(&mut self, bytes: u64) -> Result<(), ReadFault> {
+        charge(&mut self.usage.work_bytes, bytes.into(), self.limits.work_bytes, ReadResource::WorkBytes)
+    }
     pub(super) fn begin_member(
         &mut self,
         packed: u64,
@@ -174,7 +175,7 @@ impl EncryptedReadLedger {
         self.charge_member_attempt(packed)?;
         admit(ReadResource::MemberPackedBytes, self.limits.member_packed_bytes.into(), packed.into())?;
         admit(ReadResource::MemberDecodedBytes, self.limits.member_decoded_bytes.into(), decoded.into())?;
-        if ciphertext > self.limits.ciphertext_memory_bytes {
+        if aes && ciphertext > self.limits.ciphertext_memory_bytes {
             admit(ReadResource::MemberSpoolBytes, self.limits.member_spool_bytes.into(), ciphertext.into())?;
         }
         admit(ReadResource::PasswordBytes, self.limits.password_bytes.into(), password.into())?;
@@ -182,8 +183,39 @@ impl EncryptedReadLedger {
         self.usage.member_packed_bytes = packed;
         self.usage.member_decoded_bytes = 0;
         self.member_expected = decoded;
-        self.usage.member_spool_bytes = if ciphertext > self.limits.ciphertext_memory_bytes { ciphertext } else { 0 };
+        self.usage.member_spool_bytes =
+            if aes && ciphertext > self.limits.ciphertext_memory_bytes { ciphertext } else { 0 };
         self.usage.allocation_attempts = 0;
+        let disk = aes && ciphertext > self.limits.ciphertext_memory_bytes;
+        let io = u128::from(packed)
+            .checked_add(if disk { product(ciphertext.into(), 3)? } else { 0 })
+            .ok_or(ReadFault::CounterOverflow)?;
+        admit(ReadResource::IoBytes, self.limits.io_bytes, checked_sum(self.usage.io_bytes, io)?)?;
+        admit(
+            ReadResource::SourceBytes,
+            self.limits.source_bytes,
+            checked_sum(self.usage.source_bytes, packed.into())?,
+        )?;
+        let work = if aes {
+            checked_sum(product(ciphertext.into(), 3)?, decoded.into())?
+        } else {
+            checked_sum(checked_sum(packed.into(), ciphertext.into())?, decoded.into())?
+        };
+        if aes && !disk {
+            admit(
+                ReadResource::ReaderCapacity,
+                self.limits.reader_capacity.into(),
+                checked_sum(self.usage.reader_capacity.into(), ciphertext.into())?,
+            )?;
+        }
+        if disk {
+            admit(
+                ReadResource::LiveSpoolBytes,
+                self.limits.live_spool_bytes,
+                checked_sum(self.usage.live_spool_bytes, ciphertext.into())?,
+            )?;
+        }
+        admit(ReadResource::WorkBytes, self.limits.work_bytes, checked_sum(self.usage.work_bytes, work)?)?;
         if aes {
             charge64(&mut self.usage.kdf_calls, 1, self.limits.kdf_calls, ReadResource::KdfCalls)?;
         }
@@ -198,15 +230,12 @@ impl EncryptedReadLedger {
     /// Terminal admission for malformed/unsupported encrypted records. The caller
     /// returns this fault directly, rather than calling begin_member afterward:
     /// both paths spend exactly one member/P attempt, without KDF or payload work.
-    #[allow(dead_code)] // Task2/4 framing/method rejection uses this terminal-only admission seam.
     pub(super) fn reject_member(&mut self, packed: u64, rejection: ReadFault) -> ReadFault {
         match self.charge_member_attempt(packed) {
             Ok(()) => rejection,
             Err(exhausted) => exhausted,
         }
     }
-    // Task2 owns fallible reader buffer acquisition, and Task3 native step/work admission.
-    #[allow(dead_code)]
     pub(super) fn allocation(&mut self, capacity: u64) -> Result<(), ReadFault> {
         charge64(
             &mut self.usage.allocation_attempts,
@@ -274,7 +303,7 @@ pub(super) enum PlannedOutput {
     StagedFiles,
     VerifiedStdout,
 }
-#[allow(dead_code)] // Task2 consumes checked sizes/cipher; Task4 constructs from original metadata.
+#[derive(Clone, Copy)]
 pub(super) struct MemberPlan {
     pub(super) source: SourceStamp,
     pub(super) scope: ProjectedReadScope,
@@ -430,6 +459,18 @@ impl LedgerState {
         } else {
             Ok((creates, retries))
         }
+    }
+    pub(super) fn verify_member(&self, member: &MemberPlan, cipher: CipherKind) -> Result<(), ReadFault> {
+        self.verify_source(member.source)?;
+        let binding = self.run.plan.as_ref().and_then(|p| p.binding.as_ref()).ok_or(ReadFault::InvalidPlan)?;
+        if member.scope != binding.scope
+            || member.output != binding.output
+            || member.cipher != Some(cipher)
+            || matches!(member.scope, ProjectedReadScope::Entry(n) if n as u64 != member.ordinal)
+        {
+            return Err(ReadFault::InvalidPlan);
+        }
+        Ok(())
     }
     pub(super) fn verify_source(&self, source: SourceStamp) -> Result<(), ReadFault> {
         let binding = self.run.plan.as_ref().and_then(|plan| plan.binding.as_ref()).ok_or(ReadFault::InvalidPlan)?;

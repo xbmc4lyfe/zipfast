@@ -16,9 +16,11 @@
 
 //! Checked ZIP read policy, bounded output leases, and inline terminal evidence.
 mod budget;
+mod cipher;
 mod error;
 pub(super) mod io;
 mod shared;
+mod spool;
 use crate::extract::Cancellation;
 pub use budget::{EncryptedReadLimits, EncryptedReadUsage, RunUsage};
 pub use error::*;

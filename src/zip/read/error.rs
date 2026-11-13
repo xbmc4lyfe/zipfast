@@ -406,11 +406,12 @@ pub(crate) struct ObjectCleanupReport {
     len: u8,
 }
 impl ObjectCleanupReport {
-    #[allow(dead_code)] // Task2/5 explicit object finish constructs its bounded terminal report.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
     pub(crate) fn new(object: OwnedObject) -> Self {
         Self { object, slots: std::array::from_fn(|_| None), len: 0 }
     }
-    #[allow(dead_code)] // Task2/5 object finish records each observed terminal fault.
     pub(crate) fn push(&mut self, fault: CleanupFault) {
         assert_eq!(fault.object, self.object, "one object per cleanup report");
         assert!(usize::from(self.len) < self.slots.len(), "eight terminal operations per object exceeded");

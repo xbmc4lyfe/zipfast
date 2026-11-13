@@ -15,3 +15,8 @@
 // rights and limitations under the RPL.
 
 mod core;
+
+#[cfg(unix)]
+mod cipher;
+#[cfg(unix)]
+mod spool;

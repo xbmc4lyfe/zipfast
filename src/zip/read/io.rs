@@ -15,7 +15,11 @@
 // rights and limitations under the RPL.
 
 //! Application transfers are bounded, charged before calls, and never retry callbacks.
-use super::{budget::LedgerState, shared::ReservationLedger, *};
+use super::{
+    budget::LedgerState,
+    shared::{LedgerAccess, LedgerView},
+    *,
+};
 use crate::extract::Cancellation;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 pub(super) const WINDOW: usize = 64 << 10;
@@ -23,11 +27,15 @@ pub(super) const WINDOW: usize = 64 << 10;
 pub(super) fn canceled(cancel: Option<&Cancellation>) -> Result<(), ReadFault> {
     if cancel.is_some_and(Cancellation::is_canceled) { Err(ReadFault::Cancelled) } else { Ok(()) }
 }
-fn attempt(ledger: &ReservationLedger, encrypted: bool, cancel: Option<&Cancellation>) -> Result<(), ReadFault> {
+fn attempt(
+    ledger: &(impl LedgerAccess + ?Sized),
+    encrypted: bool,
+    cancel: Option<&Cancellation>,
+) -> Result<(), ReadFault> {
     canceled(cancel)?;
     ledger.with_state(|s| s.attempt(encrypted))
 }
-fn interrupted(ledger: &ReservationLedger, retries: &mut u64) -> Result<(), ReadFault> {
+fn interrupted(ledger: &(impl LedgerAccess + ?Sized), retries: &mut u64) -> Result<(), ReadFault> {
     *retries = retries.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
     ledger.with_state(|s| {
         budget::admit(
@@ -46,9 +54,9 @@ fn request(s: &mut LedgerState, encrypted: bool, source: bool, wanted: usize) ->
     Ok(count)
 }
 pub(super) fn read(
-    ledger: &ReservationLedger,
+    ledger: &(impl LedgerAccess + ?Sized),
     encrypted: bool,
-    reader: &mut impl Read,
+    reader: &mut (impl Read + ?Sized),
     stage: IoStage,
     offset: u64,
     bytes: &mut [u8],
@@ -77,7 +85,7 @@ pub(super) fn read(
     }
 }
 pub(super) fn write(
-    ledger: &ReservationLedger,
+    ledger: &(impl LedgerAccess + ?Sized),
     encrypted: bool,
     writer: &mut impl Write,
     stage: IoStage,
@@ -121,7 +129,7 @@ pub(super) fn write(
 /// Tasks2/5 separately meter their bounded auxiliary namespace operations and
 /// prove their fixed per-try count fits the plan's twelve-operation envelope.
 pub(super) struct CreationGroup<'a> {
-    ledger: &'a ReservationLedger,
+    ledger: LedgerView<'a>,
     encrypted: bool,
     stage: IoStage,
     limit: u64,
@@ -130,9 +138,8 @@ pub(super) struct CreationGroup<'a> {
     terminal: bool,
 }
 impl<'a> CreationGroup<'a> {
-    #[allow(dead_code)] // Task2 spool / Task5 stage acquisition consumes one namespace group.
     pub(super) fn new(
-        ledger: &'a ReservationLedger,
+        ledger: &'a (impl LedgerAccess + ?Sized),
         encrypted: bool,
         stage: IoStage,
         cancel: &Cancellation,
@@ -146,9 +153,8 @@ impl<'a> CreationGroup<'a> {
             }
             Ok(policy)
         })?;
-        Ok(Self { ledger, encrypted, stage, limit, retry_limit, attempts: 0, terminal: false })
+        Ok(Self { ledger: ledger.view(), encrypted, stage, limit, retry_limit, attempts: 0, terminal: false })
     }
-    #[allow(dead_code)] // Task2/5 supply one actual create syscall per callback; no hidden retries.
     pub(super) fn create<T>(
         &mut self,
         cancel: &Cancellation,
@@ -199,7 +205,7 @@ impl<'a> CreationGroup<'a> {
 /// One finite metadata/seek/namespace operation. Callers select and consume the
 /// concrete category before entering; Interrupted consumes another ordinary attempt.
 pub(super) fn operation<T>(
-    ledger: &ReservationLedger,
+    ledger: &(impl LedgerAccess + ?Sized),
     encrypted: bool,
     category: RunCategory,
     stage: IoStage,
@@ -224,7 +230,7 @@ pub(super) fn operation<T>(
     }
 }
 pub(super) fn rewind(
-    ledger: &ReservationLedger,
+    ledger: &(impl LedgerAccess + ?Sized),
     encrypted: bool,
     file: &mut impl Seek,
     cancel: &Cancellation,
@@ -317,7 +323,7 @@ impl BootstrapIo {
     #[allow(dead_code)] // Task4 parser bootstrap will consume this finite fetch wrapper.
     pub(super) fn read(
         &mut self,
-        reader: &mut impl Read,
+        reader: &mut (impl Read + ?Sized),
         bytes: &mut [u8],
         cancel: &Cancellation,
     ) -> Result<usize, ReadFault> {
@@ -356,9 +362,8 @@ impl BootstrapIo {
 /// Both ordinary and emergency accounting are finite; EINTR is ambiguous and
 /// is never retried. Exhaustion leaves unresolved usage rather than making an
 /// uncharged syscall or reconstructing an OwnedFd.
-#[allow(dead_code)] // Task2 spool and Task5 stage owners consume this tested close primitive.
 pub(super) fn retire_once(
-    ledger: &ReservationLedger,
+    ledger: &(impl LedgerAccess + ?Sized),
     encrypted: bool,
     object: OwnedObject,
     close: impl FnOnce() -> std::io::Result<()>,

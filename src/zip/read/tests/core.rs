@@ -392,7 +392,7 @@ fn every_payload_limit_is_enforced_at_exact_zero_and_one_under() {
     cases!(live_fds, 5, |s: &mut budget::LedgerState| s.acquire_fds(5));
     for cap in [0, 2, 3] {
         let limits = EncryptedReadLimits { member_spool_bytes: cap, ciphertext_memory_bytes: 0, ..Default::default() };
-        assert_eq!(fresh(limits).encrypted.begin_member(3, 0, 3, 0, false).is_ok(), cap == 3);
+        assert_eq!(fresh(limits).encrypted.begin_member(3, 0, 3, 0, true).is_ok(), cap == 3);
     }
     for cap in [0, 2, 3] {
         let limits = EncryptedReadLimits { decoded_bytes: cap, ..Default::default() };
@@ -481,8 +481,8 @@ fn all_record_geometry_categories_have_exact_finite_allowances() {
     );
 }
 
-fn bind_plan(state: &mut budget::LedgerState, plan: budget::ActionPlan) {
-    let fixture = tempfile::NamedTempFile::new().unwrap();
+pub(super) fn bind_plan(state: &mut budget::LedgerState, plan: budget::ActionPlan) -> crate::zip::session::SourceStamp {
+    let fixture = tempfile::NamedTempFile::new_in("/tmp").unwrap();
     let mut bootstrap = io::BootstrapIo::new(0, 16).unwrap();
     let stamp = crate::zip::session::SourceStamp::capture_checked(fixture.as_file(), fixture.path(), |stage, call| {
         bootstrap.stat(stage, call)
@@ -499,6 +499,7 @@ fn bind_plan(state: &mut budget::LedgerState, plan: budget::ActionPlan) {
         configuration_id: 1,
     };
     state.bind(plan.with_binding(binding).unwrap()).unwrap();
+    stamp
 }
 
 #[test]
@@ -1325,4 +1326,25 @@ fn r1_copy_prefix_then_failure_reports_actual_accepted_bytes_and_releases_scratc
     assert_eq!(context.run_usage().io_bytes - run_before.io_bytes, 8);
     assert_eq!(error.usage(), context.usage());
     assert_eq!(error.run_usage(), context.run_usage());
+}
+
+#[test]
+fn checked_ledger_identity_exhaustion_and_concurrent_uniqueness() {
+    use std::sync::{Arc, atomic::AtomicU64};
+    let sequence = AtomicU64::new(u64::MAX - 1);
+    assert_eq!(shared::test_issue_identity(&sequence).unwrap(), u64::MAX - 1);
+    assert!(matches!(shared::test_issue_identity(&sequence), Err(ReadFault::CounterOverflow)));
+    let sequence = Arc::new(AtomicU64::new(1));
+    let threads = (0..4)
+        .map(|_| {
+            let sequence = sequence.clone();
+            std::thread::spawn(move || {
+                (0..1000).map(|_| shared::test_issue_identity(&sequence).unwrap()).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut ids = threads.into_iter().flat_map(|t| t.join().unwrap()).collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    assert_eq!(ids.len(), 4000);
 }
