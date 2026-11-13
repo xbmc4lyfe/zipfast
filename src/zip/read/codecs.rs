@@ -183,6 +183,17 @@ fn byte_charge(
     }
     Ok(())
 }
+fn output_allowance(decoded: u64, declared: u64) -> Result<usize, ReadFault> {
+    let remaining = u128::from(declared).checked_sub(decoded.into()).ok_or(ReadFault::CounterOverflow)?;
+    let probe = remaining.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+    Ok(probe.min(io::WINDOW as u128) as usize)
+}
+fn observe_native(ledger: LedgerView<'_>, encrypted: bool, produced: usize, work: usize) -> Result<(), ReadFault> {
+    if encrypted {
+        ledger.with_state(|s| s.encrypted.observe_native(produced as u64, work as u64))?;
+    }
+    Ok(())
+}
 #[derive(Debug)]
 #[cfg_attr(not(test), allow(dead_code))] // Task4 verifies the exact completed C/U receipt.
 pub(super) struct DecodeReceipt {
@@ -256,10 +267,9 @@ pub(super) fn decode(
             synthetic[..5].copy_from_slice(&header[4..]);
             synthetic[5..].copy_from_slice(&if flags & 2 != 0 { u64::MAX } else { plan.decoded }.to_le_bytes());
             step_charge(workspace.ledger, encrypted, cancel)?;
-            let p = engine.step(&synthetic, &mut workspace.output, false);
-            if encrypted {
-                workspace.ledger.with_state(|s| s.encrypted.work((p.consumed + p.produced) as u64))?;
-            }
+            let output_limit = output_allowance(decoded, plan.decoded)?;
+            let p = engine.step(&synthetic, &mut workspace.output[..output_limit], false);
+            observe_native(workspace.ledger, encrypted, p.produced, p.consumed + p.produced)?;
             if p.fault.is_some() || p.consumed != synthetic.len() || p.produced != 0 || p.end {
                 return Err(integrity(IntegrityReason::Framing));
             }
@@ -303,30 +313,26 @@ pub(super) fn decode(
             } else {
                 end - begin
             };
+            let output_limit = output_allowance(decoded, plan.decoded)?;
             let p = engine.step(
                 &workspace.input[begin..begin + offered],
-                &mut workspace.output,
+                &mut workspace.output[..output_limit],
                 fetched == plan.ciphertext,
             );
-            if p.consumed > end - begin || p.produced > workspace.output.len() {
+            if p.consumed > offered || p.produced > output_limit {
                 return Err(ReadFault::InvalidPlan.into());
             }
+            observe_native(workspace.ledger, encrypted, p.produced, p.consumed + p.produced)?;
             begin += p.consumed;
             consumed = consumed.checked_add(p.consumed as u64).ok_or(ReadFault::CounterOverflow)?;
-            let next = decoded.checked_add(p.produced as u64).ok_or(ReadFault::CounterOverflow)?;
-            if encrypted {
-                workspace.ledger.with_state(|s| s.encrypted.work((p.consumed + p.produced) as u64))?;
+            let next = u128::from(decoded).checked_add(p.produced as u128).ok_or(ReadFault::CounterOverflow)?;
+            if next > u128::from(plan.decoded) {
+                return Err(integrity(IntegrityReason::DecodedSize));
             }
             if let Some(reason) = p.fault {
                 return Err(integrity(reason));
             }
-            if next > plan.decoded {
-                return Err(integrity(IntegrityReason::DecodedSize));
-            }
-            if encrypted {
-                workspace.ledger.with_state(|s| s.encrypted.decode_bytes(p.produced as u64, 0))?;
-            };
-            decoded = next;
+            decoded = u64::try_from(next).map_err(|_| ReadFault::CounterOverflow)?;
             if p.produced != 0 {
                 io::canceled(Some(cancel))?;
                 if expected_crc.is_some() {
@@ -372,7 +378,10 @@ pub(super) fn decode(
         }
         Ok(())
     })();
-    input.finish(result.map_err(|error| error.accepted(accepted)))?;
+    input.finish(result).map_err(|error| {
+        let retained = error.accepted_output_bytes().max(accepted);
+        error.accepted(retained)
+    })?;
     Ok(DecodeReceipt { consumed, decoded })
 }
 

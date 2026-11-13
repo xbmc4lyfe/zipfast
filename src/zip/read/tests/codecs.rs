@@ -889,3 +889,503 @@ fn real_authenticated_sink_and_source_error_need_no_wrapper_allocation() {
     assert!(error.is_source_changed());
     assert!(matches!(error.sink_fault(), Some(ZipSinkFault::StageChanged)));
 }
+
+#[test]
+fn r1_successful_callbacks_keep_counts_on_new_source_finish_errors() {
+    for encrypted in [false, true] {
+        for refusal in [false, true] {
+            for empty in [false, true] {
+                let data = if empty { &b""[..] } else { &b"x"[..] };
+                let (ledger, stamp) = super::spool::ledger(65536);
+                let delivered = Cell::new(0u64);
+                let terminal = Cell::new(false);
+                let bytes = if encrypted { super::cipher::framed(1, "password", data) } else { data.to_vec() };
+                let plan =
+                    member(stamp, data, bytes.len(), data.len(), if encrypted { Some(CipherKind::Aes) } else { None });
+                let mut source = cipher::CheckedInput {
+                    reader: std::io::Cursor::new(bytes),
+                    check: |_: shared::LedgerView<'_>| {
+                        if terminal.get() {
+                            if refusal {
+                                Err(io::SourceCheckError::Admission(ReadFault::Cancelled))
+                            } else {
+                                Err(io::SourceCheckError::Source(CheckedSourceFault::StampMismatch))
+                            }
+                        } else {
+                            Ok(())
+                        }
+                    },
+                };
+                let kind = if encrypted {
+                    cipher::InputKind::Aes { strength: 1, version: 1 }
+                } else {
+                    cipher::InputKind::Clear
+                };
+                let admitted = cipher::Admission::new(&ledger, &mut source, plan, Some("password"), kind).unwrap();
+                let (admitted, mut workspace) = admitted.workspace().unwrap();
+                let input = if encrypted {
+                    let pending =
+                        cipher::PendingAes::copy_admitted(admitted, None, &mut workspace.input, &Default::default())
+                            .unwrap();
+                    codecs::PlainInput::Aes(pending.authenticate(&mut workspace.input, &Default::default()).unwrap())
+                } else {
+                    admitted.clear().unwrap()
+                };
+                terminal.set(true);
+                let error =
+                    codecs::decode(input, &mut workspace, 0, 0, &Default::default(), &Default::default(), &mut |b| {
+                        delivered.set(delivered.get() + b.len() as u64);
+                        Ok(())
+                    })
+                    .unwrap_err();
+                assert_eq!(delivered.get(), data.len() as u64);
+                assert_eq!(error.accepted_output_bytes(), data.len() as u64, "encrypted={encrypted} refusal={refusal}");
+                if refusal {
+                    assert!(matches!(error.operation(), Some(ReadFault::Cancelled)));
+                    assert!(!error.is_source_changed());
+                } else {
+                    assert!(error.is_source_changed());
+                    assert!(matches!(error.source_change(), Some(CheckedSourceFault::StampMismatch)));
+                }
+                assert!(error.sink_fault().is_none());
+                assert_eq!(error.cleanup_errors().len(), 0);
+                ledger.with_state(|s| {
+                    assert_eq!(s.live_fds, 1);
+                    assert_eq!(s.encrypted.usage.live_spool_bytes, 0);
+                });
+            }
+        }
+    }
+}
+#[test]
+fn r1_successful_aes_callback_keeps_count_on_owned_close_failure() {
+    use std::rc::Rc;
+    for changed in [false, true] {
+        let (ledger, stamp) = super::spool::ledger(0);
+        let data = b"x";
+        let cancel = crate::extract::Cancellation::default();
+        let bytes = super::cipher::framed(1, "password", data);
+        let plan = member(stamp, data, bytes.len(), 1, Some(CipherKind::Aes));
+        let delivered_flag = Cell::new(false);
+        let mut source = cipher::CheckedInput {
+            reader: std::io::Cursor::new(bytes),
+            check: |_: shared::LedgerView<'_>| {
+                if changed && delivered_flag.get() {
+                    Err(io::SourceCheckError::Source(CheckedSourceFault::StampMismatch))
+                } else {
+                    Ok(())
+                }
+            },
+        };
+        let admitted = cipher::Admission::new(
+            &ledger,
+            &mut source,
+            plan,
+            Some("password"),
+            cipher::InputKind::Aes { strength: 1, version: 1 },
+        )
+        .unwrap();
+        let (admitted, mut workspace) = admitted.workspace().unwrap();
+        let directory = spool::ResolvedTempDirectory::resolve(&ledger, None, &cancel).unwrap();
+        let pending =
+            cipher::PendingAes::copy_admitted(admitted, Some(&directory), &mut workspace.input, &cancel).unwrap();
+        let input = codecs::PlainInput::Aes(pending.authenticate(&mut workspace.input, &cancel).unwrap());
+        let closes = Rc::new(Cell::new(0));
+        let counter = closes.clone();
+        spool::hooks::HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |op, fd| {
+                if op == ReadIoOperation::Close {
+                    counter.set(counter.get() + 1);
+                    assert_eq!(unsafe { libc::close(fd) }, 0);
+                    Some(std::io::Error::from_raw_os_error(libc::EINTR))
+                } else {
+                    None
+                }
+            }))
+        });
+        let mut delivered = 0;
+        let result = codecs::decode(input, &mut workspace, 0, 0, &Default::default(), &cancel, &mut |b| {
+            delivered += b.len();
+            delivered_flag.set(true);
+            Ok(())
+        });
+        spool::hooks::HOOK.with(|h| *h.borrow_mut() = None);
+        let error = result.unwrap_err();
+        assert_eq!(delivered, 1);
+        assert_eq!(closes.get(), 1);
+        assert_eq!(error.accepted_output_bytes(), 1);
+        if changed {
+            assert!(error.is_source_changed());
+        } else {
+            assert_eq!(error.kind(), ZipReadErrorKind::Cleanup);
+        }
+        assert!(error.operation().is_none());
+        assert!(error.sink_fault().is_none());
+        let cleanup = error.cleanup_errors().next().unwrap();
+        assert_eq!(cleanup.object, OwnedObject::Ciphertext);
+        assert_eq!(cleanup.operation, ReadIoOperation::Close);
+        assert_eq!(cleanup.close, CloseDisposition::Unresolved);
+        assert!(matches!(&cleanup.cause,CleanupCause::Io(e) if e.raw_os_error()==Some(libc::EINTR)));
+        ledger.with_state(|s| {
+            assert!(s.poisoned);
+            assert_eq!(s.live_fds, 2);
+            assert_eq!(s.encrypted.usage.live_spool_bytes, 1);
+        });
+        directory.finish_capacity(&ledger).unwrap();
+    }
+}
+#[allow(clippy::result_large_err)] // Same fixed inline production evidence under test.
+fn r1_aes_progress(
+    ledger: &shared::ContextLedger,
+    stamp: crate::zip::session::SourceStamp,
+    payload: &[u8],
+    declared: usize,
+    before_decode: impl FnOnce(),
+    sink: &mut impl FnMut(&[u8]) -> ZipSinkResult<()>,
+) -> ZipReadResult<codecs::DecodeReceipt> {
+    let bytes = super::cipher::framed(1, "password", payload);
+    let expected = vec![0; declared];
+    let plan = member(stamp, &expected, bytes.len(), payload.len(), Some(CipherKind::Aes));
+    let checks = Cell::new(0);
+    let mut source = cipher::CheckedInput {
+        reader: std::io::Cursor::new(bytes),
+        check: |_: shared::LedgerView<'_>| {
+            checks.set(checks.get() + 1);
+            Ok(())
+        },
+    };
+    let admitted = cipher::Admission::new(
+        ledger,
+        &mut source,
+        plan,
+        Some("password"),
+        cipher::InputKind::Aes { strength: 1, version: 1 },
+    )?;
+    let (admitted, mut workspace) = admitted.workspace()?;
+    let pending = cipher::PendingAes::copy_admitted(admitted, None, &mut workspace.input, &Default::default())?;
+    let input = codecs::PlainInput::Aes(pending.authenticate(&mut workspace.input, &Default::default())?);
+    let before = checks.get();
+    before_decode();
+    let result = codecs::decode(input, &mut workspace, 8, 0, &Default::default(), &Default::default(), sink);
+    assert_eq!(checks.get(), before + 1);
+    ledger.with_state(|s| eprintln!("r1-native-progress U={declared} C={} member_actual={} cumulative_actual={} work_actual={} accepted={} final_source_checks={}",payload.len(),s.encrypted.usage.member_decoded_bytes,s.encrypted.usage.decoded_bytes,s.encrypted.usage.work_bytes,result.as_ref().err().map_or(declared as u64,|e|e.accepted_output_bytes()),checks.get()-before));
+    drop(workspace);
+    ledger.with_state(|s| {
+        assert_eq!(s.live_fds, 1);
+        assert_eq!(s.encrypted.usage.live_spool_bytes, 0);
+        assert_eq!(s.encrypted.usage.reader_capacity, shared::SHARED_LEDGER_CAPACITY as u64);
+    });
+    result
+}
+#[test]
+fn r1_authenticated_native_error_observes_produced_bytes_without_crc_or_delivery() {
+    let payload = [0, 1, 0, 0xfe, 0xff, b'x', 7];
+    let (ledger, stamp) = super::spool::ledger(65536);
+    let mut calls = 0;
+    let error = r1_aes_progress(&ledger, stamp, &payload, 2, || {}, &mut |_| {
+        calls += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(calls, 0);
+    assert_eq!(error.accepted_output_bytes(), 0);
+    assert!(matches!(
+        error.operation(),
+        Some(ReadFault::Integrity {
+            reason: IntegrityReason::Decoder,
+            password_evidence: PasswordEvidence::Authenticated
+        })
+    ));
+    ledger.with_state(|s| {
+        assert_eq!(s.encrypted.usage.member_decoded_bytes, 1);
+        assert_eq!(s.encrypted.usage.decoded_bytes, 1);
+        assert_eq!(s.encrypted.usage.work_bytes, 22);
+    });
+}
+#[test]
+fn r1_declared_zero_overshoot_is_one_unexposed_byte() {
+    let payload = packed(8, &b"bounded probe ".repeat(10000));
+    let (ledger, stamp) = super::spool::ledger(65536);
+    let mut calls = 0;
+    let error = r1_aes_progress(&ledger, stamp, &payload, 0, || {}, &mut |_| {
+        calls += 1;
+        Ok(())
+    })
+    .unwrap_err();
+    assert_eq!(calls, 0);
+    assert_eq!(error.accepted_output_bytes(), 0);
+    assert!(matches!(
+        error.operation(),
+        Some(ReadFault::Integrity {
+            reason: IntegrityReason::DecodedSize,
+            password_evidence: PasswordEvidence::Authenticated
+        })
+    ));
+    ledger.with_state(|s| {
+        assert_eq!(s.encrypted.usage.member_decoded_bytes, 1);
+        assert_eq!(s.encrypted.usage.decoded_bytes, 1);
+    });
+}
+
+#[test]
+fn r1_native_error_repeated_attempts_and_explicit_decoded_limits() {
+    let payload = [0, 1, 0, 0xfe, 0xff, b'x', 7];
+    for limit in [0, 1, 2] {
+        let (ledger, stamp) = super::spool::ledger(65536);
+        ledger.with_state(|s| s.encrypted.limits.decoded_bytes = limit);
+        for attempt in 1..=limit + 1 {
+            let error = r1_aes_progress(&ledger, stamp, &payload, 2, || {}, &mut |_| {
+                panic!("native-error output must not reach sink")
+            })
+            .unwrap_err();
+            ledger.with_state(|s| {
+                assert_eq!(s.encrypted.usage.decoded_bytes, attempt);
+                assert_eq!(s.encrypted.usage.member_decoded_bytes, 1);
+                assert_eq!(s.encrypted.usage.work_bytes, attempt * 22);
+                assert_eq!(s.encrypted.usage.members, attempt as u64);
+            });
+            if attempt > limit {
+                assert!(
+                    matches!(error.operation(),Some(ReadFault::Limit {resource:ReadResource::DecodedBytes,limit:cap,attempted}) if *cap==limit && *attempted==attempt)
+                );
+            } else {
+                assert!(matches!(
+                    error.operation(),
+                    Some(ReadFault::Integrity {
+                        reason: IntegrityReason::Decoder,
+                        password_evidence: PasswordEvidence::Authenticated
+                    })
+                ));
+            }
+        }
+    }
+    // Two real bytes produced in one failing call, one-under cumulative bound.
+    let (ledger, stamp) = super::spool::ledger(65536);
+    ledger.with_state(|s| s.encrypted.limits.decoded_bytes = 1);
+    let error = r1_aes_progress(&ledger, stamp, &[0, 2, 0, 0xfd, 0xff, b'x', b'y', 7], 3, || {}, &mut |_| {
+        panic!("no delivery")
+    })
+    .unwrap_err();
+    assert!(matches!(
+        error.operation(),
+        Some(ReadFault::Limit { resource: ReadResource::DecodedBytes, limit: 1, attempted: 2 })
+    ));
+    ledger.with_state(|s| {
+        assert_eq!(s.encrypted.usage.decoded_bytes, 2);
+        assert_eq!(s.encrypted.usage.member_decoded_bytes, 2);
+        assert_eq!(s.encrypted.usage.work_bytes, 26);
+    });
+}
+#[test]
+fn r1_output_observation_precedes_work_refusal_and_declared_overshoot() {
+    let (ledger, stamp) = super::spool::ledger(65536);
+    let error = r1_aes_progress(
+        &ledger,
+        stamp,
+        &[0, 1, 0, 0xfe, 0xff, b'x', 7],
+        2,
+        || ledger.with_state(|s| s.encrypted.limits.work_bytes = 21),
+        &mut |_| panic!("no delivery"),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.operation(),
+        Some(ReadFault::Limit { resource: ReadResource::WorkBytes, limit: 21, attempted: 22 })
+    ));
+    ledger.with_state(|s| {
+        assert_eq!(s.encrypted.usage.decoded_bytes, 1);
+        assert_eq!(s.encrypted.usage.member_decoded_bytes, 1);
+        assert_eq!(s.encrypted.usage.work_bytes, 22);
+    });
+    let (both, stamp) = super::spool::ledger(65536);
+    both.with_state(|s| s.encrypted.limits.decoded_bytes = 0);
+    let error = r1_aes_progress(
+        &both,
+        stamp,
+        &[0, 1, 0, 0xfe, 0xff, b'x', 7],
+        2,
+        || both.with_state(|s| s.encrypted.limits.work_bytes = 21),
+        &mut |_| panic!("no delivery"),
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error.operation(),
+        Some(ReadFault::Limit { resource: ReadResource::DecodedBytes, limit: 0, attempted: 1 })
+    ));
+    both.with_state(|s| {
+        assert_eq!(s.encrypted.usage.decoded_bytes, 1);
+        assert_eq!(s.encrypted.usage.work_bytes, 22);
+    });
+    for mode in [0, 1, 2] {
+        let (ledger, stamp) = super::spool::ledger(65536);
+        let data = b"two";
+        let declared = b"x";
+        let (bytes, cipher, kind) = match mode {
+            0 => (data.to_vec(), None, cipher::InputKind::Clear),
+            1 => {
+                let mut bytes = vec![0; 12];
+                bytes[11] = (crc32fast::hash(declared) >> 24) as u8;
+                bytes.extend(data);
+                crate::crypto::ZipCrypto::new("password").encrypt(&mut bytes);
+                (bytes, Some(CipherKind::ZipCrypto), cipher::InputKind::ZipCrypto { descriptor: false, time: 0 })
+            }
+            _ => (
+                super::cipher::framed(1, "password", data),
+                Some(CipherKind::Aes),
+                cipher::InputKind::Aes { strength: 1, version: 1 },
+            ),
+        };
+        let plan = member(stamp, declared, bytes.len(), data.len(), cipher);
+        let checks = Cell::new(0);
+        let mut source = cipher::CheckedInput {
+            reader: std::io::Cursor::new(bytes),
+            check: |_: shared::LedgerView<'_>| {
+                checks.set(checks.get() + 1);
+                Ok(())
+            },
+        };
+        let admitted = cipher::Admission::new(&ledger, &mut source, plan, Some("password"), kind).unwrap();
+        let (admitted, mut workspace) = admitted.workspace().unwrap();
+        let input = match mode {
+            0 => admitted.clear().unwrap(),
+            1 => codecs::PlainInput::ZipCrypto(
+                cipher::ZipCryptoInput::open_admitted(admitted, &Default::default()).unwrap(),
+            ),
+            _ => {
+                let pending =
+                    cipher::PendingAes::copy_admitted(admitted, None, &mut workspace.input, &Default::default())
+                        .unwrap();
+                codecs::PlainInput::Aes(pending.authenticate(&mut workspace.input, &Default::default()).unwrap())
+            }
+        };
+        let before = checks.get();
+        let error = codecs::decode(input, &mut workspace, 0, 0, &Default::default(), &Default::default(), &mut |_| {
+            panic!("U+1 output must not reach sink")
+        })
+        .unwrap_err();
+        assert_eq!(checks.get(), before + 1);
+        assert_eq!(error.accepted_output_bytes(), 0);
+        let evidence = match mode {
+            0 => PasswordEvidence::NotEncrypted,
+            1 => PasswordEvidence::HeaderMatched,
+            _ => PasswordEvidence::Authenticated,
+        };
+        assert!(
+            matches!(error.operation(),Some(ReadFault::Integrity {reason:IntegrityReason::DecodedSize,password_evidence}) if *password_evidence==evidence)
+        );
+        ledger.with_state(|s| {
+            assert_eq!(s.encrypted.usage.decoded_bytes, if mode == 0 { 0 } else { 2 });
+            assert_eq!(s.encrypted.usage.member_decoded_bytes, if mode == 0 { 0 } else { 2 });
+        });
+    }
+}
+#[test]
+fn r1_probe_envelope_allows_zero_lie_then_valid_member_with_hard_overrides() {
+    for cap in [0, 1, 3] {
+        // S_U1+N2; explicit smaller caps are hard refusals.
+        let (ledger, stamp) = super::spool::ledger(65536);
+        ledger.with_state(|s| s.encrypted.limits.decoded_bytes = cap);
+        let bad =
+            r1_aes_progress(&ledger, stamp, &packed(8, b"too much"), 0, || {}, &mut |_| panic!("no probe delivery"))
+                .unwrap_err();
+        ledger.with_state(|s| assert_eq!(s.encrypted.usage.decoded_bytes, 1));
+        if cap == 0 {
+            assert!(matches!(
+                bad.operation(),
+                Some(ReadFault::Limit { resource: ReadResource::DecodedBytes, limit: 0, attempted: 1 })
+            ));
+            continue;
+        }
+        assert!(matches!(bad.operation(), Some(ReadFault::Integrity { reason: IntegrityReason::DecodedSize, .. })));
+        // Helper's expected zero byte supplies the declared U/CRC of this valid member.
+        let mut accepted = 0;
+        let valid = r1_aes_progress(&ledger, stamp, &packed(8, &[0]), 1, || {}, &mut |b| {
+            assert_eq!(b, &[0]);
+            accepted += b.len();
+            Ok(())
+        });
+        if cap == 3 {
+            assert_eq!(valid.unwrap().decoded, 1);
+            assert_eq!(accepted, 1);
+        } else {
+            assert_eq!(accepted, 0);
+            assert!(matches!(
+                valid.unwrap_err().operation(),
+                Some(ReadFault::Limit { resource: ReadResource::DecodedBytes, limit: 1, attempted: 2 })
+            ));
+        }
+        ledger.with_state(|s| {
+            assert_eq!(s.encrypted.usage.decoded_bytes, 2);
+            assert_eq!(s.encrypted.usage.members, 2);
+        });
+    }
+}
+#[test]
+fn r1_observation_counter_boundary_retains_exact_rejected_attempt() {
+    let (ledger, _) = super::spool::ledger(65536);
+    let fault = ledger.with_state(|s| {
+        s.encrypted.limits.member_decoded_bytes = u64::MAX;
+        s.encrypted.limits.decoded_bytes = u128::MAX;
+        s.encrypted.usage.member_decoded_bytes = u64::MAX;
+        s.encrypted.usage.decoded_bytes = u64::MAX.into();
+        s.encrypted.observe_native(1, 0).unwrap_err()
+    });
+    assert!(
+        matches!(fault,ReadFault::Limit {resource:ReadResource::MemberDecodedBytes,limit,attempted} if limit==u128::from(u64::MAX) && attempted==u128::from(u64::MAX)+1)
+    );
+    ledger.with_state(|s| {
+        assert_eq!(s.encrypted.usage.member_decoded_bytes, u64::MAX);
+        assert_eq!(s.encrypted.usage.decoded_bytes, u128::from(u64::MAX) + 1);
+    });
+}
+#[test]
+fn r1_zstd_skippable_only_empty_and_malformed_transitions_finish_source() {
+    let skip = vec![0x50, 0x2a, 0x4d, 0x18, 3, 0, 0, 0, 1, 2, 3];
+    let zero = vec![0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0];
+    for bytes in [skip.clone(), zero.clone(), packed(93, b"")] {
+        assert!(run(93, b"", bytes, 1, 0).unwrap().is_empty());
+    }
+    assert!(run(93, b"", vec![], 1, 0).is_err());
+    let mut twice = zero;
+    twice.extend(&skip);
+    assert!(run(93, b"", twice, 1, 0).unwrap().is_empty());
+    let mut cut = skip.clone();
+    cut.pop();
+    assert!(run(93, b"", cut, 1, 0).is_err());
+    let mut cut_header = skip.clone();
+    cut_header.extend([0x28, 0xb5]);
+    assert!(run(93, b"", cut_header, 1, 0).is_err());
+    let mut junk = skip.clone();
+    junk.extend([0, 0, 0, 0]);
+    assert!(run(93, b"", junk, 1, 0).is_err());
+    let mut transition = packed(93, b"x");
+    transition.extend(&skip[..9]);
+    assert!(run(93, b"x", transition, 1, 0).is_err());
+}
+#[test]
+fn r1_lzma_invalid_five_byte_properties_and_truncated_real_prefix_finish_source() {
+    let bytes = packed(14, b"x");
+    for length in 0..9 {
+        let error = run(14, b"x", bytes[..length].to_vec(), 1, 2).unwrap_err();
+        assert!(
+            matches!(
+                error.operation(),
+                Some(ReadFault::Integrity {
+                    reason: IntegrityReason::Truncated,
+                    password_evidence: PasswordEvidence::NotEncrypted
+                })
+            ),
+            "length={length} error={error:?}"
+        );
+    }
+    let mut bad = bytes;
+    bad[4..9].copy_from_slice(&[0xff, 0, 0, 0, 0]);
+    let error = run(14, b"x", bad, 1, 2).unwrap_err();
+    assert!(matches!(
+        error.operation(),
+        Some(ReadFault::Integrity {
+            reason: IntegrityReason::Framing,
+            password_evidence: PasswordEvidence::NotEncrypted
+        })
+    ));
+}

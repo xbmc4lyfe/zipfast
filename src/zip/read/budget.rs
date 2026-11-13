@@ -262,6 +262,23 @@ impl EncryptedReadLedger {
         charge(&mut self.usage.codec_steps, 1, self.limits.codec_steps, ReadResource::CodecSteps)?;
         self.decode_bytes(output, work)
     }
+    /// Post-native observation is irreversible: retain actual production even
+    /// when it crosses a quota. Admission charges remain side-effect-free on
+    /// refusal; this seam deliberately records work already performed.
+    pub(super) fn observe_native(&mut self, output: u64, work: u64) -> Result<(), ReadFault> {
+        let member = checked_sum(self.usage.member_decoded_bytes.into(), output.into())?;
+        let cumulative = checked_sum(self.usage.decoded_bytes, output.into())?;
+        self.usage.decoded_bytes = cumulative;
+        if let Ok(actual) = u64::try_from(member) {
+            self.usage.member_decoded_bytes = actual;
+        }
+        self.usage.work_bytes = checked_sum(self.usage.work_bytes, work.into())?;
+        // All representable post-native counters are retained, even when more
+        // than one quota refuses. Cumulative decoded refusal stays terminal.
+        admit(ReadResource::DecodedBytes, self.limits.decoded_bytes, cumulative)?;
+        admit(ReadResource::MemberDecodedBytes, self.limits.member_decoded_bytes.into(), member)?;
+        admit(ReadResource::WorkBytes, self.limits.work_bytes, self.usage.work_bytes)
+    }
     pub(super) fn decode_bytes(&mut self, output: u64, work: u128) -> Result<(), ReadFault> {
         let actual = self.usage.member_decoded_bytes.checked_add(output).ok_or(ReadFault::CounterOverflow)?;
         admit(
