@@ -77,9 +77,15 @@ fn catalogue_string_allocation_refusal_returns_typed_error() {
         if matches!(mode.to_str().unwrap(), "issue" | "incomplete") {
             ALIGN.store(align_of::<RarFailure>(), Relaxed);
         }
+        let output = env::var_os("ZIPFAST_TEST_CATALOGUE_OUTPUT_GUARD").map(|_| tempfile::tempfile().unwrap());
         REMAINING.store(request, Relaxed);
         SIZE.store(size, Relaxed);
-        let result = RarSession::open(Path::new(&path), None, RarSessionOptions::default());
+        let result = match output.as_ref() {
+            Some(output) => {
+                RarSession::open_with_output_file(Path::new(&path), None, RarSessionOptions::default(), output)
+            }
+            None => RarSession::open(Path::new(&path), None, RarSessionOptions::default()),
+        };
         SIZE.store(0, Relaxed);
         assert_eq!(REMAINING.load(Relaxed), 0, "allocation fault did not run");
         let failure = result.err().expect("allocation refusal must stop the catalogue");
@@ -130,6 +136,7 @@ fn catalogue_string_allocation_refusal_returns_typed_error() {
         }
         assert_eq!(fs::read(&archive).unwrap(), bytes);
 
+        check_guarded_fault(mode, &archive);
         let child = Command::new(env::current_exe().unwrap())
             .args(["--exact", "catalogue_string_allocation_refusal_returns_typed_error", "--nocapture"])
             .env(CHILD_MODE, mode)
@@ -162,6 +169,7 @@ fn catalogue_payload_issue_allocation_refusal_returns_typed_error() {
         fs::write(&path, bytes).unwrap();
         let session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
         assert!(session.entries().all(|member| member.payload_issue().is_some()));
+        check_guarded_fault(mode, &path);
         let child = Command::new(env::current_exe().unwrap())
             .args(["--exact", "catalogue_string_allocation_refusal_returns_typed_error", "--nocapture"])
             .env(CHILD_MODE, mode)
@@ -220,6 +228,7 @@ fn rar4_catalogue_name_allocation_refusal_returns_typed_error() {
             RarSession::open(&path, None, RarSessionOptions::default()).unwrap().entries().next().unwrap().name().len(),
             WIDTH
         );
+        check_guarded_fault(mode, &path);
         let child = Command::new(env::current_exe().unwrap())
             .args(["--exact", "catalogue_string_allocation_refusal_returns_typed_error", "--nocapture"])
             .env(CHILD_MODE, mode)
@@ -228,4 +237,15 @@ fn rar4_catalogue_name_allocation_refusal_returns_typed_error() {
             .unwrap();
         assert!(child.status.success(), "{mode}: {child:?}");
     }
+}
+
+fn check_guarded_fault(mode: &str, path: &Path) {
+    let child = Command::new(env::current_exe().unwrap())
+        .args(["--exact", "catalogue_string_allocation_refusal_returns_typed_error", "--nocapture"])
+        .env(CHILD_MODE, mode)
+        .env(CHILD_PATH, path)
+        .env("ZIPFAST_TEST_CATALOGUE_OUTPUT_GUARD", "1")
+        .output()
+        .unwrap();
+    assert!(child.status.success(), "guarded {mode}: {child:?}");
 }
