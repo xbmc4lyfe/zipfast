@@ -2316,3 +2316,6 @@ fn find_call(data: &[u8], mut j: usize, end: usize, e9: bool) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod rar4;
