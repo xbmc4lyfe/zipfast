@@ -147,3 +147,20 @@ end records and archive comment. It returns Finished after the sink
 flushes and cancellation is checked again. A transport may have accepted
 bytes before a late failure, so use the successful result to determine
 whether the archive was finalized.
+
+### Traditional ZIP encryption
+
+Use `ZipStreamWriter::add_zipcrypto_file` for legacy ZipCrypto
+interoperability. ZipCrypto does not authenticate member data. The caller
+supplies a borrowed UTF-8 password with no NUL bytes and fills eleven
+header bytes with fresh operating-system cryptographic randomness for
+each member. The call retains neither the password nor cipher state.
+The entropy callback runs once after preflight and before source or sink
+I/O. Entropy failure leaves the writer reusable and charges one attempt.
+
+Encrypted files use the DOS time password-check byte and a signed data
+descriptor. Empty encrypted files use Stored and still carry both the
+encryption header and descriptor. The 12-byte encryption header counts
+toward the packed size and can force ZIP64 framing for exact-length
+Stored data. The descriptor counts toward physical extent and output
+bytes. After admission, a source or sink failure poisons the writer.
