@@ -37,7 +37,9 @@ use crate::rar5::Redirection;
 use crate::stream::{LZMA_MEMORY_LIMIT, zstd_decoder};
 
 pub mod create;
+pub mod read;
 pub mod recovery;
+pub use read::*;
 pub mod rewrite;
 mod session;
 pub mod write;
