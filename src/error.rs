@@ -138,6 +138,7 @@ pub enum RarIntegrityReason {
 #[non_exhaustive]
 pub enum RarUnsupported {
     ArchiveVersion(u8),
+    Rar4Feature(&'static str),
     SourceIdentity,
     CompressionAlgorithm { algorithm: u8, method: u8 },
     EncryptionVersion(u64),
