@@ -523,3 +523,21 @@ fn cancellation_poll_detects_crossed_work_interval() {
     d.work.cancel_at = Some(256);
     assert!(matches!(d.work.tick(2), Err(Rar4DecodeError::Canceled)));
 }
+
+#[test]
+fn logical_completion_accepts_real_terminal_prefix_and_physical_slack() {
+    let packed = fixture!("literal-a");
+    let mut shortened = decoder(packed.len() - 1, 1);
+    let mut out = Vec::new();
+    assert_eq!(shortened.feed(&packed[..packed.len() - 1], &mut collect(&mut out)).unwrap(), Rar4FeedState::Complete);
+    shortened.finish(&mut collect(&mut out)).unwrap();
+    assert_eq!(out, b"A");
+    for tail in [0, 255] {
+        let mut d = decoder(packed.len() + 1, 1);
+        let mut out = Vec::new();
+        assert_eq!(d.feed(packed, &mut collect(&mut out)).unwrap(), Rar4FeedState::Complete);
+        assert_eq!(d.feed(&[tail], &mut collect(&mut out)).unwrap(), Rar4FeedState::Complete);
+        d.finish(&mut collect(&mut out)).unwrap();
+        assert_eq!(out, b"A");
+    }
+}
