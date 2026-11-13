@@ -28,7 +28,7 @@ impl CreatePlan {
     /// See [`CreateReport`] for when receipts are available.
     pub fn publish_with_receipts(self) -> CreateReport {
         let mut written = Vec::new();
-        let outcome = self.publish_inner(Some(&mut written), None);
+        let outcome = self.publish_inner(Some(&mut written), None, None);
         CreateReport { outcome, written }
     }
 
@@ -40,8 +40,18 @@ impl CreatePlan {
     /// not authenticate content. See [`CreateReport`] for receipt semantics.
     pub fn publish_zipcrypto_with_receipts(self, password: &str) -> CreateReport {
         let mut written = Vec::new();
-        let outcome = self.publish_inner(Some(&mut written), Some(password));
+        let outcome = self.publish_inner(Some(&mut written), Some(password), None);
         CreateReport { outcome, written }
+    }
+
+    /// Publish with write receipts and a held binding to the verified output.
+    /// A missing binding means the destination could not be proved stable
+    /// through finalization. Consult the report for the publication outcome.
+    pub fn publish_with_bound_receipts(self) -> (CreateReport, Option<PublishedArchiveBinding>) {
+        let mut written = Vec::new();
+        let mut binding = None;
+        let outcome = self.publish_inner(Some(&mut written), None, Some(&mut binding));
+        (CreateReport { outcome, written }, binding)
     }
 
     /// Write and verify a private stage and atomically publish a new archive.
@@ -49,7 +59,7 @@ impl CreatePlan {
     /// deciding whether another creation attempt is appropriate.
     #[allow(clippy::result_large_err, reason = "creation failures retain component usage and outcome inline")]
     pub fn publish(self) -> std::result::Result<CreatedArchive, CreateFailure> {
-        self.publish_inner(None, None)
+        self.publish_inner(None, None, None)
     }
 
     #[allow(clippy::result_large_err, reason = "creation failures retain component usage and outcome inline")]
@@ -57,6 +67,7 @@ impl CreatePlan {
         mut self,
         written: Option<&mut Vec<EntryWritten>>,
         password: Option<&str>,
+        binding: Option<&mut Option<PublishedArchiveBinding>>,
     ) -> std::result::Result<CreatedArchive, CreateFailure> {
         if password.is_some_and(|password| {
             password.is_empty() || password.len() > u16::MAX as usize || password.as_bytes().contains(&0)
@@ -80,17 +91,19 @@ impl CreatePlan {
             Err(error) => return Err(self.failure(Stopped::at(CreateStage::StageCreate, error), CleanupState::Clean)),
         };
 
-        let result = self.execute(&mut stage, &mut receipts, password);
-        if matches!(result, Ok(Publication::Published))
+        let reserve_count = Cell::new(0);
+        let reserve = Attempts::finalization(&reserve_count);
+        let binding_count = Cell::new(0);
+        let binding_budget = Attempts::finalization(&binding_count);
+        let result = self.execute(&mut stage, &mut receipts, password, binding.as_ref().map(|_| &binding_budget));
+        if result.is_ok()
             && let Some(written) = written
         {
             *written = receipts;
         } else {
             drop(receipts);
         }
-        let reserve_count = Cell::new(0);
-        let reserve = Attempts::finalization(&reserve_count);
-        let publication = result.as_ref().map_or_else(|stop| stop.publication, |&committed| committed);
+        let publication = result.as_ref().map_or_else(|stop| stop.publication, |_| Publication::Published);
         let aftermath = cleanup(&self.parent, &stage, publication, &reserve);
         let sync =
             if publication == Publication::Published && self.options.durability == Durability::SyncFileAndDirectory {
@@ -98,8 +111,11 @@ impl CreatePlan {
             } else {
                 Ok(())
             };
+        if let (Some(binding), Ok(Some(stamp)), Ok(()), Aftermath::Clean) = (binding, &result, &sync, &aftermath) {
+            *binding = unix::bound_publication(&self.parent, &stage, *stamp, &binding_budget);
+        }
         let cleanup = aftermath.into_public(stage);
-        self.usage.finalization_attempts = reserve_count.get();
+        self.usage.finalization_attempts = reserve_count.get() + binding_count.get();
         let summary = self.usage();
         if let Err(stopped) = result {
             return Err(self.failure(stopped, cleanup));
@@ -146,7 +162,8 @@ impl CreatePlan {
         stage: &mut Stage,
         receipts: &mut Vec<EntryWritten>,
         password: Option<&str>,
-    ) -> std::result::Result<Publication, Stopped> {
+        binding: Option<&Attempts<'_>>,
+    ) -> std::result::Result<Option<Stamp>, Stopped> {
         let attempts = Attempts::new(&self.options, &self.attempts);
         let parent_stamp =
             super::stage_parent_stamp(&self.entries, &self.parent, &attempts).at(CreateStage::Precommit)?;
@@ -232,10 +249,10 @@ impl CreatePlan {
             },
             cause: error.into_cause(),
         })?;
-        let publication = Publication::Published;
+        let bound = binding.and_then(|budget| unix::publication_stamp(stage, held, budget));
         #[cfg(test)]
         let _ = tests::event(tests::Event::AfterCommit, Some(stage.path()));
-        Ok(publication)
+        Ok(bound)
     }
 
     fn write_stage<'a>(

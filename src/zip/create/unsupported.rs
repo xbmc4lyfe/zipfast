@@ -100,4 +100,9 @@ impl CreatePlan {
     pub fn publish_with_receipts(self) -> CreateReport {
         match self.0 {}
     }
+
+    /// Publishes with write receipts and a verified destination binding.
+    pub fn publish_with_bound_receipts(self) -> (CreateReport, Option<PublishedArchiveBinding>) {
+        match self.0 {}
+    }
 }
