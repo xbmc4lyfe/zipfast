@@ -97,6 +97,70 @@ fn creation_receipts_match_published_output_with_the_existing_plan_budget() {
 }
 
 #[test]
+fn native_zipcrypto_creation_verifies_every_regular_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encrypted.zip");
+    let source = dir.path().join("source");
+    let empty = dir.path().join("empty");
+    let data = b"verified source".repeat(4096);
+    fs::write(&source, &data).unwrap();
+    fs::write(&empty, []).unwrap();
+    let mut plan = CreatePlan::new(&path, CreateOptions::default()).unwrap();
+    plan.add_directory_from_path(dir.path(), options(EntryName::Utf8("dir/"), Method::Stored, 0o755), None).unwrap();
+    for (name, method, input) in
+        [("dir/store", Method::Stored, &source), ("deflate", deflate(6), &source), ("empty", deflate(6), &empty)]
+    {
+        plan.add_file(input, options(EntryName::Utf8(name), method, 0o640), None).unwrap();
+    }
+    let password = "native test password";
+    let report = plan.publish_zipcrypto_with_receipts(password);
+    let usage = report.outcome.unwrap().summary;
+    assert_eq!(usage.verification.entries, 4);
+    assert_eq!(usage.verification.payloads, 3);
+    assert_eq!(usage.verification.decoded_bytes, 2 * data.len() as u64);
+    assert_eq!(usage.writer.output_bytes, usage.writer.archive_extent);
+    assert_eq!(report.written.iter().map(|r| r.ordinal).collect::<Vec<_>>(), [0, 1, 2, 3]);
+    assert_eq!(report.written[1].packed_size, data.len() as u64 + 12);
+    assert_eq!(report.written[3].packed_size, 12);
+    assert_eq!(report.written[3].method, Method::Stored);
+    let metadata = ReadSession::open(&path).unwrap().metadata();
+    for (index, entry) in metadata.entries().enumerate() {
+        assert_eq!(entry.encrypted(), index != 0);
+        assert_eq!(entry.packed_size(), report.written[index].packed_size);
+    }
+    let mut archive = Archive::open(&path).unwrap();
+    for (index, expected) in [(1, data.as_slice()), (2, data.as_slice()), (3, &[])] {
+        let mut decoded = Vec::new();
+        archive
+            .read_at(index, Some(password), 1 << 20, |chunk| {
+                decoded.extend_from_slice(chunk);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(decoded, expected);
+    }
+    assert!(archive.read_at(1, Some("wrong"), 1 << 20, |_| Ok(())).is_err());
+}
+
+#[test]
+fn native_zipcrypto_invalid_credentials_fail_before_staging() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("encrypted.zip");
+    let long = "é".repeat(32768);
+    for password in ["", "with\0nul", &long] {
+        let report =
+            CreatePlan::new(&path, CreateOptions::default()).unwrap().publish_zipcrypto_with_receipts(password);
+        let failure = report.outcome.unwrap_err();
+        assert_eq!(failure.stage, zipfast::zip::create::CreateStage::Planning);
+        assert_eq!(failure.summary.stage_attempts, 0);
+        assert!(matches!(failure.cause, CreateError::InvalidOptions(_)));
+        assert_eq!(failure.publication, Publication::NotPublished);
+        assert!(report.written.is_empty());
+        assert!(!path.exists());
+    }
+}
+
+#[test]
 fn public_creation_preserves_order_metadata_and_payloads() {
     let dir = tempfile::tempdir().unwrap();
     let archive_path = dir.path().join("archive.zip");

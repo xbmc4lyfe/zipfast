@@ -38,6 +38,9 @@ tempfile = "3.27"
 zip-container = { version = "0.1.0", path = "crates/zip-container" }
 zstd = "0.14.3"
 
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+getrandom = { version = "0.4.3", features = ["std"] }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 

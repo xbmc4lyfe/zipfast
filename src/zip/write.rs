@@ -69,6 +69,8 @@ mod records;
 mod split;
 mod stream;
 pub use stream::ZipStreamWriter;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) use stream::exact_zipcrypto_geometry;
 #[cfg(test)]
 mod tests;
 

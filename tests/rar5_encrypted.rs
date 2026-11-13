@@ -282,6 +282,14 @@ fn encrypted_split_uses_the_final_volume_crc_mode() {
     let last = FileSpec { size: first.size, extra: encryption_record(true), ..FileSpec::new("f", &encrypted) };
     split_archive(dir.path(), &first, &last, 7, encrypted_crc(plain));
     assert_extracts(&archive, &out, plain);
+    use zipfast::rar5::session::{RarPrintOptions, RarSession, RarSessionOptions};
+    let mut session = RarSession::open(&archive, Some(PASSWORD), RarSessionOptions::default()).unwrap();
+    let selection = session.select(|_| true).unwrap();
+    let mut printed = Vec::new();
+    let options = RarPrintOptions { member_spool_bytes: plain.len() as u64, ..RarPrintOptions::default() };
+    let summary = session.print_selected(&selection, &mut printed, &options, |_| {}).unwrap();
+    assert_eq!((summary.files, summary.volumes, summary.bytes), (1, 2, 17));
+    assert_eq!(printed, plain);
     let limit = encrypted.len() as u64;
     extract::SelectedEntry::open(&archive, 0, Some(PASSWORD), limit).unwrap().read(Some(PASSWORD), |_| Ok(())).unwrap();
     let error = extract::SelectedEntry::open(&archive, 0, Some(PASSWORD), limit - 1)

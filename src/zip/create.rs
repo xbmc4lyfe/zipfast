@@ -385,7 +385,7 @@ pub struct VerificationUsage {
 pub struct CreateUsage {
     /// Plan accounting.
     pub plan: PlanUsage,
-    /// Seekable writer accounting.
+    /// Writer accounting.
     pub writer: WriteUsage,
     /// Strict verification accounting.
     pub verification: VerificationUsage,
