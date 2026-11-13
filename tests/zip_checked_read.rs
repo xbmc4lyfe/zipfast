@@ -259,3 +259,84 @@ fn raw_native_relative_unicode_removed_cwd_nul_and_long_paths() {
         assert_eq!(e.bootstrap_usage().unwrap().opens(), 0);
     }
 }
+
+#[test]
+fn r1_public_selection_refusals_keep_completed_parser_usage() {
+    use zipfast::extract::SelectedEntry;
+    use zipfast::zip::{CloseDisposition, ReadFault, ReadResource};
+    let mut encoder = flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::fast());
+    let decoded = [0u8; 256];
+    encoder.write_all(&decoded).unwrap();
+    let compressed = encoder.finish().unwrap();
+    for case in 0..4 {
+        let member = match case {
+            1 => fixture::Member::stored(b"directory/", b""),
+            3 => fixture::Member::deflated(b"entry", &compressed, &decoded),
+            _ => fixture::Member::stored(b"entry", b"payload"),
+        };
+        let bytes = fixture::build(&[member], &[0], b"", b"", false).bytes;
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&bytes).unwrap();
+        let expected = ProjectedReadSession::open(file.path(), &Cancellation::default()).unwrap().parser_usage();
+        let error = SelectedEntry::open_cancelable_with_zip_limit(
+            file.path(),
+            if case == 0 { 9 } else { 0 },
+            None,
+            match case {
+                2 => 2,
+                3 => 10,
+                _ => 1024,
+            },
+            None,
+            Cancellation::default(),
+        )
+        .err()
+        .unwrap();
+        match case {
+            0 | 1 => assert!(matches!(error.operation(), Some(ReadFault::CheckedFormat { .. }))),
+            2 => assert!(matches!(
+                error.operation(),
+                Some(ReadFault::Limit { resource: ReadResource::MemberPackedBytes, .. })
+            )),
+            3 => assert!(matches!(
+                error.operation(),
+                Some(ReadFault::Limit { resource: ReadResource::MemberDecodedBytes, .. })
+            )),
+            _ => unreachable!(),
+        }
+        assert_eq!(error.parser_usage(), Some(expected));
+        assert!(expected.fetched_bytes > 0);
+        let boot = error.bootstrap_usage().unwrap();
+        assert_eq!(boot.metadata(), 6);
+        assert_eq!(boot.source_retirement(), Some(CloseDisposition::Closed));
+        assert_eq!(boot.acquired_fds(), 1);
+        assert_eq!(error.cleanup_errors().len(), 0);
+    }
+}
+#[test]
+fn r1_public_unbound_missing_source_keeps_action_plan_origin() {
+    use zipfast::zip::{BootstrapPhase, CheckedSourceFault, ReadIoOperation};
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(&fixture::build(&[fixture::Member::stored(b"entry", b"one")], &[0], b"", b"", false).bytes).unwrap();
+    let cancel = Cancellation::default();
+    let mut session = ProjectedReadSession::open(file.path(), &cancel).unwrap();
+    let mut context = EncryptedReadContext::new(Default::default()).unwrap();
+    std::fs::remove_file(file.path()).unwrap();
+    let mut calls = 0;
+    let error = session
+        .read_at_with_context(0, None, 64, &cancel, &mut context, |_| {
+            calls += 1;
+            Ok(())
+        })
+        .unwrap_err();
+    assert_eq!(calls, 0);
+    assert!(matches!(error.source_change(), Some(CheckedSourceFault::Unavailable { .. })));
+    let boot = error.bootstrap_usage().expect("originating explicit binding snapshot");
+    assert_eq!(boot, context.bootstrap_usage());
+    assert_eq!(boot.phase(), BootstrapPhase::ActionPlan);
+    assert_eq!((boot.metadata(), boot.attempts(), boot.bytes(), boot.acquisition_attempts()), (2, 2, 0, 1));
+    assert_eq!(context.run_usage().records, 0);
+    assert_eq!(context.run_usage().io_attempts, 0);
+    assert!(error.parser_usage().is_none());
+    assert!(error.cleanup_errors().all(|e| e.operation != ReadIoOperation::Close));
+}

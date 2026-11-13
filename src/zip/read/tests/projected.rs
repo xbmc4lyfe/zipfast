@@ -1334,3 +1334,297 @@ fn legacy_length_change_before_proof_cannot_bless_older_parser_geometry() {
         Some(CheckedSourceFault::PreviouslyInvalidated { .. })
     ));
 }
+
+#[test]
+fn r1_postparse_constructor_failures_keep_successful_usage_and_retirement() {
+    for generic in [false, true] {
+        for case in 0..6 {
+            let bytes = build(&[Member::stored(b"entry", b"one")], &[0], b"", b"", false).bytes;
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(&bytes).unwrap();
+            let cancel = Cancellation::default();
+            let baseline = if generic {
+                let (source, _) = CheckedOpen::open(file.path(), &cancel).unwrap().probe(1024, &cancel).unwrap();
+                ProjectedReadSession { owner: source.into_zip(&cancel).unwrap() }
+            } else {
+                ProjectedReadSession::open(file.path(), &cancel).unwrap()
+            };
+            let expected = baseline.parser_usage();
+            let attempts = baseline.bootstrap_usage().attempts();
+            drop(baseline);
+            let path = file.path().to_path_buf();
+            let held = cancel.clone();
+            OPEN_HOOK.with(|s| {
+                *s.borrow_mut() = Some(Box::new(move |event| {
+                    if event == 6 {
+                        match case {
+                            0 => std::fs::remove_file(&path).unwrap(),
+                            1 => std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"x").unwrap(),
+                            2 => {
+                                inject_bootstrap(Some(IoStage::SourceHandle), ReadIoOperation::Stat, 1, libc::EIO, true)
+                            }
+                            3 => inject_bootstrap(
+                                Some(IoStage::SourceHandle),
+                                ReadIoOperation::Stat,
+                                17,
+                                libc::EINTR,
+                                true,
+                            ),
+                            4 => held.cancel(),
+                            5 => IDENTITY_FAULT.with(|s| s.set(true)),
+                            _ => unreachable!(),
+                        }
+                    }
+                }))
+            });
+            let result = if generic {
+                crate::extract::SelectedEntry::open_cancelable_with_zip_limit(
+                    file.path(),
+                    0,
+                    None,
+                    64,
+                    None,
+                    cancel.clone(),
+                )
+                .map(|_| ())
+            } else {
+                ProjectedReadSession::open(file.path(), &cancel).map(|_| ())
+            };
+            REFUSE_ALLOCATIONS.with(|s| s.set(false));
+            OPEN_HOOK.with(|s| *s.borrow_mut() = None);
+            let error = result.unwrap_err();
+            match case {
+                0 | 2 => assert!(matches!(error.source_change(), Some(CheckedSourceFault::Unavailable { .. }))),
+                1 => assert!(matches!(error.source_change(), Some(CheckedSourceFault::StampMismatch))),
+                3 => assert!(matches!(
+                    error.operation(),
+                    Some(ReadFault::Limit { resource: ReadResource::InterruptedRetries, limit: 16, attempted: 17 })
+                )),
+                4 => assert!(matches!(error.operation(), Some(ReadFault::Cancelled))),
+                5 => assert!(matches!(error.operation(), Some(ReadFault::CounterOverflow))),
+                _ => unreachable!(),
+            }
+            assert_eq!(error.parser_usage(), Some(expected), "generic={generic} case={case}");
+            let boot = error.bootstrap_usage().unwrap();
+            assert_eq!(boot.phase(), BootstrapPhase::SourceOpen);
+            assert_eq!(
+                boot.metadata(),
+                match case {
+                    0 => 5,
+                    2 | 3 => 4,
+                    _ => 6,
+                }
+            );
+            assert_eq!(
+                boot.attempts(),
+                match case {
+                    0 => attempts,
+                    2 => attempts - 1,
+                    3 => attempts + 15,
+                    _ => attempts + 1,
+                }
+            );
+            assert_eq!(boot.source_retirement(), Some(CloseDisposition::Closed));
+            assert_eq!(error.cleanup_errors().len(), 0);
+            assert!(IDENTITY_FAULT.with(|s| !s.get()));
+        }
+    }
+}
+#[test]
+fn r1_explicit_postfactory_source_refusals_keep_action_plan_usage() {
+    for admission in [false, true] {
+        let (file, mut session) = opened(&[Member::stored(b"entry", b"one")]);
+        let mut context = EncryptedReadContext::new(Default::default()).unwrap();
+        let path = file.path().to_path_buf();
+        OPEN_HOOK.with(|s| {
+            *s.borrow_mut() = Some(Box::new(move |event| {
+                if event == 8 {
+                    if admission {
+                        inject_bootstrap(Some(IoStage::SourceHandle), ReadIoOperation::Stat, 17, libc::EINTR, true);
+                    } else {
+                        std::fs::remove_file(&path).unwrap();
+                    }
+                }
+            }))
+        });
+        let mut calls = 0;
+        let result = session.read_at_with_context(0, None, 64, &Cancellation::default(), &mut context, |_| {
+            calls += 1;
+            Ok(())
+        });
+        REFUSE_ALLOCATIONS.with(|s| s.set(false));
+        OPEN_HOOK.with(|s| *s.borrow_mut() = None);
+        let error = result.unwrap_err();
+        assert_eq!(calls, 0);
+        if admission {
+            assert!(!error.is_source_changed());
+            assert!(matches!(
+                error.operation(),
+                Some(ReadFault::Limit { resource: ReadResource::InterruptedRetries, .. })
+            ));
+        } else {
+            assert!(error.is_source_changed());
+        }
+        let boot = error.bootstrap_usage().expect("postfactory binding origin");
+        assert_eq!(boot, context.bootstrap_usage());
+        assert_eq!(boot.phase(), BootstrapPhase::ActionPlan);
+        assert_eq!(boot.metadata(), if admission { 4 } else { 5 });
+        assert_eq!(boot.attempts(), if admission { 20 } else { 5 });
+        assert_eq!(boot.bytes(), 0);
+        assert_eq!(boot.acquisition_attempts(), 1);
+        assert!(error.parser_usage().is_none());
+        assert_eq!(context.run_usage(), RunUsage::default());
+        assert_eq!(context.usage().members, 0);
+        assert_eq!(context.usage().packed_bytes, 0);
+    }
+}
+
+#[test]
+fn r1_member_failures_are_not_relabelled_as_prebinding_failures() {
+    for bound in [false, true] {
+        let mut m = Member::stored(b"entry", b"one");
+        m.crc = Some(0);
+        let (_file, mut session) = opened(&[m]);
+        let cancel = Cancellation::default();
+        let mut context = if bound {
+            EncryptedReadContext::for_projected(
+                &mut session,
+                ProjectedReadScope::Entry(0),
+                Some(64),
+                ZipReadOutput::Callback,
+                None,
+                &Default::default(),
+                &cancel,
+            )
+            .unwrap()
+        } else {
+            EncryptedReadContext::new(Default::default()).unwrap()
+        };
+        let mut delivered = 0;
+        let error = session
+            .read_at_with_context(0, None, 64, &cancel, &mut context, |b| {
+                delivered += b.len();
+                Ok(())
+            })
+            .unwrap_err();
+        assert_eq!(delivered, 3);
+        assert!(matches!(error.operation(), Some(ReadFault::Integrity { reason: IntegrityReason::Checksum, .. })));
+        assert!(error.bootstrap_usage().is_none());
+        assert!(error.parser_usage().is_none());
+        assert_eq!(context.bootstrap_usage().metadata(), 6);
+        assert_eq!(context.run_usage().records, 1);
+    }
+}
+#[test]
+fn r1_cancel_origin_belongs_only_to_unbound_prebinding() {
+    for bound in [false, true] {
+        let (_file, mut session) = opened(&[Member::stored(b"entry", b"one")]);
+        let cancel = Cancellation::default();
+        let mut context = if bound {
+            EncryptedReadContext::for_projected(
+                &mut session,
+                ProjectedReadScope::Entry(0),
+                Some(64),
+                ZipReadOutput::Callback,
+                None,
+                &Default::default(),
+                &cancel,
+            )
+            .unwrap()
+        } else {
+            EncryptedReadContext::new(Default::default()).unwrap()
+        };
+        cancel.cancel();
+        let error = session
+            .read_at_with_context(0, None, 64, &cancel, &mut context, |_| panic!("no cancelled payload"))
+            .unwrap_err();
+        assert!(matches!(error.operation(), Some(ReadFault::Cancelled)));
+        if bound {
+            assert!(error.bootstrap_usage().is_none());
+        } else {
+            let boot = error.bootstrap_usage().unwrap();
+            assert_eq!(boot.phase(), BootstrapPhase::ActionPlan);
+            assert_eq!((boot.metadata(), boot.attempts(), boot.acquisition_attempts()), (0, 0, 1));
+        }
+        assert_eq!(context.run_usage(), RunUsage::default());
+    }
+}
+#[test]
+fn r1_existing_legacy_origin_survives_unbound_generic_read() {
+    let bytes = build(&[Member::stored(b"entry", b"one")], &[0], b"", b"", false).bytes;
+    let mut file = tempfile::Builder::new().prefix(".zipfast-r1-origin-").tempfile_in(".").unwrap();
+    file.write_all(&bytes).unwrap();
+    let path = Path::new(file.path().file_name().unwrap());
+    LEGACY_CWD_FAULT.with(|s| s.set(Some(libc::ENOENT)));
+    let mut selected = crate::extract::SelectedEntry::open(path, 0, None, 64).unwrap();
+    let mut context = EncryptedReadContext::new(Default::default()).unwrap();
+    let error =
+        selected.read_with_zip_context(None, &mut context, |_| panic!("unproved source cannot deliver")).unwrap_err();
+    assert!(matches!(error.operation(), Some(ReadFault::Io { stage: IoStage::SourcePath, .. })));
+    assert!(!error.is_source_changed());
+    assert_eq!(error.bootstrap_usage().unwrap().phase(), BootstrapPhase::LegacySourceProof);
+    assert_eq!(context.bootstrap_usage().metadata(), 0);
+    assert_eq!(context.run_usage(), RunUsage::default());
+}
+#[test]
+fn r1_parse_failure_snapshot_survives_and_preparse_snapshot_is_not_invented() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(file.path(), [0u8; 100]).unwrap();
+    let cancel = Cancellation::default();
+    let error = ProjectedReadSession::open(file.path(), &cancel).err().unwrap();
+    let usage = error.parser_usage().unwrap();
+    assert_eq!(usage.fetched_bytes, 100);
+    assert_eq!(error.bootstrap_usage().unwrap().bytes(), 100);
+    assert_eq!(error.bootstrap_usage().unwrap().metadata(), 6);
+    assert_eq!(error.bootstrap_usage().unwrap().source_retirement(), Some(CloseDisposition::Closed));
+    inject_bootstrap(Some(IoStage::SourceHandle), ReadIoOperation::Stat, 1, libc::EIO, true);
+    let result = ProjectedReadSession::open(file.path(), &cancel);
+    REFUSE_ALLOCATIONS.with(|s| s.set(false));
+    let error = result.err().unwrap();
+    assert!(error.parser_usage().is_none());
+    assert!(error.is_source_changed());
+    assert_eq!(error.bootstrap_usage().unwrap().metadata(), 1);
+    assert_eq!(error.bootstrap_usage().unwrap().source_retirement(), Some(CloseDisposition::Closed));
+}
+#[test]
+fn r1_prebinding_factory_fault_keeps_final_source_admission_and_latest_snapshot() {
+    let plain = vec![0; 65537];
+    let frame = super::cipher::framed(1, "pw", &plain);
+    let aes = fixture::extra(0x9901, &[2, 0, b'A', b'E', 1, 0, 0]);
+    let mut member = Member::stored(b"entry", &frame);
+    member.flags = 1;
+    member.method = 99;
+    member.decoded = Some(&plain);
+    member.central_extra = &aes;
+    let (_file, mut session) = opened(&[member]);
+    let mut context =
+        EncryptedReadContext::new(EncryptedReadOptions::default().with_temp_dir("p".repeat(5000).into())).unwrap();
+    OPEN_HOOK.with(|s| {
+        *s.borrow_mut() = Some(Box::new(move |event| {
+            if event == 8 {
+                inject_bootstrap(Some(IoStage::SourceHandle), ReadIoOperation::Stat, 17, libc::EINTR, true);
+            }
+        }))
+    });
+    let result = session.read_at_with_context(0, Some("pw"), 1 << 20, &Cancellation::default(), &mut context, |_| {
+        panic!("no prebinding output")
+    });
+    REFUSE_ALLOCATIONS.with(|s| s.set(false));
+    OPEN_HOOK.with(|s| *s.borrow_mut() = None);
+    let error = result.unwrap_err();
+    assert!(matches!(error.operation(), Some(ReadFault::InvalidPlan)));
+    assert!(!error.is_source_changed());
+    let fault = error.cleanup_errors().next().unwrap();
+    assert_eq!(fault.operation, ReadIoOperation::Stat);
+    assert_eq!(fault.close, CloseDisposition::NotApplicable);
+    assert!(matches!(
+        &fault.cause,
+        CleanupCause::Admission(ReadFault::Limit { resource: ReadResource::InterruptedRetries, .. })
+    ));
+    let boot = error.bootstrap_usage().unwrap();
+    assert_eq!(boot, context.bootstrap_usage());
+    assert_eq!(boot.phase(), BootstrapPhase::ActionPlan);
+    assert_eq!((boot.metadata(), boot.attempts(), boot.acquisition_attempts()), (4, 21, 2));
+    assert_eq!(context.usage().members, 0);
+    assert_eq!(context.run_usage(), RunUsage::default());
+}

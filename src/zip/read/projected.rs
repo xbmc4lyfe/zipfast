@@ -35,6 +35,8 @@ thread_local! {pub(super) static OBSERVATIONS:std::cell::Cell<Observations>=cons
 #[cfg(test)]
 thread_local! {pub(super) static CLOSE_FAULT:std::cell::Cell<Option<i32>>=const{std::cell::Cell::new(None)};}
 #[cfg(test)]
+thread_local! {pub(super) static IDENTITY_FAULT:std::cell::Cell<bool>=const{std::cell::Cell::new(false)};}
+#[cfg(test)]
 thread_local! {pub(super) static LEGACY_CWD_FAULT:std::cell::Cell<Option<i32>>=const{std::cell::Cell::new(None)};}
 #[cfg(test)]
 type OpeningHook = Option<Box<dyn FnMut(u8)>>;
@@ -50,7 +52,7 @@ pub(in crate::zip) fn observe(kind: u8) {
             2 => n.records += 1,
             3 => n.names += 1,
             4 => n.headers += 1,
-            5 => {} // Legacy length/proof boundary fault control only.
+            5 | 6 | 8 => {} // Legacy proof, completed parse, explicit postfactory controls only.
             _ => unreachable!(),
         };
         s.set(n);
@@ -68,6 +70,10 @@ pub(super) fn next_identity(counter: &AtomicU64) -> Result<u64, ReadFault> {
         .map_err(|_| ReadFault::CounterOverflow)
 }
 pub(in crate::zip) fn identity() -> Result<u64, ReadFault> {
+    #[cfg(test)]
+    if IDENTITY_FAULT.with(|s| s.take()) {
+        return Err(ReadFault::CounterOverflow);
+    }
     next_identity(&IDENTITIES)
 }
 
@@ -187,6 +193,7 @@ impl ProjectedOwner {
                 Err(error) => return Err(retire_open(file, error.into(), &mut bootstrap)),
             };
             let parsed = parse_projected(&mut file, stamp.len, &mut bootstrap, cancel);
+            let completed_parser_usage = parsed.as_ref().ok().map(|(_, usage)| *usage);
             let final_source = SourceStamp::capture_checked(&file, &path, |stage, call| bootstrap.stat(stage, call));
             let result = match final_source {
                 Ok(after) if after == stamp => parsed,
@@ -205,14 +212,30 @@ impl ProjectedOwner {
             };
             let (entries, parser_usage) = match result {
                 Ok(result) => result,
-                Err(error) => return Err(retire_open(file, error, &mut bootstrap)),
+                Err(error) => {
+                    let error = match completed_parser_usage {
+                        Some(usage) => error.with_parser_usage(usage),
+                        None => error,
+                    };
+                    return Err(retire_open(file, error, &mut bootstrap));
+                }
             };
             if let Err(fault) = io::canceled(Some(cancel)) {
-                return Err(retire_open(file, fault.into(), &mut bootstrap));
+                return Err(retire_open(
+                    file,
+                    ZipReadError::from(fault).with_parser_usage(parser_usage),
+                    &mut bootstrap,
+                ));
             }
             let identity = match identity() {
                 Ok(id) => id,
-                Err(fault) => return Err(retire_open(file, fault.into(), &mut bootstrap)),
+                Err(fault) => {
+                    return Err(retire_open(
+                        file,
+                        ZipReadError::from(fault).with_parser_usage(parser_usage),
+                        &mut bootstrap,
+                    ));
+                }
             };
             Ok((file, entries, SourceBinding::from_checked(path, stamp), identity, parser_usage))
         })();
@@ -295,7 +318,8 @@ impl ProjectedOwner {
         )
     }
     pub(crate) fn reject(mut self, error: ZipReadError) -> ZipReadError {
-        retire_open(self.file, error, &mut self.opening).with_bootstrap(self.opening.usage())
+        retire_open(self.file, error.with_parser_usage(self.parser_usage), &mut self.opening)
+            .with_bootstrap(self.opening.usage())
     }
     pub(crate) fn entries(&self) -> &[ZipEntry] {
         &self.entries
@@ -407,6 +431,8 @@ fn parse_projected(
     let mut entries = directory.entries;
     zip::relocate_projected(&mut entries, directory.prefix_shift, len, Some(cancel))
         .map_err(|fault| ZipReadError::from(fault).with_parser_usage(usage))?;
+    #[cfg(test)]
+    observe(6);
     Ok((entries, usage))
 }
 #[cfg(unix)]
@@ -1000,52 +1026,64 @@ fn checked_read_inner(
     context: &mut EncryptedReadContext,
     sink: &mut impl FnMut(&[u8]) -> ZipSinkResult<()>,
 ) -> ZipReadResult<()> {
-    io::canceled(Some(cancel))?;
     if context.action.is_none() {
-        binding.verify_with(file, |stage, call| context.bootstrap.stat(stage, call))?;
-        let result = factory(
-            context,
-            false,
-            std::iter::once((
-                ReadDescription {
-                    name: e.name,
-                    flags: e.flags,
-                    method: e.method,
-                    crc32: e.crc32,
-                    packed: e.packed,
-                    size: e.size,
-                    local_at: e.local_at,
-                    aes_info: e.aes_info,
-                },
+        let binding_result = (|| -> ZipReadResult<()> {
+            io::canceled(Some(cancel))?;
+            binding.verify_with(file, |stage, call| context.bootstrap.stat(stage, call))?;
+            let result = factory(
+                context,
                 false,
-                false,
-            )),
-            identity,
-            binding.stamp,
-            binding.path.as_os_str().len(),
-            ProjectedReadScope::Entry(index),
-            Some(max_bytes),
-            ZipReadOutput::Callback,
-            password,
-            &EncryptedReadOverrides::default(),
-            cancel,
-        );
-        let checked = binding.verify_with(file, |stage, call| context.bootstrap.stat(stage, call));
-        match checked {
-            Ok(()) => result?,
-            Err(io::SourceCheckError::Source(fault)) => {
-                return Err(match result {
-                    Ok(()) => fault.into(),
-                    Err(error) => error.merge_source(fault),
-                });
+                std::iter::once((
+                    ReadDescription {
+                        name: e.name,
+                        flags: e.flags,
+                        method: e.method,
+                        crc32: e.crc32,
+                        packed: e.packed,
+                        size: e.size,
+                        local_at: e.local_at,
+                        aes_info: e.aes_info,
+                    },
+                    false,
+                    false,
+                )),
+                identity,
+                binding.stamp,
+                binding.path.as_os_str().len(),
+                ProjectedReadScope::Entry(index),
+                Some(max_bytes),
+                ZipReadOutput::Callback,
+                password,
+                &EncryptedReadOverrides::default(),
+                cancel,
+            );
+            #[cfg(test)]
+            observe(8);
+            let checked = binding.verify_with(file, |stage, call| context.bootstrap.stat(stage, call));
+            match checked {
+                Ok(()) => result?,
+                Err(io::SourceCheckError::Source(fault)) => {
+                    return Err(match result {
+                        Ok(()) => fault.into(),
+                        Err(error) => error.merge_source(fault),
+                    });
+                }
+                Err(io::SourceCheckError::Admission(fault)) => {
+                    return Err(match result {
+                        Ok(()) => fault.into(),
+                        Err(error) => merge_source_admission(error, fault),
+                    });
+                }
             }
-            Err(io::SourceCheckError::Admission(fault)) => {
-                return Err(match result {
-                    Ok(()) => fault.into(),
-                    Err(error) => merge_source_admission(error, fault),
-                });
-            }
-        }
+            Ok(())
+        })();
+        binding_result.map_err(|error| match error.bootstrap_usage().map(|usage| usage.phase()) {
+            None | Some(BootstrapPhase::ActionPlan) => error.with_bootstrap(context.bootstrap.usage()),
+            // A genuine earlier opening/legacy origin must never be relabelled.
+            Some(_) => error,
+        })?;
+    } else {
+        io::canceled(Some(cancel))?;
     }
     context.verify_identity(identity)?;
     let action = context.action.as_mut().ok_or(ReadFault::InvalidPlan)?;
@@ -1290,6 +1328,7 @@ impl CheckedOpen {
         };
         let source = SourceBinding::from_checked(self.path, stamp);
         let parsed = parse_projected_with_dispatch(&mut self.file, source.stamp.len, &mut self.bootstrap, cancel);
+        let completed_parser_usage = parsed.as_ref().ok().map(|(_, usage)| *usage);
         let checked =
             SourceStamp::capture_checked(&self.file, &source.path, |stage, call| self.bootstrap.stat(stage, call));
         let result = match checked {
@@ -1310,20 +1349,30 @@ impl CheckedOpen {
         let (entries, parser_usage) = match result {
             Ok(value) => value,
             Err(error) => {
+                let error = match completed_parser_usage {
+                    Some(usage) => error.with_parser_usage(usage),
+                    None => error,
+                };
                 return Err(retire_open(self.file, error, &mut self.bootstrap).with_bootstrap(self.bootstrap.usage()));
             }
         };
         if let Err(fault) = io::canceled(Some(cancel)) {
-            return Err(
-                retire_open(self.file, fault.into(), &mut self.bootstrap).with_bootstrap(self.bootstrap.usage())
-            );
+            return Err(retire_open(
+                self.file,
+                ZipReadError::from(fault).with_parser_usage(parser_usage),
+                &mut self.bootstrap,
+            )
+            .with_bootstrap(self.bootstrap.usage()));
         }
         let identity = match identity() {
             Ok(value) => value,
             Err(fault) => {
-                return Err(
-                    retire_open(self.file, fault.into(), &mut self.bootstrap).with_bootstrap(self.bootstrap.usage())
-                );
+                return Err(retire_open(
+                    self.file,
+                    ZipReadError::from(fault).with_parser_usage(parser_usage),
+                    &mut self.bootstrap,
+                )
+                .with_bootstrap(self.bootstrap.usage()));
             }
         };
         Ok(ProjectedOwner {
