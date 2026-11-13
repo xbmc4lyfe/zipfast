@@ -129,13 +129,13 @@ Returned reports retain the selected strength and variant without credentials.
 All regular files, including empty ones, use AES. Explicit and tracked
 directories remain clear. Native creation reads each captured source length
 exactly. The low-level writer and strict verifier also support unknown
-lengths. Native salt comes from the operating system once per regular member;
-empty and directory-only plans request no entropy. A failed salt request
-stops creation without publication or a fallback.
+lengths. Native salt comes from the operating system once per regular member.
+Empty and directory-only plans complete with clear framing. A failed salt request
+returns a typed failure before publication.
 
 The `AesCreateReport` uses the existing publication rules for common write
-receipts. Their CRC equals the wire value: plaintext for AE-1 and zero for
-AE-2. Private plaintext CRC data remains inside creation until authenticated stage
+receipts. Their CRC equals the plaintext CRC for AE-1 and the wire value
+zero for AE-2. Private plaintext CRC data remains inside creation until authenticated stage
 verification completes. AES creation reserves and charges that additional
 capacity before staging. Clear and ZipCrypto creation keep their existing
 allocations and budget charges.
@@ -148,10 +148,10 @@ packed ceiling. All ordinary source, stage, permission, namespace,
 durability, and cleanup checks still apply.
 
 Use `publish_winzip_aes_with_bound_receipts` to request the existing held
-output binding alongside the AES report. A missing binding means stable
-destination identity was not proved through finalization. Common receipts
-can still accompany a confirmed publication followed by a cleanup or sync
-failure; ambiguous publication exposes no success receipts.
+output binding alongside the AES report. Use an available binding to establish
+the held destination identity through finalization. Common receipts can
+accompany confirmed publication followed by a cleanup or sync failure.
+Ambiguous publication returns its reconciliation state with an empty receipt list.
 
 ## Resource ceilings
 

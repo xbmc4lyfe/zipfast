@@ -500,8 +500,9 @@ pub struct CreateReport {
 }
 
 /// Native AES creation with common wire receipts and the requested regular-file
-/// policy. Explicit directories remain clear. No credentials or private
-/// plaintext CRCs are retained in this report.
+/// policy. Explicit directories use clear framing. Credentials stay borrowed
+/// through synchronous creation, and plaintext CRCs remain engine-owned during
+/// verification.
 #[derive(Debug)]
 #[must_use]
 pub struct AesCreateReport {

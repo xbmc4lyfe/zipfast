@@ -54,7 +54,7 @@ impl CreatePlan {
     }
 
     /// Publish with AES wire receipts and an optional held binding to the
-    /// verified output. A missing binding does not prove a stable destination.
+    /// verified output. Use an available binding to establish its held identity.
     pub fn publish_winzip_aes_with_bound_receipts(
         self,
         request: WinZipAesRequest<'_>,

@@ -68,7 +68,7 @@ impl RewritePlan {
     /// Open an existing regular archive through its held parent, without
     /// following a symlink in the destination's final component.
     pub fn open(path: &Path, options: RewriteOptions) -> Result<Self> {
-        Self::open_source(path, options, false)
+        Self::open_source(path, options, false, None)
     }
 
     /// Opens a rewrite plan with central extended Unix timestamps (UT) for
@@ -83,10 +83,10 @@ impl RewritePlan {
     /// Use [`EntryMetadata::header()`](crate::zip::EntryMetadata::header)
     /// to read the raw DOS fields for local wall-clock comparisons.
     pub fn open_with_central_ut(path: &Path, options: RewriteOptions) -> Result<Self> {
-        Self::open_source(path, options, true)
+        Self::open_source(path, options, true, None)
     }
 
-    fn open_source(path: &Path, options: RewriteOptions, central_ut_only: bool) -> Result<Self> {
+    fn open_source(path: &Path, options: RewriteOptions, central_ut_only: bool, output: Option<&File>) -> Result<Self> {
         if options.output_permissions.is_some_and(|mode| mode > 0o777) {
             return Err(CreateError::InvalidOptions("invalid output permission bits").into());
         }
@@ -95,6 +95,9 @@ impl RewritePlan {
         let budget = Attempts::with_limits(&options.cancel, common.transaction_attempts, &attempts);
         let parent = Parent::bind(path, &budget, common.plan_capacity)?;
         let (file, stamp) = parent.open_existing_regular(&budget)?;
+        if let Some(output) = output {
+            check_output_identity(stamp, output, &budget)?;
+        }
         check_source(&parent, &file, stamp, &budget)?;
         let limits = options.limits;
         let mut usage = RewriteUsage::default();
@@ -655,6 +658,15 @@ fn after_commit_sync(file: &File, attempts: &Attempts<'_>) -> create::Result<()>
 
 fn file_identity(stamp: Stamp) -> FileIdentity {
     FileIdentity { device: stamp.identity.0, inode: stamp.identity.1 }
+}
+
+fn check_output_identity(stamp: Stamp, output: &File, attempts: &Attempts<'_>) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = attempts.run(|| output.metadata())?;
+    if unix::Identity(metadata.dev(), metadata.ino()) == stamp.identity {
+        return Err(RewriteError::OutputAliasesArchive);
+    }
+    Ok(())
 }
 
 fn check_source(parent: &Parent, file: &File, stamp: Stamp, attempts: &Attempts<'_>) -> Result<()> {
