@@ -168,6 +168,7 @@ pub struct RarMember<'a> {
     ordinal: u64,
     member: &'a Member,
     parts: &'a [Part],
+    issue: Option<&'a RarFailure>,
 }
 
 impl<'a> RarMember<'a> {
@@ -244,7 +245,7 @@ impl<'a> RarMember<'a> {
 
     /// First issue discovered in the member's headers that blocks decoding.
     pub fn payload_issue(&self) -> Option<&'a RarFailure> {
-        self.member.issue.as_deref()
+        self.issue
     }
 
     pub fn final_checks(&self) -> Option<RarChecks> {
@@ -263,7 +264,7 @@ struct Member {
     packed_size: u64,
     unpacked_size: Option<u64>,
     complete: bool,
-    issue: Option<Box<RarFailure>>,
+    issue: Option<usize>,
     _history_barrier: bool,
 }
 
@@ -280,6 +281,7 @@ pub struct RarSession {
     volumes: Vec<HeldVolume>,
     members: Vec<Member>,
     parts: Vec<Part>,
+    issues: Vec<RarFailure>,
     usage: RarCatalogueUsage,
 }
 
@@ -294,6 +296,7 @@ impl RarSession {
                 volumes: Vec::new(),
                 members: Vec::new(),
                 parts: Vec::new(),
+                issues: Vec::new(),
                 usage: RarCatalogueUsage::default(),
             },
             options,
@@ -325,6 +328,7 @@ impl RarSession {
             ordinal: index as u64,
             member,
             parts: &self.parts[member.parts.clone()],
+            issue: member.issue.map(|index| &self.issues[index]),
         })
     }
 
@@ -425,6 +429,12 @@ impl Catalogue {
             }
         }
         self.end_incomplete()?;
+        #[cfg(all(test, unix))]
+        BEFORE_FINAL_BINDING_CHECK.with_borrow_mut(|hook| {
+            if let Some(hook) = hook.take() {
+                hook();
+            }
+        });
         for volume in &self.session.volumes {
             check_cancel(&self.options.cancel)?;
             volume.stamp.check(&volume.file, &volume.path)?;
@@ -491,19 +501,20 @@ impl Catalogue {
         } else {
             payload_issue(&header, crypt, ordinal)
         };
-        let issue_bytes = issue.as_ref().map_or(0, |_| size_of::<RarFailure>() as u64);
+        let issue_minimum = u64::from(issue.is_some() && self.session.issues.len() == self.session.issues.capacity())
+            * size_of::<RarFailure>() as u64;
         let part_index = self.session.parts.len();
         if associated {
-            let base = add(self.capacity_without::<Part>(self.session.parts.capacity())?, issue_bytes)?;
+            let base = add(self.capacity_without::<Part>(self.session.parts.capacity())?, issue_minimum)?;
             reserve_one(&mut self.session.parts, base, self.options.limits.capacity)?;
-            self.owned_capacity = add(self.owned_capacity, issue_bytes)?;
+            let issue = self.retain_issue(issue)?;
             let member = self.session.members.last_mut().unwrap();
             member.parts.end += 1;
             member.packed_size = add(member.packed_size, header.packed_size)?;
             member.unpacked_size = member.unpacked_size.or(size);
             member.complete = final_part;
-            if let Some(issue) = issue {
-                member.issue = Some(Box::new(issue));
+            if issue.is_some() {
+                member.issue = issue;
             }
         } else {
             let entries = add(self.session.usage.entries, 1)?;
@@ -515,16 +526,20 @@ impl Catalogue {
             limit(names, self.options.limits.name_bytes, RarResource::CatalogueNameBytes)?;
             let allocation = add(
                 add(header.name.capacity() as u64, wire.name.capacity() as u64)?,
-                add(target.map_or(0, |t| t.capacity() as u64), issue_bytes)?,
+                target.map_or(0, |t| t.capacity() as u64),
             )?;
             let part_minimum =
                 u64::from(self.session.parts.len() == self.session.parts.capacity()) * size_of::<Part>() as u64;
-            let base =
-                add(add(self.capacity_without::<Member>(self.session.members.capacity())?, allocation)?, part_minimum)?;
+            let base = add(
+                self.capacity_without::<Member>(self.session.members.capacity())?,
+                add(add(allocation, part_minimum)?, issue_minimum)?,
+            )?;
             reserve_one(&mut self.session.members, base, self.options.limits.capacity)?;
-            let base = add(self.capacity_without::<Part>(self.session.parts.capacity())?, allocation)?;
+            let base =
+                add(self.capacity_without::<Part>(self.session.parts.capacity())?, add(allocation, issue_minimum)?)?;
             reserve_one(&mut self.session.parts, base, self.options.limits.capacity)?;
             self.owned_capacity = add(self.owned_capacity, allocation)?;
+            let issue = self.retain_issue(issue)?;
             self.session.usage.entries = entries;
             self.session.usage.name_bytes = names;
             let history_barrier = header.method != 0
@@ -538,7 +553,7 @@ impl Catalogue {
                 packed_size: part.packed_size,
                 unpacked_size: size,
                 complete: final_part,
-                issue: issue.map(Box::new),
+                issue,
                 _history_barrier: history_barrier,
             });
         }
@@ -551,11 +566,8 @@ impl Catalogue {
         if std::mem::take(&mut self.pending) {
             let index = self.session.members.len() - 1;
             if self.session.members[index].issue.is_none() {
-                let extra = size_of::<RarFailure>() as u64;
-                limit(add(self.capacity()?, extra)?, self.options.limits.capacity, RarResource::CatalogueCapacity)?;
-                self.owned_capacity = add(self.owned_capacity, extra)?;
-                self.session.members[index].issue =
-                    Some(Box::new(member_integrity(index as u64, RarIntegrityReason::MissingSplitContinuation)));
+                let issue = member_integrity(index as u64, RarIntegrityReason::MissingSplitContinuation);
+                self.session.members[index].issue = self.retain_issue(Some(issue))?;
                 self.update_capacity()?;
             }
         }
@@ -567,9 +579,24 @@ impl Catalogue {
         reserve_one(&mut self.session.volumes, base, self.options.limits.capacity)
     }
 
+    fn retain_issue(&mut self, issue: Option<RarFailure>) -> RarResult<Option<usize>> {
+        let Some(issue) = issue else { return Ok(None) };
+        let base = self.capacity_without::<RarFailure>(self.session.issues.capacity())?;
+        reserve_one(&mut self.session.issues, base, self.options.limits.capacity)?;
+        let index = self.session.issues.len();
+        self.session.issues.push(issue);
+        Ok(Some(index))
+    }
+
     fn capacity(&self) -> RarResult<u64> {
         add(
-            add(self.owned_capacity, vector_bytes::<HeldVolume>(self.session.volumes.capacity())?)?,
+            add(
+                self.owned_capacity,
+                add(
+                    vector_bytes::<HeldVolume>(self.session.volumes.capacity())?,
+                    vector_bytes::<RarFailure>(self.session.issues.capacity())?,
+                )?,
+            )?,
             add(
                 vector_bytes::<Member>(self.session.members.capacity())?,
                 vector_bytes::<Part>(self.session.parts.capacity())?,
@@ -726,6 +753,8 @@ fn open_read_only(path: &Path) -> io::Result<File> {
 #[cfg(all(test, unix))]
 thread_local! {
     static OPENED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static BEFORE_FINAL_BINDING_CHECK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -790,6 +819,16 @@ mod tests {
 
     #[test]
     fn opens_each_volume_once_and_keeps_it_until_drop() {
+        const CHILD: &str = "ZIPFAST_TEST_RAR_CATALOGUE_FD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "rar5::session::tests::opens_each_volume_once_and_keeps_it_until_drop"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stdout));
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let first = dir.path().join("set.part1.rar");
         let second = dir.path().join("set.part2.rar");
@@ -804,6 +843,7 @@ mod tests {
         let session = RarSession::open(&first, None, RarSessionOptions::default()).unwrap();
         assert_eq!(OPENED.get(), 2);
         assert_eq!(session.volumes.len(), 2);
+        let mut descriptors = Vec::new();
         for (volume, path) in session.volumes.iter().zip([first, second]) {
             assert_eq!(volume.path, path);
             let fd = volume.file.as_raw_fd();
@@ -811,8 +851,34 @@ mod tests {
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             assert!(flags >= 0);
             assert_eq!(flags & libc::O_ACCMODE, libc::O_RDONLY);
+            descriptors.push(fd);
         }
         drop(session);
+        for fd in descriptors {
+            // SAFETY: F_GETFD accepts an open or closed descriptor number.
+            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+            assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        }
+    }
+
+    #[test]
+    fn catalogue_open_detects_volume_replacement_before_returning_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.rar");
+        let replacement = dir.path().join("replacement");
+        let main = [0xc5, 0x1a, 0x33, 0x32, 3, 1, 0, 0];
+        let end = [0x19, 0xb2, 0x3a, 0x35, 3, 5, 0, 0];
+        let bytes = [super::super::SIGNATURE.as_slice(), &main, &end].concat();
+        fs::write(&first, &bytes).unwrap();
+        fs::write(&replacement, &bytes).unwrap();
+        let observed = first.clone();
+        BEFORE_FINAL_BINDING_CHECK.with_borrow_mut(|hook| {
+            *hook = Some(Box::new(move || fs::rename(replacement, observed).unwrap()));
+        });
+        let failure = RarSession::open(&first, None, RarSessionOptions::default()).err().unwrap();
+        assert!(matches!(failure.failure.as_ref(), RarFailure::SourceChanged { path } if path == &first));
+        assert_eq!(failure.partial.volumes, 1);
+        assert_eq!(fs::read(first).unwrap(), bytes);
     }
 
     #[test]
@@ -837,5 +903,69 @@ mod tests {
         fs::write(&path, b"new").unwrap();
         let fault = stamp.check(&held, &path).unwrap_err();
         assert!(matches!(fault.failure.as_ref(), RarFailure::SourceChanged { path: changed } if changed == &path));
+    }
+
+    #[test]
+    fn capacity_counts_each_grown_vector_and_retained_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("growth.rar");
+        let main = [0xc5, 0x1a, 0x33, 0x32, 3, 1, 0, 0];
+        let end = [0x19, 0xb2, 0x3a, 0x35, 3, 5, 0, 0];
+        let mut bytes = [super::super::SIGNATURE.as_slice(), &main].concat();
+        for name in b'a'..=b'i' {
+            let body = [2, 1, 3, 0, 0, 0, 0, 1, 1, name, 2, 1, 0];
+            let mut sized = vec![body.len() as u8];
+            sized.extend(body);
+            bytes.extend(crate::crc32::hash(&sized).to_le_bytes());
+            bytes.extend(sized);
+        }
+        bytes.extend(end);
+        fs::write(&path, bytes).unwrap();
+        let session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+        assert_eq!(session.entries().len(), 9);
+        assert_eq!(session.issues.len(), 9);
+        let variable = session.volumes[0].path.capacity()
+            + session.members.iter().map(|row| row.header.name.capacity() + row.wire.name.capacity()).sum::<usize>();
+        let actual = variable
+            + session.members.capacity() * size_of::<Member>()
+            + session.parts.capacity() * size_of::<Part>()
+            + session.issues.capacity() * size_of::<RarFailure>()
+            + session.volumes.capacity() * size_of::<HeldVolume>();
+        assert_eq!(session.usage().capacity, actual as u64);
+        let impossible = variable
+            + 9 * (size_of::<Member>() + size_of::<Part>() + size_of::<RarFailure>())
+            + size_of::<HeldVolume>()
+            - 1;
+        let mut options = RarSessionOptions::default();
+        options.limits.capacity = impossible as u64;
+        let failure = RarSession::open(&path, None, options).err().unwrap();
+        assert!(matches!(failure.failure.as_ref(), RarFailure::Limit { resource: RarResource::CatalogueCapacity, .. }));
+    }
+
+    #[test]
+    fn rejects_packed_range_overflow_and_truncation_during_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ranges.rar");
+        let main = [0xc5, 0x1a, 0x33, 0x32, 3, 1, 0, 0];
+        for (encoded_size, overflow) in [(&[0xff; 9][..], true), (&[1][..], false)] {
+            let mut body = vec![2, 2];
+            body.extend(encoded_size);
+            if overflow {
+                body.push(1);
+            }
+            body.extend([0, 1, 0, 0, 1, 1, b'a']);
+            let mut sized = vec![body.len() as u8];
+            sized.extend(body);
+            let mut bytes = [super::super::SIGNATURE.as_slice(), &main].concat();
+            bytes.extend(crate::crc32::hash(&sized).to_le_bytes());
+            bytes.extend(sized);
+            fs::write(&path, bytes).unwrap();
+            let failure = RarSession::open(&path, None, RarSessionOptions::default()).err().unwrap();
+            assert!(matches!(
+                (overflow, failure.failure.as_ref()),
+                (true, RarFailure::Integrity { reason: RarIntegrityReason::HeaderFraming("data size"), .. })
+                    | (false, RarFailure::Integrity { reason: RarIntegrityReason::TruncatedData, .. })
+            ));
+        }
     }
 }

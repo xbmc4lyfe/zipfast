@@ -211,6 +211,89 @@ fn retains_framed_payload_issues_and_rejects_broken_headers() {
 }
 
 #[test]
+fn preserves_first_payload_issue_when_the_member_remains_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("incomplete.rar");
+    let spec = FileSpec { extra: vec![2, 1, 0], ..FileSpec::new("incomplete", b"x") };
+    write_volume(&path, main_block(false, None), &[file_block(&spec, b"x", 0, false, true)], Some(false));
+    let session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let member = session.entries().next().unwrap();
+    assert!(!member.is_complete());
+    assert!(member.final_checks().is_none());
+    assert!(matches!(
+        member.payload_issue(),
+        Some(RarFailure::Integrity {
+            scope: RarScope::Member { index: Some(0) },
+            reason: RarIntegrityReason::MalformedEncryptionRecord,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn projects_raw_and_effective_compression_nanos_and_keyed_checks() {
+    use zipfast::error::RarUnsupported;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("technical.rar");
+    let make = |compression, extra: &[u8]| {
+        let mut fields = vec![4, 0, 0];
+        fields.extend(0x1234_5678u32.to_le_bytes());
+        vint(compression, &mut fields);
+        fields.extend([1, 1, b'n']);
+        block(2, 0, &fields, extra, b"", false)
+    };
+    let mut extra = vec![10, 3, 0x13];
+    extra.extend(1_700_000_000u32.to_le_bytes());
+    extra.extend(345_678_901u32.to_le_bytes());
+    extra.extend([36, 1, 0, 2, 4]);
+    extra.extend([0x5a; 32]);
+    let compression = 1 | 0x10_0000 | (3 << 7) | (2 << 10) | 0x40;
+    write_volume(
+        &path,
+        main_block_flags(false, None, true),
+        &[make(compression, &extra), make(1 | (3 << 7), b"")],
+        Some(false),
+    );
+    let session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
+    let members: Vec<_> = session.entries().collect();
+    assert_eq!(members[0].compression_info(), compression);
+    assert_eq!(members[0].algorithm(), 0);
+    assert_eq!(members[0].dictionary(), 512 * 1024);
+    assert!(members[0].solid());
+    assert!(members[0].encrypted());
+    assert_eq!(members[0].modified(), Some((1_700_000_000, 345_678_901)));
+    let checks = members[0].final_checks().unwrap();
+    assert_eq!(checks.crc32, Some(0x1234_5678));
+    assert!(checks.keyed);
+    assert!(members[0].payload_issue().is_none());
+    assert_eq!(members[1].ordinal(), 1);
+    assert_eq!(members[1].algorithm(), 1);
+    assert!(matches!(
+        members[1].payload_issue(),
+        Some(RarFailure::Unsupported(RarUnsupported::CompressionAlgorithm { algorithm: 1, method: 3 }))
+    ));
+}
+
+#[test]
+fn rejects_reused_volume_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let first = dir.path().join("set.part1.rar");
+    let second = dir.path().join("set.part2.rar");
+    write_volume(&first, main_block(true, None), &[], Some(true));
+    fs::hard_link(&first, &second).unwrap();
+    let failure = RarSession::open(&first, None, RarSessionOptions::default()).err().unwrap();
+    assert!(matches!(
+        failure.failure.as_ref(),
+        RarFailure::Integrity {
+            scope: RarScope::Header { volume },
+            reason: RarIntegrityReason::HeaderFraming(_),
+            ..
+        } if volume == &second
+    ));
+}
+
+#[test]
 fn required_missing_volume_and_optional_missing_volume_have_different_results() {
     let dir = tempfile::tempdir().unwrap();
     let first = dir.path().join("set.part1.rar");
@@ -343,6 +426,37 @@ fn counts_encrypted_and_skipped_physical_headers() {
                 | (true, RarFailure::WrongPassword { scope: RarScope::Header { .. } })
         ));
     }
+    let first = dir.path().join("change.part1.rar");
+    let second = dir.path().join("change.part2.rar");
+    write_volume(&first, main_block(true, None), &[], Some(true));
+    fs::write(&second, &bytes).unwrap();
+    let failure = RarSession::open(&first, Some(password), RarSessionOptions::default()).err().unwrap();
+    assert!(matches!(
+        failure.failure.as_ref(),
+        RarFailure::Integrity {
+            scope: RarScope::Header { volume },
+            reason: RarIntegrityReason::HeaderFraming(_),
+            ..
+        } if volume == &second
+    ));
+
+    let mut corrupt = SIG.to_vec();
+    corrupt.extend(block(4, 0, &params, &[], &[], false));
+    let mut main = main_block(false, None);
+    main[0] ^= 1;
+    main.resize(main.len().next_multiple_of(16), 0);
+    corrupt.extend(iv);
+    corrupt.extend(encrypt_cbc(&key, &iv, &main).unwrap());
+    fs::write(&path, corrupt).unwrap();
+    let failure = RarSession::open(&path, Some(password), RarSessionOptions::default()).err().unwrap();
+    assert!(matches!(
+        failure.failure.as_ref(),
+        RarFailure::Integrity {
+            scope: RarScope::Header { .. },
+            reason: RarIntegrityReason::HeaderCrc,
+            password: zipfast::error::RarPasswordEvidence::VerifierMatched,
+        }
+    ));
 }
 
 #[test]

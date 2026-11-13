@@ -652,8 +652,11 @@ impl Volume {
                     return Ok(Some((Block::Main(MainHeader { flags, volume_number }), None, None)));
                 }
                 HEAD_FILE | HEAD_SERVICE => {
-                    let (h, crypt, wire) = parse_file_impl(&head, fields, extra, budget.is_some() && kind == HEAD_FILE)
-                        .map_err(|e| self.parse_fault(e))?;
+                    let (h, crypt, wire) =
+                        parse_file_impl(&head, fields, extra, budget.is_some()).map_err(|error| match error {
+                            FileParseError::Format(error) => self.parse_fault(error),
+                            FileParseError::Allocation => allocation(),
+                        })?;
                     let block = if kind == HEAD_FILE { Block::File(h) } else { Block::Service(h) };
                     return Ok(Some((block, crypt, wire)));
                 }
