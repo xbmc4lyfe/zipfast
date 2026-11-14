@@ -23,34 +23,45 @@ use crate::error::{Error, Result};
 /// `windows_names`: the archive was made on Windows, so a backslash is a separator there and a drive letter or
 /// a reserved character means nothing on this side.
 pub fn sanitize(name: &str, windows_names: bool) -> Result<PathBuf> {
-    let unsafe_path = || Error::UnsafePath(name.to_string());
-    let normalized: String = if windows_names { name.replace('\\', "/") } else { name.to_string() };
-    let mut out = PathBuf::new();
-    for (i, part) in normalized.split('/').enumerate() {
+    sanitize_fallible(name, windows_names).map_err(|_| Error::UnsafePath(name.to_string()))
+}
+
+pub(crate) enum ProjectionError {
+    Unsafe,
+    Allocation(std::collections::TryReserveError),
+}
+
+// A single component traversal serves both the legacy and bounded RAR paths.
+// A normalized UTF-8 name never grows: replacement characters are all ASCII.
+pub(crate) fn sanitize_fallible(name: &str, windows_names: bool) -> std::result::Result<PathBuf, ProjectionError> {
+    let mut out = String::new();
+    out.try_reserve_exact(name.len()).map_err(ProjectionError::Allocation)?;
+    for (i, part) in name.split(|c| c == '/' || (windows_names && c == '\\')).enumerate() {
         match part {
-            "" if i == 0 && !normalized.is_empty() => return Err(unsafe_path()),
+            "" if i == 0 && !name.is_empty() => return Err(ProjectionError::Unsafe),
             "" | "." => continue,
-            ".." => return Err(unsafe_path()),
+            ".." => return Err(ProjectionError::Unsafe),
             _ => {}
         }
-        if part.contains('\0') {
-            return Err(unsafe_path());
+        if part.contains('\0') || (windows_names && i == 0 && part.len() == 2 && part.ends_with(':')) {
+            return Err(ProjectionError::Unsafe);
         }
-        if windows_names && i == 0 && part.len() == 2 && part.ends_with(':') {
-            return Err(unsafe_path());
+        if !out.is_empty() {
+            out.push('/');
         }
-        let cleaned: String = if cfg!(windows) || windows_names {
-            part.chars().map(|c| if matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') { '_' } else { c }).collect()
-        } else {
-            part.to_string()
-        };
-        out.push(cleaned);
+        for c in part.chars() {
+            out.push(if (cfg!(windows) || windows_names) && matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*') {
+                '_'
+            } else {
+                c
+            });
+        }
     }
-    // a final check against whatever the platform's own parser makes of it
-    if out.as_os_str().is_empty() || out.components().any(|c| !matches!(c, Component::Normal(_))) {
-        return Err(unsafe_path());
+    let path = PathBuf::from(out);
+    if path.as_os_str().is_empty() || path.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return Err(ProjectionError::Unsafe);
     }
-    Ok(out)
+    Ok(path)
 }
 
 /// Whether `target` resolves inside `root` once joined to `link_dir`, without touching the file system.

@@ -45,12 +45,12 @@ impl RarSession {
     }
 }
 
-struct Extraction<'a> {
+pub(super) struct Extraction<'a> {
     options: &'a Options,
     dirs: Vec<DirectoryOutput>,
 }
 
-struct DirectoryOutput {
+pub(super) struct DirectoryOutput {
     path: PathBuf,
     identity: (u64, u64),
     ordinal: usize,
@@ -58,7 +58,7 @@ struct DirectoryOutput {
 }
 
 impl<'a> Extraction<'a> {
-    fn new(options: &'a Options) -> Self {
+    pub(super) fn new(options: &'a Options) -> Self {
         Self { options, dirs: Vec::new() }
     }
 
@@ -68,8 +68,26 @@ impl<'a> Extraction<'a> {
         session: &mut RarSession,
         index: usize,
     ) -> Result<RarOutcome, Arc<RarFailure>> {
-        match self.member_inner(run, session, index) {
-            Err(failure) if !is_terminal(&failure) => Ok(RarOutcome::Failed(failure)),
+        let entry = RarEntryIdentity { index: Some(index as u64), order: index as u64, name: String::new() };
+        match self.member_controlled(run, session, index, &entry, &mut LegacyHooks) {
+            Ok(outcome) => Ok(outcome),
+            Err(SelectedStop::Native(failure)) => Err(failure),
+            Err(_) => unreachable!("legacy extraction has no control stops"),
+        }
+    }
+
+    pub(super) fn member_controlled(
+        &mut self,
+        run: &mut SelectedRun,
+        session: &mut RarSession,
+        index: usize,
+        entry: &RarEntryIdentity,
+        hooks: &mut impl ExtractionHooks,
+    ) -> Result<RarOutcome, SelectedStop> {
+        let result = self.member_inner(run, session, index, entry, hooks);
+        hooks.release_parent();
+        match result {
+            Err(SelectedStop::Native(failure)) if !is_terminal(&failure) => Ok(RarOutcome::Failed(failure)),
             result => result,
         }
     }
@@ -79,7 +97,9 @@ impl<'a> Extraction<'a> {
         run: &mut SelectedRun,
         session: &mut RarSession,
         index: usize,
-    ) -> Result<RarOutcome, Arc<RarFailure>> {
+        entry: &RarEntryIdentity,
+        hooks: &mut impl ExtractionHooks,
+    ) -> Result<RarOutcome, SelectedStop> {
         check_cancel(&session.options.cancel).map_err(own_fault)?;
         let member = &session.members[index];
         let header = &member.header;
@@ -87,27 +107,29 @@ impl<'a> Extraction<'a> {
             return Ok(RarOutcome::Skipped(RarSkipReason::OlderVersion(version)));
         }
         if member.issue.is_some() || header.redirection.is_some() {
-            return run.test(session, index, None);
+            return run.test(session, index, None).map_err(SelectedStop::Native);
         }
         if header.name.contains('\u{fffe}') || std::str::from_utf8(&member.wire.name).is_err() {
-            return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::NameEncoding)));
+            return Err(Arc::new(RarFailure::Unsupported(RarUnsupported::NameEncoding)).into());
         }
-        let relative = sanitize(&header.name, !header.is_unix())
-            .map_err(|_| policy(RarPolicyReason::UnsafePath, PathBuf::from(&header.name)))?;
+        let relative = hooks.project(header)?;
         let meta = Meta::from(header);
         if header.is_dir() {
             let outcome = run.test(session, index, None)?;
             if !self.options.flatten && matches!(outcome, RarOutcome::Directory) {
-                let path = self.options.dest.join(&relative);
+                let path = hooks.target(self.options, &relative, false)?;
                 self.protect_source_name(session, &path)?;
-                self.dirs.try_reserve(1).map_err(|_| own_fault(allocation()))?;
+                hooks.before_path(index);
+                hooks.reserve_directory(&mut self.dirs, &path, path.capacity())?;
                 self.ensure_root().map_err(own_fault)?;
                 make_dirs_detailed(&self.options.dest, &relative).map_err(own_fault)?;
                 let observed =
                     fs::symlink_metadata(&path).map_err(|source| output_fault(IoOperation::Metadata, &path, source))?;
                 if !observed.is_dir() {
-                    return Err(policy(RarPolicyReason::TargetChanged, path));
+                    return Err(policy(RarPolicyReason::TargetChanged, path).into());
                 }
+                hooks.created(&path);
+                hooks.directory_committed();
                 self.dirs.push(DirectoryOutput {
                     path,
                     identity: (observed.dev(), observed.ino()),
@@ -118,12 +140,11 @@ impl<'a> Extraction<'a> {
             return Ok(outcome);
         }
         let parent = relative.parent().expect("sanitized relative path");
-        let name = relative.file_name().expect("sanitized relative file");
-        let target =
-            if self.options.flatten { self.options.dest.join(name) } else { self.options.dest.join(&relative) };
+        let target = hooks.target(self.options, &relative, self.options.flatten)?;
         let parent = if self.options.flatten { Path::new("") } else { parent };
         let initial = self.inspect_target(session, &target)?;
-        if initial.is_some() && self.options.overwrite == Overwrite::Skip {
+        hooks.before_path(index);
+        if !hooks.replace(session, entry, &target, initial, self.options.overwrite)? {
             return Ok(RarOutcome::Skipped(RarSkipReason::ExistingTarget));
         }
         let mut output = None;
@@ -144,12 +165,14 @@ impl<'a> Extraction<'a> {
             Some(output) => output,
             None => self.open_stage(parent, &target).map_err(own_fault)?,
         };
+        hooks.created(target.parent().expect("target parent"));
         let mut file = output.handoff_detailed().map_err(|error| own_fault(error.detailed(false)))?;
         #[cfg(test)]
         event(Event::Flush, &target).map_err(|source| output_fault(IoOperation::Flush, &target, source))?;
         file.file.flush().map_err(|source| output_fault(IoOperation::Flush, &target, source))?;
         finish_file(&file.file, &meta);
         let stage_stamp = self.stage_stamp(&file.file, &target)?;
+        hooks.stage(index, stage_stamp);
         #[cfg(test)]
         event(Event::BeforePublish, &target).map_err(|source| output_fault(IoOperation::Publish, &target, source))?;
 
@@ -162,13 +185,21 @@ impl<'a> Extraction<'a> {
             };
         mark_volumes(&mut sources, &session.parts[session.members[index].parts.clone()]);
         check_volumes(session, &sources)?;
+        hooks.recheck(session, &target, initial)?;
         if self.inspect_target(session, &target)? != initial {
-            return Err(policy(RarPolicyReason::TargetChanged, target));
+            return Err(policy(RarPolicyReason::TargetChanged, target).into());
         }
         if self.stage_stamp(&file.file, &target)? != stage_stamp {
-            return Err(policy(RarPolicyReason::StageChanged, target));
+            return Err(policy(RarPolicyReason::StageChanged, target).into());
         }
-        file.publish_selected(initial.is_some()).map_err(|error| own_fault(error.detailed(false)))?;
+        if hooks.observe_publication() {
+            file.publish_selected_observed(initial.is_some(), |held, published| {
+                hooks.published(index, &target, held, published)
+            })
+        } else {
+            file.publish_selected(initial.is_some())
+        }
+        .map_err(|error| own_fault(error.detailed(false)))?;
         Ok(RarOutcome::Verified { bytes, checks, output: RarOutput::Written })
     }
 
@@ -274,8 +305,8 @@ impl<'a> Extraction<'a> {
     }
 }
 
-impl Drop for Extraction<'_> {
-    fn drop(&mut self) {
+impl Extraction<'_> {
+    pub(super) fn finalize(&mut self) {
         use std::os::unix::fs::OpenOptionsExt;
 
         use std::cmp::Reverse;
@@ -302,6 +333,98 @@ impl Drop for Extraction<'_> {
                 _ => {}
             }
         }
+        self.dirs = Vec::new();
+    }
+}
+
+impl Drop for Extraction<'_> {
+    fn drop(&mut self) {
+        self.finalize();
+    }
+}
+
+// The controlled native path and optional inventory share this exact target
+// projection, including flattening. Budgets admit its allocation beforehand.
+pub(super) fn selected_relative(relative: &Path, flatten: bool) -> &Path {
+    if flatten { Path::new(relative.file_name().expect("sanitized relative file")) } else { relative }
+}
+pub(super) fn target_capacity(options: &Options, relative: &Path, flatten: bool) -> Option<usize> {
+    options
+        .dest
+        .as_os_str()
+        .len()
+        .checked_add(selected_relative(relative, flatten).as_os_str().len())
+        .and_then(|n| n.checked_add(1))
+}
+pub(super) fn project_target(
+    options: &Options,
+    relative: &Path,
+    flatten: bool,
+    capacity: usize,
+) -> Result<PathBuf, std::collections::TryReserveError> {
+    let mut target = PathBuf::new();
+    target.try_reserve_exact(capacity)?;
+    target.push(&options.dest);
+    target.push(selected_relative(relative, flatten));
+    Ok(target)
+}
+
+pub(super) trait ExtractionHooks {
+    fn before_path(&mut self, _index: usize) {}
+    fn observe_publication(&self) -> bool {
+        false
+    }
+    fn project(&mut self, header: &FileHeader) -> Result<PathBuf, SelectedStop>;
+    fn target(&mut self, options: &Options, relative: &Path, flatten: bool) -> Result<PathBuf, SelectedStop>;
+    fn reserve_directory(
+        &mut self,
+        dirs: &mut Vec<DirectoryOutput>,
+        path: &Path,
+        path_capacity: usize,
+    ) -> Result<(), SelectedStop>;
+    fn replace(
+        &mut self,
+        session: &mut RarSession,
+        entry: &RarEntryIdentity,
+        target: &Path,
+        initial: Option<SourceStamp>,
+        legacy: Overwrite,
+    ) -> Result<bool, SelectedStop>;
+    fn recheck(
+        &mut self,
+        _session: &mut RarSession,
+        _target: &Path,
+        _initial: Option<SourceStamp>,
+    ) -> Result<(), SelectedStop> {
+        Ok(())
+    }
+    fn release_parent(&mut self) {}
+    fn created(&mut self, _path: &Path) {}
+    fn directory_committed(&mut self) {}
+    fn stage(&mut self, _index: usize, _stamp: SourceStamp) {}
+    fn published(&mut self, _index: usize, _target: &Path, _held: &File, _published: bool) {}
+}
+struct LegacyHooks;
+impl ExtractionHooks for LegacyHooks {
+    fn project(&mut self, header: &FileHeader) -> Result<PathBuf, SelectedStop> {
+        sanitize(&header.name, !header.is_unix())
+            .map_err(|_| policy(RarPolicyReason::UnsafePath, PathBuf::from(&header.name)).into())
+    }
+    fn target(&mut self, options: &Options, relative: &Path, flatten: bool) -> Result<PathBuf, SelectedStop> {
+        Ok(options.dest.join(if flatten { Path::new(relative.file_name().expect("sanitized file")) } else { relative }))
+    }
+    fn reserve_directory(&mut self, dirs: &mut Vec<DirectoryOutput>, _: &Path, _: usize) -> Result<(), SelectedStop> {
+        dirs.try_reserve(1).map_err(|_| SelectedStop::Native(own_fault(allocation())))
+    }
+    fn replace(
+        &mut self,
+        _: &mut RarSession,
+        _: &RarEntryIdentity,
+        _: &Path,
+        initial: Option<SourceStamp>,
+        legacy: Overwrite,
+    ) -> Result<bool, SelectedStop> {
+        Ok(initial.is_none() || legacy != Overwrite::Skip)
     }
 }
 
