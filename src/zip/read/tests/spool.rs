@@ -330,6 +330,11 @@ fn synthetic_owner_type_mode_and_link_policy() {
     s.st_nlink = 1;
     assert!(spool::trusted_file(&s, 1, uid));
     assert!(!spool::trusted_file(&s, 0, uid));
+    for links in [2, libc::nlink_t::MAX] {
+        s.st_nlink = links;
+        assert!(!spool::trusted_file(&s, 0, uid));
+        assert!(!spool::trusted_file(&s, 1, uid));
+    }
     s.st_nlink = 0;
     assert!(spool::trusted_file(&s, 0, uid));
     s.st_mode |= 0o040;

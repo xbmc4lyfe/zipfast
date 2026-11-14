@@ -130,11 +130,8 @@ pub(super) fn trusted_dir(s: &libc::stat, uid: libc::uid_t) -> bool {
         && (s.st_mode & 0o022 == 0 || s.st_mode & libc::S_ISVTX != 0)
 }
 #[cfg(unix)]
-pub(super) fn trusted_file(s: &libc::stat, links: u64, uid: libc::uid_t) -> bool {
-    s.st_mode & libc::S_IFMT == libc::S_IFREG
-        && s.st_uid == uid
-        && s.st_mode & 0o777 == 0o600
-        && s.st_nlink as u64 == links
+pub(super) fn trusted_file(s: &libc::stat, links: libc::nlink_t, uid: libc::uid_t) -> bool {
+    s.st_mode & libc::S_IFMT == libc::S_IFREG && s.st_uid == uid && s.st_mode & 0o777 == 0o600 && s.st_nlink == links
 }
 
 pub(super) struct FixedCiphertext<'a> {
