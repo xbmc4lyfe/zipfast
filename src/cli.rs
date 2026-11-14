@@ -103,8 +103,12 @@ pub(crate) fn main() -> ExitCode {
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn legacy_list(archive: &Path, password: Option<&str>) -> ExitCode {
-    match extract::list_with_password(archive, password) {
+    legacy_list_result(archive, extract::list_with_password(archive, password))
+}
+fn legacy_list_result(archive: &Path, result: crate::Result<Vec<extract::Entry>>) -> ExitCode {
+    match result {
         Ok(entries) => {
             println!("{:>14} {:>14} {:>8} {:>6}  name", "size", "packed", "crc32", "method");
             for e in &entries {
@@ -122,9 +126,18 @@ fn legacy_list(archive: &Path, password: Option<&str>) -> ExitCode {
     }
 }
 
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 fn legacy_run(archive: &Path, opts: &Options, password: Option<&str>, quiet: bool) -> ExitCode {
     let started = Instant::now();
     let result = extract::run_with_password(archive, opts, password, |line| eprintln!("{line}"));
+    legacy_run_result(archive, quiet, started, result)
+}
+fn legacy_run_result(
+    archive: &Path,
+    quiet: bool,
+    started: Instant,
+    result: crate::Result<extract::Summary>,
+) -> ExitCode {
     match result {
         Ok(s) => {
             if !quiet {
@@ -206,7 +219,7 @@ fn overrides() -> Result<crate::zip::EncryptedReadOverrides, &'static str> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(clippy::result_large_err)] // Borrowed checked failures remain fixed-size, never boxed.
 fn run(archive: &Path, opts: &Options, password: Option<&str>, quiet: bool) -> ExitCode {
-    use crate::zip::read::{CheckedOpen, with_opened_policy};
+    use crate::zip::read::with_opened_policy;
     let started = Instant::now();
     let cancel = extract::Cancellation::default();
     let overrides = match overrides() {
@@ -216,20 +229,21 @@ fn run(archive: &Path, opts: &Options, password: Option<&str>, quiet: bool) -> E
             return ExitCode::from(2);
         }
     };
-    let (opened, head) = match CheckedOpen::open(archive, &cancel).and_then(|o| o.probe(1024, &cancel)) {
-        Ok(v) => v,
+    let opened = match extract::checked_route(archive, &cancel) {
+        Ok(extract::CheckedRoute::Zip(opened)) => opened,
+        Ok(extract::CheckedRoute::Legacy(route)) => {
+            return legacy_run_result(
+                archive,
+                quiet,
+                started,
+                route.run(archive, opts, password, |line| eprintln!("{line}")),
+            );
+        }
         Err(error) => {
             early(format_args!("{}: {error}\n", archive.display()));
             return ExitCode::from(2);
         }
     };
-    if !crate::zip::sniff(&head) {
-        if let Err(error) = opened.retire() {
-            early(format_args!("{}: {error}\n", archive.display()));
-            return ExitCode::from(2);
-        }
-        return legacy_run(archive, opts, password, quiet);
-    }
     let session = match opened.into_zip_projected(&cancel) {
         Ok(v) => v,
         Err(error) => {
@@ -259,26 +273,21 @@ fn run(archive: &Path, opts: &Options, password: Option<&str>, quiet: bool) -> E
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(clippy::result_large_err)] // Borrowed checked failures remain fixed-size, never boxed.
 fn list(archive: &Path, password: Option<&str>) -> ExitCode {
-    use crate::zip::read::CheckedOpen;
     let cancel = extract::Cancellation::default();
     if let Err(error) = overrides() {
         early(format_args!("{error}\n"));
         return ExitCode::from(2);
     }
-    let (opened, head) = match CheckedOpen::open(archive, &cancel).and_then(|o| o.probe(1024, &cancel)) {
-        Ok(v) => v,
+    let opened = match extract::checked_route(archive, &cancel) {
+        Ok(extract::CheckedRoute::Zip(opened)) => opened,
+        Ok(extract::CheckedRoute::Legacy(route)) => {
+            return legacy_list_result(archive, route.list(archive, password));
+        }
         Err(error) => {
             early(format_args!("{}: {error}\n", archive.display()));
             return ExitCode::from(2);
         }
     };
-    if !crate::zip::sniff(&head) {
-        if let Err(error) = opened.retire() {
-            early(format_args!("{}: {error}\n", archive.display()));
-            return ExitCode::from(2);
-        }
-        return legacy_list(archive, password);
-    }
     let session = match opened.into_zip_projected(&cancel) {
         Ok(v) => v,
         Err(error) => {

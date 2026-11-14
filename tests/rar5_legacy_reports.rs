@@ -16,6 +16,9 @@
 
 //! Legacy RAR5 callback, summary, and destination behavior using generated archives.
 mod common;
+#[allow(dead_code)]
+#[path = "common/zip_parity_fixture.rs"]
+mod zip_fixture;
 
 use std::fs;
 use std::io::ErrorKind;
@@ -312,6 +315,59 @@ fn terminal_header_password_rejection_has_no_member_reports() {
         bytes.extend(encrypt_cbc(&key, &IV, &header).unwrap());
     }
     fs::write(&arc, &bytes).unwrap();
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use zipfast::zip::{ReadFault, ZipRunEvent};
+        let combined =
+            zip_fixture::build(&[zip_fixture::Member::stored(b"zip-tail", b"one")], &[0], &bytes, b"", false).bytes;
+        let path = scratch.path().join("rar-with-zip-tail.bin");
+        fs::write(&path, &combined).unwrap();
+        let opts = Options { mode: Mode::Test, ..options(&scratch.path().join("unused"), 1) };
+        for password in [None, Some("wrong-password")] {
+            let error = extract::run_with_zip_policy(
+                &path,
+                &opts,
+                password,
+                &extract::Cancellation::default(),
+                &Default::default(),
+                |_: ZipRunEvent<'_>| Ok(()),
+            )
+            .unwrap_err();
+            assert!(matches!(error.operation(), Some(ReadFault::Legacy(Error::Encrypted))));
+            let mut context = zipfast::zip::EncryptedReadContext::new(Default::default()).unwrap();
+            let error = extract::run_with_zip_context(
+                &path,
+                &opts,
+                password,
+                &extract::Cancellation::default(),
+                &mut context,
+                |_: ZipRunEvent<'_>| Ok(()),
+            )
+            .unwrap_err();
+            assert!(matches!(error.operation(), Some(ReadFault::Legacy(Error::Encrypted))));
+            for command in ["t", "l", "v"] {
+                let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_zipfast"));
+                child.arg(command).arg(&path);
+                if password.is_some() {
+                    child.arg("-pwrong-password");
+                }
+                let result = child.output().unwrap();
+                assert_eq!(result.status.code(), Some(2), "{command}: {result:?}");
+                assert!(!String::from_utf8_lossy(&result.stdout).contains("zip-tail"));
+            }
+        }
+        let report = extract::run_with_zip_policy(
+            &path,
+            &opts,
+            Some(PASSWORD),
+            &extract::Cancellation::default(),
+            &Default::default(),
+            |_: ZipRunEvent<'_>| Ok(()),
+        )
+        .unwrap();
+        assert_eq!((report.files(), report.failed()), (1, 0));
+        assert_eq!(fs::read(&path).unwrap(), combined);
+    }
 
     for threads in [1, 4] {
         let out = scratch.path().join(format!("out-{threads}"));

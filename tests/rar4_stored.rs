@@ -328,6 +328,40 @@ fn signature_dispatch_and_cancellation_preserve_format_precedence() {
     let session = RarSession::open(&path, None, RarSessionOptions::default()).unwrap();
     assert_eq!(session.archive().format(), RarFormat::Rar4);
     assert_eq!(session.volumes().next().unwrap().format(), RarFormat::Rar4);
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use zipfast::zip::ZipRunEvent;
+        let opts = options(&dir.path().join("unused"), Mode::Test);
+        let report = extract::run_with_zip_policy(
+            &path,
+            &opts,
+            None,
+            &Cancellation::default(),
+            &Default::default(),
+            |_: ZipRunEvent<'_>| Ok(()),
+        )
+        .unwrap();
+        assert_eq!((report.files(), report.failed()), (1, 0));
+        let mut context = zipfast::zip::EncryptedReadContext::new(Default::default()).unwrap();
+        let report = extract::run_with_zip_context(
+            &path,
+            &opts,
+            None,
+            &Cancellation::default(),
+            &mut context,
+            |_: ZipRunEvent<'_>| Ok(()),
+        )
+        .unwrap();
+        assert_eq!((report.files(), report.failed()), (1, 0));
+        for command in ["t", "l", "v"] {
+            let result =
+                std::process::Command::new(env!("CARGO_BIN_EXE_zipfast")).arg(command).arg(&path).output().unwrap();
+            assert!(result.status.success(), "{command}: {result:?}");
+            if command != "t" {
+                assert!(String::from_utf8_lossy(&result.stdout).contains("file"));
+            }
+        }
+    }
     let cancel = Cancellation::default();
     cancel.cancel();
     let options = RarSessionOptions { cancel, ..RarSessionOptions::default() };

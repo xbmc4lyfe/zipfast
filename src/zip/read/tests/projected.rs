@@ -1626,3 +1626,177 @@ fn r1_prebinding_factory_fault_keeps_final_source_admission_and_latest_snapshot(
     assert_eq!(context.usage().members, 0);
     assert_eq!(context.run_usage(), RunUsage::default());
 }
+
+#[test]
+fn r2_shared_route_retains_probe_charges_and_one_original_catalogue() {
+    use crate::extract::{CheckedRoute, checked_route};
+    let cancel = Cancellation::default();
+    for prefix in [b"".as_slice(), b"launcher".as_slice()] {
+        let fixture = build(&[Member::stored(b"entry", b"one")], &[0], prefix, b"", false);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&fixture.bytes).unwrap();
+        OBSERVATIONS.with(|s| s.set(Default::default()));
+        let CheckedRoute::Zip(opened) = checked_route(file.path(), &cancel).unwrap() else { panic!("ZIP route") };
+        let session = opened.into_zip_projected(&cancel).unwrap();
+        let dispatch = fixture.bytes.len() as u64 * if prefix.is_empty() { 1 } else { 2 };
+        assert_eq!(session.dispatch_bytes(), dispatch);
+        assert_eq!(session.bootstrap_usage().bytes(), dispatch + session.parser_usage().fetched_bytes);
+        assert!(session.bootstrap_usage().bytes() <= 129 << 20);
+        assert_eq!(session.bootstrap_usage().acquired_fds(), 1);
+        let seen = OBSERVATIONS.with(|s| s.get());
+        assert_eq!((seen.opens, seen.parses, seen.records, seen.names), (1, 1, 1, 1));
+        assert_eq!(session.bootstrap_usage().acquisition_attempts(), if prefix.is_empty() { 3 } else { 4 });
+        eprintln!(
+            "R2 discovery prefix={} file={} dispatch={} parser={} bootstrap={:?}",
+            prefix.len(),
+            fixture.bytes.len(),
+            dispatch,
+            session.parser_usage().fetched_bytes,
+            session.bootstrap_usage()
+        );
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn r2_affected_public_run_preserves_bootstrap_faults_and_once_retirement() {
+    use crate::extract::{self, Mode, Options, Overwrite};
+    use crate::zip::ZipRunEvent;
+    let fixture = build(&[Member::stored(b"entry", b"one")], &[0], b"launcher", b"", false);
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(&fixture.bytes).unwrap();
+    let options = Options {
+        mode: Mode::Test,
+        dest: Path::new("").to_path_buf(),
+        overwrite: Overwrite::Skip,
+        flatten: false,
+        threads: Some(1),
+        protected_paths: Default::default(),
+        parallel_min: None,
+    };
+    for case in 0..6 {
+        let cancel = Cancellation::default();
+        match case {
+            0 => crate::test_alloc::DENY_LAYOUT.with(|s| s.set(Some((1024, 1)))),
+            1 => crate::test_alloc::DENY_LAYOUT
+                .with(|s| s.set(Some((crate::rar5::reader::SIGNATURE_PROBE_BYTES as usize, 1)))),
+            2 => inject_bootstrap(None, ReadIoOperation::Read, 1, libc::EIO, false),
+            3 => {
+                inject_bootstrap(None, ReadIoOperation::Read, 1, libc::EIO, false);
+                CLOSE_FAULT.with(|s| s.set(Some(libc::EINTR)));
+            }
+            4 => cancel.cancel(),
+            5 => {
+                let signal = cancel.clone();
+                OPEN_HOOK.with(|s| {
+                    *s.borrow_mut() = Some(Box::new(move |event| {
+                        if event == 0 {
+                            signal.cancel();
+                        }
+                    }))
+                });
+            }
+            _ => unreachable!(),
+        }
+        let error = extract::run_with_zip_policy(
+            file.path(),
+            &options,
+            None,
+            &cancel,
+            &Default::default(),
+            |_: ZipRunEvent<'_>| panic!("before observer"),
+        )
+        .unwrap_err();
+        OPEN_HOOK.with(|s| *s.borrow_mut() = None);
+        crate::test_alloc::DENY_LAYOUT.with(|s| assert!(s.get().is_none()));
+        let boot = error.bootstrap_usage().unwrap();
+        match case {
+            0 | 1 => {
+                assert!(matches!(error.operation(), Some(ReadFault::Allocation { .. })));
+                assert_eq!(boot.source_retirement(), Some(CloseDisposition::Closed));
+                assert_eq!(boot.dispatch_bytes(), if case == 1 { fixture.bytes.len() as u64 } else { 0 });
+            }
+            2 | 3 => {
+                assert!(matches!(error.operation(), Some(ReadFault::Io { operation: ReadIoOperation::Read, .. })));
+                assert_eq!(
+                    boot.source_retirement(),
+                    Some(if case == 3 { CloseDisposition::Unresolved } else { CloseDisposition::Closed })
+                );
+                assert_eq!(error.cleanup_errors().len(), usize::from(case == 3));
+            }
+            4 | 5 => {
+                assert!(matches!(error.operation(), Some(ReadFault::Cancelled)));
+                assert_eq!(boot.acquired_fds(), u64::from(case == 5));
+                assert_eq!(boot.source_retirement(), if case == 5 { Some(CloseDisposition::Closed) } else { None });
+            }
+            _ => unreachable!(),
+        }
+    }
+    // A path swap during the only central parse must be detected; neither the
+    // old generic fallback nor a new pathname open may rescue the run.
+    let path = file.path().to_path_buf();
+    OPEN_HOOK.with(|s| {
+        *s.borrow_mut() = Some(Box::new(move |event| {
+            if event == 1 {
+                std::fs::remove_file(&path).unwrap();
+            }
+        }))
+    });
+    let error = extract::run_with_zip_policy(
+        file.path(),
+        &options,
+        None,
+        &Cancellation::default(),
+        &Default::default(),
+        |_: ZipRunEvent<'_>| panic!("before observer"),
+    )
+    .unwrap_err();
+    OPEN_HOOK.with(|s| *s.borrow_mut() = None);
+    assert!(error.is_source_changed());
+    assert_eq!(error.bootstrap_usage().unwrap().source_retirement(), Some(CloseDisposition::Closed));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn r2_both_public_runs_open_parse_catalogue_and_close_once() {
+    use crate::extract::{self, Mode, Options, Overwrite};
+    use crate::zip::ZipRunEvent;
+    let fixture = build(&[Member::stored(b"entry", b"one")], &[0], b"launcher", b"", false);
+    let mut file = tempfile::NamedTempFile::new().unwrap();
+    file.write_all(&fixture.bytes).unwrap();
+    let options = Options {
+        mode: Mode::Test,
+        dest: Path::new("").to_path_buf(),
+        overwrite: Overwrite::Skip,
+        flatten: false,
+        threads: Some(1),
+        protected_paths: Default::default(),
+        parallel_min: None,
+    };
+    for supplied_context in [false, true] {
+        OBSERVATIONS.with(|s| s.set(Default::default()));
+        super::super::run::OWNED_CLOSE_CALLS.with(|s| s.set(0));
+        let cancel = Cancellation::default();
+        let report = if supplied_context {
+            let mut context = EncryptedReadContext::new(Default::default()).unwrap();
+            extract::run_with_zip_context(file.path(), &options, None, &cancel, &mut context, |_: ZipRunEvent<'_>| {
+                Ok(())
+            })
+            .unwrap()
+        } else {
+            extract::run_with_zip_policy(
+                file.path(),
+                &options,
+                None,
+                &cancel,
+                &Default::default(),
+                |_: ZipRunEvent<'_>| Ok(()),
+            )
+            .unwrap()
+        };
+        assert_eq!((report.files(), report.failed(), report.run_usage().records), (1, 0, 1));
+        let seen = OBSERVATIONS.with(|s| s.get());
+        assert_eq!((seen.opens, seen.parses, seen.records, seen.names, seen.headers), (1, 1, 1, 1, 1));
+        super::super::run::OWNED_CLOSE_CALLS.with(|s| assert_eq!(s.get(), 1));
+    }
+}

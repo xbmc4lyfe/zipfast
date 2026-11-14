@@ -378,6 +378,15 @@ impl Volume {
         let HeldSignature { file, len, next, format } = signature;
         Self::initialize_held(path, file, len, password, next, format, false, None).map_err(RarFault::into_legacy)
     }
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn from_held_signature_detailed(
+        path: &Path,
+        signature: HeldSignature,
+        password: Option<&str>,
+    ) -> RarResult<Self> {
+        let HeldSignature { file, len, next, format } = signature;
+        Self::initialize_held(path, file, len, password, next, format, true, None)
+    }
     pub fn open(path: &Path) -> Result<Volume> {
         Self::open_with_password(path, None)
     }

@@ -77,6 +77,48 @@ fn checked_generic_recognized_rar_is_terminal_while_legacy_falls_through() {
         .err()
         .unwrap();
     assert!(matches!(error.operation(), Some(ReadFault::Legacy(zipfast::Error::NotAnArchive))));
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        use zipfast::extract::{self, Mode, Options, Overwrite};
+        use zipfast::zip::ZipRunEvent;
+        let options = Options {
+            mode: Mode::Test,
+            dest: dir.path().join("out"),
+            overwrite: Overwrite::Skip,
+            flatten: false,
+            threads: Some(1),
+            protected_paths: Default::default(),
+            parallel_min: None,
+        };
+        let error = extract::run_with_zip_policy(
+            &first,
+            &options,
+            None,
+            &Cancellation::default(),
+            &Default::default(),
+            |_: ZipRunEvent<'_>| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(error.operation(), Some(ReadFault::Legacy(zipfast::Error::NotAnArchive))));
+        let mut context = EncryptedReadContext::new(Default::default()).unwrap();
+        let error = extract::run_with_zip_context(
+            &first,
+            &options,
+            None,
+            &Cancellation::default(),
+            &mut context,
+            |_: ZipRunEvent<'_>| Ok(()),
+        )
+        .unwrap_err();
+        assert!(matches!(error.operation(), Some(ReadFault::Legacy(zipfast::Error::NotAnArchive))));
+        for command in ["t", "l", "v"] {
+            let result =
+                std::process::Command::new(env!("CARGO_BIN_EXE_zipfast")).arg(command).arg(&first).output().unwrap();
+            assert_eq!(result.status.code(), Some(2), "{command}: {result:?}");
+            assert!(!String::from_utf8_lossy(&result.stdout).contains("zip"));
+        }
+        assert_eq!(std::fs::read(&first).unwrap(), zip);
+    }
 }
 #[test]
 fn checked_rar_selected_header_parity_and_old_nonzip_consuming_read() {
@@ -339,4 +381,73 @@ fn r1_public_unbound_missing_source_keeps_action_plan_origin() {
     assert_eq!(context.run_usage().io_attempts, 0);
     assert!(error.parser_usage().is_none());
     assert!(error.cleanup_errors().all(|e| e.operation != ReadIoOperation::Close));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn r2_rar_precedence_survives_sfx_corrupt_initializer_and_zip_tail() {
+    use zipfast::extract::{self, Mode, Options, Overwrite};
+    use zipfast::zip::{ReadFault, ZipRunEvent};
+    let dir = tempfile::tempdir().unwrap();
+    let rar = common::archive(&[common::FileSpec::new("rar-entry", b"payload")]);
+    for prefix in [b"".as_slice(), b"launcher".as_slice()] {
+        for corrupt in [false, true] {
+            let mut first = prefix.to_vec();
+            first.extend_from_slice(&rar);
+            if corrupt {
+                first[prefix.len() + common::SIG.len()] ^= 1;
+            }
+            let combined =
+                fixture::build(&[fixture::Member::stored(b"zip-tail", b"one")], &[0], &first, b"", false).bytes;
+            let path = dir.path().join(format!("case-{}-{corrupt}.bin", prefix.len()));
+            std::fs::write(&path, &combined).unwrap();
+            let options = Options {
+                mode: Mode::Test,
+                dest: dir.path().join("unused"),
+                overwrite: Overwrite::Skip,
+                flatten: false,
+                threads: Some(1),
+                protected_paths: Default::default(),
+                parallel_min: None,
+            };
+            let result = extract::run_with_zip_policy(
+                &path,
+                &options,
+                None,
+                &Cancellation::default(),
+                &Default::default(),
+                |_: ZipRunEvent<'_>| Ok(()),
+            );
+            let mut context = EncryptedReadContext::new(Default::default()).unwrap();
+            let contextual = extract::run_with_zip_context(
+                &path,
+                &options,
+                None,
+                &Cancellation::default(),
+                &mut context,
+                |_: ZipRunEvent<'_>| Ok(()),
+            );
+            for result in [result, contextual] {
+                if corrupt {
+                    assert!(matches!(
+                        result.unwrap_err().operation(),
+                        Some(ReadFault::Legacy(zipfast::Error::Corrupt(_)))
+                    ));
+                } else {
+                    let report = result.unwrap();
+                    assert_eq!((report.files(), report.decoded_bytes(), report.failed()), (1, 7, 0));
+                }
+            }
+            for command in ["t", "l", "v"] {
+                let result =
+                    std::process::Command::new(env!("CARGO_BIN_EXE_zipfast")).arg(command).arg(&path).output().unwrap();
+                assert_eq!(result.status.code(), Some(if corrupt { 2 } else { 0 }), "{command}: {result:?}");
+                assert!(!String::from_utf8_lossy(&result.stdout).contains("zip-tail"));
+                if !corrupt && command != "t" {
+                    assert!(String::from_utf8_lossy(&result.stdout).contains("rar-entry"));
+                }
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), combined);
+        }
+    }
 }

@@ -800,3 +800,54 @@ fn selected_tar_preserves_fractional_times_before_the_epoch() {
     assert!(summary.errors.is_empty(), "{:?}", summary.errors);
     assert_eq!(fs::metadata(output.join("f")).unwrap().modified().unwrap(), expected);
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn r2_checked_dispatch_keeps_direct_tar_and_compressed_tar_parity() {
+    use zipfast::extract::Cancellation;
+    use zipfast::zip::{EncryptedReadContext, ZipRunEvent};
+    let tar = Tar::default().file("tar-entry", b"payload").end();
+    for bytes in [tar.clone(), gzip(&tar)] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("archive.bin");
+        fs::write(&path, &bytes).unwrap();
+        let options = opts(Mode::Test, &dir.path().join("unused"));
+        let baseline = extract::run(&path, &options, |_| {}).unwrap();
+        let report = extract::run_with_zip_policy(
+            &path,
+            &options,
+            None,
+            &Cancellation::default(),
+            &Default::default(),
+            |_: ZipRunEvent<'_>| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            (report.files(), report.decoded_bytes(), report.failed()),
+            (baseline.files, u128::from(baseline.bytes), 0)
+        );
+        let mut context = EncryptedReadContext::new(Default::default()).unwrap();
+        let report = extract::run_with_zip_context(
+            &path,
+            &options,
+            None,
+            &Cancellation::default(),
+            &mut context,
+            |_: ZipRunEvent<'_>| Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            (report.files(), report.decoded_bytes(), report.failed()),
+            (baseline.files, u128::from(baseline.bytes), 0)
+        );
+        for command in ["t", "l", "v"] {
+            let result =
+                std::process::Command::new(env!("CARGO_BIN_EXE_zipfast")).arg(command).arg(&path).output().unwrap();
+            assert!(result.status.success(), "{command}: {result:?}");
+            if command != "t" {
+                assert!(String::from_utf8_lossy(&result.stdout).contains("tar-entry"));
+            }
+        }
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+    }
+}

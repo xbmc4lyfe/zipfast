@@ -457,6 +457,69 @@ fn classify_head(head: &[u8]) -> Format {
     }
 }
 
+// Keep the original file and bootstrap ledger through format discovery. These
+// fallible pre-action probes (1024 + at most 1 MiB + 8 bytes) are dropped before
+// central parsing; they are not part of the encrypted payload scratch bound.
+#[allow(clippy::large_enum_variant)] // Keep the checked owner inline, without a new fallible allocation.
+pub(crate) enum CheckedRoute {
+    Zip(crate::zip::read::CheckedOpen),
+    Legacy(LegacyRoute),
+}
+pub(crate) enum LegacyRoute {
+    Tar,
+    Rar { signature: crate::rar5::reader::HeldSignature, path: PathBuf },
+}
+#[allow(clippy::result_large_err)]
+pub(crate) fn checked_route(path: &Path, cancel: &Cancellation) -> crate::zip::ZipReadResult<CheckedRoute> {
+    let (opened, head) = crate::zip::read::CheckedOpen::open(path, cancel)?.probe(HEAD_PROBE_BYTES, cancel)?;
+    match classify_head(&head) {
+        Format::Zip => Ok(CheckedRoute::Zip(opened)),
+        Format::Tar => {
+            // TAR deliberately retains its incumbent path-based ownership scope.
+            opened.retire()?;
+            Ok(CheckedRoute::Legacy(LegacyRoute::Tar))
+        }
+        Format::Other => {
+            let (opened, probe) = opened.probe(SIGNATURE_PROBE_BYTES as usize, cancel)?;
+            match opened.recognize_rar(&probe) {
+                Ok((signature, path)) => Ok(CheckedRoute::Legacy(LegacyRoute::Rar { signature, path })),
+                Err(opened) => Ok(CheckedRoute::Zip(opened)),
+            }
+        }
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+impl LegacyRoute {
+    pub(crate) fn run(
+        self,
+        first: &Path,
+        options: &Options,
+        password: Option<&str>,
+        mut report: impl FnMut(&str),
+    ) -> Result<Summary> {
+        match self {
+            Self::Tar => crate::tar::run(first, options, &mut report),
+            Self::Rar { signature, .. } => {
+                let mut reports = Reports::Legacy { summary: Summary::default(), callback: &mut report };
+                rar_run_shared_open(first, options, password, &mut reports, || {
+                    Volume::from_held_signature_detailed(first, signature, password)
+                })
+                .map_err(RunFault::into_legacy)?;
+                let Reports::Legacy { summary, .. } = reports else { unreachable!() };
+                Ok(summary)
+            }
+        }
+    }
+    pub(crate) fn list(self, first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
+        match self {
+            Self::Tar => crate::tar::list(first),
+            Self::Rar { signature, .. } => {
+                rar_list_from_volume(Volume::from_held_signature(first, signature, password)?, password)
+            }
+        }
+    }
+}
+
 #[allow(clippy::large_enum_variant)] // Own the immutable ZIP catalogue and raw initial proof inline, without another allocation.
 enum SelectedSource {
     Zip(crate::zip::read::ProjectedOwner),
@@ -601,54 +664,46 @@ impl SelectedEntry {
         cancel: Cancellation,
     ) -> crate::zip::ZipReadResult<Self> {
         use crate::zip::{ReadFault, ReadResource};
-        let (mut opened, head) =
-            crate::zip::read::CheckedOpen::open(path, &cancel)?.probe(HEAD_PROBE_BYTES, &cancel)?;
-        let format = classify_head(&head);
-        if matches!(format, Format::Tar) {
-            opened.retire()?;
-            let selected =
-                crate::tar::Selected::open(path, index, max_bytes, cancel.clone()).map_err(ReadFault::Legacy)?;
-            return Ok(Self {
-                meta: selected.meta,
-                windows_names: false,
-                index,
-                limit: max_bytes,
-                source: SelectedSource::Tar(Box::new(selected)),
-                cancel,
-            });
-        }
-        if matches!(format, Format::Other) {
-            let (held, probe) = opened.probe(SIGNATURE_PROBE_BYTES as usize, &cancel)?;
-            match held.recognize_rar(&probe) {
-                Ok((signature, held_path)) => {
-                    let volume =
-                        Volume::from_held_signature(&held_path, signature, password).map_err(ReadFault::Legacy)?;
-                    let (header, chain_start) =
-                        rar_selected_header_from_volume(volume, index, password, &cancel).map_err(ReadFault::Legacy)?;
-                    if header.is_dir() || header.redirection.is_some() {
-                        return Err(ReadFault::Legacy(Error::Unsupported(
-                            "the selected RAR5 entry is not a regular file".into(),
-                        ))
-                        .into());
-                    }
-                    if header.packed_size > max_bytes || (!header.size_unknown() && header.unpacked_size > max_bytes) {
-                        return Err(ReadFault::Legacy(Error::Unsupported(
-                            "the selected RAR5 entry exceeds the byte limit".into(),
-                        ))
-                        .into());
-                    }
-                    return Ok(Self {
-                        meta: Meta::from(&header),
-                        windows_names: !header.is_unix(),
-                        index,
-                        limit: max_bytes,
-                        source: SelectedSource::Rar { path: held_path, chain_start, name: header.name },
-                        cancel,
-                    });
-                }
-                Err(held) => opened = held,
+        let opened = match checked_route(path, &cancel)? {
+            CheckedRoute::Zip(opened) => opened,
+            CheckedRoute::Legacy(LegacyRoute::Tar) => {
+                let selected =
+                    crate::tar::Selected::open(path, index, max_bytes, cancel.clone()).map_err(ReadFault::Legacy)?;
+                return Ok(Self {
+                    meta: selected.meta,
+                    windows_names: false,
+                    index,
+                    limit: max_bytes,
+                    source: SelectedSource::Tar(Box::new(selected)),
+                    cancel,
+                });
             }
-        }
+            CheckedRoute::Legacy(LegacyRoute::Rar { signature, path: held_path }) => {
+                let volume = Volume::from_held_signature(&held_path, signature, password).map_err(ReadFault::Legacy)?;
+                let (header, chain_start) =
+                    rar_selected_header_from_volume(volume, index, password, &cancel).map_err(ReadFault::Legacy)?;
+                if header.is_dir() || header.redirection.is_some() {
+                    return Err(ReadFault::Legacy(Error::Unsupported(
+                        "the selected RAR5 entry is not a regular file".into(),
+                    ))
+                    .into());
+                }
+                if header.packed_size > max_bytes || (!header.size_unknown() && header.unpacked_size > max_bytes) {
+                    return Err(ReadFault::Legacy(Error::Unsupported(
+                        "the selected RAR5 entry exceeds the byte limit".into(),
+                    ))
+                    .into());
+                }
+                return Ok(Self {
+                    meta: Meta::from(&header),
+                    windows_names: !header.is_unix(),
+                    index,
+                    limit: max_bytes,
+                    source: SelectedSource::Rar { path: held_path, chain_start, name: header.name },
+                    cancel,
+                });
+            }
+        };
         let owner = opened.into_zip(&cancel)?;
         let selection = (|| -> crate::zip::ZipReadResult<_> {
             let entry =
@@ -909,19 +964,17 @@ pub fn run_with_zip_policy(
     overrides: &crate::zip::EncryptedReadOverrides,
     observe: impl crate::zip::ZipRunObserver,
 ) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
-    let (opened, head) = crate::zip::read::CheckedOpen::open(first, cancel)?.probe(HEAD_PROBE_BYTES, cancel)?;
-    if matches!(classify_head(&head), Format::Zip) {
-        return crate::zip::read::with_opened_policy(
+    match checked_route(first, cancel)? {
+        CheckedRoute::Zip(opened) => crate::zip::read::with_opened_policy(
             opened.into_zip_projected(cancel)?,
             options,
             password,
             cancel,
             overrides,
             observe,
-        );
+        ),
+        CheckedRoute::Legacy(route) => legacy_zip_report(route, first, options, password, observe),
     }
-    opened.retire()?;
-    legacy_zip_report(first, options, password, observe)
 }
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(clippy::result_large_err)]
@@ -933,23 +986,22 @@ pub fn run_with_zip_context(
     context: &mut crate::zip::EncryptedReadContext,
     observe: impl crate::zip::ZipRunObserver,
 ) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
-    let (opened, head) = crate::zip::read::CheckedOpen::open(first, cancel)?.probe(HEAD_PROBE_BYTES, cancel)?;
-    if matches!(classify_head(&head), Format::Zip) {
-        return crate::zip::read::with_opened_context(
+    match checked_route(first, cancel)? {
+        CheckedRoute::Zip(opened) => crate::zip::read::with_opened_context(
             opened.into_zip_projected(cancel)?,
             options,
             password,
             cancel,
             context,
             observe,
-        );
+        ),
+        CheckedRoute::Legacy(route) => legacy_zip_report(route, first, options, password, observe),
     }
-    opened.retire()?;
-    legacy_zip_report(first, options, password, observe)
 }
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[allow(clippy::result_large_err)]
 fn legacy_zip_report(
+    route: LegacyRoute,
     first: &Path,
     options: &Options,
     password: Option<&str>,
@@ -957,7 +1009,7 @@ fn legacy_zip_report(
 ) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
     use crate::zip::{ReadFault, ZipReadError, ZipRunEvent, ZipRunReport};
     let mut fault: Option<ZipReadError> = None;
-    let result = run_with_password(first, options, password, |message| {
+    let result = route.run(first, options, password, |message| {
         if fault.is_none() {
             let mut scope = crate::zip::ZipDiagnosticScope::legacy();
             let result = observe.observe(ZipRunEvent::LegacyDiagnostic { message }, &mut scope);
@@ -1024,9 +1076,13 @@ fn zip_run(path: &Path, opts: &Options, password: Option<&str>, report: &mut imp
 }
 
 fn rar_list(first: &Path, password: Option<&str>) -> Result<Vec<Entry>> {
+    rar_list_from_volume(Volume::open_with_password(first, password)?, password)
+}
+
+fn rar_list_from_volume(volume: Volume, password: Option<&str>) -> Result<Vec<Entry>> {
     let mut out: Vec<Entry> = Vec::new();
     let mut budget = ListingBudget::default();
-    walk(Volume::open_with_password(first, password)?, password, |_, block| {
+    walk(volume, password, |_, block| {
         let Block::File(h) = block else { return Ok(()) };
         if h.split_before() {
             if let Some(last) = out.last_mut().filter(|e| e.name == h.name) {
@@ -1786,11 +1842,21 @@ fn rar_run_shared<'a>(
     password: Option<&str>,
     reports: &mut Reports<'a>,
 ) -> RunResult<()> {
+    rar_run_shared_open(first, opts, password, reports, || Volume::open_detailed(first, password))
+}
+
+fn rar_run_shared_open<'a>(
+    first: &Path,
+    opts: &Options,
+    password: Option<&str>,
+    reports: &mut Reports<'a>,
+    open: impl FnOnce() -> crate::error::RarResult<Volume>,
+) -> RunResult<()> {
     if opts.mode == Mode::Extract {
         fs::create_dir_all(&opts.dest)
             .map_err(|e| RarFault::output(IoOperation::CreateDirectory, Some(opts.dest.clone()), None, e, false))?;
     }
-    let first_volume = Volume::open_detailed(first, password)?;
+    let first_volume = open()?;
     let mut opts = match opts.protecting_detailed(first) {
         Ok(opts) => opts,
         Err(fault) => {

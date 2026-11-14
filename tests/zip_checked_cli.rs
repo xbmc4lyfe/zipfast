@@ -498,3 +498,157 @@ fn r1_provided_wrong_password_keeps_existing_target_skip() {
     assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"original");
     assert_eq!(fs::read(input).unwrap(), bytes);
 }
+
+// The launcher has no format-specific heuristic: discovery must use the same
+// held-file RAR probe and central ZIP parser as checked selected reads.
+fn sfx_aes() -> Vec<u8> {
+    let mut bytes = b"MZ tiny SFX launcher\r\n".to_vec();
+    bytes.extend(aes(false));
+    bytes
+}
+#[test]
+fn r2_prefixed_zip_cli_caps_and_source_aliases() {
+    for prefixed in [false, true] {
+        let bytes = if prefixed { sfx_aes() } else { aes(false) };
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("archive.bin");
+        fs::write(&input, &bytes).unwrap();
+        for cap in [0, 24, 25] {
+            let result = Command::new(env!("CARGO_BIN_EXE_zipfast"))
+                .args(["t", "-ppw", "-q"])
+                .arg(&input)
+                .env("ZIPFAST_ZIP_ENCRYPTED_MAX_BYTES", cap.to_string())
+                .output()
+                .unwrap();
+            assert_eq!(
+                result.status.code(),
+                Some(if cap == 25 { 0 } else { 1 }),
+                "prefix={prefixed} max={cap}: {result:?}"
+            );
+        }
+        for cap in [0, 4, 1024] {
+            let dest = dir.path().join(format!("out-{cap}"));
+            let result = Command::new(env!("CARGO_BIN_EXE_zipfast"))
+                .args(["x", "-ppw", "-q"])
+                .arg(&input)
+                .arg(&dest)
+                .env("ZIPFAST_ZIP_TEMP_BYTES", cap.to_string())
+                .output()
+                .unwrap();
+            assert_eq!(
+                result.status.code(),
+                Some(if cap == 1024 { 0 } else { 2 }),
+                "prefix={prefixed} temp={cap}: {result:?}"
+            );
+            if cap == 1024 {
+                assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"hello");
+            } else {
+                assert!(!dest.join("a.txt").exists());
+            }
+        }
+        for command in ["t", "l", "v"] {
+            for hardlink in [false, true] {
+                let alias = dir.path().join(format!("alias-{command}-{hardlink}"));
+                if hardlink {
+                    fs::hard_link(&input, &alias).unwrap();
+                }
+                let sink = OpenOptions::new().append(true).open(if hardlink { &alias } else { &input }).unwrap();
+                let mut cmd = Command::new(env!("CARGO_BIN_EXE_zipfast"));
+                cmd.args([command, "-ppw"]).arg(&input);
+                if command == "t" {
+                    cmd.stderr(sink);
+                } else {
+                    cmd.stdout(sink);
+                }
+                let result = cmd.output().unwrap();
+                assert_eq!(result.status.code(), Some(2), "{command} prefix={prefixed} hardlink={hardlink}");
+                assert_eq!(fs::read(&input).unwrap(), bytes);
+            }
+        }
+    }
+}
+#[test]
+fn r2_prefixed_zip_public_policy_context_and_selected_caps() {
+    use zipfast::extract::{self, Cancellation, Mode, Options, Overwrite, SelectedEntry};
+    use zipfast::zip::{
+        EncryptedReadContext, EncryptedReadLimits, EncryptedReadOptions, EncryptedReadOverrides, ZipRunEvent,
+    };
+    for prefixed in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("archive.bin");
+        let bytes = if prefixed { sfx_aes() } else { aes(false) };
+        fs::write(&input, &bytes).unwrap();
+        let opts = Options {
+            mode: Mode::Test,
+            dest: dir.path().join("unused"),
+            overwrite: Overwrite::Skip,
+            flatten: false,
+            threads: Some(1),
+            protected_paths: Default::default(),
+            parallel_min: None,
+        };
+        for cap in [0, 24, 25] {
+            let mut overrides = EncryptedReadOverrides::default();
+            overrides.member_packed_bytes = Some(cap);
+            overrides.member_decoded_bytes = Some(cap);
+            let report = extract::run_with_zip_policy(
+                &input,
+                &opts,
+                Some("pw"),
+                &Cancellation::default(),
+                &overrides,
+                |_: ZipRunEvent<'_>| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(report.failed(), u64::from(cap != 25));
+            assert_eq!(report.files(), u64::from(cap == 25));
+            assert_eq!(report.run_usage().records, 1);
+            assert_eq!(report.usage().members, 1);
+            let mut limits = EncryptedReadLimits::default();
+            limits.member_packed_bytes = cap;
+            limits.member_decoded_bytes = cap;
+            let mut context = EncryptedReadContext::new(EncryptedReadOptions::default().with_limits(limits)).unwrap();
+            let report = extract::run_with_zip_context(
+                &input,
+                &opts,
+                Some("pw"),
+                &Cancellation::default(),
+                &mut context,
+                |_: ZipRunEvent<'_>| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(report.failed(), u64::from(cap != 25));
+            let selection = SelectedEntry::open_cancelable_with_zip_limit(
+                &input,
+                0,
+                Some("pw"),
+                u64::MAX,
+                Some(cap),
+                Cancellation::default(),
+            );
+            assert_eq!(selection.is_ok(), cap == 25);
+        }
+        for cap in [0, 4, 1024] {
+            let mut extraction = opts.clone();
+            extraction.mode = Mode::Extract;
+            extraction.dest = dir.path().join(format!("public-{cap}"));
+            let mut overrides = EncryptedReadOverrides::default();
+            overrides.live_spool_bytes = Some(cap);
+            let result = extract::run_with_zip_policy(
+                &input,
+                &extraction,
+                Some("pw"),
+                &Cancellation::default(),
+                &overrides,
+                |_: ZipRunEvent<'_>| Ok(()),
+            );
+            assert_eq!(result.is_ok(), cap == 1024);
+            if cap == 1024 {
+                assert_eq!(fs::read(extraction.dest.join("a.txt")).unwrap(), b"hello");
+            } else {
+                assert!(!extraction.dest.join("a.txt").exists());
+            }
+        }
+        assert_eq!(fs::read(&input).unwrap(), bytes);
+    }
+}
