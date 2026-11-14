@@ -45,8 +45,9 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # Rust 1.100.0
         with:
+          toolchain: 1.100.0
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo fmt --all -- --check
@@ -69,15 +70,15 @@ jobs:
       - run: cargo test --workspace --doc --locked
 
   zipview-msrv:
-    name: Zipview on Rust 1.87
+    name: Zipview on Rust 1.100.0
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4
         with:
-          toolchain: 1.87.0
-      - run: cargo +1.87.0 test -p zipview --locked
+          toolchain: 1.100.0
+      - run: cargo +1.100.0 test -p zipview --locked
 
   audit:
     name: Audit
@@ -85,13 +86,17 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # Rust 1.100.0
+        with:
+          toolchain: 1.100.0
       - run: cargo install cargo-audit --locked
       - run: cargo audit --file Cargo.lock
       - run: cargo audit --file crates/zipview/fuzz/Cargo.lock
 
   fuzz:
     name: Zipview fuzz (smoke)
+    env:
+      RUSTUP_TOOLCHAIN: nightly
     runs-on: ubuntu-latest
     timeout-minutes: 25
     defaults:

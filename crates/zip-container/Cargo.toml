@@ -19,7 +19,7 @@
 name = "zip-container"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.100"
 authors = ["zipview contributors", "xbmc4lyfe"]
 license = "RPL-1.5"
 description = "Checked wire-format primitives for ZIP container metadata"

@@ -18,6 +18,7 @@
 name = "zipview-fuzz"
 version = "0.0.0"
 edition = "2024"
+rust-version = "1.100"
 license = "RPL-1.5"
 publish = false
 
