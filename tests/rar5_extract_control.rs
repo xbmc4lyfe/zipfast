@@ -1953,3 +1953,92 @@ fn trailing_directory_failed_header_does_not_apply_its_metadata_and_optional_fau
         assert_eq!(result.diagnostic_failure.is_some(), mute);
     }
 }
+
+#[test]
+fn trailing_directory_empty_destination_is_observed_as_current_directory() {
+    let mut failures = Vec::new();
+    for preexisting in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("source.rar"),
+            archive(&[directory_spec("empty/"), FileSpec::new("later", b"later exact bytes")]),
+        )
+        .unwrap();
+        if preexisting {
+            fs::create_dir(d.path().join("empty")).unwrap();
+        }
+        // Set cwd only on a fresh child, never on this parallel test process.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "trailing_directory_empty_destination_child", "--nocapture"])
+            .env("ZIPFAST_TEST_EMPTY_DIRECTORY_ROOT_CHILD", if preexisting { "preexisting" } else { "missing" })
+            .current_dir(d.path())
+            .output()
+            .unwrap();
+        eprintln!(
+            "preexisting={preexisting} status={}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            failures.push(preexisting);
+        } else {
+            assert!(d.path().join("empty").is_dir());
+            assert_eq!(fs::read(d.path().join("later")).unwrap(), b"later exact bytes");
+        }
+    }
+    assert!(failures.is_empty(), "empty-destination child cases failed: {failures:?}");
+}
+
+#[test]
+fn trailing_directory_empty_destination_child() {
+    let Ok(case) = std::env::var("ZIPFAST_TEST_EMPTY_DIRECTORY_ROOT_CHILD") else { return };
+    assert!(case == "missing" || case == "preexisting");
+    let source = Path::new("source.rar").canonicalize().unwrap();
+    let diagnostic = OpenOptions::new().create_new(true).append(true).open("log").unwrap();
+    let mut s = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+    let selected = s.select(|_| true).unwrap();
+    let mut c = RarExtractControl::new(Some(diagnostic), RarOverwriteMode::Ask, RarExtractControlLimits::default());
+    struct Events(Vec<&'static str>);
+    impl RarExtractObserver for Events {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            panic!("directory existence must not ask for overwrite")
+        }
+        fn entry(&mut self, event: &RarEntryOutcome, _: RarDiagnostic<'_>) {
+            self.0.push(match event.outcome {
+                zipfast::extract::RarOutcome::Directory => "Directory",
+                zipfast::extract::RarOutcome::Verified { .. } => "Verified",
+                zipfast::extract::RarOutcome::Failed(_) => "Failed",
+                _ => "Other",
+            });
+        }
+    }
+    let mut events = Events(Vec::new());
+    let opts = options(Path::new(""));
+    assert!(opts.dest.as_os_str().is_empty());
+    let mut report = s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut events);
+    eprintln!(
+        "case={case} events={:?} result={:?} diagnostic={:?}",
+        events.0,
+        report.outcome(),
+        report.diagnostic_failure()
+    );
+    let summary = report.outcome().as_ref().unwrap();
+    assert_eq!((summary.failed, summary.dirs, summary.files), (0, 1, 1));
+    assert_eq!(events.0, ["Directory", "Verified"]);
+    assert!(Path::new("empty").is_dir());
+    assert_eq!(fs::read("later").unwrap(), b"later exact bytes");
+    assert!(report.diagnostic_failure().is_none());
+    report
+        .diagnostic()
+        .writer()
+        .expect("empty-root observation must preserve diagnostic bindings")
+        .write_all(b"done\n")
+        .unwrap();
+    assert!(report.finish().diagnostic_failure.is_none());
+    assert_eq!(fs::read("log").unwrap(), b"done\n");
+}

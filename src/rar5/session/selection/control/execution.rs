@@ -320,7 +320,9 @@ impl<O: ?Sized> Hooks<'_, O> {
         let mut at = PathBuf::new();
         at.try_reserve_exact(capacity).map_err(RarExtractControlError::Allocation)?;
         self.allocated(at.capacity())?;
-        at.push(root);
+        // An empty destination projects relative to cwd; an empty metadata
+        // pathname would instead report ENOENT. Normalize observation only.
+        at.push(if root.as_os_str().is_empty() { Path::new(".") } else { root });
         for component in std::iter::once(None).chain(relative.components().map(Some)) {
             if let Some(component) = component {
                 at.push(component);
