@@ -837,3 +837,768 @@ fn corrupt_payload_keeps_regular_diagnostics_for_created_directories() {
         assert_eq!(fs::read(source).unwrap(), original);
     }
 }
+
+#[test]
+fn dot_and_repeated_separator_destinations_keep_regular_diagnostics() {
+    struct Log;
+    impl RarExtractObserver for Log {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            panic!("new targets")
+        }
+        fn entry(&mut self, _: &RarEntryOutcome, mut diagnostic: RarDiagnostic<'_>) {
+            diagnostic
+                .writer()
+                .expect("equivalent destination components remain admitted")
+                .write_all(b"entry\n")
+                .unwrap();
+        }
+    }
+    for spelling in ["existing/./new", "new/.", "new/./", "new//", "new//./"] {
+        for nested in [false, true] {
+            for corrupt in [false, true] {
+                let d = tempfile::tempdir().unwrap();
+                let source = d.path().join("source.rar");
+                fs::create_dir(d.path().join("existing")).unwrap();
+                if spelling == "new/." || spelling == "new/./" || spelling == "new//./" {
+                    fs::create_dir(d.path().join("new")).unwrap();
+                }
+                let dest = d.path().join(spelling);
+                let log = d.path().join("log");
+                let a = if nested { "nested/a" } else { "a" };
+                let b = if nested { "nested/b" } else { "b" };
+                fs::write(
+                    &source,
+                    archive_with(
+                        &[
+                            (FileSpec::new(a, b"A"), crc32fast::hash(b"A") ^ u32::from(corrupt)),
+                            (FileSpec::new(b, b"B"), crc32fast::hash(b"B")),
+                        ],
+                        false,
+                    ),
+                )
+                .unwrap();
+                let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+                let selected = session.select(|_| true).unwrap();
+                let mut control = RarExtractControl::new(
+                    Some(OpenOptions::new().create_new(true).append(true).open(&log).unwrap()),
+                    RarOverwriteMode::Always,
+                    RarExtractControlLimits::default(),
+                );
+                let mut report = session.extract_selected_controlled(
+                    &selected,
+                    &options(&dest),
+                    RarDecodeLimits::default(),
+                    &mut control,
+                    &mut Log,
+                );
+                let summary = report.outcome().as_ref().unwrap();
+                assert_eq!(
+                    (summary.files, summary.failed, summary.skipped),
+                    (if corrupt { 1 } else { 2 }, u64::from(corrupt), 0)
+                );
+                report
+                    .diagnostic()
+                    .writer()
+                    .expect("terminal log after harmless spelling variations")
+                    .write_all(b"terminal\n")
+                    .unwrap();
+                assert!(report.finish().diagnostic_failure.is_none());
+                assert_eq!(fs::read(dest.join(b)).unwrap(), b"B");
+                assert_eq!(dest.join(a).exists(), !corrupt);
+                assert_eq!(fs::read(log).unwrap(), b"entry\nentry\nterminal\n");
+            }
+        }
+    }
+}
+
+#[test]
+fn replacing_one_selected_hardlink_preserves_other_target_diagnostics() {
+    struct Log {
+        skip_second: bool,
+        quiet: bool,
+    }
+    impl RarExtractObserver for Log {
+        fn overwrite(
+            &mut self,
+            conflict: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            Ok(if conflict.entry.order == 1 && self.skip_second {
+                RarOverwriteDecision::Skip
+            } else {
+                RarOverwriteDecision::Replace
+            })
+        }
+        fn entry(&mut self, _: &RarEntryOutcome, mut diagnostic: RarDiagnostic<'_>) {
+            if !self.quiet {
+                diagnostic
+                    .writer()
+                    .expect("known incumbent unlink does not revoke unrelated logging")
+                    .write_all(b"entry\n")
+                    .unwrap();
+            }
+        }
+    }
+    for (skip_second, always) in [(false, false), (true, false), (false, true)] {
+        for quiet in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let source = d.path().join("source.rar");
+            let dest = d.path().join("out");
+            let log = d.path().join("log");
+            let survivor = d.path().join("old-link");
+            fs::create_dir(&dest).unwrap();
+            fs::write(dest.join("a"), b"incumbent").unwrap();
+            fs::hard_link(dest.join("a"), dest.join("b")).unwrap();
+            fs::hard_link(dest.join("a"), &survivor).unwrap();
+            fs::write(&source, archive(&[FileSpec::new("a", b"A"), FileSpec::new("b", b"B")])).unwrap();
+            let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+            let selected = session.select(|_| true).unwrap();
+            let mut control = RarExtractControl::new(
+                Some(OpenOptions::new().create_new(true).append(true).open(&log).unwrap()),
+                if always { RarOverwriteMode::Always } else { RarOverwriteMode::Ask },
+                RarExtractControlLimits::default(),
+            );
+            let mut observer = Log { skip_second, quiet };
+            let mut report = session.extract_selected_controlled(
+                &selected,
+                &options(&dest),
+                RarDecodeLimits::default(),
+                &mut control,
+                &mut observer,
+            );
+            let summary = report.outcome().as_ref().unwrap();
+            assert_eq!(
+                (summary.files, summary.skipped, summary.failed),
+                (if skip_second { 1 } else { 2 }, u64::from(skip_second), 0)
+            );
+            assert_eq!(report.usage().decision_calls, if always { 0 } else { 2 });
+            report
+                .diagnostic()
+                .writer()
+                .expect("quiet and terminal paths retain valid hardlink observations")
+                .write_all(b"terminal\n")
+                .unwrap();
+            assert!(report.finish().diagnostic_failure.is_none());
+            assert_eq!(fs::read(dest.join("a")).unwrap(), b"A");
+            assert_eq!(
+                fs::read(dest.join("b")).unwrap(),
+                if skip_second { b"incumbent".as_slice() } else { b"B".as_slice() }
+            );
+            assert_eq!(fs::read(survivor).unwrap(), b"incumbent");
+            assert_eq!(
+                fs::read(log).unwrap(),
+                if quiet { b"terminal\n".as_slice() } else { b"entry\nentry\nterminal\n".as_slice() }
+            );
+        }
+    }
+}
+
+#[test]
+fn terminal_dot_after_symlink_to_regular_protects_the_followed_obstruction() {
+    use std::os::unix::fs::symlink;
+    struct Log {
+        admitted: bool,
+    }
+    impl RarExtractObserver for Log {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            panic!("obstructed root")
+        }
+        fn entry(&mut self, _: &RarEntryOutcome, mut diagnostic: RarDiagnostic<'_>) {
+            if let Some(file) = diagnostic.writer() {
+                self.admitted = true;
+                file.write_all(b"entry\n").unwrap();
+            }
+        }
+    }
+    for aliases in [true, false] {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.rar");
+        let obstruction = d.path().join("obstruction");
+        let alias = d.path().join("alias");
+        let independent = d.path().join("log");
+        fs::write(&source, archive(&[FileSpec::new("a", b"A")])).unwrap();
+        fs::write(&obstruction, b"original bytes").unwrap();
+        fs::write(&independent, b"").unwrap();
+        symlink(&obstruction, &alias).unwrap();
+        let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let diagnostic =
+            OpenOptions::new().append(true).open(if aliases { &obstruction } else { &independent }).unwrap();
+        let mut control =
+            RarExtractControl::new(Some(diagnostic), RarOverwriteMode::Always, RarExtractControlLimits::default());
+        let mut observer = Log { admitted: false };
+        let mut report = session.extract_selected_controlled(
+            &selected,
+            &options(&alias.join(".")),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut observer,
+        );
+        assert!(
+            matches!(report.outcome(),Err(RarExtractError::Native(error)) if error.partial.files==0&&error.partial.failed==1)
+        );
+        if let Some(file) = report.diagnostic().writer() {
+            file.write_all(b"terminal\n").unwrap();
+        }
+        report.finish();
+        assert_eq!(
+            fs::read(&obstruction).unwrap(),
+            b"original bytes",
+            "diagnostics must preserve the followed regular obstruction"
+        );
+        assert_eq!(observer.admitted, !aliases);
+        assert_eq!(
+            fs::read(independent).unwrap(),
+            if aliases { b"".as_slice() } else { b"entry\nterminal\n".as_slice() }
+        );
+    }
+}
+
+#[test]
+fn symlink_and_parent_components_keep_their_lookup_semantics() {
+    use std::os::unix::fs::symlink;
+    for parent_component in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.rar");
+        let real = d.path().join("elsewhere");
+        fs::create_dir_all(real.join("child")).unwrap();
+        symlink(real.join("child"), d.path().join("link")).unwrap();
+        let (dest, actual) = if parent_component {
+            fs::create_dir(real.join("destination")).unwrap();
+            (d.path().join("link/../destination/."), real.join("destination"))
+        } else {
+            (d.path().join("link/."), real.join("child"))
+        };
+        let log = d.path().join("log");
+        fs::write(&source, archive(&[FileSpec::new("nested/a", b"A")])).unwrap();
+        let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let mut control = RarExtractControl::new(
+            Some(OpenOptions::new().create_new(true).append(true).open(&log).unwrap()),
+            RarOverwriteMode::Always,
+            RarExtractControlLimits::default(),
+        );
+        let mut report = session.extract_selected_controlled(
+            &selected,
+            &options(&dest),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut Observer { replace: true, calls: 0, outcomes: 0 },
+        );
+        assert_eq!(report.outcome().as_ref().unwrap().files, 1);
+        report
+            .diagnostic()
+            .writer()
+            .expect("raw symlink/dot and parent-component probes retain actual lookup")
+            .write_all(b"terminal\n")
+            .unwrap();
+        assert!(report.finish().diagnostic_failure.is_none());
+        assert_eq!(fs::read(actual.join("nested/a")).unwrap(), b"A");
+        assert!(!d.path().join("destination").exists());
+        assert_eq!(fs::read(log).unwrap(), b"outcome\nterminal\n");
+    }
+}
+
+#[test]
+fn unrelated_ctime_changes_after_known_unlink_still_revoke_diagnostics() {
+    use std::os::unix::fs::MetadataExt;
+    struct Change {
+        b: std::path::PathBuf,
+        extra: std::path::PathBuf,
+    }
+    impl RarExtractObserver for Change {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            Ok(RarOverwriteDecision::Replace)
+        }
+        fn entry(&mut self, entry: &RarEntryOutcome, mut diagnostic: RarDiagnostic<'_>) {
+            if entry.entry.order == 0 {
+                diagnostic.writer().expect("known unlink was admitted").write_all(b"first\n").unwrap();
+                let before = fs::metadata(&self.b).unwrap();
+                fs::hard_link(&self.b, &self.extra).unwrap();
+                fs::remove_file(&self.extra).unwrap();
+                let after = fs::metadata(&self.b).unwrap();
+                assert_eq!(
+                    (after.ino(), after.nlink(), after.len(), after.mtime(), after.mtime_nsec()),
+                    (before.ino(), before.nlink(), before.len(), before.mtime(), before.mtime_nsec())
+                );
+                assert_ne!((after.ctime(), after.ctime_nsec()), (before.ctime(), before.ctime_nsec()));
+                assert!(
+                    diagnostic.writer().is_none(),
+                    "an unrelated ctime-only change must not inherit unlink authority"
+                );
+            } else {
+                assert!(diagnostic.writer().is_none());
+            }
+        }
+    }
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("source.rar");
+    let out = d.path().join("out");
+    fs::create_dir(&out).unwrap();
+    fs::write(out.join("a"), b"old").unwrap();
+    fs::hard_link(out.join("a"), out.join("b")).unwrap();
+    fs::write(&source, archive(&[FileSpec::new("a", b"A"), FileSpec::new("b", b"B")])).unwrap();
+    let log = d.path().join("log");
+    let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    let mut control = RarExtractControl::new(
+        Some(OpenOptions::new().create_new(true).append(true).open(&log).unwrap()),
+        RarOverwriteMode::Ask,
+        RarExtractControlLimits::default(),
+    );
+    let mut report = session.extract_selected_controlled(
+        &selected,
+        &options(&out),
+        RarDecodeLimits::default(),
+        &mut control,
+        &mut Change { b: out.join("b"), extra: d.path().join("extra") },
+    );
+    assert_eq!(report.outcome().as_ref().unwrap().files, 2);
+    assert!(report.diagnostic().writer().is_none());
+    assert!(report.finish().diagnostic_failure.is_some());
+    assert_eq!(fs::read(log).unwrap(), b"first\n");
+    assert_eq!(fs::read(out.join("a")).unwrap(), b"A");
+    assert_eq!(fs::read(out.join("b")).unwrap(), b"B");
+}
+
+#[test]
+fn selected_leaf_symlinks_protect_followed_bytes_and_keep_distinct_logging() {
+    use std::os::unix::fs::symlink;
+    for replace_referent in [false, true] {
+        for aliases in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let source = d.path().join("source.rar");
+            let out = d.path().join("out");
+            let original = d.path().join("original-link");
+            let log = d.path().join("log");
+            fs::create_dir(&out).unwrap();
+            fs::write(out.join("a"), b"incumbent").unwrap();
+            fs::hard_link(out.join("a"), &original).unwrap();
+            symlink(out.join("a"), out.join("leaf")).unwrap();
+            let members = if replace_referent {
+                vec![FileSpec::new("a", b"A"), FileSpec::new("leaf", b"L")]
+            } else {
+                vec![FileSpec::new("leaf", b"L")]
+            };
+            fs::write(&source, archive(&members)).unwrap();
+            fs::write(&log, b"").unwrap();
+            let diagnostic = OpenOptions::new().append(true).open(if aliases { &original } else { &log }).unwrap();
+            let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+            let selected = session.select(|_| true).unwrap();
+            let mut control =
+                RarExtractControl::new(Some(diagnostic), RarOverwriteMode::Always, RarExtractControlLimits::default());
+            let mut report = session.extract_selected_controlled(
+                &selected,
+                &options(&out),
+                RarDecodeLimits::default(),
+                &mut control,
+                &mut Observer { replace: true, calls: 0, outcomes: 0 },
+            );
+            let summary = report.outcome().as_ref().unwrap();
+            assert_eq!((summary.files, summary.failed), (u64::from(replace_referent), 1));
+            if aliases {
+                assert!(report.diagnostic().writer().is_none());
+            } else {
+                report
+                    .diagnostic()
+                    .writer()
+                    .expect("a rejected symlink target does not silence independent logging")
+                    .write_all(b"terminal\n")
+                    .unwrap();
+            }
+            let finished = report.finish();
+            assert_eq!(finished.diagnostic_failure.is_some(), aliases);
+            assert_eq!(fs::read(original).unwrap(), b"incumbent");
+            assert_eq!(
+                fs::read(out.join("a")).unwrap(),
+                if replace_referent { b"A".as_slice() } else { b"incumbent".as_slice() }
+            );
+            assert_eq!(
+                fs::read(log).unwrap(),
+                if aliases {
+                    b"".as_slice()
+                } else if replace_referent {
+                    b"outcome\noutcome\nterminal\n".as_slice()
+                } else {
+                    b"outcome\nterminal\n".as_slice()
+                }
+            );
+        }
+    }
+}
+
+#[test]
+fn dangling_followed_bindings_are_not_treated_as_permission_for_later_objects() {
+    use std::os::unix::fs::symlink;
+    struct Observer {
+        referent: std::path::PathBuf,
+        log: std::path::PathBuf,
+        install: bool,
+    }
+    impl RarExtractObserver for Observer {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            panic!("symlink target refused")
+        }
+        fn entry(&mut self, _: &RarEntryOutcome, mut diagnostic: RarDiagnostic<'_>) {
+            diagnostic.writer().expect("proven dangling target permits distinct log").write_all(b"first\n").unwrap();
+            if self.install {
+                fs::hard_link(&self.log, &self.referent).unwrap();
+                assert!(diagnostic.writer().is_none(), "new followed alias must revoke permission");
+            }
+        }
+    }
+    for install in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.rar");
+        let out = d.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let referent = d.path().join("missing");
+        let log = d.path().join("log");
+        symlink(&referent, out.join("leaf")).unwrap();
+        fs::write(&source, archive(&[FileSpec::new("leaf", b"L")])).unwrap();
+        let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let mut control = RarExtractControl::new(
+            Some(OpenOptions::new().create_new(true).append(true).open(&log).unwrap()),
+            RarOverwriteMode::Always,
+            RarExtractControlLimits::default(),
+        );
+        let mut observer = Observer { referent: referent.clone(), log: log.clone(), install };
+        let mut report = session.extract_selected_controlled(
+            &selected,
+            &options(&out),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut observer,
+        );
+        assert_eq!(report.outcome().as_ref().unwrap().failed, 1);
+        if install {
+            assert!(report.diagnostic().writer().is_none());
+        } else {
+            report.diagnostic().writer().unwrap().write_all(b"terminal\n").unwrap();
+        }
+        assert_eq!(report.finish().diagnostic_failure.is_some(), install);
+        assert_eq!(
+            fs::read(log).unwrap(),
+            if install { b"first\n".as_slice() } else { b"first\nterminal\n".as_slice() }
+        );
+        if install {
+            assert_eq!(fs::read(referent).unwrap(), b"first\n");
+        }
+    }
+}
+
+#[test]
+fn followed_symlink_records_obey_separate_path_capacity_and_attempt_limits() {
+    use std::os::unix::fs::symlink;
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("source.rar");
+    let out = d.path().join("out");
+    let referent = d.path().join("referent");
+    let log = d.path().join("log");
+    fs::create_dir(&out).unwrap();
+    fs::write(&referent, b"old").unwrap();
+    fs::write(&log, b"").unwrap();
+    symlink(&referent, out.join("leaf")).unwrap();
+    fs::write(&source, archive(&[FileSpec::new("leaf", b"L")])).unwrap();
+    let run = |diagnostics: RarDiagnosticLimits| {
+        let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let mut control = RarExtractControl::new(
+            Some(OpenOptions::new().append(true).open(&log).unwrap()),
+            RarOverwriteMode::Always,
+            RarExtractControlLimits { diagnostics, ..Default::default() },
+        );
+        let mut report = session.extract_selected_controlled(
+            &selected,
+            &options(&out),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut Quiet,
+        );
+        let admitted = report.diagnostic().writer().is_some();
+        let usage = report.usage();
+        assert_eq!(report.finish().outcome.unwrap().failed, 1);
+        (admitted, usage)
+    };
+    let (admitted, usage) = run(RarDiagnosticLimits::default());
+    assert!(admitted);
+    assert_eq!(usage.diagnostics.targets, 1, "followed records do not add logical targets");
+    for field in 0..7 {
+        let value = match field {
+            0 => usage.diagnostics.targets,
+            1 => usage.diagnostics.parents,
+            2 => usage.diagnostics.capacity_peak,
+            3 => usage.diagnostics.open_handles_peak,
+            4 => usage.diagnostics.work,
+            5 => usage.diagnostics.io_attempts,
+            6 => usage.diagnostics.checkpoint_attempts_peak,
+            _ => unreachable!(),
+        };
+        for exact in [true, false] {
+            let allowed = if exact { value } else { value - 1 };
+            let mut limits = RarDiagnosticLimits::default();
+            match field {
+                0 => limits.targets = allowed,
+                1 => limits.parents = allowed,
+                2 => limits.capacity = allowed,
+                3 => limits.open_handles = allowed,
+                4 => limits.work = allowed,
+                5 => limits.io_attempts = allowed,
+                6 => limits.checkpoint_attempts = allowed,
+                _ => unreachable!(),
+            };
+            assert_eq!(run(limits).0, exact, "followed field {field}");
+        }
+    }
+}
+
+#[test]
+fn missing_trailing_dot_root_retains_incumbent_native_behavior() {
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("source.rar");
+    let root = d.path().join("missing");
+    let dest = root.join(".");
+    fs::write(&source, archive(&[FileSpec::new("a", b"A")])).unwrap();
+    let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    let legacy = session.extract_selected(&selected, &options(&dest), RarDecodeLimits::default(), |_| {});
+    if root.exists() {
+        fs::remove_dir_all(&root).unwrap();
+    }
+    let log = d.path().join("log");
+    let mut control = RarExtractControl::new(
+        Some(OpenOptions::new().create_new(true).append(true).open(log).unwrap()),
+        RarOverwriteMode::Always,
+        RarExtractControlLimits::default(),
+    );
+    let mut report = session.extract_selected_controlled(
+        &selected,
+        &options(&dest),
+        RarDecodeLimits::default(),
+        &mut control,
+        &mut Quiet,
+    );
+    match (&legacy, report.outcome()) {
+        (Ok(left), Ok(right)) => {
+            assert_eq!((left.files, left.failed, left.bytes), (right.files, right.failed, right.bytes))
+        }
+        (Err(left), Err(RarExtractError::Native(right))) => {
+            assert_eq!(format!("{:?}", left.failure), format!("{:?}", right.failure));
+            assert_eq!((left.partial.files, left.partial.failed), (right.partial.files, right.partial.failed));
+        }
+        other => panic!("incumbent and controlled native outcomes differ: {other:?}"),
+    }
+    #[cfg(target_os = "macos")]
+    assert!(
+        matches!(report.outcome(),Err(RarExtractError::Native(error)) if matches!(error.failure.as_ref(),zipfast::error::RarFailure::Output{operation:zipfast::error::IoOperation::CreateDirectory,source,..} if source.raw_os_error()==Some(libc::ENOENT)))
+    );
+    assert!(report.diagnostic().writer().is_some());
+    report.finish();
+}
+
+#[test]
+fn foreign_hardlink_parent_rebinding_is_not_admitted_as_an_unlink_effect() {
+    struct Rebind {
+        out: std::path::PathBuf,
+    }
+    impl RarExtractObserver for Rebind {
+        fn overwrite(
+            &mut self,
+            conflict: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            if conflict.entry.order == 0 {
+                fs::rename(self.out.join("nested"), self.out.join("old-parent")).unwrap();
+                fs::create_dir(self.out.join("nested")).unwrap();
+                fs::write(self.out.join("nested/b"), b"foreign").unwrap();
+            }
+            Ok(RarOverwriteDecision::Replace)
+        }
+        fn entry(&mut self, _: &RarEntryOutcome, mut diagnostic: RarDiagnostic<'_>) {
+            assert!(diagnostic.writer().is_none(), "publication cannot authorize a foreign parent rebinding");
+        }
+    }
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("source.rar");
+    let out = d.path().join("out");
+    let log = d.path().join("log");
+    fs::create_dir_all(out.join("nested")).unwrap();
+    fs::write(out.join("a"), b"incumbent").unwrap();
+    fs::hard_link(out.join("a"), out.join("nested/b")).unwrap();
+    fs::write(&source, archive(&[FileSpec::new("a", b"A"), FileSpec::new("nested/b", b"B")])).unwrap();
+    let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    let mut control = RarExtractControl::new(
+        Some(OpenOptions::new().create_new(true).append(true).open(&log).unwrap()),
+        RarOverwriteMode::Ask,
+        RarExtractControlLimits::default(),
+    );
+    let finished = session
+        .extract_selected_controlled(
+            &selected,
+            &options(&out),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut Rebind { out: out.clone() },
+        )
+        .finish();
+    assert_eq!(finished.outcome.unwrap().files, 2);
+    assert!(finished.diagnostic_failure.is_some());
+    assert_eq!(fs::read(out.join("a")).unwrap(), b"A");
+    assert_eq!(fs::read(out.join("nested/b")).unwrap(), b"B");
+    assert_eq!(fs::read(out.join("old-parent/b")).unwrap(), b"incumbent");
+    assert!(fs::read(log).unwrap().is_empty());
+}
+
+#[test]
+fn a_rebound_leaf_symlink_revokes_its_followed_authority() {
+    use std::os::unix::fs::symlink;
+    struct Rebind {
+        leaf: std::path::PathBuf,
+        log: std::path::PathBuf,
+    }
+    impl RarExtractObserver for Rebind {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            panic!("symlink refused")
+        }
+        fn entry(&mut self, _: &RarEntryOutcome, mut diagnostic: RarDiagnostic<'_>) {
+            diagnostic.writer().expect("initial distinct referent").write_all(b"before\n").unwrap();
+            fs::remove_file(&self.leaf).unwrap();
+            symlink(&self.log, &self.leaf).unwrap();
+            assert!(diagnostic.writer().is_none());
+        }
+    }
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("source.rar");
+    let out = d.path().join("out");
+    fs::create_dir(&out).unwrap();
+    let referent = d.path().join("referent");
+    fs::write(&referent, b"original").unwrap();
+    let leaf = out.join("leaf");
+    symlink(&referent, &leaf).unwrap();
+    let log = d.path().join("log");
+    fs::write(&source, archive(&[FileSpec::new("leaf", b"L")])).unwrap();
+    let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    let mut control = RarExtractControl::new(
+        Some(OpenOptions::new().create_new(true).append(true).open(&log).unwrap()),
+        RarOverwriteMode::Always,
+        RarExtractControlLimits::default(),
+    );
+    let mut report = session.extract_selected_controlled(
+        &selected,
+        &options(&out),
+        RarDecodeLimits::default(),
+        &mut control,
+        &mut Rebind { leaf, log: log.clone() },
+    );
+    assert_eq!(report.outcome().as_ref().unwrap().failed, 1);
+    assert!(report.diagnostic().writer().is_none());
+    assert!(report.finish().diagnostic_failure.is_some());
+    assert_eq!(fs::read(log).unwrap(), b"before\n");
+    assert_eq!(fs::read(referent).unwrap(), b"original");
+}
+
+#[test]
+fn engine_created_referents_of_dangling_selected_symlinks_remain_loggable() {
+    use std::os::unix::fs::symlink;
+    for directory in [false, true] {
+        for corrupt in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let source = d.path().join("source.rar");
+            let out = d.path().join("out");
+            let log = d.path().join("log");
+            fs::create_dir(&out).unwrap();
+            let name = if directory { "nested/a" } else { "a" };
+            symlink(out.join(if directory { "nested" } else { "a" }), out.join("leaf")).unwrap();
+            fs::write(
+                &source,
+                archive_with(
+                    &[
+                        (FileSpec::new(name, b"A"), crc32fast::hash(b"A") ^ u32::from(corrupt)),
+                        (FileSpec::new("leaf", b"L"), crc32fast::hash(b"L")),
+                    ],
+                    false,
+                ),
+            )
+            .unwrap();
+            let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+            let selected = session.select(|_| true).unwrap();
+            let mut control = RarExtractControl::new(
+                Some(OpenOptions::new().create_new(true).append(true).open(&log).unwrap()),
+                RarOverwriteMode::Always,
+                RarExtractControlLimits::default(),
+            );
+            let mut report = session.extract_selected_controlled(
+                &selected,
+                &options(&out),
+                RarDecodeLimits::default(),
+                &mut control,
+                &mut Observer { replace: true, calls: 0, outcomes: 0 },
+            );
+            let summary = report.outcome().as_ref().unwrap();
+            assert_eq!((summary.files, summary.failed), (u64::from(!corrupt), 1 + u64::from(corrupt)));
+            report
+                .diagnostic()
+                .writer()
+                .expect("known created referent must not masquerade as a foreign binding")
+                .write_all(b"terminal\n")
+                .unwrap();
+            assert!(report.finish().diagnostic_failure.is_none());
+            assert_eq!(fs::read(log).unwrap(), b"outcome\noutcome\nterminal\n");
+            assert_eq!(out.join(name).exists(), !corrupt);
+        }
+    }
+}
+
+#[test]
+fn an_unresolved_obstruction_inside_a_symlink_target_cannot_prove_distinctness() {
+    use std::os::unix::fs::symlink;
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("source.rar");
+    let out = d.path().join("out");
+    fs::create_dir(&out).unwrap();
+    let obstruction = d.path().join("obstruction");
+    fs::write(&obstruction, b"original").unwrap();
+    symlink(obstruction.join("."), out.join("leaf")).unwrap();
+    fs::write(&source, archive(&[FileSpec::new("leaf", b"L")])).unwrap();
+    let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+    let selected = session.select(|_| true).unwrap();
+    let mut control = RarExtractControl::new(
+        Some(OpenOptions::new().append(true).open(&obstruction).unwrap()),
+        RarOverwriteMode::Always,
+        RarExtractControlLimits::default(),
+    );
+    let mut report = session.extract_selected_controlled(
+        &selected,
+        &options(&out),
+        RarDecodeLimits::default(),
+        &mut control,
+        &mut Observer { replace: true, calls: 0, outcomes: 0 },
+    );
+    assert_eq!(report.outcome().as_ref().unwrap().failed, 1);
+    assert!(report.diagnostic().writer().is_none());
+    report.finish();
+    assert_eq!(fs::read(obstruction).unwrap(), b"original");
+}

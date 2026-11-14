@@ -121,6 +121,7 @@ impl<'a> Extraction<'a> {
                 self.protect_source_name(session, &path)?;
                 hooks.before_path(index);
                 hooks.reserve_directory(&mut self.dirs, &path, path.capacity())?;
+                hooks.before_directories();
                 self.ensure_root().map_err(own_fault)?;
                 make_dirs_detailed(&self.options.dest, &relative).map_err(own_fault)?;
                 let observed =
@@ -191,6 +192,7 @@ impl<'a> Extraction<'a> {
         if self.stage_stamp(&file.file, &target)? != stage_stamp {
             return Err(policy(RarPolicyReason::StageChanged, target).into());
         }
+        hooks.before_publication(index, initial);
         if hooks.observe_publication() {
             file.publish_selected_observed(initial.is_some(), |held, published| {
                 hooks.published(index, &target, held, published)
@@ -293,6 +295,7 @@ impl<'a> Extraction<'a> {
     }
 
     fn open_stage(&self, parent: &Path, target: &Path, hooks: &mut impl ExtractionHooks) -> RarResult<Output> {
+        hooks.before_directories();
         self.ensure_root()?;
         let directories = make_dirs_detailed(&self.options.dest, parent);
         // Capture completed native directory preparation before tempfile creation
@@ -376,6 +379,8 @@ pub(super) fn project_target(
 }
 
 pub(super) trait ExtractionHooks {
+    fn before_directories(&mut self) {}
+    fn before_publication(&mut self, _index: usize, _initial: Option<SourceStamp>) {}
     fn before_path(&mut self, _index: usize) {}
     fn observe_publication(&self) -> bool {
         false

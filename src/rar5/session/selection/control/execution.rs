@@ -383,6 +383,12 @@ impl<O: ?Sized> Hooks<'_, O> {
     }
 }
 impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
+    fn before_directories(&mut self) {
+        self.control.capture_before_directories();
+    }
+    fn before_publication(&mut self, index: usize, initial: Option<SourceStamp>) {
+        self.control.capture_before_publication(index, initial);
+    }
     fn before_path(&mut self, index: usize) {
         self.control.capture_before_path(index);
     }

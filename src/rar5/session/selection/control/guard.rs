@@ -15,6 +15,7 @@
 // rights and limitations under the RPL.
 
 use super::*;
+use std::ffi::OsStr;
 use std::mem::MaybeUninit;
 use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 
@@ -26,6 +27,7 @@ pub(super) struct Stamp {
     pub mtime: (i64, i64),
     pub ctime: (i64, i64),
     pub mode: libc::mode_t,
+    pub links: u64,
 }
 impl Stamp {
     fn identity(self) -> (u64, u64) {
@@ -50,7 +52,12 @@ fn convert(s: libc::stat) -> io::Result<Stamp> {
     let device = s.st_dev as u64;
     #[cfg(not(target_os = "macos"))]
     let device = s.st_dev;
+    #[cfg(target_os = "macos")]
+    let links = u64::from(s.st_nlink);
+    #[cfg(not(target_os = "macos"))]
+    let links = s.st_nlink;
     Ok(Stamp {
+        links,
         dev: device,
         ino: s.st_ino,
         len: u64::try_from(s.st_size).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?,
@@ -70,11 +77,14 @@ pub(super) fn stat_at(fd: libc::c_int, path: &[u8]) -> io::Result<Option<Stamp>>
     stat_at_flags(fd, path, libc::AT_SYMLINK_NOFOLLOW)
 }
 pub(super) fn stat_at_flags(fd: libc::c_int, path: &[u8], flags: libc::c_int) -> io::Result<Option<Stamp>> {
+    stat_at_probe(fd, path, flags, true)
+}
+fn stat_at_probe(fd: libc::c_int, path: &[u8], flags: libc::c_int, missing_parent: bool) -> io::Result<Option<Stamp>> {
     let mut out = MaybeUninit::uninit();
     let result = unsafe { libc::fstatat(fd, path.as_ptr().cast(), out.as_mut_ptr(), flags) };
     if result < 0 {
         let e = io::Error::last_os_error();
-        if e.raw_os_error() == Some(libc::ENOENT) || e.raw_os_error() == Some(libc::ENOTDIR) {
+        if e.raw_os_error() == Some(libc::ENOENT) || (missing_parent && e.raw_os_error() == Some(libc::ENOTDIR)) {
             return Ok(None);
         }
         return Err(e);
@@ -95,9 +105,15 @@ struct Record {
     stage: Option<(u64, u64)>,
     ordinal: Option<u64>,
     leaf: bool,
+    follow: bool,
 }
 struct SourceProbe {
     path: Vec<u8>,
+}
+#[derive(Clone, Copy)]
+struct PendingUnlink {
+    index: usize,
+    old: Stamp,
 }
 #[derive(Default)]
 pub(super) struct Guard {
@@ -107,6 +123,8 @@ pub(super) struct Guard {
     prepared: bool,
     identity: Option<(u64, u64)>,
     deferred: Option<RarDiagnosticFailure>,
+    pending_unlink: Option<PendingUnlink>,
+    pending_publication: Option<usize>,
 }
 fn metadata(source: io::Error) -> RarDiagnosticFailure {
     RarDiagnosticFailure::Metadata { operation: IoOperation::Metadata, source }
@@ -238,6 +256,16 @@ impl RarExtractControl {
             self.mute(f);
         }
     }
+    pub(super) fn capture_before_directories(&mut self) {
+        if !self.guard.prepared || self.failure.is_some() {
+            return;
+        }
+        let mut attempts = 0;
+        let result = self.with_guard(|guard, c| guard.check_followed(c, &mut attempts));
+        if let Err(failure) = result {
+            self.mute(failure);
+        }
+    }
     pub(super) fn capture_created(&mut self, path: &Path) {
         if !self.guard.prepared || self.failure.is_some() {
             return;
@@ -265,6 +293,16 @@ impl RarExtractControl {
         }
         if self.guard.identity == Some(identity) {
             self.mute(RarDiagnosticFailure::AliasTarget { ordinal: index as u64 });
+        }
+    }
+    pub(super) fn capture_before_publication(&mut self, index: usize, initial: Option<SourceStamp>) {
+        if !self.guard.prepared || self.failure.is_some() {
+            return;
+        }
+        let mut attempts = 0;
+        let result = self.with_guard(|guard, c| guard.before_publication(c, index, initial, &mut attempts));
+        if let Err(failure) = result {
+            self.mute(failure);
         }
     }
     pub(super) fn capture_published(&mut self, index: usize, target: &Path, held: &File, published: bool) {
@@ -420,53 +458,74 @@ impl Guard {
         for end in (1..=path.len()).filter(|&i| i == path.len() || path[i] == b'/') {
             c.proof_work(end as u64)?;
             let leaf = end == path.len();
-            let parents = checked(c.usage.diagnostics.parents, 1)?;
-            if parents > c.limits.diagnostics.parents {
-                return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Parents));
+            let expected = self.admit_record(c, &path[..end], ordinal, leaf, false, attempts)?;
+            if expected.is_some_and(|stamp| stamp.mode & libc::S_IFMT == libc::S_IFLNK) {
+                // Keep the no-follow binding and separately protect the object
+                // reached when this prefix is traversed by the actual lookup.
+                self.admit_record(c, &path[..end], ordinal, leaf, true, attempts)?;
             }
-            c.reserve_proof(&mut self.records, 1)?;
-            let probe = c.proof_path(&path[..end])?;
-            let expected = match self.observe(c, &probe, attempts) {
-                Ok(observation) => observation,
-                Err(failure @ RarDiagnosticFailure::Metadata { .. }) => {
-                    if self.deferred.is_none() {
-                        self.deferred = Some(failure);
-                    }
-                    None
-                }
-                Err(failure) => return Err(failure),
-            };
-            if let Some(stamp) = expected {
-                if self.identity == Some(stamp.identity()) {
-                    return Err(if leaf {
-                        RarDiagnosticFailure::AliasTarget { ordinal }
-                    } else {
-                        RarDiagnosticFailure::AliasAncestor { ordinal: Some(ordinal) }
-                    });
-                }
-                if !leaf && !stamp.directory() { /* regular obstruction remains protected; descendants cannot exist */ }
-            }
-            self.records.push(Record {
-                path: probe,
-                expected,
-                original: expected.map(Stamp::identity),
-                stage: None,
-                ordinal: Some(ordinal),
-                leaf,
-            });
-            c.usage.diagnostics.parents = parents;
         }
         Ok(())
+    }
+    fn admit_record(
+        &mut self,
+        c: &mut RarExtractControl,
+        path: &[u8],
+        ordinal: u64,
+        leaf: bool,
+        follow: bool,
+        attempts: &mut u64,
+    ) -> Result<Option<Stamp>, RarDiagnosticFailure> {
+        let parents = checked(c.usage.diagnostics.parents, 1)?;
+        if parents > c.limits.diagnostics.parents {
+            return Err(RarDiagnosticFailure::Limit(RarDiagnosticLimit::Parents));
+        }
+        c.reserve_proof(&mut self.records, 1)?;
+        let probe = c.proof_path(path)?;
+        let expected = match self.observe(c, &probe, attempts, follow) {
+            Ok(observation) => observation,
+            Err(failure @ RarDiagnosticFailure::Metadata { .. }) => {
+                if self.deferred.is_none() {
+                    self.deferred = Some(failure);
+                }
+                None
+            }
+            Err(failure) => return Err(failure),
+        };
+        if expected.is_some_and(|stamp| self.identity == Some(stamp.identity())) {
+            return Err(if leaf {
+                RarDiagnosticFailure::AliasTarget { ordinal }
+            } else {
+                RarDiagnosticFailure::AliasAncestor { ordinal: Some(ordinal) }
+            });
+        }
+        self.records.push(Record {
+            path: probe,
+            expected,
+            original: expected.map(Stamp::identity),
+            stage: None,
+            ordinal: Some(ordinal),
+            leaf,
+            follow,
+        });
+        c.usage.diagnostics.parents = parents;
+        Ok(expected)
     }
     fn observe(
         &self,
         c: &mut RarExtractControl,
         path: &[u8],
         attempts: &mut u64,
+        follow: bool,
     ) -> Result<Option<Stamp>, RarDiagnosticFailure> {
         loop {
             c.proof_io(attempts)?;
-            match stat_at(self.anchor.as_ref().expect("guard anchor").as_raw_fd(), anchored(path)) {
+            match stat_at_probe(
+                self.anchor.as_ref().expect("guard anchor").as_raw_fd(),
+                anchored(path),
+                if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW },
+                !follow,
+            ) {
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                 result => return result.map_err(metadata),
             }
@@ -523,7 +582,7 @@ impl Guard {
                     RarDiagnosticFailure::AliasAncestor { ordinal: r.ordinal }
                 });
             }
-            let now = self.observe(c, &r.path, attempts)?;
+            let now = self.observe(c, &r.path, attempts, r.follow)?;
             if now.is_some_and(|s| Some(s.identity()) == self.identity) {
                 return Err(if r.leaf {
                     RarDiagnosticFailure::AliasTarget { ordinal: r.ordinal.expect("selected ordinal") }
@@ -559,7 +618,7 @@ impl Guard {
                 continue;
             }
             c.proof_work(r.path.len() as u64)?;
-            let now = self.observe(c, &r.path, attempts)?;
+            let now = self.observe(c, &r.path, attempts, r.follow)?;
             if now.is_some_and(|s| Some(s.identity()) == self.identity) {
                 return Err(if r.leaf {
                     RarDiagnosticFailure::AliasTarget { ordinal: index as u64 }
@@ -577,6 +636,51 @@ impl Guard {
         }
         Ok(())
     }
+    fn check_followed(&self, c: &mut RarExtractControl, attempts: &mut u64) -> Result<(), RarDiagnosticFailure> {
+        for r in &self.records {
+            c.proof_work(1)?;
+            if !r.follow {
+                continue;
+            }
+            c.proof_work(r.path.len() as u64)?;
+            let now = self.observe(c, &r.path, attempts, true)?;
+            if now.is_some_and(|stamp| Some(stamp.identity()) == self.identity) {
+                return Err(if r.leaf {
+                    RarDiagnosticFailure::AliasTarget { ordinal: r.ordinal.expect("selected ordinal") }
+                } else {
+                    RarDiagnosticFailure::AliasAncestor { ordinal: r.ordinal }
+                });
+            }
+            let matches = match (r.expected, now) {
+                (Some(a), Some(b)) if a.directory() && b.directory() => a.identity() == b.identity(),
+                (a, b) => a == b,
+            };
+            if !matches {
+                return Err(RarDiagnosticFailure::BindingChanged { ordinal: r.ordinal });
+            }
+        }
+        Ok(())
+    }
+    fn followed_created_directory(
+        &mut self,
+        c: &mut RarExtractControl,
+        known: Stamp,
+        attempts: &mut u64,
+    ) -> Result<(), RarDiagnosticFailure> {
+        for i in 0..self.records.len() {
+            c.proof_work(1)?;
+            let r = &self.records[i];
+            if !r.follow || r.expected.is_some() {
+                continue;
+            }
+            c.proof_work(r.path.len() as u64)?;
+            let now = self.observe(c, &r.path, attempts, true)?;
+            if now.is_some_and(|stamp| stamp.directory() && stamp.identity() == known.identity()) {
+                self.records[i].expected = now;
+            }
+        }
+        Ok(())
+    }
     fn created(
         &mut self,
         c: &mut RarExtractControl,
@@ -586,20 +690,17 @@ impl Guard {
         let cwd = cwd(c, attempts)?;
         let target = project_bytes(c, &cwd, path, Path::new(""))?;
         for i in 0..self.records.len() {
-            c.proof_work(checked(self.records[i].path.len() as u64, 1)?)?;
+            comparison_work(c, self.records[i].path.len(), target.len())?;
             let r = &self.records[i];
             let bytes = &r.path[..r.path.len() - 1];
-            if r.expected.is_none()
-                && bytes.len() <= target.len()
-                && target.starts_with(bytes)
-                && (bytes.len() == target.len() || target[bytes.len()] == b'/')
-            {
-                let now = self.observe(c, &r.path, attempts)?;
+            if r.expected.is_none() && as_path(&target).starts_with(as_path(bytes)) {
+                let now = self.observe(c, &r.path, attempts, r.follow)?;
                 if let Some(stamp) = now {
                     if !stamp.directory() {
                         return Err(RarDiagnosticFailure::BindingChanged { ordinal: r.ordinal });
                     }
                     self.records[i].expected = Some(stamp);
+                    self.followed_created_directory(c, stamp, attempts)?;
                 }
             }
         }
@@ -611,6 +712,46 @@ impl Guard {
             .ok_or(RarDiagnosticFailure::CounterOverflow)?;
         Ok(())
     }
+    fn before_publication(
+        &mut self,
+        c: &mut RarExtractControl,
+        index: usize,
+        initial: Option<SourceStamp>,
+        attempts: &mut u64,
+    ) -> Result<(), RarDiagnosticFailure> {
+        self.pending_unlink = None;
+        self.pending_publication = None;
+        self.check_followed(c, attempts)?;
+        let Some(initial) = initial else {
+            self.pending_publication = Some(index);
+            return Ok(());
+        };
+        let mut old = None;
+        for r in &self.records {
+            c.proof_work(1)?;
+            if r.leaf && r.ordinal == Some(index as u64) {
+                old = r.expected;
+                break;
+            }
+        }
+        let old = old
+            .filter(|stamp| stamp.regular() && stamp.source() == initial && stamp.links != 0)
+            .ok_or(RarDiagnosticFailure::BindingChanged { ordinal: Some(index as u64) })?;
+        // Validate every known binding to the incumbent immediately before the
+        // engine's one unlink. No foreign observation becomes a new baseline.
+        for r in &self.records {
+            c.proof_work(1)?;
+            if r.expected.is_some_and(|s| s.identity() == old.identity()) {
+                c.proof_work(r.path.len() as u64)?;
+                if r.expected != Some(old) || self.observe(c, &r.path, attempts, r.follow)? != Some(old) {
+                    return Err(RarDiagnosticFailure::BindingChanged { ordinal: r.ordinal });
+                }
+            }
+        }
+        self.pending_unlink = Some(PendingUnlink { index, old });
+        self.pending_publication = Some(index);
+        Ok(())
+    }
     fn published(
         &mut self,
         c: &mut RarExtractControl,
@@ -619,6 +760,8 @@ impl Guard {
         held: &File,
         attempts: &mut u64,
     ) -> Result<(), RarDiagnosticFailure> {
+        let pending = self.pending_unlink.take().filter(|pending| pending.index == index);
+        let prepared = self.pending_publication.take() == Some(index);
         let cwd = cwd(c, attempts)?;
         let target = project_bytes(c, &cwd, target, Path::new(""))?;
         c.proof_io(attempts)?;
@@ -628,10 +771,10 @@ impl Guard {
         }
         let mut found = false;
         for i in 0..self.records.len() {
-            c.proof_work(checked(self.records[i].path.len() as u64, 1)?)?;
+            comparison_work(c, self.records[i].path.len(), target.len())?;
             let r = &self.records[i];
-            if r.path[..r.path.len() - 1] == target {
-                let now = self.observe(c, &r.path, attempts)?;
+            if as_path(&r.path[..r.path.len() - 1]) == as_path(&target) {
+                let now = self.observe(c, &r.path, attempts, r.follow)?;
                 if now != Some(stamp) {
                     return Err(RarDiagnosticFailure::PublicationUnverified { ordinal: index as u64 });
                 }
@@ -642,6 +785,31 @@ impl Guard {
                     found = true;
                 }
                 self.records[i].expected = Some(stamp);
+            } else if prepared && r.follow && r.expected.is_none() {
+                let now = self.observe(c, &r.path, attempts, true)?;
+                if now == Some(stamp) {
+                    self.records[i].expected = Some(stamp);
+                } else if now.is_some() {
+                    return Err(RarDiagnosticFailure::BindingChanged { ordinal: r.ordinal });
+                }
+            } else if let Some(pending) =
+                pending.filter(|pending| r.expected.is_some_and(|old| old.identity() == pending.old.identity()))
+            {
+                let now = self
+                    .observe(c, &r.path, attempts, r.follow)?
+                    .ok_or(RarDiagnosticFailure::BindingChanged { ordinal: r.ordinal })?;
+                let permitted = Stamp {
+                    ctime: now.ctime,
+                    links: pending.old.links.checked_sub(1).ok_or(RarDiagnosticFailure::CounterOverflow)?,
+                    ..pending.old
+                };
+                let follows_published = r.follow && now == stamp;
+                // Exactly the known link removal may advance ctime. Every
+                // other field stays strict, including all future checkpoints.
+                if r.expected != Some(pending.old) || (!follows_published && now != permitted) {
+                    return Err(RarDiagnosticFailure::BindingChanged { ordinal: r.ordinal });
+                }
+                self.records[i].expected = Some(now);
             }
         }
         c.usage.diagnostics.capacity = c
@@ -701,6 +869,17 @@ fn project_bytes(
         out.pop();
     }
     Ok(out)
+}
+
+fn as_path(bytes: &[u8]) -> &Path {
+    Path::new(OsStr::from_bytes(bytes))
+}
+fn comparison_work(c: &mut RarExtractControl, a: usize, b: usize) -> Result<(), RarDiagnosticFailure> {
+    let work = checked(a as u64, b as u64)?
+        .checked_mul(4)
+        .and_then(|n| n.checked_add(2))
+        .ok_or(RarDiagnosticFailure::CounterOverflow)?;
+    c.proof_work(work)
 }
 
 fn anchored(path: &[u8]) -> &[u8] {
