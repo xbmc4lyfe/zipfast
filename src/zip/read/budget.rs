@@ -94,6 +94,10 @@ pub struct EncryptedReadUsage {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct RunUsage {
+    pub canonical_metadata_operations: u128,
+    pub policy_probe_operations: u128,
+    pub output_directory_operations: u128,
+    pub storage_backend_operations: u128,
     pub source_seeks: u128,
     pub records: u128,
     pub source_check_groups: u128,
@@ -113,6 +117,10 @@ pub struct RunUsage {
 impl RunUsage {
     fn counter(&mut self, category: RunCategory) -> &mut u128 {
         match category {
+            RunCategory::CanonicalMetadataOperations => &mut self.canonical_metadata_operations,
+            RunCategory::PolicyProbeOperations => &mut self.policy_probe_operations,
+            RunCategory::OutputDirectoryOperations => &mut self.output_directory_operations,
+            RunCategory::StorageBackendOperations => &mut self.storage_backend_operations,
             RunCategory::SourceSeeks => &mut self.source_seeks,
             RunCategory::Records => &mut self.records,
             RunCategory::SourceCheckGroups => &mut self.source_check_groups,
@@ -127,6 +135,44 @@ impl RunUsage {
             RunCategory::EmergencyCleanup => &mut self.emergency_cleanup,
             RunCategory::IoAttempts => &mut self.io_attempts,
             RunCategory::IoBytes => &mut self.io_bytes,
+        }
+    }
+}
+/// Actual separately scoped policy allocation observations; allocator overhead is not capacity.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct PolicyAllocationUsage {
+    pub allocation_attempts: u64,
+    pub allocations: u64,
+    pub releases: u64,
+    pub live_allocations: u64,
+    pub peak_allocations: u64,
+    pub requested_bytes: u128,
+    pub allocated_bytes: u128,
+    pub live_requested_bytes: u128,
+    pub live_capacity: u128,
+    pub peak_requested_bytes: u128,
+    pub peak_capacity: u128,
+}
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
+pub struct PolicyMetadataUsage {
+    pub caller: PolicyAllocationUsage,
+    pub native_acl: PolicyAllocationUsage,
+    pub scratch: PolicyAllocationUsage,
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum PolicyComponent {
+    Caller,
+    NativeAcl,
+    Scratch,
+}
+impl PolicyMetadataUsage {
+    fn component(&mut self, kind: PolicyComponent) -> &mut PolicyAllocationUsage {
+        match kind {
+            PolicyComponent::Caller => &mut self.caller,
+            PolicyComponent::NativeAcl => &mut self.native_acl,
+            PolicyComponent::Scratch => &mut self.scratch,
         }
     }
 }
@@ -308,9 +354,20 @@ pub(super) struct PlanGeometry {
     pub(super) output_passes: u128,
     pub(super) output_encrypted: bool,
 }
+/// Checked processed caller-policy geometry; this is not allocated payload memory.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct PolicyGeometry {
+    pub(super) protected: u128,
+    pub(super) raw_bytes: u128,
+    pub(super) absolute_bytes: u128,
+    pub(super) cwd_bytes: u128,
+    pub(super) relative: bool,
+}
 // Task4 alone binds immutable source/scope identity after borrowed catalogue derivation.
 #[derive(Debug)]
 pub(super) struct ActionPlan {
+    geometry: PlanGeometry,
+    policy_bound: bool,
     bounds: RunUsage,
     pub(super) live_spool: u128,
     output_encrypted: bool,
@@ -348,6 +405,60 @@ pub(super) struct MemberPlan {
     pub(super) output: PlannedOutput,
 }
 impl ActionPlan {
+    fn bind_policy_geometry(&mut self, policy: PolicyGeometry) -> Result<u128, ReadFault> {
+        if self.policy_bound || self.output_passes != 1 {
+            return Err(ReadFault::InvalidPlan);
+        }
+        let g = self.geometry;
+        let r1 = checked_sum(g.records, 1)?;
+        let rg1 = checked_sum(g.regular, 1)?;
+        let raw = checked_sum(policy.raw_bytes, policy.protected)?;
+        if policy.absolute_bytes < raw {
+            return Err(ReadFault::InvalidPlan);
+        }
+        let w1 = checked_sum(policy.cwd_bytes, 1)?;
+        let qraw = checked_sum(checked_sum(raw, policy.absolute_bytes)?, checked_sum(w1, product(r1, w1)?)?)?;
+        let canonical = checked_sum(checked_sum(policy.protected, 1)?, product(2, g.regular)?)?;
+        #[cfg(target_os = "macos")]
+        let (canonical_ops, qcanon, probe_tail) = {
+            let h = libc::PATH_MAX as u128;
+            let visits = product(34, checked_sum(h, 1)?)?;
+            let n = checked_sum(product(checked_sum(h, 4)?, visits)?, 41)?;
+            (product(product(2, n)?, canonical)?, product(product(2, canonical)?, visits)?, 15u128)
+        };
+        #[cfg(target_os = "linux")]
+        let (canonical_ops, qcanon, probe_tail) =
+            (product(8, canonical)?, product(canonical, checked_sum(libc::PATH_MAX as u128, 1)?)?, 17u128);
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        return Err(ReadFault::UnsupportedIdentity);
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let qdir = checked_sum(product(2, g.path_bytes)?, product(210, rg1)?)?;
+            let dlraw = checked_sum(checked_sum(policy.protected, 1)?, u128::from(policy.relative))?;
+            let dl = checked_sum(product(4, checked_sum(checked_sum(qraw, qcanon)?, qdir)?)?, dlraw)?;
+            let twice_c = product(2, self.namespace_creates.into())?;
+            let probe = product(g.regular, checked_sum(twice_c, probe_tail)?)?;
+            let private_dir = product(g.regular, checked_sum(twice_c, 9)?)?;
+            let final_extra = checked_sum(product(11, g.regular)?, g.large_aes)?;
+            let named_create = product(twice_c, g.regular)?;
+            let dm = [canonical_ops, probe, private_dir, final_extra, named_create, g.regular, product(5, dl)?]
+                .into_iter()
+                .try_fold(0, checked_sum)?;
+            let extra_attempts = product(dm, checked_sum(self.namespace_retries.into(), 1)?)?;
+            let mut bounds = self.bounds;
+            bounds.canonical_metadata_operations = checked_sum(bounds.canonical_metadata_operations, canonical_ops)?;
+            bounds.policy_probe_operations = checked_sum(bounds.policy_probe_operations, probe)?;
+            bounds.output_directory_operations = checked_sum(bounds.output_directory_operations, private_dir)?;
+            bounds.storage_backend_operations = checked_sum(bounds.storage_backend_operations, g.regular)?;
+            bounds.temporary_groups = checked_sum(bounds.temporary_groups, product(2, g.regular)?)?;
+            bounds.path_steps = checked_sum(bounds.path_steps, dl)?;
+            bounds.stage_finalization = checked_sum(bounds.stage_finalization, final_extra)?;
+            bounds.io_attempts = checked_sum(bounds.io_attempts, extra_attempts)?;
+            self.bounds = bounds;
+            self.policy_bound = true;
+            Ok(bounds.io_attempts)
+        }
+    }
     pub(super) fn attempt_bound(&self) -> u128 {
         self.bounds.io_attempts
     }
@@ -384,6 +495,8 @@ impl ActionPlan {
         let l = checked_sum(product(4, g.path_bytes)?, product(4, r1)?)?;
         let t = checked_sum(g.regular, g.large_aes)?;
         let source = product(8, r1)?;
+        let anonymous = checked_sum(g.large_aes, if g.output_passes == 3 { g.regular } else { 0 })?;
+        let anonymous_delta = if cfg!(target_os = "macos") { product(creates.into(), anonymous)? } else { 0 };
         let terminal = product(4, rg1)?;
         let stage = product(16, rg1)?;
         let dirs = product(12, rd1)?;
@@ -396,6 +509,7 @@ impl ActionPlan {
             dirs,
             16,
             product(2, g.regular)?,
+            anonymous_delta,
         ]
         .into_iter()
         .try_fold(0, checked_sum)?;
@@ -403,7 +517,13 @@ impl ActionPlan {
         let decode =
             product(4, checked_sum(checked_sum(g.packed, g.decoded)?, checked_sum(product(64, g.regular)?, 1)?)?)?;
         Ok(Self {
+            geometry: g,
+            policy_bound: false,
             bounds: RunUsage {
+                canonical_metadata_operations: 0,
+                policy_probe_operations: 0,
+                output_directory_operations: 0,
+                storage_backend_operations: anonymous,
                 source_seeks: product(2, g.regular)?,
                 records: g.records,
                 source_check_groups: source,
@@ -442,9 +562,14 @@ impl RunLedger {
     }
 }
 pub(super) struct LedgerState {
+    pub(super) policy_metadata: PolicyMetadataUsage,
     pub(super) encrypted: EncryptedReadLedger,
     pub(super) run: RunLedger,
     pub(super) live_fds: u64,
+    pub(super) peak_fds: u64,
+    // The controlled engine reserves the caller's original source once. This is
+    // borrowed occupancy, never authority to close or reconstruct that File.
+    controlled_source: bool,
     pub(super) poisoned: bool,
     pub(super) active_encrypted: Option<bool>,
 }
@@ -462,6 +587,7 @@ impl LedgerState {
             return Err(ReadFault::InvalidPlan);
         }
         Ok(Self {
+            policy_metadata: PolicyMetadataUsage::default(),
             encrypted: EncryptedReadLedger {
                 limits,
                 usage: EncryptedReadUsage {
@@ -472,9 +598,78 @@ impl LedgerState {
             },
             run: RunLedger { usage: RunUsage::default(), plan: None },
             live_fds: 0,
+            peak_fds: 0,
+            controlled_source: false,
             poisoned: false,
             active_encrypted: None,
         })
+    }
+    pub(super) fn begin_policy_allocation(&mut self, kind: PolicyComponent, requested: usize) -> Result<(), ReadFault> {
+        if self.poisoned {
+            return Err(ReadFault::InvalidPlan);
+        }
+        let component = self.policy_metadata.component(kind);
+        let next_live = component.live_allocations.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+        match kind {
+            PolicyComponent::Caller => {}
+            PolicyComponent::Scratch => {
+                admit(ReadResource::PolicyScratchAllocations, 1, next_live.into())?;
+                admit(ReadResource::PolicyScratchBytes, 65536, requested as u128)?;
+            }
+            PolicyComponent::NativeAcl => {
+                #[cfg(target_os = "macos")]
+                let (count, bytes) = (2, 44 + 128 * 24);
+                #[cfg(target_os = "linux")]
+                let (count, bytes) = (3, 65536);
+                #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                return Err(ReadFault::UnsupportedIdentity);
+                #[cfg(any(target_os = "macos", target_os = "linux"))]
+                {
+                    admit(ReadResource::PolicyNativeAllocations, count, next_live.into())?;
+                    admit(ReadResource::PolicyNativeBytes, bytes, requested as u128)?;
+                }
+            }
+        }
+        let attempts = component.allocation_attempts.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+        let bytes = checked_sum(component.requested_bytes, requested as u128)?;
+        component.allocations.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+        component.releases.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+        checked_sum(component.allocated_bytes, usize::MAX as u128)?;
+        checked_sum(component.live_capacity, usize::MAX as u128)?;
+        checked_sum(component.live_requested_bytes, requested as u128)?;
+        component.allocation_attempts = attempts;
+        component.requested_bytes = bytes;
+        Ok(())
+    }
+    pub(super) fn acquired_policy_allocation(
+        &mut self,
+        kind: PolicyComponent,
+        requested: usize,
+        capacity: usize,
+    ) -> Result<(), ReadFault> {
+        let component = self.policy_metadata.component(kind);
+        let allocations = component.allocations.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+        let live = component.live_allocations.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+        let allocated = checked_sum(component.allocated_bytes, capacity as u128)?;
+        let live_capacity = checked_sum(component.live_capacity, capacity as u128)?;
+        let live_requested = checked_sum(component.live_requested_bytes, requested as u128)?;
+        component.allocations = allocations;
+        component.live_allocations = live;
+        component.allocated_bytes = allocated;
+        component.live_capacity = live_capacity;
+        component.live_requested_bytes = live_requested;
+        component.peak_allocations = component.peak_allocations.max(live);
+        component.peak_capacity = component.peak_capacity.max(live_capacity);
+        component.peak_requested_bytes = component.peak_requested_bytes.max(live_requested);
+        Ok(())
+    }
+    pub(super) fn release_policy_allocation(&mut self, kind: PolicyComponent, requested: usize, capacity: usize) {
+        let component = self.policy_metadata.component(kind);
+        component.live_allocations = component.live_allocations.checked_sub(1).expect("owned policy allocation");
+        component.live_capacity = component.live_capacity.checked_sub(capacity as u128).expect("owned policy capacity");
+        component.live_requested_bytes =
+            component.live_requested_bytes.checked_sub(requested as u128).expect("owned policy request");
+        component.releases = component.releases.checked_add(1).expect("prechecked policy release");
     }
     pub(super) fn bind(&mut self, plan: ActionPlan) -> Result<(), ReadFault> {
         if self.run.plan.is_some() || self.poisoned || plan.binding.is_none() {
@@ -482,6 +677,16 @@ impl LedgerState {
         }
         self.run.plan = Some(plan);
         Ok(())
+    }
+    pub(super) fn bind_policy_geometry(&mut self, policy: PolicyGeometry) -> Result<u128, ReadFault> {
+        if self.poisoned {
+            return Err(ReadFault::InvalidPlan);
+        }
+        let result = self.run.plan.as_mut().ok_or(ReadFault::InvalidPlan)?.bind_policy_geometry(policy);
+        if result.is_err() {
+            self.poisoned = true;
+        }
+        result
     }
     pub(super) fn charge_category(&mut self, category: RunCategory, count: u128) -> Result<(), ReadFault> {
         self.run.charge(category, count)
@@ -560,6 +765,29 @@ impl LedgerState {
         let limit = self.encrypted.limits.live_fds.min(5);
         charge64(&mut self.live_fds, count, limit, ReadResource::LiveFds)?;
         self.encrypted.usage.live_fds = self.live_fds;
+        self.peak_fds = self.peak_fds.max(self.live_fds);
+        Ok(())
+    }
+    pub(super) fn register_controlled_source(&mut self) -> Result<(), ReadFault> {
+        if !self.controlled_source {
+            self.acquire_fds(1)?;
+            self.controlled_source = true;
+        }
+        Ok(())
+    }
+    /// Cleanup-only acquisition: one already-reserved terminal operation, with
+    /// existing actual/unresolved charges included and no poison reset.
+    pub(super) fn acquire_cleanup_fd(&mut self) -> Result<(), ReadFault> {
+        if !self.poisoned {
+            return Err(ReadFault::InvalidPlan);
+        }
+        let next = self.live_fds.checked_add(1).ok_or(ReadFault::CounterOverflow)?;
+        let limit = self.encrypted.limits.live_fds.min(5);
+        admit(ReadResource::LiveFds, limit.into(), next.into())?;
+        self.charge_category(RunCategory::EmergencyCleanup, 1)?;
+        self.live_fds = next;
+        self.encrypted.usage.live_fds = next;
+        self.peak_fds = self.peak_fds.max(next);
         Ok(())
     }
     pub(super) fn retire_fd(&mut self, confirmed_closed: bool) {
@@ -611,9 +839,21 @@ impl LedgerState {
         self.encrypted.usage.reader_capacity =
             self.encrypted.usage.reader_capacity.checked_sub(capacity).expect("reserved reader capacity");
     }
-    pub(super) fn close_attempt(&mut self, encrypted: bool) -> Result<(), ReadFault> {
+    pub(super) fn close_attempt_in(&mut self, encrypted: bool, category: Option<RunCategory>) -> Result<(), ReadFault> {
+        if category.is_some_and(|c| {
+            !matches!(
+                c,
+                RunCategory::StageFinalization
+                    | RunCategory::PathSteps
+                    | RunCategory::CanonicalMetadataOperations
+                    | RunCategory::PolicyProbeOperations
+                    | RunCategory::OutputDirectoryOperations
+            )
+        }) {
+            return Err(ReadFault::InvalidPlan);
+        }
         let plan = self.run.plan.as_mut().ok_or(ReadFault::InvalidPlan)?;
-        for category in [RunCategory::StageFinalization, RunCategory::IoAttempts] {
+        for category in [category, Some(RunCategory::IoAttempts)].into_iter().flatten() {
             let next = checked_sum(*self.run.usage.counter(category), 1)?;
             admit(ReadResource::Run(category), *plan.bounds.counter(category), next)?;
         }
@@ -624,7 +864,9 @@ impl LedgerState {
                 checked_sum(self.encrypted.usage.io_attempts, 1)?,
             )?;
         }
-        self.charge_category(RunCategory::StageFinalization, 1)?;
+        if let Some(category) = category {
+            self.charge_category(category, 1)?;
+        }
         self.attempt(encrypted)
     }
     pub(super) fn attempt(&mut self, encrypted: bool) -> Result<(), ReadFault> {

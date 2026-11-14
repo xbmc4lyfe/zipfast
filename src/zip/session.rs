@@ -226,6 +226,21 @@ impl ReadSession {
         Arc::clone(&self.metadata)
     }
 
+    /// Admits the actual output descriptor against this original checked owner.
+    #[cfg(unix)]
+    #[allow(clippy::result_large_err)]
+    pub fn admit_output_fd(
+        &mut self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        context: &mut EncryptedReadContext,
+    ) -> ZipReadResult<()> {
+        if !context.has_action_plan() {
+            return Err(super::ReadFault::InvalidPlan.into());
+        }
+        self.check_source_checked(context)?;
+        context.admit_output_descriptor(self.checked_identity, self.source.stamp, fd)
+    }
+
     /// Checks the original source without allocating an error wrapper.
     /// The first observation is moved out; subsequent checks return a Copy invalidation code.
     #[allow(clippy::result_large_err)] // Fixed inline terminal evidence must survive allocation refusal.
@@ -239,7 +254,9 @@ impl ReadSession {
             .map_err(|fault| ZipReadError::from(fault).with_usage(context.usage(), context.run_usage()))?;
         self.source
             .verify_checked(&self.file, context)
-            .map_err(|fault| ZipReadError::from(fault).with_usage(context.usage(), context.run_usage()))
+            .map_err(|fault| ZipReadError::from(fault).with_usage(context.usage(), context.run_usage()))?;
+        context.successful_source_observation(self.checked_identity, self.source.stamp)?;
+        Ok(())
     }
 
     /// Checks that the retained handle and original path still identify the opened version.
@@ -759,6 +776,28 @@ pub struct SelectedZipEntry<'a> {
 }
 
 impl SelectedZipEntry<'_> {
+    /// Borrows this original selected record and its original sanitized path.
+    #[allow(clippy::result_large_err)]
+    pub fn stage_entry(&mut self) -> ZipReadResult<super::ZipStageEntry<'_>> {
+        let metadata = self.session.metadata.view(self.ordinal);
+        if metadata.is_dir() || metadata.is_link() || !super::supported(metadata.effective_method()) {
+            return Err(super::ReadFault::InvalidPlan.into());
+        }
+        if let Some(fault) = self.session.source.previous_invalidation() {
+            return Err(fault.into());
+        }
+        Ok(super::ZipStageEntry::original(
+            &self.session.file,
+            &mut self.session.source,
+            self.session.checked_identity,
+            self.ordinal,
+            metadata.read_description(),
+            metadata.creator_host() != 3,
+            metadata.extraction_unix_mode(),
+            metadata.modified(),
+            Some(&self.relative_path),
+        ))
+    }
     /// Borrows the selected metadata for output staging.
     pub fn metadata(&self) -> EntryMetadata<'_> {
         self.session.metadata.view(self.ordinal)

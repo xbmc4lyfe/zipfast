@@ -500,6 +500,31 @@ pub struct SelectedEntry {
 }
 
 impl SelectedEntry {
+    /// Admits the actual ZIP output descriptor; other formats return false.
+    #[cfg(unix)]
+    #[allow(clippy::result_large_err)]
+    pub fn admit_zip_output_fd(
+        &mut self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        context: &mut crate::zip::EncryptedReadContext,
+    ) -> crate::zip::ZipReadResult<bool> {
+        match &mut self.source {
+            SelectedSource::Zip(owner) => {
+                owner.admit_output_fd(fd, context)?;
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
+    /// Borrows the original ZIP record; other formats have no ZIP stage proof.
+    #[allow(clippy::result_large_err)]
+    pub fn zip_stage_entry(&mut self) -> crate::zip::ZipReadResult<Option<crate::zip::ZipStageEntry<'_>>> {
+        match &mut self.source {
+            SelectedSource::Zip(owner) => owner.stage_entry(self.index).map(Some),
+            _ => Ok(None),
+        }
+    }
     /// Opens a zero-based listing entry. The limit applies independently to
     /// packed and decoded bytes. It includes the entire compressed TAR stream
     /// or any solid RAR members required to decode the selection.

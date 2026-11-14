@@ -432,7 +432,7 @@ fn owned_resolved_path_has_same_ledger_controlled_release_and_no_borrow_trap() {
     let later_before = later.with_state(|s| s.encrypted.usage.reader_capacity);
     assert!(path.finish_capacity(&later).is_err());
     assert_eq!(later.with_state(|s| s.encrypted.usage.reader_capacity), later_before);
-    assert_eq!(shared::header_layout().0, 1152);
+    assert_eq!(shared::header_layout().0, 1904);
     assert_eq!(shared::role_sizes(), (16, 16, 16));
 }
 
@@ -471,7 +471,7 @@ fn bounded_default_response_and_preplan_resolution_have_finite_charges() {
     path.test_confstr(Ok(1)).unwrap();
     assert_eq!(path.test_path(), b".");
     path.finish_capacity(&context).unwrap();
-    assert_eq!(context.with_state(|s| s.encrypted.usage.reader_capacity), 1152);
+    assert_eq!(context.with_state(|s| s.encrypted.usage.reader_capacity), 1904);
 }
 
 #[test]
@@ -560,7 +560,7 @@ fn partial_named_cleanup_preserves_stat_and_unlink_operation_labels() {
                 }
                 if op == ReadIoOperation::Stat && fd >= 0 && seen_unlinks.get() > 0 {
                     seen_stats.set(seen_stats.get() + 1);
-                    if fail_stat && seen_stats.get() == 1 {
+                    if fail_stat && seen_stats.get() == 2 {
                         return Some(std::io::Error::from_raw_os_error(libc::EIO));
                     }
                 }
@@ -584,13 +584,13 @@ fn partial_named_cleanup_preserves_stat_and_unlink_operation_labels() {
             matches!(&cleanup.cause, CleanupCause::Io(error) if error.raw_os_error() == Some(if fail_stat { libc::EIO } else { libc::EACCES }))
         );
         assert_eq!(unlinks.get(), if fail_stat { 1 } else { 2 });
-        assert_eq!(stats_after_unlink.get(), if fail_stat { 2 } else { 3 });
+        assert_eq!(stats_after_unlink.get(), 2);
         assert_eq!(closes.get(), 2);
         ledger.with_state(|s| {
             assert!(s.poisoned);
             assert_eq!(s.live_fds, 1);
             assert_eq!(s.encrypted.usage.live_spool_bytes, 1);
-            assert_eq!(s.run.usage.emergency_cleanup, if fail_stat { 2 } else { 5 });
+            assert_eq!(s.run.usage.emergency_cleanup, if fail_stat { 2 } else { 4 });
         });
         assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
     }
@@ -624,12 +624,12 @@ fn partial_cleanup_policy_refusal_is_a_stat_without_an_unlink_retry() {
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let cleanup = error.cleanup_errors().find(|f| f.object == OwnedObject::Ciphertext).unwrap();
     assert_eq!(cleanup.operation, ReadIoOperation::Stat);
-    assert!(matches!(cleanup.cause, CleanupCause::Policy("ciphertext parent changed")));
+    assert!(matches!(cleanup.cause, CleanupCause::Policy("private storage parent changed")));
     assert_eq!(unlinks.get(), 1);
     ledger.with_state(|s| {
         assert!(s.poisoned);
         assert_eq!(s.live_fds, 1);
         assert_eq!(s.encrypted.usage.live_spool_bytes, 1);
-        assert_eq!(s.run.usage.emergency_cleanup, 2);
+        assert_eq!(s.run.usage.emergency_cleanup, 1);
     });
 }

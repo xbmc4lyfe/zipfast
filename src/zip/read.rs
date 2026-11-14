@@ -19,7 +19,13 @@ mod budget;
 mod cipher;
 mod codecs;
 mod error;
+mod output;
+#[cfg(unix)]
+mod policy;
 mod projected;
+pub use output::{ZipReadStage, ZipStageEntry};
+#[cfg(unix)]
+mod native_policy;
 pub use io::{BootstrapPhase, BootstrapUsage};
 pub use projected::ProjectedReadSession;
 #[cfg(test)]
@@ -30,7 +36,7 @@ pub(super) mod io;
 mod shared;
 mod spool;
 use crate::extract::Cancellation;
-pub use budget::{EncryptedReadLimits, EncryptedReadUsage, RunUsage};
+pub use budget::{EncryptedReadLimits, EncryptedReadUsage, PolicyAllocationUsage, PolicyMetadataUsage, RunUsage};
 pub use error::*;
 use shared::{ContextLedger, ReservationLedger};
 use std::{
@@ -130,11 +136,20 @@ impl Drop for EncryptedReadContext {
             debug_assert!(result.is_ok(), "same ledger owns temporary path capacity");
         }
         if let Some(action) = self.action.take() {
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if let Some(policy) = action.policy
+                && policy.finish(&self.ledger).is_err()
+            {
+                self.ledger.with_state(|s| s.poisoned = true);
+            }
             drop(action.destination);
         }
     }
 }
 impl EncryptedReadContext {
+    pub(in crate::zip) fn has_action_plan(&self) -> bool {
+        self.ledger.with_state(|s| s.bound())
+    }
     pub(in crate::zip) fn verify_identity(&self, identity: u64) -> Result<(), ReadFault> {
         if let Some(action) = &self.action {
             if action.identity != identity {
@@ -152,6 +167,57 @@ impl EncryptedReadContext {
         bootstrap.acquisition(shared::SHARED_LEDGER_CAPACITY)?;
         let ledger = ContextLedger::try_new(state).map_err(|error| error.with_bootstrap(bootstrap.usage()))?;
         Ok(Self { ledger, options, bootstrap, action: None, temp: None })
+    }
+    #[cfg(unix)]
+    #[allow(clippy::result_large_err, clippy::unnecessary_cast)] // Fixed evidence and platform dev/ino widths.
+    pub(in crate::zip) fn admit_output_descriptor(
+        &mut self,
+        owner: u64,
+        source: super::session::SourceStamp,
+        fd: std::os::fd::BorrowedFd<'_>,
+    ) -> ZipReadResult<()> {
+        use std::os::fd::AsRawFd;
+        self.verify_identity(owner)?;
+        self.ledger.with_state(|s| s.verify_source(source))?;
+        let stat = io::operation(
+            &self.ledger,
+            false,
+            RunCategory::StageFinalization,
+            IoStage::Output,
+            ReadIoOperation::Stat,
+            None,
+            || native_policy::stat(fd.as_raw_fd()),
+        )?;
+        if source.dev == stat.st_dev as u64 && source.ino == stat.st_ino as u64 {
+            return Err(ReadFault::CheckedFormat { reason: "output aliases ZIP source" }.into());
+        }
+        let descriptor = (fd.as_raw_fd() as usize, stat.st_dev as u64, stat.st_ino as u64, stat.st_mode as u32);
+        let action = self.action.as_mut().ok_or(ReadFault::InvalidPlan)?;
+        if action.controlled_output && action.output_descriptor != Some(descriptor) {
+            return Err(ReadFault::InvalidPlan.into());
+        }
+        action.output_descriptor = Some(descriptor);
+        Ok(())
+    }
+    pub(in crate::zip) fn successful_source_observation(
+        &mut self,
+        owner: u64,
+        source: super::session::SourceStamp,
+    ) -> Result<(), ReadFault> {
+        self.verify_identity(owner)?;
+        // Legacy checked observation also works before any action is bound;
+        // it cannot issue a controlled-stage proof.
+        if self.action.is_none() {
+            return Ok(());
+        }
+        self.ledger.with_state(|s| s.verify_source(source))?;
+        let action = self.action.as_mut().ok_or(ReadFault::InvalidPlan)?;
+        let Some(next) = action.source_observation.checked_add(1) else {
+            self.ledger.with_state(|s| s.poisoned = true);
+            return Err(ReadFault::CounterOverflow);
+        };
+        action.source_observation = next;
+        Ok(())
     }
     pub(in crate::zip) fn source_group(&mut self, source: super::session::SourceStamp) -> Result<(), ReadFault> {
         self.ledger.with_state(|s| {
@@ -194,6 +260,9 @@ impl EncryptedReadContext {
     pub fn usage(&self) -> EncryptedReadUsage {
         self.ledger.with_state(|s| s.encrypted.usage)
     }
+    pub fn policy_metadata_usage(&self) -> PolicyMetadataUsage {
+        self.ledger.with_state(|s| s.policy_metadata)
+    }
     pub fn run_usage(&self) -> RunUsage {
         self.ledger.with_state(|s| s.run.usage)
     }
@@ -221,6 +290,12 @@ impl EncryptedReadContext {
             return Err(ReadFault::InvalidPlan.into());
         }
         let encrypted = self.ledger.with_state(|s| s.output_encrypted())?;
+        if let Some(action) = self.action.as_mut() {
+            if action.controlled_output {
+                return Err(ReadFault::InvalidPlan.into());
+            }
+            action.raw_output = true;
+        }
         let token = self.ledger.mint_reservation()?;
         let result = (|| {
             let identity = io::operation(
@@ -288,7 +363,7 @@ impl EncryptedReadContext {
         result.map_err(|fault: ReadFault| ZipReadError::from(fault).with_usage(self.usage(), self.run_usage()))
     }
 }
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileIdentity {
     dev: u64,
     ino: u64,

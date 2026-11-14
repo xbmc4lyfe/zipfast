@@ -14,6 +14,11 @@
 // ENJOYMENT, OR NON-INFRINGEMENT. See the RPL for specific language governing
 // rights and limitations under the RPL.
 
+#[cfg(unix)]
+#[allow(dead_code)] // One shared first-party fixture also models metadata forms used by other suites.
+#[path = "../../../../tests/common/zip_parity_fixture.rs"]
+mod fixture;
+
 mod core;
 
 #[cfg(unix)]
@@ -26,3 +31,12 @@ mod codecs;
 
 #[cfg(unix)]
 mod projected;
+
+#[cfg(unix)]
+mod output;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod policy;
+
+#[cfg(target_os = "macos")]
+mod qualified;

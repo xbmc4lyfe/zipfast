@@ -86,6 +86,13 @@ pub(super) struct Action {
     pub(super) consumed: bool,
     pub(super) destination: Option<PathBuf>,
     pub(super) completed: bool,
+    pub(super) source_observation: u64,
+    pub(super) controlled_output: bool,
+    pub(super) raw_output: bool,
+    pub(super) output_descriptor: Option<(usize, u64, u64, u32)>,
+    pub(super) attempt_ceiling: u128,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) policy: Option<policy::FrozenPolicy>,
 }
 /// A checked owner of one original projected parse. No mutable catalogue is exposed.
 /// Handle/path identity, length, mtime and ctime checks are optimistic observations:
@@ -109,6 +116,9 @@ impl ProjectedReadSession {
         let owner = ProjectedOwner::open_checked(path, cancel)?;
         Ok(Self { owner })
     }
+    pub fn stage_entry(&mut self, ordinal: usize) -> ZipReadResult<ZipStageEntry<'_>> {
+        self.owner.stage_entry(ordinal)
+    }
     pub fn entries(&self) -> impl ExactSizeIterator<Item = &ZipEntry> {
         self.owner.entries.iter()
     }
@@ -131,36 +141,12 @@ impl ProjectedReadSession {
         self.owner.parser_usage
     }
     #[cfg(unix)]
-    #[allow(clippy::unnecessary_cast)] // Device/inode widths differ across Unix ABIs.
     pub fn admit_output_fd(
         &mut self,
         fd: std::os::fd::BorrowedFd<'_>,
         context: &mut EncryptedReadContext,
     ) -> ZipReadResult<()> {
-        use std::os::fd::AsRawFd;
-        if !context.ledger.with_state(|s| s.bound()) {
-            return Err(ReadFault::InvalidPlan.into());
-        }
-        self.check_source(context)?;
-        let source = self.owner.source.as_ref().map_err(|_| ReadFault::InvalidPlan)?.stamp;
-        let stat = io::operation(
-            &context.ledger,
-            false,
-            RunCategory::StageFinalization,
-            IoStage::Output,
-            ReadIoOperation::Stat,
-            None,
-            || {
-                let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
-                // SAFETY: the borrowed descriptor is live and the output is exact stat storage.
-                raw_io(unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) })?;
-                Ok(unsafe { stat.assume_init() })
-            },
-        )?;
-        if source.dev == stat.st_dev as u64 && source.ino == stat.st_ino as u64 {
-            return Err(ReadFault::CheckedFormat { reason: "output aliases ZIP source" }.into());
-        }
-        Ok(())
+        self.owner.admit_output_fd(fd, context)
     }
     pub fn check_source(&mut self, context: &mut EncryptedReadContext) -> ZipReadResult<()> {
         self.owner.check_source(context)
@@ -288,6 +274,25 @@ impl ProjectedOwner {
         }
         Ok(())
     }
+    pub(crate) fn stage_entry(&mut self, ordinal: usize) -> ZipReadResult<ZipStageEntry<'_>> {
+        let e = self.entries.get(ordinal).ok_or(ReadFault::InvalidPlan)?;
+        if e.is_dir() || e.is_link() || !zip::supported(e.effective_method()) {
+            return Err(ReadFault::InvalidPlan.into());
+        }
+        self.proof()?;
+        let e = &self.entries[ordinal];
+        Ok(ZipStageEntry::original(
+            &self.file,
+            self.source.as_mut().map_err(|_| ReadFault::InvalidPlan)?,
+            self.identity,
+            ordinal,
+            e.read_description(),
+            e.host != 3,
+            e.unix_mode(),
+            e.mtime.map(|s| (s, e.nanos)),
+            None,
+        ))
+    }
     pub(crate) fn read_checked(
         &mut self,
         index: usize,
@@ -346,6 +351,19 @@ impl ProjectedOwner {
             Some(cancel),
         )
     }
+    #[cfg(unix)]
+    pub(crate) fn admit_output_fd(
+        &mut self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        context: &mut EncryptedReadContext,
+    ) -> ZipReadResult<()> {
+        if !context.ledger.with_state(|s| s.bound()) {
+            return Err(ReadFault::InvalidPlan.into());
+        }
+        self.check_source(context)?;
+        let source = self.source.as_ref().map_err(|_| ReadFault::InvalidPlan)?.stamp;
+        context.admit_output_descriptor(self.identity, source, fd)
+    }
     pub(crate) fn check_source(&mut self, context: &mut EncryptedReadContext) -> ZipReadResult<()> {
         context.verify_identity(self.identity)?;
         self.proof()?;
@@ -354,7 +372,9 @@ impl ProjectedOwner {
         source
             .verify_checked(&self.file, context)
             .map_err(ZipReadError::from)
-            .map_err(|e| e.with_usage(context.usage(), context.run_usage()))
+            .map_err(|e| e.with_usage(context.usage(), context.run_usage()))?;
+        context.successful_source_observation(self.identity, source.stamp)?;
+        Ok(())
     }
 }
 fn merge_source_admission(error: ZipReadError, fault: ReadFault) -> ZipReadError {
@@ -670,6 +690,8 @@ pub(super) fn factory<'a>(
     overrides: &EncryptedReadOverrides,
     cancel: &Cancellation,
 ) -> ZipReadResult<()> {
+    let attempt_ceiling =
+        if derive_limits { overrides.io_attempts.unwrap_or(u128::MAX) } else { context.options.limits.io_attempts };
     let destination = match output {
         ZipReadOutput::StagedFiles { destination } => Some(destination),
         _ => None,
@@ -804,11 +826,7 @@ pub(super) fn factory<'a>(
             configuration_id: identity,
         })?;
         let attempts = plan.attempt_bound();
-        context.options.limits.io_attempts = attempts.min(if derive_limits {
-            overrides.io_attempts.unwrap_or(u128::MAX)
-        } else {
-            context.options.limits.io_attempts
-        });
+        context.options.limits.io_attempts = attempts.min(attempt_ceiling);
         context.ledger.with_state(|s| {
             s.encrypted.limits.io_attempts = context.options.limits.io_attempts;
             s.bind(plan)
@@ -840,6 +858,13 @@ pub(super) fn factory<'a>(
             consumed: false,
             destination: owned_destination,
             completed: false,
+            source_observation: 0,
+            controlled_output: false,
+            raw_output: false,
+            output_descriptor: None,
+            attempt_ceiling,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            policy: None,
         });
         Ok(())
     })();
@@ -1084,6 +1109,9 @@ fn checked_read_inner(
         })?;
     } else {
         io::canceled(Some(cancel))?;
+    }
+    if context.ledger.with_state(|s| s.poisoned) {
+        return Err(ReadFault::InvalidPlan.into());
     }
     context.verify_identity(identity)?;
     let action = context.action.as_mut().ok_or(ReadFault::InvalidPlan)?;

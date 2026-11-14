@@ -46,6 +46,9 @@ fn interrupted(ledger: &(impl LedgerAccess + ?Sized), retries: &mut u64) -> Resu
     })
 }
 fn request(s: &mut LedgerState, encrypted: bool, source: bool, wanted: usize) -> Result<usize, ReadFault> {
+    if s.poisoned {
+        return Err(ReadFault::InvalidPlan);
+    }
     let (available, resource, limit, used) = s.transfer_allowance(encrypted, source)?;
     let count = (wanted.min(WINDOW) as u128).min(available) as usize;
     if count == 0 && wanted > 0 {
@@ -133,6 +136,7 @@ pub(super) struct CreationGroup<'a> {
     encrypted: bool,
     stage: IoStage,
     limit: u64,
+    #[cfg(test)]
     retry_limit: u64,
     attempts: u64,
     terminal: bool,
@@ -145,7 +149,7 @@ impl<'a> CreationGroup<'a> {
         cancel: &Cancellation,
     ) -> Result<Self, ReadFault> {
         canceled(Some(cancel))?;
-        let (limit, retry_limit) = ledger.with_state(|s| {
+        let (limit, _retry_limit) = ledger.with_state(|s| {
             let policy = s.creation_policy(encrypted)?;
             s.charge_category(RunCategory::TemporaryGroups, 1)?;
             if encrypted {
@@ -153,8 +157,55 @@ impl<'a> CreationGroup<'a> {
             }
             Ok(policy)
         })?;
-        Ok(Self { ledger: ledger.view(), encrypted, stage, limit, retry_limit, attempts: 0, terminal: false })
+        Ok(Self {
+            ledger: ledger.view(),
+            encrypted,
+            stage,
+            limit,
+            #[cfg(test)]
+            retry_limit: _retry_limit,
+            attempts: 0,
+            terminal: false,
+        })
     }
+    pub(super) fn ensure_next(&self) -> Result<(), ReadFault> {
+        if self.terminal {
+            return Err(ReadFault::InvalidPlan);
+        }
+        budget::next_creation_attempt(self.attempts, self.limit).map(|_| ())
+    }
+    /// Namespace mutation is one shot: EINTR may have created a name without
+    /// returning a handle. Its caller retains that explicit ambiguous state.
+    pub(super) fn create_once<T>(
+        &mut self,
+        cancel: &Cancellation,
+        call: impl FnOnce() -> io::Result<T>,
+    ) -> Result<T, ReadFault> {
+        self.ensure_next()?;
+        canceled(Some(cancel))?;
+        let next = budget::next_creation_attempt(self.attempts, self.limit)?;
+        self.ledger.with_state(|s| {
+            if s.poisoned {
+                return Err(ReadFault::InvalidPlan);
+            }
+            s.attempt(self.encrypted)?;
+            if self.encrypted {
+                s.encrypted.usage.create_attempts = next;
+            }
+            Ok(())
+        })?;
+        self.attempts = next;
+        let result = call().map_err(|error| ReadFault::Io {
+            stage: self.stage,
+            operation: ReadIoOperation::Create,
+            offset: 0,
+            error,
+        });
+        self.terminal =
+            !matches!(&result, Err(ReadFault::Io { error, .. }) if error.kind() == io::ErrorKind::AlreadyExists);
+        result
+    }
+    #[cfg(test)] // Original generic creation admission/retry controls; storage uses one-shot mutation.
     pub(super) fn create<T>(
         &mut self,
         cancel: &Cancellation,
@@ -211,7 +262,7 @@ pub(super) fn operation<T>(
     stage: IoStage,
     operation: ReadIoOperation,
     cancel: Option<&Cancellation>,
-    mut call: impl FnMut() -> io::Result<T>,
+    call: impl FnMut() -> io::Result<T>,
 ) -> Result<T, ReadFault> {
     // Creation must use CreationGroup so callers cannot accidentally bypass its
     // per-namespace limit or charge one object group per collision.
@@ -219,6 +270,21 @@ pub(super) fn operation<T>(
         return Err(ReadFault::InvalidPlan);
     }
     ledger.with_state(|s| s.charge_category(category, 1))?;
+    attempted_operation(ledger, encrypted, stage, operation, cancel, call)
+}
+/// A group owner has already charged its concrete category; every native call
+/// still receives an ordinary attempt before entry and finite EINTR admission.
+pub(super) fn attempted_operation<T>(
+    ledger: &(impl LedgerAccess + ?Sized),
+    encrypted: bool,
+    stage: IoStage,
+    operation: ReadIoOperation,
+    cancel: Option<&Cancellation>,
+    mut call: impl FnMut() -> io::Result<T>,
+) -> Result<T, ReadFault> {
+    if operation == ReadIoOperation::Create {
+        return Err(ReadFault::InvalidPlan);
+    }
     let mut retries = 0;
     loop {
         attempt(ledger, encrypted, cancel)?;
@@ -639,33 +705,66 @@ pub(super) fn retire_once(
     object: OwnedObject,
     close: impl FnOnce() -> std::io::Result<()>,
 ) -> Result<(), CleanupFault> {
-    let ordinary = ledger.with_state(|s| s.close_attempt(encrypted));
+    let outcome = retire_in(ledger, encrypted, object, Some(RunCategory::StageFinalization), false, close);
+    match outcome.fault {
+        Some(fault) => Err(fault),
+        None => Ok(()),
+    }
+}
+/// One shot with the phase's approved semantic category. A normal-success
+/// refusal remains primary even when independently admitted cleanup succeeds.
+pub(super) struct Retirement {
+    pub(super) admission: Option<ReadFault>,
+    pub(super) fault: Option<CleanupFault>,
+    pub(super) closed: bool,
+}
+pub(super) fn retire_in(
+    ledger: &(impl LedgerAccess + ?Sized),
+    encrypted: bool,
+    object: OwnedObject,
+    category: Option<RunCategory>,
+    normal: bool,
+    close: impl FnOnce() -> std::io::Result<()>,
+) -> Retirement {
+    let ordinary = ledger.with_state(|s| s.close_attempt_in(encrypted, category));
     let admitted =
         ordinary.is_ok() || ledger.with_state(|s| s.charge_category(RunCategory::EmergencyCleanup, 1)).is_ok();
+    let admission = if normal { ordinary.err() } else { None };
+    if admission.is_some() {
+        ledger.with_state(|s| s.poisoned = true);
+    }
     if !admitted {
         ledger.with_state(|s| s.retire_fd(false));
-        return Err(CleanupFault {
-            object,
-            operation: ReadIoOperation::Close,
-            offset: None,
-            cause: CleanupCause::Policy("finite close allowance exhausted"),
-            close: CloseDisposition::Unresolved,
-        });
+        return Retirement {
+            admission,
+            closed: false,
+            fault: Some(CleanupFault {
+                object,
+                operation: ReadIoOperation::Close,
+                offset: None,
+                cause: CleanupCause::Policy("finite close allowance exhausted"),
+                close: CloseDisposition::Unresolved,
+            }),
+        };
     }
     match close() {
         Ok(()) => {
             ledger.with_state(|s| s.retire_fd(true));
-            Ok(())
+            Retirement { admission, fault: None, closed: true }
         }
         Err(error) => {
             ledger.with_state(|s| s.retire_fd(false));
-            Err(CleanupFault {
-                object,
-                operation: ReadIoOperation::Close,
-                offset: None,
-                cause: CleanupCause::Io(error),
-                close: CloseDisposition::Unresolved,
-            })
+            Retirement {
+                admission,
+                closed: false,
+                fault: Some(CleanupFault {
+                    object,
+                    operation: ReadIoOperation::Close,
+                    offset: None,
+                    cause: CleanupCause::Io(error),
+                    close: CloseDisposition::Unresolved,
+                }),
+            }
         }
     }
 }

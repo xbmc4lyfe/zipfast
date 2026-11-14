@@ -16,13 +16,11 @@
 
 use super::super::projected::*;
 use super::super::*;
+use super::fixture;
 use crate::test_alloc::REFUSE_ALLOCATIONS;
 use crate::zip::{Archive, ReadSession, ZipEntry};
-use std::io::Write;
-#[allow(dead_code)] // Shared fixture supports additional ZIP metadata forms.
-#[path = "../../../../tests/common/zip_parity_fixture.rs"]
-mod fixture;
 use fixture::{Member, build};
+use std::io::Write;
 fn opened(members: &[Member<'_>]) -> (tempfile::NamedTempFile, ProjectedReadSession) {
     let order = (0..members.len()).collect::<Vec<_>>();
     let mut file = tempfile::NamedTempFile::new().unwrap();

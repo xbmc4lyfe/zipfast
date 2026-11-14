@@ -15,7 +15,7 @@
 // rights and limitations under the RPL.
 
 //! Fixed, allocation-free checked-read terminal evidence.
-use super::{EncryptedReadUsage, RunUsage, ZipRunReport};
+use super::{EncryptedReadUsage, PolicyMetadataUsage, RunUsage, ZipRunReport};
 use crate::{Error, zip::SessionError};
 use std::{fmt, io};
 
@@ -36,6 +36,9 @@ pub enum IoStage {
 #[non_exhaustive]
 pub enum ReadIoOperation {
     DescriptorMode,
+    SetTime,
+    SetAcl,
+    ReadAcl,
     Read,
     Write,
     Seek,
@@ -121,11 +124,19 @@ pub enum ReadResource {
     ReaderCapacity,
     AllocationAttempts,
     LiveFds,
+    PolicyNativeAllocations,
+    PolicyNativeBytes,
+    PolicyScratchAllocations,
+    PolicyScratchBytes,
     Run(RunCategory),
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RunCategory {
+    CanonicalMetadataOperations,
+    PolicyProbeOperations,
+    OutputDirectoryOperations,
+    StorageBackendOperations,
     SourceSeeks,
     Records,
     SourceCheckGroups,
@@ -154,6 +165,7 @@ pub enum ReadFault {
     Io { stage: IoStage, operation: ReadIoOperation, offset: u64, error: io::Error },
     UnsupportedCheckedFormat,
     UnsupportedIdentity,
+    UnsupportedStorage,
     UnsupportedMethod { method: u16 },
     CheckedFormat { reason: &'static str },
     InvalidPlan,
@@ -194,6 +206,9 @@ pub enum OwnedObject {
     SourcePathDirectory,
     Output,
     OutputParent,
+    OutputPrivateDirectory,
+    ProbeFile,
+    PolicyPath,
     Ciphertext,
     CiphertextDirectory,
 }
@@ -250,6 +265,7 @@ pub struct ZipReadError {
     publication: PublicationState,
     accepted_output_bytes: u64,
     usage: OperationUsage,
+    policy_metadata: PolicyMetadataUsage,
     bootstrap: Option<super::io::BootstrapUsage>,
     parser_usage: Option<crate::zip::Usage>,
 }
@@ -269,6 +285,7 @@ impl ZipReadError {
             publication: PublicationState::NotPublished,
             accepted_output_bytes: 0,
             usage: OperationUsage::default(),
+            policy_metadata: PolicyMetadataUsage::default(),
         }
     }
     pub fn parser_usage(&self) -> Option<crate::zip::Usage> {
@@ -312,6 +329,13 @@ impl ZipReadError {
     pub fn accepted_output_bytes(&self) -> u64 {
         self.accepted_output_bytes
     }
+    pub fn policy_metadata_usage(&self) -> PolicyMetadataUsage {
+        self.policy_metadata
+    }
+    pub(super) fn with_policy_usage(mut self, usage: PolicyMetadataUsage) -> Self {
+        self.policy_metadata = usage;
+        self
+    }
     pub fn usage(&self) -> EncryptedReadUsage {
         self.usage.encrypted
     }
@@ -326,6 +350,66 @@ impl ZipReadError {
         self.primary = ZipReadErrorKind::SourceChanged;
         if self.source_change.is_none() {
             self.source_change = Some(fault);
+        }
+        self
+    }
+    pub(super) fn merge_cleanup_only(mut self, cleanup: Self) -> Self {
+        debug_assert!(
+            cleanup.operation.is_none()
+                && cleanup.source_change.is_none()
+                && cleanup.sink.is_none()
+                && cleanup.diagnostic.is_none()
+        );
+        for fault in cleanup.cleanup.into_iter().flatten() {
+            let mut report = ObjectCleanupReport::new(fault.object);
+            report.push(fault);
+            self = self.merge_cleanup(report);
+        }
+        self
+    }
+    /// Preserve a later one-shot retirement admission alongside an earlier
+    /// primary failure, without relabelling it as source evidence.
+    pub(super) fn retirement_cleanup(mut self, object: OwnedObject) -> Self {
+        debug_assert!(self.source_change.is_none() && self.sink.is_none() && self.diagnostic.is_none());
+        if let Some(fault) = self.operation.take() {
+            let mut report = ObjectCleanupReport::new(object);
+            report.push(CleanupFault {
+                object,
+                operation: ReadIoOperation::Close,
+                offset: None,
+                cause: CleanupCause::Admission(fault),
+                close: CloseDisposition::NotApplicable,
+            });
+            self = self.merge_cleanup(report);
+        }
+        self.primary = ZipReadErrorKind::Cleanup;
+        self
+    }
+    pub(super) fn merge_source_boundary(mut self, mut boundary: Self) -> Self {
+        if let Some(source) = boundary.source_change.take() {
+            self = self.merge_source(source);
+        }
+        if let Some(fault) = boundary.operation.take() {
+            let mut report = ObjectCleanupReport::new(OwnedObject::Source);
+            report.push(CleanupFault {
+                object: OwnedObject::Source,
+                operation: ReadIoOperation::Stat,
+                offset: None,
+                cause: CleanupCause::Admission(fault),
+                close: CloseDisposition::NotApplicable,
+            });
+            self = self.merge_cleanup(report);
+        }
+        if let Some(sink) = boundary.sink.take() {
+            self = self.merge_sink(sink);
+        }
+        if let Some(diagnostic) = boundary.diagnostic.take() {
+            self = self.merge_diagnostic(diagnostic);
+        }
+        for fault in boundary.cleanup.into_iter().flatten() {
+            let mut report = ObjectCleanupReport::new(fault.object);
+            report.push(fault);
+            self = self.merge_cleanup(report);
         }
         self
     }

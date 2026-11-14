@@ -158,6 +158,9 @@ use native::Engine;
 fn step_charge(ledger: LedgerView<'_>, encrypted: bool, cancel: &Cancellation) -> Result<(), ReadFault> {
     io::canceled(Some(cancel))?;
     ledger.with_state(|s| {
+        if s.poisoned {
+            return Err(ReadFault::InvalidPlan);
+        }
         s.charge_category(RunCategory::DecodeSteps, 1)?;
         if encrypted {
             s.encrypted.decode(0, 0)?;
