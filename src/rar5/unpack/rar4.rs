@@ -284,6 +284,8 @@ pub(crate) struct Rar4Decoder {
     table_builds: u64,
     #[cfg(test)]
     trace: Option<tests::BoundaryTrace>,
+    #[cfg(test)]
+    successor_trace: Option<tests::successor::SuccessorTrace>,
 }
 
 impl Rar4Decoder {
@@ -358,6 +360,8 @@ impl Rar4Decoder {
             table_builds: 0,
             #[cfg(test)]
             trace: None,
+            #[cfg(test)]
+            successor_trace: None,
         };
         decoder.work.tick(std::mem::size_of::<Self>() as u64)?;
         decoder.work.check()?;
@@ -460,6 +464,8 @@ impl Rar4Decoder {
         if end > self.expected {
             return Err(Rar4DecodeError::DecodedSize { expected: self.expected, actual: end });
         }
+        #[cfg(test)]
+        self.observe_successor_match(length, distance);
         self.last_length = length;
         self.phase = Phase::Copy { distance, left: length };
         Ok(())
