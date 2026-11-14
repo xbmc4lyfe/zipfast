@@ -951,6 +951,11 @@ struct HeldSource<'a> {
 }
 impl Read for HeldSource<'_> {
     fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+        let bytes = {
+            let count = super::tests::task6::read_cap(bytes.len(), true);
+            &mut bytes[..count]
+        };
         self.file.read(bytes)
     }
 }

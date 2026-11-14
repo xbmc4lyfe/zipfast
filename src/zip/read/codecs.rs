@@ -104,6 +104,11 @@ impl PlainInput<'_, '_> {
     }
     #[allow(clippy::result_large_err)] // Inline 4352-byte terminal evidence; no failure allocation.
     fn read(&mut self, bytes: &mut [u8], cancel: &Cancellation) -> ZipReadResult<usize> {
+        #[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+        let bytes = {
+            let count = super::tests::task6::read_cap(bytes.len(), false);
+            &mut bytes[..count]
+        };
         match self {
             Self::Aes(v) => v.read_plain_chunk(bytes, cancel),
             Self::ZipCrypto(v) => v.read_plain_chunk(bytes, cancel),
