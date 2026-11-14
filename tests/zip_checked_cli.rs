@@ -453,3 +453,48 @@ fn empty_destination_keeps_original_cwd_target_diagnostic_proof() {
     assert_eq!(fs::read(input).unwrap(), bytes);
     assert_eq!(fs::read(target).unwrap(), b"original");
 }
+
+#[test]
+fn r1_missing_password_existing_target_is_member_failure_even_quiet() {
+    for quiet in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("input.zip");
+        let bytes = aes(false);
+        fs::write(&input, &bytes).unwrap();
+        let dest = root.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        fs::write(dest.join("a.txt"), b"original").unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_zipfast"));
+        command.arg("x");
+        if quiet {
+            command.arg("-q");
+        }
+        let result = command.arg(&input).arg(&dest).output().unwrap();
+        assert_eq!(result.status.code(), Some(1));
+        assert!(String::from_utf8_lossy(&result.stderr).contains("password required"));
+        assert!(!String::from_utf8_lossy(&result.stderr).contains("skip"));
+        assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"original");
+        assert_eq!(fs::read(input).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn r1_provided_wrong_password_keeps_existing_target_skip() {
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("input.zip");
+    let bytes = aes(false);
+    fs::write(&input, &bytes).unwrap();
+    let dest = root.path().join("out");
+    fs::create_dir(&dest).unwrap();
+    fs::write(dest.join("a.txt"), b"original").unwrap();
+    let result = Command::new(env!("CARGO_BIN_EXE_zipfast"))
+        .args(["x", "-q", "-pwrong"])
+        .arg(&input)
+        .arg(&dest)
+        .output()
+        .unwrap();
+    assert!(result.status.success());
+    assert_eq!(result.stderr, b"a.txt: exists, skipped\n");
+    assert_eq!(fs::read(dest.join("a.txt")).unwrap(), b"original");
+    assert_eq!(fs::read(input).unwrap(), bytes);
+}

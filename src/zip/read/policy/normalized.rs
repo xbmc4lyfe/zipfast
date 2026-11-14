@@ -74,20 +74,52 @@ impl PolicyPath {
         root: &Path,
         relative: &Path,
     ) -> Result<Self, ReadFault> {
+        Self::joined_with_prefix(ledger, Path::new(""), root, relative)
+    }
+    pub(in crate::zip::read) fn joined_frozen(
+        ledger: &impl LedgerAccess,
+        root: &Path,
+        relative: &Path,
+        cwd: &Path,
+    ) -> Result<Self, ReadFault> {
+        if root.is_absolute() {
+            return Self::joined(ledger, root, relative);
+        }
+        if !cwd.is_absolute() {
+            return Err(ReadFault::InvalidPlan);
+        }
+        Self::joined_with_prefix(ledger, cwd, root, relative)
+    }
+    fn joined_with_prefix(
+        ledger: &impl LedgerAccess,
+        prefix: &Path,
+        root: &Path,
+        relative: &Path,
+    ) -> Result<Self, ReadFault> {
+        let prefix = prefix.as_os_str().as_bytes();
         let root = root.as_os_str().as_bytes();
         let rel = relative.as_os_str().as_bytes();
-        let separator = usize::from(!root.is_empty());
-        let capacity = root
+        let prefix_separator = usize::from(!prefix.is_empty());
+        let root_separator = usize::from(!root.is_empty());
+        let capacity = prefix
             .len()
-            .checked_add(rel.len())
-            .and_then(|n| n.checked_add(separator + 1))
+            .checked_add(prefix_separator)
+            .and_then(|n| n.checked_add(root.len()))
+            .and_then(|n| n.checked_add(root_separator))
+            .and_then(|n| n.checked_add(rel.len()))
+            .and_then(|n| n.checked_add(1))
             .ok_or(ReadFault::CounterOverflow)?;
         let mut bytes = MetadataLease::zeroed(ledger.view(), PolicyComponent::Caller, capacity)?;
-        bytes[..root.len()].copy_from_slice(root);
-        if separator != 0 {
-            bytes[root.len()] = b'/';
+        bytes[..prefix.len()].copy_from_slice(prefix);
+        if prefix_separator != 0 {
+            bytes[prefix.len()] = b'/';
         }
-        bytes[root.len() + separator..capacity - 1].copy_from_slice(rel);
+        let root_at = prefix.len() + prefix_separator;
+        bytes[root_at..root_at + root.len()].copy_from_slice(root);
+        if root_separator != 0 {
+            bytes[root_at + root.len()] = b'/';
+        }
+        bytes[root_at + root.len() + root_separator..capacity - 1].copy_from_slice(rel);
         Ok(Self { bytes: bytes.into_owned(), len: capacity - 1 })
     }
     pub(in crate::zip::read) fn cstr(&self) -> Result<&std::ffi::CStr, ReadFault> {

@@ -96,6 +96,9 @@ impl ZipDiagnosticStatus<'_> {
 /// Raw one-argument closures retain responsibility for their own diagnostic I/O.
 /// A structured observer admits the actually used held descriptors in `prepare`,
 /// then calls `emit` for each visible event. Suppressed events perform no diagnostic I/O.
+/// A render/write failure, post-render boundary fault, or invalid observer token
+/// stops every later callback, including `RunEnded`. A pre-write source fault may
+/// still be rendered once to an independently admitted safe sink.
 /// Legacy/non-ZIP events carry no checked ZIP source capability.
 ///
 /// ```
@@ -136,6 +139,8 @@ pub(super) struct DiagnosticState {
 }
 #[derive(Default)]
 pub(crate) struct Evidence {
+    // Callback disposition is independent of source/boundary/write priority.
+    stop_callbacks: bool,
     source: Option<io::SourceCheckError>,
     boundary: Option<DiagnosticBoundaryFault>,
     write: Option<ZipSinkFault>,
@@ -146,7 +151,7 @@ impl Evidence {
         self.source.is_some() || self.boundary.is_some() || self.write.is_some() || self.cwd.is_some()
     }
     pub(crate) fn observer_failed(&self) -> bool {
-        self.write.is_some()
+        self.stop_callbacks || self.write.is_some()
     }
     pub(crate) fn merge(self, mut error: ZipReadError) -> ZipReadError {
         if let Some(cwd) = self.cwd {
@@ -232,6 +237,7 @@ impl<'a> ZipDiagnosticScope<'a> {
         match &mut self.inner {
             ScopeInner::Bound(inner) => inner.admit_sinks(stdout, stderr),
             ScopeInner::Legacy(e) => {
+                e.stop_callbacks = true;
                 e.boundary = Some(DiagnosticBoundaryFault::Admission(ReadFault::InvalidPlan));
                 Err(ZipDiagnosticStop { token: Token { action: None, serial: 0 } })
             }
@@ -246,6 +252,7 @@ impl<'a> ZipDiagnosticScope<'a> {
         match &mut self.inner {
             ScopeInner::Bound(inner) => inner.emit(which, out, render),
             ScopeInner::Legacy(e) => {
+                e.stop_callbacks = true;
                 e.boundary = Some(DiagnosticBoundaryFault::Admission(ReadFault::InvalidPlan));
                 Err(ZipDiagnosticStop { token: Token { action: None, serial: 0 } })
             }
@@ -259,6 +266,7 @@ impl<'a> ZipDiagnosticScope<'a> {
                     Ok(()) => {}
                     Err(ZipObserverFault::Caller(f)) => e.write = Some(f),
                     Err(ZipObserverFault::Recorded(_)) => {
+                        e.stop_callbacks = true;
                         e.boundary = Some(DiagnosticBoundaryFault::Admission(ReadFault::InvalidPlan))
                     }
                 }
@@ -544,10 +552,12 @@ impl<'a> BoundScope<'a> {
     }
     pub fn admit_sinks(&mut self, stdout: Option<&dyn AsFd>, stderr: Option<&dyn AsFd>) -> ZipDiagnosticResult<()> {
         if self.emission_allowed {
+            self.evidence.stop_callbacks = true;
             self.boundary(DiagnosticBoundaryFault::Admission(ReadFault::InvalidPlan));
             return Err(self.stop());
         }
         if self.state.prepared {
+            self.evidence.stop_callbacks = true;
             self.boundary(DiagnosticBoundaryFault::Refused { reason: "diagnostic sinks already prepared" });
             return Err(self.stop());
         }
@@ -630,6 +640,7 @@ impl<'a> BoundScope<'a> {
             return Err(self.stop());
         }
         if !self.emission_allowed || self.emitted {
+            self.evidence.stop_callbacks = true;
             self.boundary(DiagnosticBoundaryFault::Admission(ReadFault::InvalidPlan));
             return Err(self.stop());
         }
@@ -638,6 +649,7 @@ impl<'a> BoundScope<'a> {
             && (retired.action != self.context.ledger.identity()
                 || self.context.verify_identity(retired.owner).is_err())
         {
+            self.evidence.stop_callbacks = true;
             self.boundary(DiagnosticBoundaryFault::Admission(ReadFault::InvalidPlan));
             return Err(self.stop());
         }
@@ -699,6 +711,7 @@ impl<'a> BoundScope<'a> {
         if let Err(stop) = result
             && (stop.token != self.token || !self.evidence.failed())
         {
+            self.evidence.stop_callbacks = true;
             self.boundary(DiagnosticBoundaryFault::Admission(ReadFault::InvalidPlan));
         }
         self.observe_source();
@@ -716,7 +729,14 @@ impl<'a> BoundScope<'a> {
                 self.boundary(f);
             }
         }
-        if self.evidence.failed() { Err(self.stop()) } else { Ok(self.state.usage.accepted_bytes - before) }
+        if self.evidence.failed() {
+            // A render has occurred. Its provisional output and post-render
+            // evidence are terminal: never call another observer or fallback.
+            self.evidence.stop_callbacks = true;
+            Err(self.stop())
+        } else {
+            Ok(self.state.usage.accepted_bytes - before)
+        }
     }
     pub(super) fn finish(mut self, result: ZipObserverResult<()>) -> Evidence {
         match result {
@@ -724,12 +744,15 @@ impl<'a> BoundScope<'a> {
             Err(ZipObserverFault::Caller(f)) => self.evidence.write = Some(f),
             Err(ZipObserverFault::Recorded(stop)) if stop.token == self.token && self.evidence.failed() => {}
             Err(ZipObserverFault::Recorded(_)) => {
-                self.evidence.boundary = Some(DiagnosticBoundaryFault::Admission(ReadFault::InvalidPlan))
+                self.evidence.stop_callbacks = true;
+                self.boundary(DiagnosticBoundaryFault::Admission(ReadFault::InvalidPlan));
             }
         }
         self.evidence
     }
 }
+#[cfg(test)]
+thread_local! { pub(super) static DESCRIPTOR_STAT_FAULT: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) }; }
 #[allow(clippy::unnecessary_cast)]
 fn classify(
     fd: i32,
@@ -739,6 +762,10 @@ fn classify(
     ) -> Result<libc::stat, ReadFault>,
 ) -> Result<Descriptor, DiagnosticBoundaryFault> {
     let stat = operation(ReadIoOperation::Stat, &mut || {
+        #[cfg(test)]
+        if let Some(code) = DESCRIPTOR_STAT_FAULT.with(|fault| fault.take()) {
+            return Err(std::io::Error::from_raw_os_error(code));
+        }
         let mut s = std::mem::MaybeUninit::uninit();
         if unsafe { libc::fstat(fd, s.as_mut_ptr()) } == 0 {
             Ok(unsafe { s.assume_init() })
@@ -770,4 +797,9 @@ fn classify(
         _ => return Err(DiagnosticBoundaryFault::Refused { reason: "unsupported diagnostic descriptor" }),
     };
     Ok(Descriptor { fd, dev: stat.st_dev as u64, ino: stat.st_ino as u64, kind: kind as u32, safe })
+}
+
+#[cfg(test)]
+pub(super) fn protocol_test_token(action: LedgerIdentity, serial: u64) -> ZipDiagnosticStop {
+    ZipDiagnosticStop { token: Token { action: Some(action), serial } }
 }

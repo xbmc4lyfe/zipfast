@@ -101,7 +101,8 @@ impl ProjectedReadSession {
             let descriptor = self.list_descriptor(out, context, &mut usage);
             let original_result = match (before, descriptor) {
                 (Ok(()), Ok(d)) if d.safe || !(d.dev == stamp.dev && d.ino == stamp.ino) => Ok(d),
-                (Err(e), _) => Err(e),
+                (Err(source), Err(boundary)) => Err(source.merge_diagnostic_boundary(boundary)),
+                (Err(e), Ok(_)) => Err(e),
                 (_, Err(f)) => Err(ZipReadError::from(ReadFault::InvalidPlan).merge_diagnostic_boundary(f)),
                 _ => Err(ZipReadError::from(ReadFault::InvalidPlan).merge_diagnostic_boundary(
                     DiagnosticBoundaryFault::Refused { reason: "listing aliases ZIP source" },

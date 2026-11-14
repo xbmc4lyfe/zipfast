@@ -80,6 +80,10 @@ type DirectoryHook = Option<Box<dyn FnMut(usize)>>;
 #[cfg(test)]
 thread_local! {pub(super) static DIRECTORY_HOOK:std::cell::RefCell<DirectoryHook>=const{std::cell::RefCell::new(None)};pub(super) static OWNED_CLOSE_BOUND:std::cell::Cell<Option<u128>>=const{std::cell::Cell::new(None)};pub(super) static OWNED_CLOSE_CALLS:std::cell::Cell<u64>=const{std::cell::Cell::new(0)};pub(super) static OWNED_HOOK:std::cell::RefCell<OwnedHook>=const{std::cell::RefCell::new(None)};}
 #[cfg(test)]
+type FinalizationHook = Option<Box<dyn FnMut()>>;
+#[cfg(test)]
+thread_local! { pub(super) static FINALIZATION_HOOK: std::cell::RefCell<FinalizationHook> = const { std::cell::RefCell::new(None) }; }
+#[cfg(test)]
 fn owned_hook(phase: u8, path: Option<&Path>) {
     let mut hook = OWNED_HOOK.with(|s| s.borrow_mut().take());
     if let Some(hook) = &mut hook {
@@ -289,9 +293,17 @@ impl ProjectedReadSession {
         if let Some(mut index) = context.action.as_mut().and_then(|a| a.directories.take()) {
             if !cancel.is_canceled() && !context.ledger.with_state(|s| s.poisoned) {
                 index.sort_unstable_by_key(|&(ordinal, depth)| (std::cmp::Reverse(depth), ordinal));
+                #[cfg(test)]
+                FINALIZATION_HOOK.with(|slot| {
+                    if let Some(hook) = slot.borrow_mut().as_mut() {
+                        hook();
+                    }
+                });
                 for &(ordinal, _) in index.iter() {
                     if cancel.is_canceled() {
-                        terminal = Some(ReadFault::Cancelled.into());
+                        if terminal.is_none() {
+                            terminal = Some(ReadFault::Cancelled.into());
+                        }
                         break;
                     }
                     if let Err(error) = self.directory(ordinal, options, cancel, context, true) {
@@ -483,6 +495,7 @@ impl ProjectedReadSession {
         let mut result = (|| -> ZipReadResult<bool> {
             let e = &self.owner.entries[ordinal];
             if options.mode == Mode::Test
+                || e.encrypted() && password.is_none_or(str::is_empty)
                 || !crate::zip::supported(e.effective_method())
                 || e.encrypted()
                     && (e.packed > context.options.limits.member_packed_bytes
@@ -606,7 +619,8 @@ impl ProjectedReadSession {
             }
             DIRECTORY_HOOK.with(|s| *s.borrow_mut() = hook);
         }
-        let target = policy::PolicyPath::joined(&context.ledger, &options.dest, relative)?;
+        let cwd = context.action.as_ref().and_then(|a| a.policy.as_ref()).ok_or(ReadFault::InvalidPlan)?.cwd();
+        let target = policy::PolicyPath::joined_frozen(&context.ledger, &options.dest, relative, cwd)?;
         let result = (|| -> ZipReadResult<()> {
             let path = target.cstr()?;
             let real = io::operation(
