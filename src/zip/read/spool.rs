@@ -753,7 +753,25 @@ impl<'a> PrivateCiphertextFile<'a> {
         // Parent observation above and this close are each attempted once.
         if let Some(parent) = directory {
             let mut report = ObjectCleanupReport::new(scope.parent);
-            if let Err(e) = close_scoped(ledger, scope.encrypted, parent.into_file(), scope.parent) {
+            if error.is_none() && scope.object == OwnedObject::Output {
+                // Successful controlled acquisition requires ordinary admission.
+                // Emergency close can retire the parent, never authorize success.
+                let raw = parent.into_file().into_raw_fd();
+                let retired = io::retire_in(
+                    &ledger,
+                    scope.encrypted,
+                    scope.parent,
+                    Some(RunCategory::StageFinalization),
+                    true,
+                    || syscall(ReadIoOperation::Close, raw, || cvt(unsafe { libc::close(raw) }).map(|_| ())),
+                );
+                if let Some(admission) = retired.admission {
+                    error = Some(admission.into());
+                }
+                if let Some(fault) = retired.fault {
+                    report.push(fault);
+                }
+            } else if let Err(e) = close_scoped(ledger, scope.encrypted, parent.into_file(), scope.parent) {
                 report.push(e);
             }
             if !report.is_empty() {

@@ -191,50 +191,57 @@ impl ZipReadStage {
         cancel: &Cancellation,
         context: &mut EncryptedReadContext,
     ) -> ZipReadResult<Self> {
-        #[cfg(not(unix))]
-        {
-            let _ = (entry, cancel, context);
-            Err(ReadFault::UnsupportedIdentity.into())
-        }
-        #[cfg(unix)]
-        {
-            let (source, encrypted, bytes) = entry.prepare_stdout(cancel, context)?;
-            let descriptor = context
-                .action
-                .as_ref()
-                .ok_or(ReadFault::InvalidPlan)?
-                .output_descriptor
-                .ok_or(ReadFault::InvalidPlan)?;
-            let token = context.ledger.mint_reservation()?;
-            let (file, identity, uid) = spool::PrivateCiphertextFile::create_output(
-                token.view(),
-                context.temp.as_ref().ok_or(ReadFault::InvalidPlan)?,
-                bytes,
-                cancel,
-                encrypted,
-            )?
-            .into_output();
-            let handle = file_handle(&file);
-            Ok(Self {
-                file: Some(file),
-                reservation: OutputReservation {
-                    ledger: token,
-                    encrypted,
+        let result: ZipReadResult<Self> = (|| {
+            #[cfg(not(unix))]
+            {
+                let _ = (entry, cancel);
+                Err(ReadFault::UnsupportedIdentity.into())
+            }
+            #[cfg(unix)]
+            {
+                let (source, encrypted, bytes) = entry.prepare_stdout(cancel, context)?;
+                let descriptor = context
+                    .action
+                    .as_ref()
+                    .ok_or(ReadFault::InvalidPlan)?
+                    .output_descriptor
+                    .ok_or(ReadFault::InvalidPlan)?;
+                let token = context.ledger.mint_reservation()?;
+                let (file, identity, uid) = spool::PrivateCiphertextFile::create_output(
+                    token.view(),
+                    context.temp.as_ref().ok_or(ReadFault::InvalidPlan)?,
                     bytes,
-                    written: 0,
-                    fds: 1,
-                    identity: FileIdentity { dev: identity.dev as u64, ino: identity.ino as u64 },
-                    handle,
-                    retired: false,
-                },
-                source,
-                uid,
-                descriptor,
-                terminal: false,
-                #[cfg(any(target_os = "macos", target_os = "linux"))]
-                named: None,
-            })
-        }
+                    cancel,
+                    encrypted,
+                )?
+                .into_output();
+                let handle = file_handle(&file);
+                Ok(Self {
+                    file: Some(file),
+                    reservation: OutputReservation {
+                        ledger: token,
+                        encrypted,
+                        bytes,
+                        written: 0,
+                        fds: 1,
+                        identity: FileIdentity { dev: identity.dev as u64, ino: identity.ino as u64 },
+                        handle,
+                        retired: false,
+                    },
+                    source,
+                    uid,
+                    descriptor,
+                    terminal: false,
+                    #[cfg(any(target_os = "macos", target_os = "linux"))]
+                    named: None,
+                })
+            }
+        })();
+        result.map_err(|error| {
+            context
+                .ledger
+                .with_state(|s| error.with_usage(s.encrypted.usage, s.run.usage).with_policy_usage(s.policy_metadata))
+        })
     }
     pub fn write_all(&mut self, bytes: &[u8], cancel: &Cancellation) -> ZipSinkResult<()> {
         if self.reservation.ledger.with_state(|s| s.poisoned) {

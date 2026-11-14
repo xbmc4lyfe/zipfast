@@ -2413,3 +2413,222 @@ fn named_actual_link_stage_replacement_and_directory_retarget_never_publish_or_u
         assert_eq!(fixture.context.policy_metadata_usage().native_acl.live_capacity, 0);
     }
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn stdout_preparation_fixture(
+    attempts: Option<u128>,
+    creates: Option<u64>,
+) -> (tempfile::NamedTempFile, ProjectedReadSession, EncryptedReadContext, File, tempfile::TempDir) {
+    use std::io::Write;
+    use std::os::fd::AsFd;
+    let frame = super::cipher::framed(1, "pw", b"data");
+    let extra = fixture::extra(0x9901, &[2, 0, b'A', b'E', 1, 0, 0]);
+    let mut member = fixture::Member::stored(b"entry", &frame);
+    member.method = 99;
+    member.flags = 1;
+    member.decoded = Some(b"data");
+    member.central_extra = &extra;
+    let bytes = fixture::build(&[member], &[0], b"", b"", false).bytes;
+    let mut source = tempfile::NamedTempFile::new().unwrap();
+    source.write_all(&bytes).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let cancel = Cancellation::default();
+    let mut session = ProjectedReadSession::open(source.path(), &cancel).unwrap();
+    let overrides = EncryptedReadOverrides {
+        io_attempts: attempts,
+        create_attempts: creates,
+        temp_dir: Some(root.path().to_owned()),
+        ..Default::default()
+    };
+    let mut context = EncryptedReadContext::for_projected(
+        &mut session,
+        ProjectedReadScope::Entry(0),
+        Some(100),
+        ZipReadOutput::VerifiedStdout,
+        Some("pw"),
+        &overrides,
+        &cancel,
+    )
+    .unwrap();
+    let out = tempfile::tempfile().unwrap();
+    session.admit_output_fd(out.as_fd(), &mut context).unwrap();
+    (source, session, context, out, root)
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+#[allow(clippy::result_large_err)] // Required admission and one physical close retain fixed inline fault evidence.
+fn public_stdout_preparation_parent_close_exact_and_one_under_cannot_use_emergency_as_success() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    #[cfg(target_os = "macos")]
+    let body = 11;
+    #[cfg(target_os = "linux")]
+    let body = 10;
+    for (cap, fault) in [(body + 1, false), (body, false), (body, true)] {
+        let (_source, mut session, mut context, out, root) = stdout_preparation_fixture(Some(cap), None);
+        let closes = Rc::new(Cell::new(0));
+        let seen = closes.clone();
+        spool::hooks::HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |op, fd| {
+                if op == ReadIoOperation::Close {
+                    seen.set(seen.get() + 1);
+                    if cap == body {
+                        crate::test_alloc::REFUSE_ALLOCATIONS.with(|v| v.set(true));
+                    }
+                    if fault && seen.get() == 1 {
+                        assert_eq!(unsafe { libc::close(fd) }, 0);
+                        return Some(std::io::Error::from_raw_os_error(libc::EINTR));
+                    }
+                }
+                None
+            }))
+        });
+        let result =
+            ZipReadStage::prepare_stdout(session.stage_entry(0).unwrap(), &Cancellation::default(), &mut context);
+        crate::test_alloc::REFUSE_ALLOCATIONS.with(|v| v.set(false));
+        spool::hooks::HOOK.with(|h| *h.borrow_mut() = None);
+        if cap == body + 1 {
+            assert!(result.is_ok());
+            assert_eq!(closes.get(), 1);
+            let stage = result.ok().unwrap();
+            let _ = stage.finish_error(ReadFault::InvalidPlan.into(), &mut context);
+        } else {
+            let error = result.err().expect("ordinary parent close refusal must stop preparation");
+            assert!(
+                matches!(error.operation(),Some(ReadFault::Limit{resource:ReadResource::IoAttempts,limit,attempted}) if *limit==cap && *attempted==cap+1)
+            );
+            assert_eq!(closes.get(), 2, "parent once plus owned anonymous file once");
+            assert_eq!(context.usage().live_fds, 1 + u64::from(fault));
+            assert_eq!(context.run_usage().live_spool_bytes, 0);
+            assert_eq!(
+                error
+                    .cleanup_errors()
+                    .filter(|e| e.object == OwnedObject::OutputParent && e.operation == ReadIoOperation::Close)
+                    .count(),
+                usize::from(fault)
+            );
+            assert_eq!(error.usage(), context.usage());
+            assert_eq!(error.run_usage(), context.run_usage());
+            assert_eq!(error.policy_metadata_usage(), context.policy_metadata_usage());
+        }
+        assert_eq!(out.metadata().unwrap().len(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert_eq!(context.usage().members, 0);
+        assert_eq!(context.usage().decoded_bytes, 0);
+    }
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+#[allow(clippy::result_large_err)] // Public error snapshots must include allocator-refused terminal cleanup.
+fn public_stdout_preparation_errors_snapshot_final_source_refusal_and_unresolved_cleanup_usage() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    for scenario in 0..4 {
+        let cancel = Cancellation::default();
+        let (source, mut session, mut context, out, root) =
+            stdout_preparation_fixture(None, if scenario == 1 { Some(0) } else { None });
+        if scenario == 0 {
+            source.as_file().set_len(source.as_file().metadata().unwrap().len() - 1).unwrap();
+        }
+        let closes = Rc::new(Cell::new(0));
+        let seen = closes.clone();
+        let stats = Rc::new(Cell::new(0));
+        let observed = stats.clone();
+        spool::hooks::HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |op, fd| {
+                if op == ReadIoOperation::Stat {
+                    observed.set(observed.get() + 1);
+                    if scenario == 2 && observed.get() == 3 {
+                        crate::test_alloc::REFUSE_ALLOCATIONS.with(|v| v.set(true));
+                        return Some(std::io::ErrorKind::Unsupported.into());
+                    }
+                }
+                if op == ReadIoOperation::Close {
+                    seen.set(seen.get() + 1);
+                    if scenario == 3 {
+                        assert_eq!(unsafe { libc::close(fd) }, 0);
+                        crate::test_alloc::REFUSE_ALLOCATIONS.with(|v| v.set(true));
+                        return Some(std::io::Error::from_raw_os_error(libc::EINTR));
+                    }
+                }
+                None
+            }))
+        });
+        if scenario < 2 {
+            crate::test_alloc::REFUSE_ALLOCATIONS.with(|v| v.set(true));
+        }
+        let result = ZipReadStage::prepare_stdout(session.stage_entry(0).unwrap(), &cancel, &mut context);
+        crate::test_alloc::REFUSE_ALLOCATIONS.with(|v| v.set(false));
+        spool::hooks::HOOK.with(|h| *h.borrow_mut() = None);
+        let error = result.err().expect("public preparation must return terminal evidence");
+        assert_eq!(error.usage(), context.usage(), "scenario {scenario}");
+        assert_eq!(error.run_usage(), context.run_usage(), "scenario {scenario}");
+        assert_eq!(error.policy_metadata_usage(), context.policy_metadata_usage());
+        if scenario == 0 {
+            assert!(error.is_source_changed());
+            assert_eq!(closes.get(), 0);
+        }
+        if scenario == 1 {
+            assert_eq!(closes.get(), 0);
+            assert_eq!(context.usage().live_fds, 1);
+        }
+        if scenario == 2 {
+            assert!(matches!(error.operation(), Some(ReadFault::UnsupportedStorage)));
+            assert_eq!(closes.get(), 1);
+        }
+        if scenario == 3 {
+            assert_eq!(closes.get(), 2);
+            assert_eq!(context.usage().live_fds, 3);
+            assert_eq!(context.run_usage().live_spool_bytes, 4);
+            assert_eq!(error.cleanup_errors().filter(|e| e.operation == ReadIoOperation::Close).count(), 2);
+        }
+        assert_eq!(out.metadata().unwrap().len(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        assert_eq!(context.usage().members, 0);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+#[allow(clippy::result_large_err)] // Real public constructor must honor its normal StageFinalization close envelope too.
+fn public_stdout_preparation_parent_stage_finalization_exact_and_one_under() {
+    use std::cell::Cell;
+    use std::rc::Rc;
+    for remaining in [0, 1] {
+        let (_source, mut session, mut context, out, root) = stdout_preparation_fixture(None, None);
+        context.ledger.with_state(|s| {
+            let available = s.run_bounds().stage_finalization - s.run.usage.stage_finalization;
+            s.charge_category(RunCategory::StageFinalization, available - remaining).unwrap();
+        });
+        let closes = Rc::new(Cell::new(0));
+        let seen = closes.clone();
+        spool::hooks::HOOK.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move |op, _| {
+                if op == ReadIoOperation::Close {
+                    seen.set(seen.get() + 1);
+                }
+                None
+            }))
+        });
+        let result =
+            ZipReadStage::prepare_stdout(session.stage_entry(0).unwrap(), &Cancellation::default(), &mut context);
+        spool::hooks::HOOK.with(|h| *h.borrow_mut() = None);
+        if remaining == 1 {
+            assert_eq!(closes.get(), 1);
+            let _ = result.ok().unwrap().finish_error(ReadFault::InvalidPlan.into(), &mut context);
+        } else {
+            let error = result.err().expect("StageFinalization refusal must stop preparation");
+            assert!(matches!(
+                error.operation(),
+                Some(ReadFault::Limit { resource: ReadResource::Run(RunCategory::StageFinalization), .. })
+            ));
+            assert_eq!(closes.get(), 2);
+            assert_eq!(error.usage(), context.usage());
+            assert_eq!(error.run_usage(), context.run_usage());
+            assert_eq!(context.usage().live_fds, 1);
+            assert_eq!(context.run_usage().live_spool_bytes, 0);
+        }
+        assert_eq!(out.metadata().unwrap().len(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+}
