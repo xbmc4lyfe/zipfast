@@ -907,6 +907,27 @@ impl SourceBinding {
         }
         None
     }
+    /// A current namespace observation after ownership of the original File ended.
+    /// This deliberately performs no held-descriptor observation and never refreshes the stamp.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) fn verify_retired_path(
+        &mut self,
+        mut stat: impl FnMut(
+            IoStage,
+            &mut dyn FnMut() -> io::Result<SourceStamp>,
+        ) -> std::result::Result<SourceStamp, SourceCheckError>,
+    ) -> std::result::Result<(), SourceCheckError> {
+        if let Some(fault) = self.previous_invalidation() {
+            return Err(SourceCheckError::Source(fault));
+        }
+        let result = stat(IoStage::SourcePath, &mut || SourceStamp::stat_path(&self.path)).and_then(|stamp| {
+            if stamp == self.stamp { Ok(()) } else { Err(SourceCheckError::Source(CheckedSourceFault::StampMismatch)) }
+        });
+        if let Err(SourceCheckError::Source(fault)) = &result {
+            self.checked_invalid = Some(fault.invalidation());
+        }
+        result
+    }
     pub(super) fn verify_checked(
         &mut self,
         file: &File,

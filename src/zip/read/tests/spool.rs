@@ -432,7 +432,7 @@ fn owned_resolved_path_has_same_ledger_controlled_release_and_no_borrow_trap() {
     let later_before = later.with_state(|s| s.encrypted.usage.reader_capacity);
     assert!(path.finish_capacity(&later).is_err());
     assert_eq!(later.with_state(|s| s.encrypted.usage.reader_capacity), later_before);
-    assert_eq!(shared::header_layout().0, 1904);
+    assert_eq!(shared::header_layout().0, 2032);
     assert_eq!(shared::role_sizes(), (16, 16, 16));
 }
 
@@ -471,7 +471,7 @@ fn bounded_default_response_and_preplan_resolution_have_finite_charges() {
     path.test_confstr(Ok(1)).unwrap();
     assert_eq!(path.test_path(), b".");
     path.finish_capacity(&context).unwrap();
-    assert_eq!(context.with_state(|s| s.encrypted.usage.reader_capacity), 1904);
+    assert_eq!(context.with_state(|s| s.encrypted.usage.reader_capacity), 2032);
 }
 
 #[test]

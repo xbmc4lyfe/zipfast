@@ -899,6 +899,89 @@ pub fn list_with_password(first: &Path, password: Option<&str>) -> Result<Vec<En
 }
 
 /// Tests or extracts an archive, whatever its format.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::result_large_err)]
+pub fn run_with_zip_policy(
+    first: &Path,
+    options: &Options,
+    password: Option<&str>,
+    cancel: &Cancellation,
+    overrides: &crate::zip::EncryptedReadOverrides,
+    observe: impl crate::zip::ZipRunObserver,
+) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
+    let (opened, head) = crate::zip::read::CheckedOpen::open(first, cancel)?.probe(HEAD_PROBE_BYTES, cancel)?;
+    if matches!(classify_head(&head), Format::Zip) {
+        return crate::zip::read::with_opened_policy(
+            opened.into_zip_projected(cancel)?,
+            options,
+            password,
+            cancel,
+            overrides,
+            observe,
+        );
+    }
+    opened.retire()?;
+    legacy_zip_report(first, options, password, observe)
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::result_large_err)]
+pub fn run_with_zip_context(
+    first: &Path,
+    options: &Options,
+    password: Option<&str>,
+    cancel: &Cancellation,
+    context: &mut crate::zip::EncryptedReadContext,
+    observe: impl crate::zip::ZipRunObserver,
+) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
+    let (opened, head) = crate::zip::read::CheckedOpen::open(first, cancel)?.probe(HEAD_PROBE_BYTES, cancel)?;
+    if matches!(classify_head(&head), Format::Zip) {
+        return crate::zip::read::with_opened_context(
+            opened.into_zip_projected(cancel)?,
+            options,
+            password,
+            cancel,
+            context,
+            observe,
+        );
+    }
+    opened.retire()?;
+    legacy_zip_report(first, options, password, observe)
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::result_large_err)]
+fn legacy_zip_report(
+    first: &Path,
+    options: &Options,
+    password: Option<&str>,
+    mut observe: impl crate::zip::ZipRunObserver,
+) -> crate::zip::ZipReadResult<crate::zip::ZipRunReport> {
+    use crate::zip::{ReadFault, ZipReadError, ZipRunEvent, ZipRunReport};
+    let mut fault: Option<ZipReadError> = None;
+    let result = run_with_password(first, options, password, |message| {
+        if fault.is_none() {
+            let mut scope = crate::zip::ZipDiagnosticScope::legacy();
+            let result = observe.observe(ZipRunEvent::LegacyDiagnostic { message }, &mut scope);
+            let e = scope.finish(result);
+            if e.failed() {
+                fault = Some(e.merge(ReadFault::InvalidPlan.into()));
+            }
+        }
+    });
+    let (report, mut terminal) = match result {
+        Ok(summary) => (ZipRunReport::from_legacy(&summary), None),
+        Err(error) => (ZipRunReport::default(), Some(ZipReadError::from(ReadFault::Legacy(error)))),
+    };
+    if let Some(fault) = fault {
+        return Err(fault.with_partial(report));
+    }
+    let mut scope = crate::zip::ZipDiagnosticScope::legacy();
+    let result = observe.observe(ZipRunEvent::RunEnded { report: &report, error: terminal.as_ref() }, &mut scope);
+    let evidence = scope.finish(result);
+    if evidence.failed() {
+        terminal = Some(evidence.merge(terminal.take().unwrap_or_else(|| ReadFault::InvalidPlan.into())));
+    }
+    terminal.map_or(Ok(report), |e| Err(e.with_partial(report)))
+}
 pub fn run(first: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Summary> {
     run_with_password(first, opts, None, report)
 }

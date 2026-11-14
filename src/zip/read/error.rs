@@ -19,6 +19,15 @@ use super::{EncryptedReadUsage, PolicyMetadataUsage, RunUsage, ZipRunReport};
 use crate::{Error, zip::SessionError};
 use std::{fmt, io};
 
+/// Engine-produced evidence about a borrowed diagnostic descriptor or namespace.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum DiagnosticBoundaryFault {
+    Io { operation: ReadIoOperation, error: io::Error },
+    Admission(ReadFault),
+    Refused { reason: &'static str },
+    DescriptorChanged,
+}
 pub type ZipReadResult<T> = Result<T, ZipReadError>;
 pub type ZipSinkResult<T> = Result<T, ZipSinkFault>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -133,6 +142,8 @@ pub enum ReadResource {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum RunCategory {
+    DiagnosticSourceGroups,
+    DiagnosticAdmissionOperations,
     CanonicalMetadataOperations,
     PolicyProbeOperations,
     OutputDirectoryOperations,
@@ -255,9 +266,11 @@ pub struct OperationUsage {
 #[derive(Debug)]
 pub struct ZipReadError {
     primary: ZipReadErrorKind,
+    member_local: bool,
     operation: Option<ReadFault>,
     sink: Option<ZipSinkFault>,
     diagnostic: Option<ZipSinkFault>,
+    diagnostic_boundary: Option<DiagnosticBoundaryFault>,
     source_change: Option<CheckedSourceFault>,
     cleanup: [Option<CleanupFault>; 40],
     cleanup_len: u8,
@@ -273,11 +286,13 @@ impl ZipReadError {
     fn empty(primary: ZipReadErrorKind) -> Self {
         Self {
             primary,
+            member_local: false,
             bootstrap: None,
             parser_usage: None,
             operation: None,
             sink: None,
             diagnostic: None,
+            diagnostic_boundary: None,
             source_change: None,
             cleanup: std::array::from_fn(|_| None),
             cleanup_len: 0,
@@ -302,6 +317,13 @@ impl ZipReadError {
         self.bootstrap = Some(usage);
         self
     }
+    pub(crate) fn member_local(&self) -> bool {
+        self.member_local
+    }
+    pub(super) fn with_member_local(mut self, local: bool) -> Self {
+        self.member_local = local;
+        self
+    }
     pub fn kind(&self) -> ZipReadErrorKind {
         self.primary
     }
@@ -310,6 +332,18 @@ impl ZipReadError {
     }
     pub fn sink_fault(&self) -> Option<&ZipSinkFault> {
         self.sink.as_ref()
+    }
+    pub fn diagnostic_boundary_fault(&self) -> Option<&DiagnosticBoundaryFault> {
+        self.diagnostic_boundary.as_ref()
+    }
+    pub(super) fn merge_diagnostic_boundary(mut self, fault: DiagnosticBoundaryFault) -> Self {
+        if !self.is_source_changed() {
+            self.primary = ZipReadErrorKind::Diagnostic;
+        }
+        if self.diagnostic_boundary.is_none() {
+            self.diagnostic_boundary = Some(fault);
+        }
+        self
     }
     pub fn diagnostic_fault(&self) -> Option<&ZipSinkFault> {
         self.diagnostic.as_ref()
@@ -359,6 +393,7 @@ impl ZipReadError {
                 && cleanup.source_change.is_none()
                 && cleanup.sink.is_none()
                 && cleanup.diagnostic.is_none()
+                && cleanup.diagnostic_boundary.is_none()
         );
         for fault in cleanup.cleanup.into_iter().flatten() {
             let mut report = ObjectCleanupReport::new(fault.object);
@@ -367,10 +402,40 @@ impl ZipReadError {
         }
         self
     }
+    pub(super) fn is_placeholder(&self) -> bool {
+        matches!(self.operation, Some(ReadFault::InvalidPlan))
+            && self.sink.is_none()
+            && self.diagnostic.is_none()
+            && self.diagnostic_boundary.is_none()
+            && self.source_change.is_none()
+            && self.cleanup_len == 0
+            && self.partial_run.is_none()
+    }
+    pub(super) fn owned_boundary_error(mut self, object: OwnedObject, operation: ReadIoOperation) -> Self {
+        if let Some(fault) = self.operation.take() {
+            let (operation, offset, cause) = match fault {
+                ReadFault::Io { operation, offset, error, .. } => (operation, Some(offset), CleanupCause::Io(error)),
+                ReadFault::CheckedFormat { reason } => (operation, None, CleanupCause::Policy(reason)),
+                fault => (operation, None, CleanupCause::Admission(fault)),
+            };
+            let mut cleanup = ObjectCleanupReport::new(object);
+            cleanup.push(CleanupFault { object, operation, offset, cause, close: CloseDisposition::NotApplicable });
+            self = self.merge_cleanup(cleanup);
+        }
+        if !self.is_source_changed() && self.diagnostic.is_none() && self.diagnostic_boundary.is_none() {
+            self.primary = ZipReadErrorKind::Cleanup;
+        }
+        self
+    }
     /// Preserve a later one-shot retirement admission alongside an earlier
     /// primary failure, without relabelling it as source evidence.
     pub(super) fn retirement_cleanup(mut self, object: OwnedObject) -> Self {
-        debug_assert!(self.source_change.is_none() && self.sink.is_none() && self.diagnostic.is_none());
+        debug_assert!(
+            self.source_change.is_none()
+                && self.sink.is_none()
+                && self.diagnostic.is_none()
+                && self.diagnostic_boundary.is_none()
+        );
         if let Some(fault) = self.operation.take() {
             let mut report = ObjectCleanupReport::new(object);
             report.push(CleanupFault {
@@ -403,6 +468,9 @@ impl ZipReadError {
         if let Some(sink) = boundary.sink.take() {
             self = self.merge_sink(sink);
         }
+        if let Some(fault) = boundary.diagnostic_boundary.take() {
+            self = self.merge_diagnostic_boundary(fault);
+        }
         if let Some(diagnostic) = boundary.diagnostic.take() {
             self = self.merge_diagnostic(diagnostic);
         }
@@ -415,7 +483,7 @@ impl ZipReadError {
     }
     #[allow(dead_code)] // Task3/5 attach a callback fault without losing a later operation observation.
     pub(crate) fn merge_sink(mut self, fault: ZipSinkFault) -> Self {
-        if !self.is_source_changed() && self.diagnostic.is_none() {
+        if !self.is_source_changed() && self.diagnostic.is_none() && self.diagnostic_boundary.is_none() {
             self.primary = ZipReadErrorKind::Sink;
         }
         if self.sink.is_none() {

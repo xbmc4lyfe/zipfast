@@ -18,12 +18,23 @@
 mod budget;
 mod cipher;
 mod codecs;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) mod diagnostic;
 mod error;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub use diagnostic::{
+    ZipDiagnosticResult, ZipDiagnosticScope, ZipDiagnosticSink, ZipDiagnosticStatus, ZipDiagnosticStop,
+    ZipDiagnosticUsage, ZipDiagnosticWriter, ZipObserverFault, ZipObserverResult, ZipRunObserver,
+};
 mod output;
 #[cfg(unix)]
 mod policy;
 mod projected;
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod run;
 pub use output::{ZipReadStage, ZipStageEntry};
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) use run::{with_opened_context, with_opened_policy};
 #[cfg(unix)]
 mod native_policy;
 pub use io::{BootstrapPhase, BootstrapUsage};
@@ -139,6 +150,12 @@ impl Drop for EncryptedReadContext {
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             if let Some(policy) = action.policy
                 && policy.finish(&self.ledger).is_err()
+            {
+                self.ledger.with_state(|s| s.poisoned = true);
+            }
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            if let Some(index) = action.directories
+                && index.finish(&self.ledger).is_err()
             {
                 self.ledger.with_state(|s| s.poisoned = true);
             }
@@ -587,6 +604,14 @@ impl Drop for OutputReservation {
         }
     }
 }
+#[non_exhaustive]
+pub enum ZipRunEvent<'a> {
+    MemberFailed { ordinal: u64, name: &'a str, error: &'a ZipReadError },
+    MemberSkipped { ordinal: u64, name: &'a str },
+    MemberSucceeded { ordinal: u64, name: &'a str, decoded_bytes: u64 },
+    LegacyDiagnostic { message: &'a str },
+    RunEnded { report: &'a ZipRunReport, error: Option<&'a ZipReadError> },
+}
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ZipRunReport {
     files: u64,
@@ -597,8 +622,27 @@ pub struct ZipRunReport {
     decoded_bytes: u128,
     usage: EncryptedReadUsage,
     run_usage: RunUsage,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    diagnostic_usage: ZipDiagnosticUsage,
 }
 impl ZipRunReport {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(crate) fn from_legacy(summary: &crate::extract::Summary) -> Self {
+        Self {
+            files: summary.files,
+            dirs: summary.dirs,
+            skipped: summary.skipped,
+            failed: summary.errors.len() as u64,
+            volumes: summary.volumes,
+            decoded_bytes: summary.bytes as u128,
+            ..Default::default()
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub fn diagnostic_usage(&self) -> ZipDiagnosticUsage {
+        self.diagnostic_usage
+    }
     pub fn files(&self) -> u64 {
         self.files
     }

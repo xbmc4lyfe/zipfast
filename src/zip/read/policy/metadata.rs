@@ -101,6 +101,20 @@ impl<'a> MetadataLease<'a, u8> {
     }
 }
 impl<T> OwnedMetadata<T> {
+    pub(in crate::zip::read) fn push_bounded(&mut self, value: T) -> Result<(), ReadFault> {
+        let bytes = self
+            .bytes
+            .len()
+            .checked_add(1)
+            .and_then(|n| n.checked_mul(std::mem::size_of::<T>()))
+            .ok_or(ReadFault::CounterOverflow)?;
+        if bytes > self.requested || self.bytes.len() == self.bytes.capacity() {
+            return Err(ReadFault::InvalidPlan);
+        }
+        self.bytes.push(value);
+        Ok(())
+    }
+
     pub(in crate::zip::read) fn pop(&mut self) -> Option<T> {
         self.bytes.pop()
     }

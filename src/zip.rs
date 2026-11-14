@@ -796,6 +796,30 @@ pub fn list(path: &Path) -> Result<Vec<Entry>> {
         .collect())
 }
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::result_large_err)] // The public checked result preserves fixed failure evidence.
+pub fn run_with_policy(
+    path: &Path,
+    options: &Options,
+    password: Option<&str>,
+    cancel: &Cancellation,
+    overrides: &EncryptedReadOverrides,
+    observe: impl ZipRunObserver,
+) -> ZipReadResult<ZipRunReport> {
+    read::with_opened_policy(ProjectedReadSession::open(path, cancel)?, options, password, cancel, overrides, observe)
+}
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[allow(clippy::result_large_err)] // The public checked result preserves fixed failure evidence.
+pub fn run_with_context(
+    path: &Path,
+    options: &Options,
+    password: Option<&str>,
+    cancel: &Cancellation,
+    context: &mut EncryptedReadContext,
+    observe: impl ZipRunObserver,
+) -> ZipReadResult<ZipRunReport> {
+    read::with_opened_context(ProjectedReadSession::open(path, cancel)?, options, password, cancel, context, observe)
+}
 pub fn run(path: &Path, opts: &Options, report: impl FnMut(&str)) -> Result<Summary> {
     run_with_password(path, opts, None, report)
 }

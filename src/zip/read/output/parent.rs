@@ -132,7 +132,17 @@ impl HeldParent {
         normal: bool,
         encrypted: bool,
     ) -> ZipReadResult<()> {
-        let result = close(ledger, self.file, encrypted, RunCategory::StageFinalization, normal);
+        self.finish_in(ledger, normal, encrypted, RunCategory::StageFinalization)
+    }
+    #[allow(clippy::result_large_err)]
+    pub(in crate::zip::read) fn finish_in(
+        self,
+        ledger: &impl LedgerAccess,
+        normal: bool,
+        encrypted: bool,
+        category: RunCategory,
+    ) -> ZipReadResult<()> {
+        let result = close(ledger, self.file, encrypted, category, normal);
         let released = self.path.finish(ledger).map_err(|(_, fault)| ZipReadError::from(fault));
         match (result, released) {
             (Err(error), _) => Err(error),

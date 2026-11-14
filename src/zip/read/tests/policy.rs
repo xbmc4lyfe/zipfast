@@ -256,7 +256,8 @@ fn controlled_policy_envelope_is_once_bound_exact_and_does_not_reset_usage() {
         assert_eq!(bounds.policy_probe_operations, 94);
         assert_eq!(bounds.output_directory_operations, 82);
         assert_eq!(bounds.path_steps, 1954732);
-        assert_eq!(bounds.io_attempts, 8692721928);
+        // Staged-only source correction: 2 regular * 3 native stats * 17 attempts.
+        assert_eq!(bounds.io_attempts, 8692722030);
     }
     assert_eq!(bounds.stage_finalization, 71);
     assert_eq!(bounds.temporary_groups, 7);

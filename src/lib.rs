@@ -37,3 +37,10 @@ pub mod volume;
 pub mod zip;
 
 pub use error::{Error, Result};
+
+mod cli;
+
+#[doc(hidden)]
+pub fn cli_main() -> std::process::ExitCode {
+    cli::main()
+}

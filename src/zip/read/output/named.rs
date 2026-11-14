@@ -280,7 +280,7 @@ impl NamedFile {
         directory: &PrivateDirectory,
         encrypted: bool,
     ) -> (bool, ObjectCleanupReport) {
-        self.retire_in(ledger, parent, directory, encrypted, true)
+        self.retire_in(ledger, parent, directory, encrypted, true, false)
     }
     pub(in crate::zip::read) fn retire_blocked(
         &mut self,
@@ -289,7 +289,16 @@ impl NamedFile {
         directory: &PrivateDirectory,
         encrypted: bool,
     ) -> (bool, ObjectCleanupReport) {
-        self.retire_in(ledger, parent, directory, encrypted, false)
+        self.retire_in(ledger, parent, directory, encrypted, false, false)
+    }
+    pub(in crate::zip::read) fn retire_normal(
+        &mut self,
+        ledger: &impl LedgerAccess,
+        parent: &HeldParent,
+        directory: &PrivateDirectory,
+        encrypted: bool,
+    ) -> (bool, ObjectCleanupReport) {
+        self.retire_in(ledger, parent, directory, encrypted, true, true)
     }
     fn retire_in(
         &mut self,
@@ -298,6 +307,7 @@ impl NamedFile {
         directory: &PrivateDirectory,
         encrypted: bool,
         allow_namespace: bool,
+        normal_close: bool,
     ) -> (bool, ObjectCleanupReport) {
         let mut report = ObjectCleanupReport::new(OwnedObject::Output);
         let emergency = |op, call: &mut dyn FnMut() -> std::io::Result<()>| -> Result<(), CleanupCause> {
@@ -432,13 +442,22 @@ impl NamedFile {
                 encrypted,
                 OwnedObject::Output,
                 Some(RunCategory::StageFinalization),
-                false,
+                normal_close,
                 || {
                     spool::syscall(ReadIoOperation::Close, fd, || {
                         native_policy::cvt(unsafe { libc::close(fd) }).map(|_| ())
                     })
                 },
             );
+            if let Some(fault) = closed.admission {
+                report.push(CleanupFault {
+                    object: OwnedObject::Output,
+                    operation: ReadIoOperation::Close,
+                    offset: None,
+                    cause: CleanupCause::Admission(fault),
+                    close: CloseDisposition::NotApplicable,
+                });
+            }
             self.close_resolved = closed.closed;
             self.fd_reserved = false;
             if let Some(fault) = closed.fault {

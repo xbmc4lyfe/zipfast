@@ -19,8 +19,6 @@ use super::*;
 use crate::extract::{Mode, Options, Overwrite};
 use crate::zip::read::shared::{LedgerAccess, LedgerView};
 use crate::zip::session::SourceStamp;
-#[cfg(target_os = "macos")]
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStrExt;
 
 #[derive(Clone, Copy)]
@@ -109,89 +107,12 @@ impl<'a> Builder<'a> {
     }
 }
 #[allow(clippy::result_large_err)] // Fixed inline source/cleanup evidence, including allocation refusal.
-#[cfg(target_os = "macos")]
 fn cwd<'a>(
     ledger: LedgerView<'a>,
     scratch: &mut PolicyScratch<'a>,
     cancel: &Cancellation,
 ) -> ZipReadResult<MetadataLease<'a, u8>> {
-    ledger.with_state(|s| {
-        s.charge_category(RunCategory::PathSteps, 1)?;
-        s.acquire_fds(1)
-    })?;
-    let acquired =
-        io::attempted_operation(&ledger, false, IoStage::SourcePath, ReadIoOperation::Open, Some(cancel), || {
-            native_policy::cvt(unsafe {
-                libc::open(c".".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
-            })
-        });
-    let fd = match acquired {
-        Ok(fd) => fd,
-        Err(f) => {
-            ledger.with_state(|s| s.retire_fd(true));
-            return Err(f.into());
-        }
-    };
-    let file = unsafe { File::from_raw_fd(fd) };
-    let result = (|| -> ZipReadResult<_> {
-        io::attempted_operation(
-            &ledger,
-            false,
-            IoStage::SourcePath,
-            ReadIoOperation::DescriptorMode,
-            Some(cancel),
-            || native_policy::cvt(unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, scratch.as_mut_ptr()) }),
-        )?;
-        let h = libc::PATH_MAX as usize;
-        let n = scratch[..h]
-            .iter()
-            .position(|b| *b == 0)
-            .ok_or(ReadFault::CheckedFormat { reason: "unterminated frozen cwd" })?;
-        if n == 0 || scratch[0] != b'/' {
-            return Err(ReadFault::CheckedFormat { reason: "invalid frozen cwd" }.into());
-        }
-        let mut copy = MetadataLease::zeroed(ledger, PolicyComponent::Caller, n + 1)?;
-        copy.copy_from_slice(&scratch[..=n]);
-        Ok(copy)
-    })();
-    let raw = file.into_raw_fd();
-    let closed = io::retire_in(&ledger, false, OwnedObject::SourcePathDirectory, None, result.is_ok(), || {
-        native_policy::cvt(unsafe { libc::close(raw) }).map(|_| ())
-    });
-    let mut closing = closed.admission.map(ZipReadError::from);
-    if let Some(fault) = closed.fault {
-        let mut report = ObjectCleanupReport::new(OwnedObject::SourcePathDirectory);
-        report.push(fault);
-        closing = Some(match closing {
-            Some(error) => error.merge_cleanup(report),
-            None => report.into(),
-        });
-    }
-    match (result, closing) {
-        (result, None) => result,
-        (Ok(_), Some(error)) => Err(error),
-        // Prior body failure means cleanup mode, so closing has cleanup evidence only.
-        (Err(error), Some(closing)) => Err(error.merge_cleanup_only(closing)),
-    }
-}
-#[cfg(target_os = "linux")]
-#[allow(clippy::result_large_err)] // Same fixed inline allocation/refusal evidence as the source binding.
-fn cwd<'a>(
-    ledger: LedgerView<'a>,
-    scratch: &mut PolicyScratch<'a>,
-    cancel: &Cancellation,
-) -> ZipReadResult<MetadataLease<'a, u8>> {
-    ledger.with_state(|s| s.charge_category(RunCategory::PathSteps, 1))?;
-    let n = io::attempted_operation(&ledger, false, IoStage::SourcePath, ReadIoOperation::Read, Some(cancel), || {
-        let n = unsafe { libc::syscall(libc::SYS_getcwd, scratch.as_mut_ptr(), libc::PATH_MAX as usize) };
-        if n < 0 { Err(std::io::Error::last_os_error()) } else { Ok(n as usize) }
-    })?;
-    if n < 2 || n > libc::PATH_MAX as usize || scratch[n - 1] != 0 || scratch[0] != b'/' {
-        return Err(ReadFault::CheckedFormat { reason: "invalid native frozen cwd" }.into());
-    }
-    let mut copy = MetadataLease::zeroed(ledger, PolicyComponent::Caller, n)?;
-    copy.copy_from_slice(&scratch[..n]);
-    Ok(copy)
+    super::cwd::capture(ledger, scratch, cancel, &mut || Ok(())).map_err(super::cwd::CwdFailure::into_stage_error)
 }
 #[allow(clippy::result_large_err)] // Linux metadata FD failures retain fixed inline cleanup evidence.
 fn canonical_key(

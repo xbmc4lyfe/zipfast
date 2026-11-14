@@ -148,7 +148,7 @@ fn original_borrowed_receipt_rejects_nonregular_and_invalid_ordinal() {
 }
 
 #[test]
-#[allow(clippy::result_large_err)] // Exercises fixed5120-byte allocator-independent production terminal evidence.
+#[allow(clippy::result_large_err)] // Exercises fixed5360-byte allocator-independent production terminal evidence.
 fn final_boundary_requires_fresh_actual_original_source_observation() {
     use std::io::Write;
     let bytes = fixture::build(&[fixture::Member::stored(b"entry", b"data")], &[0], b"", b"", false).bytes;
@@ -196,7 +196,7 @@ fn final_boundary_requires_fresh_actual_original_source_observation() {
 
 #[cfg(unix)]
 #[test]
-#[allow(clippy::result_large_err)] // Exercises fixed5120-byte allocator-independent production terminal evidence.
+#[allow(clippy::result_large_err)] // Exercises fixed5360-byte allocator-independent production terminal evidence.
 fn stdout_is_real_file_verified_and_requires_actual_fd_admission() {
     use std::io::Write;
     use std::os::fd::AsFd;
@@ -263,7 +263,7 @@ fn stdout_stage(
     (source, session, context, stage, out)
 }
 #[test]
-#[allow(clippy::result_large_err)] // Exercises fixed5120-byte allocator-independent production terminal evidence.
+#[allow(clippy::result_large_err)] // Exercises fixed5360-byte allocator-independent production terminal evidence.
 fn byte_count_cannot_forge_completion_or_final_source() {
     let cancel = Cancellation::default();
     let (_source, mut session, mut context, mut stage, mut out) = stdout_stage(b"data");
@@ -280,7 +280,7 @@ fn byte_count_cannot_forge_completion_or_final_source() {
     assert_eq!(context.run_usage().live_spool_bytes, 0);
 }
 #[test]
-#[allow(clippy::result_large_err)] // Exercises fixed5120-byte allocator-independent production terminal evidence.
+#[allow(clippy::result_large_err)] // Exercises fixed5360-byte allocator-independent production terminal evidence.
 fn actual_writer_must_match_original_admission() {
     let cancel = Cancellation::default();
     let (_source, mut session, mut context, mut stage, out) = stdout_stage(b"data");
@@ -324,7 +324,7 @@ impl std::io::Write for PartialWriter {
     }
 }
 #[test]
-#[allow(clippy::result_large_err)] // Exercises fixed5120-byte allocator-independent production terminal evidence.
+#[allow(clippy::result_large_err)] // Exercises fixed5360-byte allocator-independent production terminal evidence.
 fn first_middle_final_broken_pipe_keeps_exact_bytes_and_postfault_source() {
     let cancel = Cancellation::default();
     for limit in [0, 2, 3] {
@@ -386,7 +386,7 @@ fn shared_namespace_does_not_retry_ambiguous_create() {
 }
 
 #[test]
-#[allow(clippy::result_large_err)] // Exercises fixed5120-byte allocator-independent production terminal evidence.
+#[allow(clippy::result_large_err)] // Exercises fixed5360-byte allocator-independent production terminal evidence.
 fn stdout_preparation_freezes_the_actual_descriptor() {
     use std::os::fd::AsFd;
     let cancel = Cancellation::default();
@@ -691,7 +691,7 @@ fn file_binding_rejects_foreign_tuple_before_effects_and_borrows_operational_nam
 }
 
 #[test]
-#[allow(clippy::result_large_err)] // Exercises fixed5120-byte allocator-independent production terminal evidence.
+#[allow(clippy::result_large_err)] // Exercises fixed5360-byte allocator-independent production terminal evidence.
 fn normal_stdout_close_admission_stays_primary_after_successful_emergency_close() {
     let cancel = Cancellation::default();
     let (_source, mut session, mut context, mut stage, mut out) = stdout_stage(b"data");
@@ -1075,7 +1075,7 @@ fn original_file_stage_is_private_during_fill_and_finish_error_preserves_prior_t
 
 #[cfg(target_os = "macos")]
 #[test]
-#[allow(clippy::result_large_err)] // Exercises fixed5120-byte allocator-independent production terminal evidence.
+#[allow(clippy::result_large_err)] // Exercises fixed5360-byte allocator-independent production terminal evidence.
 fn original_file_publication_requires_completion_and_two_fresh_source_observations() {
     use std::io::Write;
     let root = tempfile::tempdir().unwrap();
@@ -1202,7 +1202,7 @@ fn file_fixture_ready(overwrite: crate::extract::Overwrite, prior: Option<&[u8]>
 }
 #[cfg(target_os = "macos")]
 #[test]
-#[allow(clippy::result_large_err)] // Exercises fixed5120-byte allocator-independent production terminal evidence.
+#[allow(clippy::result_large_err)] // Exercises fixed5360-byte allocator-independent production terminal evidence.
 fn named_publication_each_of_nineteen_native_boundaries_preserves_status_and_one_close() {
     use std::cell::Cell;
     use std::rc::Rc;
@@ -1266,7 +1266,7 @@ fn named_publication_each_of_nineteen_native_boundaries_preserves_status_and_one
 
 #[cfg(target_os = "macos")]
 #[test]
-#[allow(clippy::result_large_err)] // Exercises fixed5120-byte allocator-independent production terminal evidence.
+#[allow(clippy::result_large_err)] // Exercises fixed5360-byte allocator-independent production terminal evidence.
 fn actual_original_named_aes_pipeline_has_five_reserved_fds_and_one_under_refuses_before_cipher_birth() {
     use std::io::Write;
     for limit in [4, 5] {
@@ -1492,12 +1492,12 @@ fn named_stage_phase_control_includes_held_namespace_and_native_birth_frames() {
         "named_stage/prepared/preparing/entry/binding/parent/directory/inode/metadata/scratch/dirfailure/filefailure={s:?} native_stat={native_stat} backend={backend} decode={decode} cipher_birth={cipher_birth} preparing={preparing} publication={publication} max={max}"
     );
     assert!(max <= 16384);
-    assert_eq!(shared::SHARED_LEDGER_CAPACITY, 1904);
+    assert_eq!(shared::SHARED_LEDGER_CAPACITY, 2032);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
-#[allow(clippy::result_large_err)] // Exercises fixed5120-byte allocator-independent production terminal evidence.
+#[allow(clippy::result_large_err)] // Exercises fixed5360-byte allocator-independent production terminal evidence.
 fn linux_real_original_named_stage_publication_uses_eighteen_final_calls() {
     let mut fixture = file_fixture(crate::extract::Overwrite::Always, Some(b"prior"));
     let before = fixture.context.run_usage().stage_finalization;

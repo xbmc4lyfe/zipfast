@@ -94,6 +94,8 @@ pub struct EncryptedReadUsage {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 #[non_exhaustive]
 pub struct RunUsage {
+    pub diagnostic_source_groups: u128,
+    pub diagnostic_admission_operations: u128,
     pub canonical_metadata_operations: u128,
     pub policy_probe_operations: u128,
     pub output_directory_operations: u128,
@@ -117,6 +119,8 @@ pub struct RunUsage {
 impl RunUsage {
     fn counter(&mut self, category: RunCategory) -> &mut u128 {
         match category {
+            RunCategory::DiagnosticSourceGroups => &mut self.diagnostic_source_groups,
+            RunCategory::DiagnosticAdmissionOperations => &mut self.diagnostic_admission_operations,
             RunCategory::CanonicalMetadataOperations => &mut self.canonical_metadata_operations,
             RunCategory::PolicyProbeOperations => &mut self.policy_probe_operations,
             RunCategory::OutputDirectoryOperations => &mut self.output_directory_operations,
@@ -368,6 +372,7 @@ pub(super) struct PolicyGeometry {
 pub(super) struct ActionPlan {
     geometry: PlanGeometry,
     policy_bound: bool,
+    diagnostic_attempts: u128,
     bounds: RunUsage,
     pub(super) live_spool: u128,
     output_encrypted: bool,
@@ -456,7 +461,7 @@ impl ActionPlan {
             bounds.io_attempts = checked_sum(bounds.io_attempts, extra_attempts)?;
             self.bounds = bounds;
             self.policy_bound = true;
-            Ok(bounds.io_attempts)
+            bounds.io_attempts.checked_sub(self.diagnostic_attempts).ok_or(ReadFault::CounterOverflow)
         }
     }
     pub(super) fn attempt_bound(&self) -> u128 {
@@ -494,7 +499,9 @@ impl ActionPlan {
         )?;
         let l = checked_sum(product(4, g.path_bytes)?, product(4, r1)?)?;
         let t = checked_sum(g.regular, g.large_aes)?;
-        let source = product(8, r1)?;
+        // Task5B actual staged AES inventory needs nine groups per regular member;
+        // retain the old envelope elsewhere and reserve one staged-only group.
+        let source = checked_sum(product(8, r1)?, if g.output_passes == 1 { g.regular } else { 0 })?;
         let anonymous = checked_sum(g.large_aes, if g.output_passes == 3 { g.regular } else { 0 })?;
         let anonymous_delta = if cfg!(target_os = "macos") { product(creates.into(), anonymous)? } else { 0 };
         let terminal = product(4, rg1)?;
@@ -519,7 +526,10 @@ impl ActionPlan {
         Ok(Self {
             geometry: g,
             policy_bound: false,
+            diagnostic_attempts: 0,
             bounds: RunUsage {
+                diagnostic_source_groups: 0,
+                diagnostic_admission_operations: 0,
                 canonical_metadata_operations: 0,
                 policy_probe_operations: 0,
                 output_directory_operations: 0,
@@ -572,7 +582,10 @@ pub(super) struct LedgerState {
     controlled_source: bool,
     pub(super) poisoned: bool,
     pub(super) active_encrypted: Option<bool>,
+    pub(super) diagnostic_identities: [Option<(u64, u64)>; 2],
 }
+#[cfg(test)]
+thread_local! {pub(super) static DIAGNOSTIC_BOUNDS:std::cell::Cell<Option<(u128,u128)>>=const{std::cell::Cell::new(None)};}
 impl LedgerState {
     pub(super) fn new(options: &EncryptedReadOptions) -> Result<Self, ReadFault> {
         let limits = options.limits.clone();
@@ -602,6 +615,7 @@ impl LedgerState {
             controlled_source: false,
             poisoned: false,
             active_encrypted: None,
+            diagnostic_identities: [None; 2],
         })
     }
     pub(super) fn begin_policy_allocation(&mut self, kind: PolicyComponent, requested: usize) -> Result<(), ReadFault> {
@@ -676,6 +690,51 @@ impl LedgerState {
             return Err(ReadFault::InvalidPlan);
         }
         self.run.plan = Some(plan);
+        Ok(())
+    }
+    pub(super) fn bind_listing_diagnostics(&mut self) -> Result<(), ReadFault> {
+        let plan = self.run.plan.as_mut().ok_or(ReadFault::InvalidPlan)?;
+        if self.run.usage != RunUsage::default() || plan.bounds.diagnostic_source_groups != 0 {
+            return Err(ReadFault::InvalidPlan);
+        }
+        plan.bounds.diagnostic_source_groups = 2;
+        plan.bounds.diagnostic_admission_operations = 4;
+        let attempts = product(10, checked_sum(plan.namespace_retries.into(), 1)?)?;
+        plan.diagnostic_attempts = attempts;
+        plan.bounds.io_attempts = checked_sum(plan.bounds.io_attempts, attempts)?;
+        Ok(())
+    }
+    pub(super) fn bind_diagnostics(
+        &mut self,
+        records: u128,
+        candidates: u128,
+        protected: u128,
+        cwd: bool,
+    ) -> Result<(), ReadFault> {
+        let plan = self.run.plan.as_mut().ok_or(ReadFault::InvalidPlan)?;
+        if self.run.usage != RunUsage::default() || plan.bounds.diagnostic_source_groups != 0 {
+            return Err(ReadFault::InvalidPlan);
+        }
+        let events = checked_sum(records, 2)?;
+        let groups = checked_sum(2, product(2, events)?)?;
+        let operations =
+            [4, product(4, events)?, product(2, candidates)?, product(2, protected)?, product(2, records)?]
+                .into_iter()
+                .try_fold(0, checked_sum)?;
+        let metadata = checked_sum(checked_sum(product(3, groups)?, operations)?, if cwd { 5 } else { 0 })?;
+        if cwd {
+            plan.bounds.path_steps = checked_sum(plan.bounds.path_steps, 1)?;
+        }
+        let attempts = product(metadata, checked_sum(plan.namespace_retries.into(), 1)?)?;
+        plan.diagnostic_attempts = attempts;
+        plan.bounds.diagnostic_source_groups = groups;
+        plan.bounds.diagnostic_admission_operations = operations;
+        plan.bounds.io_attempts = checked_sum(plan.bounds.io_attempts, attempts)?;
+        #[cfg(test)]
+        if let Some((groups, operations)) = DIAGNOSTIC_BOUNDS.with(|s| s.take()) {
+            plan.bounds.diagnostic_source_groups = groups;
+            plan.bounds.diagnostic_admission_operations = operations;
+        }
         Ok(())
     }
     pub(super) fn bind_policy_geometry(&mut self, policy: PolicyGeometry) -> Result<u128, ReadFault> {
@@ -768,6 +827,13 @@ impl LedgerState {
         self.peak_fds = self.peak_fds.max(self.live_fds);
         Ok(())
     }
+    #[cfg(test)]
+    pub(super) fn test_limit_category(&mut self, category: RunCategory, limit: u128) {
+        *self.run.plan.as_mut().unwrap().bounds.counter(category) = limit;
+    }
+    pub(super) fn source_registered(&self) -> bool {
+        self.controlled_source
+    }
     pub(super) fn register_controlled_source(&mut self) -> Result<(), ReadFault> {
         if !self.controlled_source {
             self.acquire_fds(1)?;
@@ -844,6 +910,8 @@ impl LedgerState {
             !matches!(
                 c,
                 RunCategory::StageFinalization
+                    | RunCategory::FinalOperations
+                    | RunCategory::DirectoryFinalization
                     | RunCategory::PathSteps
                     | RunCategory::CanonicalMetadataOperations
                     | RunCategory::PolicyProbeOperations

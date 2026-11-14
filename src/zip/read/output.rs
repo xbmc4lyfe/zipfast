@@ -158,7 +158,11 @@ impl ZipStageEntry<'_> {
         context.verify_identity(self.owner)?;
         let action = context.action.as_ref().ok_or(ReadFault::InvalidPlan)?;
         if action.output != budget::PlannedOutput::VerifiedStdout
-            || action.scope != ProjectedReadScope::Entry(self.ordinal)
+            || !(action.scope == ProjectedReadScope::Entry(self.ordinal)
+                || action.scope == ProjectedReadScope::AllRegular
+                    && action.active_ordinal == Some(self.ordinal)
+                    && action.run_bound
+                    && action.active_record_charged)
             || action.consumed
             || action.completed
             || action.controlled_output
@@ -533,7 +537,11 @@ impl ZipStageEntry<'_> {
             context.verify_identity(self.owner)?;
             let action = context.action.as_ref().ok_or(ReadFault::InvalidPlan)?;
             if context.ledger.with_state(|s| s.poisoned)
-                || action.scope != ProjectedReadScope::Entry(self.ordinal)
+                || !(action.scope == ProjectedReadScope::Entry(self.ordinal)
+                    || action.scope == ProjectedReadScope::AllRegular
+                        && action.active_ordinal == Some(self.ordinal)
+                        && action.run_bound
+                        && action.active_record_charged)
                 || action.output != budget::PlannedOutput::StagedFiles
                 || action.consumed
                 || action.completed
@@ -561,6 +569,7 @@ impl ZipStageEntry<'_> {
             };
             let operational = Path::new(operational);
             if let Some(policy) = action.policy.as_ref()
+                && !action.run_bound
                 && !policy.matches(options, action.destination.as_ref().unwrap())
             {
                 return Err(ReadFault::InvalidPlan.into());

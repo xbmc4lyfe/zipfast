@@ -24,8 +24,26 @@ pub(in crate::zip::read) enum Target {
     Missing,
     Existing,
     Skip,
+    Blocked(Refusal),
 }
-#[allow(clippy::result_large_err)]
+#[derive(Clone, Copy)]
+pub(in crate::zip::read) enum Refusal {
+    Symlink,
+    Directory,
+    Protected,
+}
+impl Refusal {
+    pub(in crate::zip::read) fn fault(self) -> ReadFault {
+        ReadFault::CheckedFormat {
+            reason: match self {
+                Self::Symlink => "output target is a symlink",
+                Self::Directory => "output target is a directory",
+                Self::Protected => "output target replaces a protected input",
+            },
+        }
+    }
+}
+#[allow(clippy::result_large_err, clippy::unnecessary_cast)] // Inline evidence and Unix inode ABI widths.
 pub(in crate::zip::read) fn inspect(
     ledger: &impl LedgerAccess,
     parent: &mut parent::HeldParent,
@@ -55,14 +73,21 @@ pub(in crate::zip::read) fn inspect(
     let Some(actual) = actual else {
         return Ok(Target::Missing);
     };
+    if ledger.with_state(|s| {
+        s.diagnostic_identities.into_iter().flatten().any(|id| id == (actual.st_dev as u64, actual.st_ino as u64))
+    }) {
+        return Err(ZipReadError::from(ReadFault::InvalidPlan).merge_diagnostic_boundary(
+            DiagnosticBoundaryFault::Refused { reason: "publication target aliases admitted diagnostic" },
+        ));
+    }
     if actual.st_mode & libc::S_IFMT == libc::S_IFLNK {
-        return Err(ReadFault::CheckedFormat { reason: "output target is a symlink" }.into());
+        return Ok(Target::Blocked(Refusal::Symlink));
     }
     if overwrite == crate::extract::Overwrite::Skip {
         return Ok(Target::Skip);
     }
     if actual.st_mode & libc::S_IFMT == libc::S_IFDIR {
-        return Err(ReadFault::CheckedFormat { reason: "output target is a directory" }.into());
+        return Ok(Target::Blocked(Refusal::Directory));
     }
     let expected = policy::CanonicalIdentity::of(&actual);
     let retries = ledger.with_state(|s| s.creation_policy(false).map(|p| p.1))?;
@@ -95,7 +120,7 @@ pub(in crate::zip::read) fn inspect(
     }
     let name = Path::new(std::ffi::OsStr::from_bytes(evidence.bytes(scratch)));
     if policy.protects(name, evidence.identity) {
-        return Err(ReadFault::CheckedFormat { reason: "output target replaces a protected input" }.into());
+        return Ok(Target::Blocked(Refusal::Protected));
     }
     Ok(Target::Existing)
 }

@@ -40,3 +40,9 @@ mod policy;
 
 #[cfg(target_os = "macos")]
 mod qualified;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod run;
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+mod diagnostic;

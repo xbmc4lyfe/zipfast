@@ -113,3 +113,9 @@ pub(super) use security::ParentPolicy;
 
 mod probe;
 pub(super) use probe::{ChildPolicy, probe};
+
+mod normalized;
+pub(super) use normalized::{PathFailure, PolicyPath};
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(super) mod cwd;

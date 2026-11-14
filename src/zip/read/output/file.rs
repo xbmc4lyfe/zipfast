@@ -96,7 +96,12 @@ impl PreparedNamed {
         }
         error.map_or(Ok(()), Err)
     }
-    fn finish_unpublished(mut self, ledger: &impl LedgerAccess, encrypted: bool) -> (bool, Option<ZipReadError>) {
+    fn finish_unpublished(
+        mut self,
+        ledger: &impl LedgerAccess,
+        encrypted: bool,
+        normal_output_close: bool,
+    ) -> (bool, Option<ZipReadError>) {
         let mut error = None;
         let parent_ok = match self.parent.verify_cleanup_name(ledger) {
             Ok(()) => true,
@@ -108,7 +113,11 @@ impl PreparedNamed {
             }
         };
         let (clear, report) = if parent_ok {
-            self.inode.retire(ledger, &self.parent, &self.directory, encrypted)
+            if normal_output_close {
+                self.inode.retire_normal(ledger, &self.parent, &self.directory, encrypted)
+            } else {
+                self.inode.retire(ledger, &self.parent, &self.directory, encrypted)
+            }
         } else {
             self.inode.retire_blocked(ledger, &self.parent, &self.directory, encrypted)
         };
@@ -116,6 +125,8 @@ impl PreparedNamed {
         // Normal-success admission remains required even though no-clobber
         // collision/Skip transfers no target. One actual close, no retry.
         if let Err(next) = self.directory.close_final(ledger, encrypted) {
+            let next =
+                if normal_output_close { next.retirement_cleanup(OwnedObject::OutputPrivateDirectory) } else { next };
             error = Some(match error.take() {
                 Some(prior) => prior.merge_cleanup_only(next.retirement_cleanup(OwnedObject::OutputPrivateDirectory)),
                 None => next,
@@ -131,6 +142,7 @@ impl PreparedNamed {
             metadata_fault(&mut error, fault);
         }
         if let Err(next) = self.parent.finish_observed(ledger, error.is_none(), encrypted) {
+            let next = if normal_output_close { next.retirement_cleanup(OwnedObject::OutputParent) } else { next };
             if error.is_some() {
                 merge_error(&mut error, next);
             } else {
@@ -305,6 +317,8 @@ fn acquire(
     options: &crate::extract::Options,
     context: &EncryptedReadContext,
     cancel: &Cancellation,
+    blocked: &mut Option<target::Refusal>,
+    allow_blocked: bool,
 ) -> ZipReadResult<Option<PreparedNamed>> {
     ledger.with_state(|s| s.reserve(binding.encrypted, binding.bytes, 2))?;
     let mut preparing = Preparing {
@@ -329,11 +343,15 @@ fn acquire(
         preparing.parent = Some(parent::open_parent(&ledger, &options.dest, relative, frozen.cwd(), cancel)?);
         let parent = preparing.parent.as_mut().unwrap();
         let mut scratch = policy::PolicyScratch::new(ledger)?;
-        if matches!(
-            target::inspect(&ledger, parent, frozen, options.overwrite, RunCategory::PathSteps, &mut scratch, cancel)?,
-            target::Target::Skip
-        ) {
-            return Ok(false);
+        match target::inspect(&ledger, parent, frozen, options.overwrite, RunCategory::PathSteps, &mut scratch, cancel)?
+        {
+            target::Target::Skip => return Ok(false),
+            target::Target::Blocked(refusal) if allow_blocked => {
+                *blocked = Some(refusal);
+                return Ok(false);
+            }
+            target::Target::Blocked(refusal) => return Err(refusal.fault().into()),
+            _ => {}
         }
         io::operation(
             &ledger,
@@ -437,15 +455,43 @@ impl ZipReadStage {
     /// Prepares one original regular entry in its actual destination parent.
     /// The returned stage owns no borrow of the original source or entry.
     pub fn prepare_file(
-        mut entry: ZipStageEntry<'_>,
+        entry: ZipStageEntry<'_>,
         relative: &Path,
         options: &crate::extract::Options,
         cancel: &Cancellation,
         context: &mut EncryptedReadContext,
     ) -> ZipReadResult<Option<Self>> {
+        Self::prepare_file_inner(entry, relative, options, cancel, context, &mut None, false)
+    }
+    pub(in crate::zip::read) fn prepare_run_file(
+        entry: ZipStageEntry<'_>,
+        relative: &Path,
+        options: &crate::extract::Options,
+        cancel: &Cancellation,
+        context: &mut EncryptedReadContext,
+    ) -> ZipReadResult<(Option<Self>, Option<ReadFault>)> {
+        let mut blocked = None;
+        let ready = Self::prepare_file_inner(entry, relative, options, cancel, context, &mut blocked, true)?;
+        Ok((ready, blocked.map(target::Refusal::fault)))
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_file_inner(
+        mut entry: ZipStageEntry<'_>,
+        relative: &Path,
+        options: &crate::extract::Options,
+        cancel: &Cancellation,
+        context: &mut EncryptedReadContext,
+        blocked: &mut Option<target::Refusal>,
+        allow_blocked: bool,
+    ) -> ZipReadResult<Option<Self>> {
+        if allow_blocked
+            && !context.action.as_ref().is_some_and(|a| a.run_bound && a.scope == ProjectedReadScope::AllRegular)
+        {
+            return Err(ReadFault::InvalidPlan.into());
+        }
         let binding = entry.bind_file(relative, options, cancel, context)?;
         let token = context.ledger.mint_reservation()?;
-        let result = acquire(token.view(), &binding, options, context, cancel);
+        let result = acquire(token.view(), &binding, options, context, cancel, blocked, allow_blocked);
         let boundary = entry.observe_source(context);
         let result = match (result, boundary) {
             (Ok(ready), Ok(())) => Ok(ready),
@@ -499,6 +545,75 @@ impl ZipReadStage {
                 }))
             }
         }
+    }
+    /// The whole-run normal member-error route never clears an emergency poison.
+    pub(in crate::zip::read) fn finish_member_error(
+        mut self,
+        mut error: ZipReadError,
+        context: &mut EncryptedReadContext,
+        cancel: &Cancellation,
+        mut source: impl FnMut(&mut EncryptedReadContext) -> ZipReadResult<()>,
+    ) -> ZipReadError {
+        let valid = context.action.as_ref().is_some_and(|a| {
+            a.run_bound
+                && a.scope == ProjectedReadScope::AllRegular
+                && a.active_ordinal.is_some()
+                && a.controlled_output
+        }) && self.reservation.ledger.identity() == context.ledger.identity()
+            && !context.ledger.with_state(|s| s.poisoned);
+        if !valid {
+            return self.finish_error_with_final_source(error, context, &mut source);
+        }
+        if let Err(boundary) = self.source.observe(context, &mut source) {
+            return self.finish_error_with_final_source(error.merge_source_boundary(boundary), context, &mut source);
+        }
+        let reopened = (|| -> ZipReadResult<()> {
+            let ready = self.named.as_mut().ok_or(ReadFault::InvalidPlan)?;
+            let mut scratch = policy::PolicyScratch::new(self.reservation.ledger.view())?;
+            ready.directory.reopen_normal(
+                &self.reservation.ledger,
+                &ready.parent,
+                self.reservation.encrypted,
+                &mut scratch,
+                cancel,
+            )
+        })();
+        if let Err(boundary) = reopened {
+            return self.finish_error_with_final_source(
+                error.merge_cleanup_only(
+                    boundary.owned_boundary_error(OwnedObject::OutputPrivateDirectory, ReadIoOperation::Open),
+                ),
+                context,
+                &mut source,
+            );
+        }
+        self.terminal = true;
+        let mut ready = self.named.take().unwrap();
+        ready.inode.file = self.file.take();
+        let (clear, cleanup) = ready.finish_unpublished(&self.reservation.ledger, self.reservation.encrypted, true);
+        if clear {
+            self.reservation.ledger.with_state(|s| s.release_bytes(self.reservation.encrypted, self.reservation.bytes));
+        }
+        self.reservation.retired = true;
+        if let Some(cleanup) = cleanup {
+            error = error.merge_cleanup_only(cleanup);
+        }
+        if let Err(boundary) = self.source.observe(context, &mut source) {
+            error = error.merge_source_boundary(boundary);
+        }
+        self.usage(error)
+    }
+    fn finish_error_with_final_source(
+        self,
+        error: ZipReadError,
+        context: &mut EncryptedReadContext,
+        source: &mut impl FnMut(&mut EncryptedReadContext) -> ZipReadResult<()>,
+    ) -> ZipReadError {
+        let mut error = self.finish_error(error, context);
+        if let Err(boundary) = source(context) {
+            error = error.merge_source_boundary(boundary);
+        }
+        error.with_usage(context.usage(), context.run_usage()).with_policy_usage(context.policy_metadata_usage())
     }
     pub(super) fn retire_named(&mut self) -> Option<ZipReadError> {
         let ready = self.named.take()?;
@@ -608,18 +723,20 @@ impl ZipReadStage {
                 ready.parent.verify_normal_name(ledger, encrypted, cancel)?;
                 ready.inode.check_inside(ledger, &ready.directory, ready.child.gid, encrypted, cancel)?;
                 let frozen = context.action.as_ref().and_then(|a| a.policy.as_ref()).ok_or(ReadFault::InvalidPlan)?;
-                Ok(!matches!(
-                    target::inspect(
-                        ledger,
-                        &mut ready.parent,
-                        frozen,
-                        ready.overwrite,
-                        RunCategory::StageFinalization,
-                        &mut scratch,
-                        cancel
-                    )?,
-                    target::Target::Skip
-                ))
+                let target = target::inspect(
+                    ledger,
+                    &mut ready.parent,
+                    frozen,
+                    ready.overwrite,
+                    RunCategory::StageFinalization,
+                    &mut scratch,
+                    cancel,
+                )?;
+                match target {
+                    target::Target::Skip => Ok(false),
+                    target::Target::Blocked(refusal) => Err(refusal.fault().into()),
+                    _ => Ok(true),
+                }
             })();
             let eligible = boundary(eligible, self.source.observe(context, &mut final_check))?;
             if !eligible {
@@ -680,7 +797,8 @@ impl ZipReadStage {
             Ok(false) => {
                 self.terminal = true;
                 let ready = self.named.take().ok_or(ReadFault::InvalidPlan)?;
-                let (clear, cleanup) = ready.finish_unpublished(&self.reservation.ledger, self.reservation.encrypted);
+                let (clear, cleanup) =
+                    ready.finish_unpublished(&self.reservation.ledger, self.reservation.encrypted, false);
                 if clear {
                     self.reservation
                         .ledger

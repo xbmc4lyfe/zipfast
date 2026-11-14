@@ -80,6 +80,9 @@ pub(in crate::zip) fn identity() -> Result<u64, ReadFault> {
 pub(super) struct Action {
     pub(super) identity: u64,
     pub(super) scope: ProjectedReadScope,
+    pub(super) active_ordinal: Option<usize>,
+    pub(super) run_bound: bool,
+    pub(super) active_record_charged: bool,
     pub(super) output: budget::PlannedOutput,
     pub(super) caller_max: Option<u64>,
     pub(super) password_bytes: u64,
@@ -93,6 +96,8 @@ pub(super) struct Action {
     pub(super) attempt_ceiling: u128,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     pub(super) policy: Option<policy::FrozenPolicy>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) directories: Option<policy::OwnedMetadata<(usize, usize)>>,
 }
 /// A checked owner of one original projected parse. No mutable catalogue is exposed.
 /// Handle/path identity, length, mtime and ctime checks are optimistic observations:
@@ -377,7 +382,7 @@ impl ProjectedOwner {
         Ok(())
     }
 }
-fn merge_source_admission(error: ZipReadError, fault: ReadFault) -> ZipReadError {
+pub(super) fn merge_source_admission(error: ZipReadError, fault: ReadFault) -> ZipReadError {
     let mut report = ObjectCleanupReport::new(OwnedObject::Source);
     report.push(CleanupFault {
         object: OwnedObject::Source,
@@ -471,7 +476,7 @@ fn terminated(path: &Path) -> Result<[u8; libc::PATH_MAX as usize], ReadFault> {
     Ok(buffer)
 }
 #[cfg(unix)]
-fn close_raw_once(fd: libc::c_int) -> std::io::Result<()> {
+pub(super) fn close_raw_once(fd: libc::c_int) -> std::io::Result<()> {
     // SAFETY: caller transferred ownership of this descriptor; close is called
     // once and never retried, even when the platform reports EINTR.
     raw_io(unsafe { libc::close(fd) })?;
@@ -852,6 +857,9 @@ pub(super) fn factory<'a>(
         context.action = Some(Action {
             identity,
             scope,
+            active_ordinal: None,
+            run_bound: false,
+            active_record_charged: false,
             output,
             caller_max,
             password_bytes,
@@ -865,6 +873,8 @@ pub(super) fn factory<'a>(
             attempt_ceiling,
             #[cfg(any(target_os = "macos", target_os = "linux"))]
             policy: None,
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            directories: None,
         });
         Ok(())
     })();
@@ -1116,7 +1126,11 @@ fn checked_read_inner(
     context.verify_identity(identity)?;
     let action = context.action.as_mut().ok_or(ReadFault::InvalidPlan)?;
     if action.identity != identity
-        || action.scope != ProjectedReadScope::Entry(index)
+        || !(action.scope == ProjectedReadScope::Entry(index)
+            || action.scope == ProjectedReadScope::AllRegular
+                && action.active_ordinal == Some(index)
+                && action.run_bound
+                && action.active_record_charged)
         || action.consumed
         || action.completed
         || action.password_bytes != password.map_or(0, str::len) as u64
@@ -1125,7 +1139,9 @@ fn checked_read_inner(
         return Err(ReadFault::InvalidPlan.into());
     }
     action.consumed = true;
-    context.ledger.with_state(|s| s.charge_category(RunCategory::Records, 1))?;
+    if !(action.scope == ProjectedReadScope::AllRegular && action.active_record_charged) {
+        context.ledger.with_state(|s| s.charge_category(RunCategory::Records, 1))?;
+    }
     let rejection = if e.packed > max_bytes {
         Some(ReadFault::Limit {
             resource: ReadResource::MemberPackedBytes,
@@ -1344,6 +1360,9 @@ impl CheckedOpen {
             Ok(signature) => Ok((signature, path)),
             Err(file) => Err(Self { file, path, len, source, bootstrap }),
         }
+    }
+    pub(crate) fn into_zip_projected(self, cancel: &Cancellation) -> ZipReadResult<ProjectedReadSession> {
+        self.into_zip(cancel).map(|owner| ProjectedReadSession { owner })
     }
     pub(crate) fn into_zip(mut self, cancel: &Cancellation) -> ZipReadResult<ProjectedOwner> {
         let stamp = match self.source {
