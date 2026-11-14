@@ -120,7 +120,14 @@ impl<'a> Extraction<'a> {
                 let path = hooks.target(self.options, &relative, false)?;
                 self.protect_source_name(session, &path)?;
                 hooks.before_path(index);
-                hooks.reserve_directory(&mut self.dirs, &path, path.capacity())?;
+                hooks.reserve_directory(
+                    &mut self.dirs,
+                    &path,
+                    path.capacity(),
+                    &self.options.dest,
+                    &session.members[index].header,
+                    &session.members[index].wire.name,
+                )?;
                 hooks.before_directories();
                 self.ensure_root().map_err(own_fault)?;
                 make_dirs_detailed(&self.options.dest, &relative).map_err(own_fault)?;
@@ -130,6 +137,11 @@ impl<'a> Extraction<'a> {
                     return Err(policy(RarPolicyReason::TargetChanged, path).into());
                 }
                 hooks.created(&path);
+                if let Some(failure) =
+                    hooks.complete_directory(session, &self.options.dest, &path, (observed.dev(), observed.ino()))?
+                {
+                    return Ok(RarOutcome::Failed(failure));
+                }
                 hooks.directory_committed();
                 self.dirs.push(DirectoryOutput {
                     path,
@@ -392,7 +404,21 @@ pub(super) trait ExtractionHooks {
         dirs: &mut Vec<DirectoryOutput>,
         path: &Path,
         path_capacity: usize,
+        root: &Path,
+        header: &FileHeader,
+        wire_name: &[u8],
     ) -> Result<(), SelectedStop>;
+    /// A qualified native directory-creation failure is recoverable for this
+    /// member only. All other stops keep the executor's ordinary classification.
+    fn complete_directory(
+        &mut self,
+        _session: &mut RarSession,
+        _root: &Path,
+        _path: &Path,
+        _identity: (u64, u64),
+    ) -> Result<Option<Arc<RarFailure>>, SelectedStop> {
+        Ok(None)
+    }
     fn replace(
         &mut self,
         session: &mut RarSession,
@@ -424,7 +450,15 @@ impl ExtractionHooks for LegacyHooks {
     fn target(&mut self, options: &Options, relative: &Path, flatten: bool) -> Result<PathBuf, SelectedStop> {
         Ok(options.dest.join(if flatten { Path::new(relative.file_name().expect("sanitized file")) } else { relative }))
     }
-    fn reserve_directory(&mut self, dirs: &mut Vec<DirectoryOutput>, _: &Path, _: usize) -> Result<(), SelectedStop> {
+    fn reserve_directory(
+        &mut self,
+        dirs: &mut Vec<DirectoryOutput>,
+        _: &Path,
+        _: usize,
+        _: &Path,
+        _: &FileHeader,
+        _: &[u8],
+    ) -> Result<(), SelectedStop> {
         dirs.try_reserve(1).map_err(|_| SelectedStop::Native(own_fault(allocation())))
     }
     fn replace(
