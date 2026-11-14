@@ -52,10 +52,11 @@ fn convert(s: libc::stat) -> io::Result<Stamp> {
     let device = s.st_dev as u64;
     #[cfg(not(target_os = "macos"))]
     let device = s.st_dev;
-    #[cfg(target_os = "macos")]
+    #[allow(
+        clippy::useless_conversion,
+        reason = "libc st_nlink is u16 on macOS, u32 on Linux ARM64 and u64 on Linux AMD64"
+    )]
     let links = u64::from(s.st_nlink);
-    #[cfg(not(target_os = "macos"))]
-    let links = s.st_nlink;
     Ok(Stamp {
         links,
         dev: device,
