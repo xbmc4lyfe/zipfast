@@ -151,6 +151,10 @@ impl Work {
 struct Bits {
     acc: u64,
     count: u8,
+    #[cfg(test)]
+    read_bytes: u64,
+    #[cfg(test)]
+    last_value: u32,
 }
 impl Bits {
     fn take(&mut self, n: u8, input: &mut &[u8]) -> Option<u32> {
@@ -160,10 +164,18 @@ impl Bits {
             *input = tail;
             self.acc = (self.acc << 8) | u64::from(byte);
             self.count += 8;
+            #[cfg(test)]
+            {
+                self.read_bytes += 1;
+            }
         }
         self.count -= n;
         let value = (self.acc >> self.count) as u32;
         self.acc &= (1u64 << self.count) - 1;
+        #[cfg(test)]
+        {
+            self.last_value = value;
+        }
         Some(value)
     }
     fn align(&mut self) {
@@ -270,6 +282,8 @@ pub(crate) struct Rar4Decoder {
     output: [u8; OUTPUT],
     filled: usize,
     table_builds: u64,
+    #[cfg(test)]
+    trace: Option<tests::BoundaryTrace>,
 }
 
 impl Rar4Decoder {
@@ -342,6 +356,8 @@ impl Rar4Decoder {
             output: [0; OUTPUT],
             filled: 0,
             table_builds: 0,
+            #[cfg(test)]
+            trace: None,
         };
         decoder.work.tick(std::mem::size_of::<Self>() as u64)?;
         decoder.work.check()?;
@@ -493,14 +509,20 @@ impl Rar4Decoder {
             }
             Phase::Mode => {
                 if take!(1) != 0 {
+                    #[cfg(test)]
+                    self.observe(tests::TraceKind::Mode { ppm: true });
                     return Err(Rar4DecodeError::Unsupported(Rar4UnsupportedMode::Ppm));
                 }
+                #[cfg(test)]
+                self.observe(tests::TraceKind::Mode { ppm: false });
                 self.phase = Phase::Retain;
             }
             Phase::Retain => {
                 if take!(1) == 0 {
                     self.old = [0; 404];
                 }
+                #[cfg(test)]
+                self.observe(tests::TraceKind::Retain { delta: self.bits.last_value != 0 });
                 self.phase = Phase::Bc { index: 0 };
             }
             Phase::Bc { index } => {
@@ -560,10 +582,18 @@ impl Rar4Decoder {
                 self.low = 0;
                 self.low_repeats = 0;
                 self.table_builds = self.table_builds.checked_add(1).ok_or(Rar4DecodeError::CounterOverflow)?;
+                #[cfg(test)]
+                self.observe(tests::TraceKind::Tables);
                 self.phase = Phase::Token;
             }
             Phase::Token => {
                 let token = symbol!(1);
+                #[cfg(test)]
+                match token {
+                    256 => self.observe(tests::TraceKind::EndSymbol),
+                    257 => self.observe(tests::TraceKind::VmFilter),
+                    _ => {}
+                }
                 self.phase = match token {
                     0..=255 => {
                         self.emit(token as u8, sink)?;
@@ -590,9 +620,13 @@ impl Rar4Decoder {
             }
             Phase::End => {
                 self.phase = if take!(1) != 0 { Phase::Align } else { Phase::EndHint };
+                #[cfg(test)]
+                self.observe(tests::TraceKind::EndBit { same_file: self.bits.last_value != 0 });
             }
             Phase::EndHint => {
                 let _hint = take!(1);
+                #[cfg(test)]
+                self.observe(tests::TraceKind::EndHint { read_tables_next: _hint != 0 });
                 return Err(Rar4DecodeError::DecodedSize { expected: self.expected, actual: self.produced });
             }
             Phase::Length { index, recent } => {

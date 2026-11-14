@@ -553,3 +553,76 @@ fn ppm_legacy_label_allocation_refusal_preserves_typed_reason() {
 fn vm_legacy_label_allocation_refusal_preserves_typed_reason() {
     unsupported_label_refusal(Rar4UnsupportedMode::VmFilter, "VM/filter payload");
 }
+
+#[path = "boundary_tests.rs"]
+mod boundary;
+
+// Fixed, opt-in observations only. No token log or dictionary/payload snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum TraceKind {
+    Mode { ppm: bool },
+    Retain { delta: bool },
+    Tables,
+    EndSymbol,
+    EndBit { same_file: bool },
+    EndHint { read_tables_next: bool },
+    VmFilter,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TraceEvent {
+    kind: TraceKind,
+    // One-past bit offset from the member's first packed MSB, including align.
+    at: u64,
+    produced: u64,
+    ring_position: u64,
+    initialized: u64,
+    table_builds: u64,
+    old_crc32: u32,
+    recent_low_crc32: u32,
+    recent: [u64; 4],
+    last_length: u64,
+    low: u64,
+    low_repeats: u8,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct BoundaryTrace {
+    events: [Option<TraceEvent>; 16],
+    len: usize,
+}
+
+impl Bits {
+    fn bit_position(&self) -> u64 {
+        self.read_bytes * 8 - u64::from(self.count)
+    }
+}
+
+impl Rar4Decoder {
+    pub(super) fn observe(&mut self, kind: TraceKind) {
+        if let Some(trace) = &mut self.trace {
+            let mut digest = crc32fast::Hasher::new();
+            for value in self.recent.into_iter().chain([self.last_length, self.low]) {
+                digest.update(&value.to_le_bytes());
+            }
+            digest.update(&[self.low_repeats]);
+            let event = TraceEvent {
+                kind,
+                at: self.bits.bit_position(),
+                produced: self.produced,
+                ring_position: self.produced & (self.dictionary.len() as u64 - 1),
+                initialized: self.produced.min(self.dictionary.len() as u64),
+                table_builds: self.table_builds,
+                old_crc32: crate::crc32::hash(&self.old),
+                recent_low_crc32: digest.finalize(),
+                recent: self.recent,
+                last_length: self.last_length,
+                low: self.low,
+                low_repeats: self.low_repeats,
+            };
+            assert!(trace.len < trace.events.len(), "bounded first-boundary trace exhausted");
+            trace.events[trace.len] = Some(event);
+            trace.len += 1;
+        }
+    }
+}
