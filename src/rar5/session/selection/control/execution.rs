@@ -136,6 +136,7 @@ impl<O: RarExtractObserver + ?Sized> SelectedDriver for Driver<'_, O> {
             parent_stamp: None,
             ancestors: Vec::new(),
             pending_directory: 0,
+            trailing_directory_fallback: false,
             source_paths: &self.source_paths,
         };
         let result = self.extraction.member_controlled(run, session, index, entry, &mut hooks);
@@ -224,6 +225,7 @@ struct Hooks<'a, O: ?Sized> {
     parent_stamp: Option<guard::Stamp>,
     ancestors: Vec<NativeBinding>,
     pending_directory: u64,
+    trailing_directory_fallback: bool,
     source_paths: &'a [Vec<u8>],
 }
 impl<O: ?Sized> Hooks<'_, O> {
@@ -268,6 +270,101 @@ impl<O: ?Sized> Hooks<'_, O> {
                 Ok(value) => return Ok(value),
             }
         }
+    }
+    fn directory_io<T>(
+        &mut self,
+        operation: IoOperation,
+        target: &Path,
+        mut call: impl FnMut() -> io::Result<T>,
+    ) -> Result<T, SelectedStop> {
+        loop {
+            self.control.native_charge(RarResource::ExtractControlIoAttempts, 1)?;
+            #[cfg(test)]
+            let result = directory_event(operation, target).and_then(|()| call());
+            #[cfg(not(test))]
+            let result = call();
+            match result {
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(source) => {
+                    return Err(SelectedStop::Native(Arc::new(RarFailure::Output {
+                        operation,
+                        path: Some(self.owned_path(target)?),
+                        offset: None,
+                        source,
+                    })));
+                }
+                Ok(value) => return Ok(value),
+            }
+        }
+    }
+    fn owned_path(&mut self, path: &Path) -> Result<PathBuf, SelectedStop> {
+        let bytes = path.as_os_str().len();
+        self.control.native_charge(RarResource::ExtractControlWork, add_capacity(bytes as u64, 1)?)?;
+        self.reserve(bytes)?;
+        let mut owned = PathBuf::new();
+        owned.try_reserve_exact(bytes).map_err(RarExtractControlError::Allocation)?;
+        self.allocated(owned.capacity())?;
+        owned.push(path);
+        Ok(owned)
+    }
+    // Walk only the configured root and relative ancestors, in order. In
+    // particular, ENOTDIR is not evidence of an absent ancestor. The generic
+    // diagnostic stat helper intentionally coalesces those errors, so do not
+    // use it for this compatibility decision.
+    fn missing_directory_ancestor(&mut self, root: &Path, target: &Path) -> Result<bool, SelectedStop> {
+        let parent = target.parent().expect("sanitized directory parent");
+        let relative = parent.strip_prefix(root).expect("directory below destination");
+        self.control.native_charge(RarResource::ExtractControlWork, linear_work(target.as_os_str().len(), 2)?)?;
+        let capacity = target.as_os_str().len();
+        self.reserve(capacity)?;
+        let mut at = PathBuf::new();
+        at.try_reserve_exact(capacity).map_err(RarExtractControlError::Allocation)?;
+        self.allocated(at.capacity())?;
+        at.push(root);
+        for component in std::iter::once(None).chain(relative.components().map(Some)) {
+            if let Some(component) = component {
+                at.push(component);
+            }
+            self.control
+                .native_charge(RarResource::ExtractControlWork, add_capacity(at.as_os_str().len() as u64, 1)?)?;
+            let observed = self.directory_io(IoOperation::Metadata, &at, || match fs::symlink_metadata(&at) {
+                Err(error) if error.raw_os_error() == Some(libc::ENOENT) => Ok(None),
+                result => result.map(Some),
+            })?;
+            let Some(observed) = observed else { return Ok(true) };
+            let reason = if observed.file_type().is_symlink() {
+                crate::error::RarPolicyReason::Symlink
+            } else if !observed.is_dir() {
+                crate::error::RarPolicyReason::ParentIsFile
+            } else {
+                continue;
+            };
+            return Err(SelectedStop::Native(Arc::new(RarFailure::Policy { reason, path: at })));
+        }
+        Ok(false)
+    }
+    fn directory_uncertain(&mut self) -> SelectedStop {
+        self.control.mute(RarDiagnosticFailure::BindingChanged { ordinal: None });
+        SelectedStop::Native(Arc::new(RarFailure::Internal(crate::error::RarInternal::Invariant(
+            "directory binding changed during final creation",
+        ))))
+    }
+    fn directory_binding(&mut self, root: &Path, path: &Path, expected: (u64, u64)) -> Result<(), SelectedStop> {
+        use std::os::unix::fs::MetadataExt;
+        match self.missing_directory_ancestor(root, path) {
+            Ok(false) => {}
+            Ok(true) => return Err(self.directory_uncertain()),
+            Err(SelectedStop::Native(failure)) if matches!(failure.as_ref(), RarFailure::Policy { .. }) => {
+                return Err(self.directory_uncertain());
+            }
+            Err(stop) => return Err(stop),
+        }
+        self.control.native_charge(RarResource::ExtractControlWork, add_capacity(path.as_os_str().len() as u64, 1)?)?;
+        let observed = self.directory_io(IoOperation::Metadata, path, || fs::symlink_metadata(path))?;
+        if !observed.is_dir() || (observed.dev(), observed.ino()) != expected {
+            return Err(self.directory_uncertain());
+        }
+        Ok(())
     }
     fn changed(target: &Path) -> SelectedStop {
         SelectedStop::Native(Arc::new(RarFailure::Policy {
@@ -430,7 +527,14 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
         dirs: &mut Vec<DirectoryOutput>,
         path: &Path,
         path_capacity: usize,
+        root: &Path,
+        header: &FileHeader,
+        wire_name: &[u8],
     ) -> Result<(), SelectedStop> {
+        self.trailing_directory_fallback = header.format == RarFormat::Rar5
+            && header.is_unix()
+            && wire_name.ends_with(b"/")
+            && self.missing_directory_ancestor(root, path)?;
         self.control.native_charge(RarResource::ExtractControlWork, add_capacity(path.as_os_str().len() as u64, 1)?)?;
         let old = dirs.capacity();
         if dirs.len() == old {
@@ -447,6 +551,40 @@ impl<O: RarExtractObserver + ?Sized> ExtractionHooks for Hooks<'_, O> {
         self.pending_directory = add_capacity(*self.retained, path_capacity as u64)?;
         Ok(())
     }
+    fn complete_directory(
+        &mut self,
+        session: &mut RarSession,
+        root: &Path,
+        path: &Path,
+        identity: (u64, u64),
+    ) -> Result<Option<Arc<RarFailure>>, SelectedStop> {
+        if !self.trailing_directory_fallback {
+            return Ok(None);
+        }
+        sources(self.control, session, self.source_paths)?;
+        self.directory_binding(root, path, identity)?;
+        // Preparation has created the terminal slash's prefix. Reproduce the
+        // actual final native attempt; only its EEXIST is a member failure.
+        let failure = match self.directory_io(IoOperation::CreateDirectory, path, || fs::create_dir(path)) {
+            Err(SelectedStop::Native(failure))
+                if matches!(failure.as_ref(), RarFailure::Output {
+                    operation: IoOperation::CreateDirectory, source, ..
+                } if source.kind() == io::ErrorKind::AlreadyExists) =>
+            {
+                failure
+            }
+            Err(stop) => return Err(stop),
+            Ok(()) => {
+                // Concurrent removal allowed a new directory to be created.
+                // The earlier created(path) proof cannot bind its identity.
+                return Err(self.directory_uncertain());
+            }
+        };
+        sources(self.control, session, self.source_paths)?;
+        self.directory_binding(root, path, identity)?;
+        Ok(Some(failure))
+    }
+
     fn directory_committed(&mut self) {
         *self.retained = self.pending_directory;
     }
@@ -506,6 +644,17 @@ impl<O: ?Sized> Drop for Hooks<'_, O> {
     fn drop(&mut self) {
         self.control.close_parent();
     }
+}
+
+#[cfg(test)]
+type DirectoryHook = Box<dyn FnMut(IoOperation, &Path) -> io::Result<()>>;
+#[cfg(test)]
+thread_local! {
+    static DIRECTORY_HOOK: std::cell::RefCell<Option<DirectoryHook>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn directory_event(operation: IoOperation, path: &Path) -> io::Result<()> {
+    DIRECTORY_HOOK.with_borrow_mut(|hook| hook.as_mut().map_or(Ok(()), |hook| hook(operation, path)))
 }
 
 #[cfg(test)]
@@ -792,5 +941,191 @@ mod directory_fault_tests {
         );
         assert_eq!(fs::metadata(out.join("parent")).unwrap().permissions().mode() & 0o777, 0o711);
         assert_eq!(fs::metadata(out.join("parent/child")).unwrap().permissions().mode() & 0o777, 0o710);
+    }
+}
+
+#[cfg(test)]
+mod trailing_directory_tests {
+    use super::*;
+    struct Observe;
+    impl RarExtractObserver for Observe {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            panic!()
+        }
+        fn entry(&mut self, _: &RarEntryOutcome, mut diagnostic: RarDiagnostic<'_>) {
+            if let Some(writer) = diagnostic.writer() {
+                use std::io::Write;
+                writer.write_all(b"entry\n").unwrap();
+            }
+        }
+    }
+    fn run(hook: impl FnMut(IoOperation, &Path) -> io::Result<()> + 'static) -> RarExtractFinished {
+        run_with_cancel(hook, crate::extract::Cancellation::default())
+    }
+    fn run_with_cancel(
+        hook: impl FnMut(IoOperation, &Path) -> io::Result<()> + 'static,
+        cancel: crate::extract::Cancellation,
+    ) -> RarExtractFinished {
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                DIRECTORY_HOOK.with_borrow_mut(|h| *h = None);
+            }
+        }
+        let _clear = Clear;
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.rar");
+        let out = d.path().join("out");
+        let hex =
+            "526172211a070100c51a333203010000aec4aed5150202000500ed830100000000000106656d7074792f19b23a3503050000";
+        let bytes: Vec<u8> = hex
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|p| u8::from_str_radix(std::str::from_utf8(p).unwrap(), 16).unwrap())
+            .collect();
+        fs::write(&source, bytes).unwrap();
+        let diagnostic = OpenOptions::new().create_new(true).append(true).open(d.path().join("log")).unwrap();
+        let mut s = RarSession::open(&source, None, RarSessionOptions { cancel, ..Default::default() }).unwrap();
+        let selected = s.select(|_| true).unwrap();
+        let mut c =
+            RarExtractControl::new(Some(diagnostic), RarOverwriteMode::Always, RarExtractControlLimits::default());
+        let opts = Options {
+            mode: crate::extract::Mode::Extract,
+            dest: out.clone(),
+            overwrite: Overwrite::Always,
+            flatten: false,
+            threads: None,
+            protected_paths: Default::default(),
+            parallel_min: None,
+        };
+        DIRECTORY_HOOK.with_borrow_mut(|h| *h = Some(Box::new(hook)));
+        let result =
+            s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut Observe).finish();
+        crate::test_alloc::DENY_LAYOUT.with(|s| s.set(None));
+        if out.exists() {
+            assert!(out.join("empty").exists());
+        }
+        result
+    }
+    #[test]
+    fn trailing_directory_interrupted_metadata_and_mkdir_attempts_are_charged() {
+        let baseline = run(|_, _| Ok(()));
+        for operation in [IoOperation::Metadata, IoOperation::CreateDirectory] {
+            let mut interrupted = false;
+            let result = run(move |op, _| {
+                if op == operation && !interrupted {
+                    interrupted = true;
+                    return Err(io::Error::from_raw_os_error(libc::EINTR));
+                }
+                Ok(())
+            });
+            assert_eq!(result.outcome.unwrap().failed, 1);
+            assert_eq!(result.usage.io_attempts, baseline.usage.io_attempts + 1);
+            assert!(result.diagnostic_failure.is_none());
+        }
+    }
+    #[test]
+    fn trailing_directory_unrelated_mkdir_failure_remains_terminal() {
+        let result =
+            run(
+                |op, _| {
+                    if op == IoOperation::CreateDirectory {
+                        Err(io::Error::from_raw_os_error(libc::EIO))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+        assert!(
+            matches!(result.outcome, Err(RarExtractError::Native(error)) if error.partial.failed == 1 && error.partial.dirs == 0 && matches!(error.failure.as_ref(), RarFailure::Output { operation: IoOperation::CreateDirectory, source, .. } if source.raw_os_error() == Some(libc::EIO)))
+        );
+        assert!(result.diagnostic_failure.is_none());
+    }
+    #[test]
+    fn trailing_directory_success_after_concurrent_removal_revokes_old_created_proof() {
+        let result = run(|op, target| {
+            if op == IoOperation::CreateDirectory {
+                fs::remove_dir(target)?;
+            }
+            Ok(())
+        });
+        assert!(
+            matches!(result.outcome, Err(RarExtractError::Native(error)) if error.partial.failed == 1 && error.partial.dirs == 0 && matches!(error.failure.as_ref(), RarFailure::Internal(crate::error::RarInternal::Invariant(_))))
+        );
+        assert!(matches!(result.diagnostic_failure, Some(RarDiagnosticFailure::BindingChanged { .. })));
+    }
+    #[test]
+    fn trailing_directory_swap_to_private_symlink_never_adopts_foreign_identity() {
+        let result = run(|op, target| {
+            if op == IoOperation::CreateDirectory {
+                let held = target.with_file_name("held");
+                fs::rename(target, &held)?;
+                std::os::unix::fs::symlink(held, target)?;
+            }
+            Ok(())
+        });
+        assert!(
+            matches!(result.outcome, Err(RarExtractError::Native(error)) if error.partial.failed == 1 && error.partial.dirs == 0 && matches!(error.failure.as_ref(), RarFailure::Internal(crate::error::RarInternal::Invariant(_))))
+        );
+        assert!(matches!(result.diagnostic_failure, Some(RarDiagnosticFailure::BindingChanged { .. })));
+    }
+    #[test]
+    fn trailing_directory_source_swap_during_final_mkdir_is_terminal() {
+        let result = run(|op, target| {
+            if op == IoOperation::CreateDirectory {
+                fs::write(target.parent().unwrap().parent().unwrap().join("source.rar"), b"changed")?;
+            }
+            Ok(())
+        });
+        assert!(
+            matches!(result.outcome, Err(RarExtractError::Native(error)) if error.partial.failed == 1 && error.partial.dirs == 0 && matches!(error.failure.as_ref(), RarFailure::SourceChanged { .. }))
+        );
+    }
+    #[test]
+    fn trailing_directory_enotdir_metadata_is_not_an_absent_ancestor() {
+        let result =
+            run(
+                |op, _| {
+                    if op == IoOperation::Metadata { Err(io::Error::from_raw_os_error(libc::ENOTDIR)) } else { Ok(()) }
+                },
+            );
+        assert!(
+            matches!(result.outcome, Err(RarExtractError::Native(error)) if error.partial.failed == 1 && matches!(error.failure.as_ref(), RarFailure::Output { operation: IoOperation::Metadata, source, .. } if source.raw_os_error() == Some(libc::ENOTDIR)))
+        );
+    }
+    #[test]
+    fn trailing_directory_error_path_allocation_is_admitted_after_the_failed_attempt() {
+        let result = run(|op, target| {
+            if op == IoOperation::CreateDirectory {
+                crate::test_alloc::DENY_LAYOUT.with(|s| s.set(Some((target.as_os_str().len(), 1))));
+            }
+            Ok(())
+        });
+        assert!(
+            matches!(result.outcome, Err(RarExtractError::Control { partial, cause: RarExtractControlError::Allocation(_), .. }) if partial.failed == 0 && partial.dirs == 0)
+        );
+    }
+    #[test]
+    fn trailing_directory_cancel_during_final_attempt_retains_terminal_classification() {
+        let cancel = crate::extract::Cancellation::default();
+        let signal = cancel.clone();
+        let result = run_with_cancel(
+            move |op, _| {
+                if op == IoOperation::CreateDirectory {
+                    signal.cancel();
+                }
+                Ok(())
+            },
+            cancel,
+        );
+        assert!(
+            matches!(result.outcome, Err(RarExtractError::Native(error)) if error.partial.failed == 1 && error.partial.dirs == 0 && matches!(error.failure.as_ref(), RarFailure::Canceled))
+        );
     }
 }
