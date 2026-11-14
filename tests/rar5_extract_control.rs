@@ -1602,3 +1602,443 @@ fn an_unresolved_obstruction_inside_a_symlink_target_cannot_prove_distinctness()
     report.finish();
     assert_eq!(fs::read(obstruction).unwrap(), b"original");
 }
+
+// These bytes are the caller's first-party, two-header regression fixture.
+fn trailing_directory_fixture() -> Vec<u8> {
+    let hex = "526172211a070100c51a333203010000aec4aed5150202000500ed830100000000000106656d7074792faec4aed5150202000500ed830100000000000106656d7074792f19b23a3503050000";
+    hex.as_bytes()
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+        .collect()
+}
+
+#[derive(Default)]
+struct DirectoryEvents(Vec<&'static str>);
+impl RarExtractObserver for DirectoryEvents {
+    fn overwrite(
+        &mut self,
+        _: &RarOverwriteConflict<'_>,
+        _: RarDiagnostic<'_>,
+    ) -> Result<RarOverwriteDecision, RarDecisionError> {
+        panic!("directory existence must not ask for overwrite")
+    }
+    fn entry(&mut self, event: &RarEntryOutcome, _: RarDiagnostic<'_>) {
+        use zipfast::{
+            error::{IoOperation, RarFailure},
+            extract::RarOutcome,
+        };
+        self.0.push(match &event.outcome {
+            RarOutcome::Failed(failure) => {
+                assert!(matches!(failure.as_ref(), RarFailure::Output {
+                    operation: IoOperation::CreateDirectory, path: Some(path), source, ..
+                } if path.ends_with("empty") && source.kind() == std::io::ErrorKind::AlreadyExists && source.raw_os_error() == Some(libc::EEXIST)), "{failure:?}");
+                "Failed(CreateDirectory/AlreadyExists)"
+            }
+            RarOutcome::Directory => "Directory",
+            RarOutcome::Verified { .. } => "Verified",
+            _ => panic!("unexpected outcome: {:?}", event.outcome),
+        });
+    }
+}
+
+#[test]
+fn trailing_directory_missing_ancestor_is_a_recoverable_first_header_failure() {
+    for single in [true, false] {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.rar");
+        let mut bytes = trailing_directory_fixture();
+        if single {
+            bytes.drain(42..68);
+        }
+        fs::write(&source, bytes).unwrap();
+        let out = d.path().join("out");
+        let mut s = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = s.select(|_| true).unwrap();
+        let mut c = RarExtractControl::new(None, RarOverwriteMode::Ask, RarExtractControlLimits::default());
+        let mut events = DirectoryEvents::default();
+        let result = s
+            .extract_selected_controlled(&selected, &options(&out), RarDecodeLimits::default(), &mut c, &mut events)
+            .finish();
+        eprintln!("single={single} events={:?} result={:?}", events.0, result.outcome);
+        assert_eq!(events.0.first(), Some(&"Failed(CreateDirectory/AlreadyExists)"));
+        assert_eq!(events.0.len(), if single { 1 } else { 2 });
+        if !single {
+            assert_eq!(events.0[1], "Directory");
+        }
+        let summary = result.outcome.unwrap();
+        assert_eq!((summary.failed, summary.dirs, summary.files), (1, if single { 0 } else { 1 }, 0));
+        assert!(out.join("empty").is_dir());
+    }
+}
+
+fn directory_spec(name: &str) -> FileSpec<'_> {
+    FileSpec { dir: true, mtime: None, unix_mode: Some(0o40710), ..FileSpec::new(name, b"") }
+}
+
+#[test]
+fn trailing_directory_fallback_depends_on_raw_separator_and_initial_ancestors() {
+    for mode in [RarOverwriteMode::Ask, RarOverwriteMode::Always, RarOverwriteMode::Skip] {
+        for case in 0..8 {
+            let d = tempfile::tempdir().unwrap();
+            let source = d.path().join("source.rar");
+            let out = d.path().join("out");
+            let name = if case == 2 {
+                "middle/empty/"
+            } else if case == 3 || case == 4 {
+                "empty"
+            } else {
+                "empty/"
+            };
+            let mut files = vec![];
+            if case == 6 {
+                files.push(FileSpec::new("empty/prior", b"earlier"));
+            }
+            files.push(directory_spec(name));
+            if case == 4 {
+                files.push(directory_spec(name));
+            }
+            files.push(FileSpec::new("later", b"later exact bytes"));
+            fs::write(&source, archive(&files)).unwrap();
+            if case == 1 || case == 2 {
+                fs::create_dir(&out).unwrap();
+            }
+            if case == 5 {
+                fs::create_dir_all(out.join("empty")).unwrap();
+            }
+            let mut s = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+            let selected = s.select(|_| true).unwrap();
+            let mut c = RarExtractControl::new(None, mode, RarExtractControlLimits::default());
+            let mut events = DirectoryEvents::default();
+            let mut opts = options(&out);
+            opts.flatten = case == 7;
+            let result = s
+                .extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut events)
+                .finish();
+            let summary = result.outcome.unwrap();
+            let failed = u64::from(case == 0 || case == 2);
+            assert_eq!(summary.failed, failed, "case={case}, mode={mode:?}, events={:?}", events.0);
+            assert_eq!(summary.dirs, 1 + u64::from(case == 4) - failed);
+            assert_eq!(summary.files, 1 + u64::from(case == 6));
+            assert_eq!(fs::read(out.join("later")).unwrap(), b"later exact bytes");
+            if case == 6 {
+                assert_eq!(fs::read(out.join("empty/prior")).unwrap(), b"earlier");
+            }
+            if case != 7 {
+                assert!(out.join(if case == 2 { "middle/empty" } else { "empty" }).is_dir());
+            }
+            assert_eq!(result.usage.decision_calls, 0);
+        }
+    }
+}
+
+#[test]
+fn trailing_directory_test_no_match_and_uncontrolled_routes_keep_their_behavior() {
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("source.rar");
+    fs::write(&source, trailing_directory_fixture()).unwrap();
+    let out = d.path().join("out");
+    let mut s = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+    let selected = s.select(|_| true).unwrap();
+    let tested = s.test_selected(&selected, RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((tested.dirs, tested.failed), (2, 0));
+    assert!(!out.exists());
+    let none = s.select(|_| false).unwrap();
+    let mut c = RarExtractControl::new(None, RarOverwriteMode::Ask, RarExtractControlLimits::default());
+    let empty =
+        s.extract_selected_controlled(&none, &options(&out), RarDecodeLimits::default(), &mut c, &mut Quiet).finish();
+    assert_eq!(empty.outcome.unwrap().matched, 0);
+    assert!(!out.exists());
+    let legacy = s.extract_selected(&selected, &options(&out), RarDecodeLimits::default(), |_| {}).unwrap();
+    assert_eq!((legacy.dirs, legacy.failed), (2, 0));
+    assert!(out.join("empty").is_dir());
+}
+
+#[test]
+fn trailing_directory_missing_ancestor_limits_have_exact_and_one_under_boundaries() {
+    use zipfast::error::RarResource;
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("source.rar");
+    let out = d.path().join("out");
+    fs::write(&source, trailing_directory_fixture()).unwrap();
+    let run = |limits| {
+        if out.exists() {
+            fs::remove_dir_all(&out).unwrap();
+        }
+        let mut s = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = s.select(|_| true).unwrap();
+        let mut c = RarExtractControl::new(None, RarOverwriteMode::Always, limits);
+        s.extract_selected_controlled(&selected, &options(&out), RarDecodeLimits::default(), &mut c, &mut Quiet)
+            .finish()
+    };
+    let baseline = run(RarExtractControlLimits::default());
+    assert_eq!(baseline.outcome.unwrap().failed, 1);
+    for (resource, value) in [
+        (RarResource::ExtractControlWork, baseline.usage.work),
+        (RarResource::ExtractControlCapacity, baseline.usage.capacity_peak),
+        (RarResource::ExtractControlIoAttempts, baseline.usage.io_attempts),
+    ] {
+        for exact in [true, false] {
+            let allowed = value - u64::from(!exact);
+            let mut limits = RarExtractControlLimits::default();
+            match resource {
+                RarResource::ExtractControlWork => limits.work = allowed,
+                RarResource::ExtractControlCapacity => limits.capacity = allowed,
+                RarResource::ExtractControlIoAttempts => limits.io_attempts = allowed,
+                _ => unreachable!(),
+            }
+            let result = run(limits);
+            if exact {
+                assert_eq!(result.outcome.unwrap().failed, 1);
+            } else {
+                assert!(
+                    matches!(result.outcome, Err(RarExtractError::Control { cause: RarExtractControlError::Limit { resource: actual, .. }, .. }) if std::mem::discriminant(&actual) == std::mem::discriminant(&resource))
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn trailing_directory_refuses_existing_regular_symlink_and_protected_paths() {
+    use std::os::unix::fs::symlink;
+    for case in 0..4 {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.rar");
+        let out = d.path().join("out");
+        fs::create_dir(&out).unwrap();
+        let name = if case == 3 { "middle/empty/" } else { "empty/" };
+        fs::write(&source, archive(&[directory_spec(name)])).unwrap();
+        let target = out.join(if case == 3 { "middle" } else { "empty" });
+        let protected = d.path().join("protected");
+        fs::write(&protected, b"preserve").unwrap();
+        match case {
+            0 | 3 => fs::write(&target, b"preserve").unwrap(),
+            1 => symlink(&protected, &target).unwrap(),
+            2 => fs::create_dir(&target).unwrap(),
+            _ => unreachable!(),
+        }
+        let mut opts = options(&out);
+        if case == 2 {
+            opts.protected_paths.insert(target.clone());
+        }
+        let mut s = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = s.select(|_| true).unwrap();
+        let mut c = RarExtractControl::new(None, RarOverwriteMode::Ask, RarExtractControlLimits::default());
+        let result =
+            s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut Quiet).finish();
+        assert_eq!(result.outcome.unwrap().failed, 1, "case={case}");
+        assert_eq!(fs::read(&protected).unwrap(), b"preserve");
+        if case == 0 || case == 3 {
+            assert_eq!(fs::read(&target).unwrap(), b"preserve");
+        }
+        assert_eq!(result.usage.decision_calls, 0);
+    }
+}
+
+#[test]
+fn trailing_directory_failure_captures_created_paths_before_lazy_diagnostics() {
+    struct Log;
+    impl RarExtractObserver for Log {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            panic!()
+        }
+        fn entry(&mut self, event: &RarEntryOutcome, mut diagnostic: RarDiagnostic<'_>) {
+            use zipfast::extract::RarOutcome;
+            let label: &[u8] = match event.outcome {
+                RarOutcome::Failed(_) => b"failed\n",
+                RarOutcome::Directory => b"directory\n",
+                RarOutcome::Verified { .. } => b"file\n",
+                _ => panic!(),
+            };
+            diagnostic
+                .writer()
+                .expect("created directories are engine-bound before failure rendering")
+                .write_all(label)
+                .unwrap();
+        }
+    }
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("source.rar");
+    let out = d.path().join("out");
+    let log = d.path().join("log");
+    fs::write(
+        &source,
+        archive(&[directory_spec("empty/"), directory_spec("empty/"), FileSpec::new("good", b"good bytes")]),
+    )
+    .unwrap();
+    let diagnostic = OpenOptions::new().create_new(true).append(true).open(&log).unwrap();
+    let mut s = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+    let selected = s.select(|_| true).unwrap();
+    let mut c = RarExtractControl::new(Some(diagnostic), RarOverwriteMode::Ask, RarExtractControlLimits::default());
+    let mut report =
+        s.extract_selected_controlled(&selected, &options(&out), RarDecodeLimits::default(), &mut c, &mut Log);
+    let summary = report.outcome().as_ref().unwrap();
+    assert_eq!((summary.failed, summary.dirs, summary.files), (1, 1, 1));
+    report.diagnostic().writer().unwrap().write_all(b"terminal\n").unwrap();
+    assert!(report.finish().diagnostic_failure.is_none());
+    assert_eq!(fs::read(log).unwrap(), b"failed\ndirectory\nfile\nterminal\n");
+    assert_eq!(fs::read(out.join("good")).unwrap(), b"good bytes");
+}
+
+#[test]
+fn trailing_directory_failure_preserves_counts_when_observer_changes_source() {
+    struct Drift(std::path::PathBuf);
+    impl RarExtractObserver for Drift {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            panic!()
+        }
+        fn entry(&mut self, event: &RarEntryOutcome, _: RarDiagnostic<'_>) {
+            assert!(matches!(event.outcome, zipfast::extract::RarOutcome::Failed(_)));
+            fs::write(&self.0, b"source changed after counted failure").unwrap();
+        }
+    }
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("source.rar");
+    fs::write(&source, trailing_directory_fixture()).unwrap();
+    let out = d.path().join("out");
+    let mut s = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+    let selected = s.select(|_| true).unwrap();
+    let mut c = RarExtractControl::new(None, RarOverwriteMode::Always, RarExtractControlLimits::default());
+    let result = s
+        .extract_selected_controlled(&selected, &options(&out), RarDecodeLimits::default(), &mut c, &mut Drift(source))
+        .finish();
+    assert!(
+        matches!(result.outcome, Err(RarExtractError::Native(error)) if error.partial.failed == 1 && error.partial.dirs == 0 && matches!(error.failure.as_ref(), zipfast::error::RarFailure::SourceChanged { .. }))
+    );
+    assert!(out.join("empty").is_dir());
+}
+
+#[test]
+fn trailing_directory_failed_header_does_not_apply_its_metadata_and_optional_faults_do_not_stop_output() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let source = d.path().join("source.rar");
+    fs::write(
+        &source,
+        archive(&[FileSpec { unix_mode: Some(0o40000), ..directory_spec("empty/") }, FileSpec::new("later", b"kept")]),
+    )
+    .unwrap();
+    for mute in [false, true] {
+        let out = d.path().join(if mute { "muted" } else { "out" });
+        let log = d.path().join(if mute { "muted-log" } else { "log" });
+        let diagnostic = OpenOptions::new().create_new(true).append(true).open(log).unwrap();
+        let mut s = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = s.select(|_| true).unwrap();
+        let mut limits = RarExtractControlLimits::default();
+        if mute {
+            limits.diagnostics.io_attempts = 0;
+        }
+        let mut c = RarExtractControl::new(Some(diagnostic), RarOverwriteMode::Always, limits);
+        let result = s
+            .extract_selected_controlled(&selected, &options(&out), RarDecodeLimits::default(), &mut c, &mut Quiet)
+            .finish();
+        let summary = result.outcome.unwrap();
+        assert_eq!((summary.failed, summary.dirs, summary.files), (1, 0, 1));
+        assert_ne!(
+            fs::metadata(out.join("empty")).unwrap().permissions().mode() & 0o700,
+            0,
+            "failed header metadata must not be committed"
+        );
+        assert_eq!(fs::read(out.join("later")).unwrap(), b"kept");
+        assert_eq!(result.diagnostic_failure.is_some(), mute);
+    }
+}
+
+#[test]
+fn trailing_directory_empty_destination_is_observed_as_current_directory() {
+    let mut failures = Vec::new();
+    for preexisting in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        fs::write(
+            d.path().join("source.rar"),
+            archive(&[directory_spec("empty/"), FileSpec::new("later", b"later exact bytes")]),
+        )
+        .unwrap();
+        if preexisting {
+            fs::create_dir(d.path().join("empty")).unwrap();
+        }
+        // Set cwd only on a fresh child, never on this parallel test process.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "trailing_directory_empty_destination_child", "--nocapture"])
+            .env("ZIPFAST_TEST_EMPTY_DIRECTORY_ROOT_CHILD", if preexisting { "preexisting" } else { "missing" })
+            .current_dir(d.path())
+            .output()
+            .unwrap();
+        eprintln!(
+            "preexisting={preexisting} status={}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        if !output.status.success() {
+            failures.push(preexisting);
+        } else {
+            assert!(d.path().join("empty").is_dir());
+            assert_eq!(fs::read(d.path().join("later")).unwrap(), b"later exact bytes");
+        }
+    }
+    assert!(failures.is_empty(), "empty-destination child cases failed: {failures:?}");
+}
+
+#[test]
+fn trailing_directory_empty_destination_child() {
+    let Ok(case) = std::env::var("ZIPFAST_TEST_EMPTY_DIRECTORY_ROOT_CHILD") else { return };
+    assert!(case == "missing" || case == "preexisting");
+    let source = Path::new("source.rar").canonicalize().unwrap();
+    let diagnostic = OpenOptions::new().create_new(true).append(true).open("log").unwrap();
+    let mut s = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+    let selected = s.select(|_| true).unwrap();
+    let mut c = RarExtractControl::new(Some(diagnostic), RarOverwriteMode::Ask, RarExtractControlLimits::default());
+    struct Events(Vec<&'static str>);
+    impl RarExtractObserver for Events {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            panic!("directory existence must not ask for overwrite")
+        }
+        fn entry(&mut self, event: &RarEntryOutcome, _: RarDiagnostic<'_>) {
+            self.0.push(match event.outcome {
+                zipfast::extract::RarOutcome::Directory => "Directory",
+                zipfast::extract::RarOutcome::Verified { .. } => "Verified",
+                zipfast::extract::RarOutcome::Failed(_) => "Failed",
+                _ => "Other",
+            });
+        }
+    }
+    let mut events = Events(Vec::new());
+    let opts = options(Path::new(""));
+    assert!(opts.dest.as_os_str().is_empty());
+    let mut report = s.extract_selected_controlled(&selected, &opts, RarDecodeLimits::default(), &mut c, &mut events);
+    eprintln!(
+        "case={case} events={:?} result={:?} diagnostic={:?}",
+        events.0,
+        report.outcome(),
+        report.diagnostic_failure()
+    );
+    let summary = report.outcome().as_ref().unwrap();
+    assert_eq!((summary.failed, summary.dirs, summary.files), (0, 1, 1));
+    assert_eq!(events.0, ["Directory", "Verified"]);
+    assert!(Path::new("empty").is_dir());
+    assert_eq!(fs::read("later").unwrap(), b"later exact bytes");
+    assert!(report.diagnostic_failure().is_none());
+    report
+        .diagnostic()
+        .writer()
+        .expect("empty-root observation must preserve diagnostic bindings")
+        .write_all(b"done\n")
+        .unwrap();
+    assert!(report.finish().diagnostic_failure.is_none());
+    assert_eq!(fs::read("log").unwrap(), b"done\n");
+}
