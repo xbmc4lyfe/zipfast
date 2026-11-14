@@ -19,7 +19,7 @@
 //! ZIP metadata and selected reads bound to one checked file and directory parse.
 
 use std::fmt;
-use std::fs::{self, File, FileType};
+use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -27,6 +27,10 @@ use std::sync::Arc;
 
 use zip_container::{CENTRAL_HEADER_LEN, CentralRecord, LimitKind};
 
+use super::read::io::SourceCheckError;
+use super::read::{
+    CheckedSourceFault, EncryptedReadContext, IoStage, SourceInvalidationCode, ZipReadError, ZipReadResult,
+};
 use super::{
     AesFields, BUF, CentralHeader, CentralLocation, Directory, DirectoryDeclaration, DirectoryError, DirectoryParser,
     EndRecord, ExtraMtime, FLAG_UTF8, HOST_UNIX, Limits, Profile, ReadDescription, ResolvedFields, Usage, Zip64End,
@@ -139,9 +143,10 @@ impl From<Error> for SessionError {
 /// Callers should stage sink bytes and publish them only after a successful
 /// read and a final caller cancellation check.
 pub struct ReadSession {
-    file: File,
-    source: SourceBinding,
-    metadata: Arc<Metadata>,
+    pub(super) file: File,
+    pub(super) source: SourceBinding,
+    pub(super) metadata: Arc<Metadata>,
+    pub(super) checked_identity: u64,
     dispatch_bytes: u64,
 }
 
@@ -197,7 +202,14 @@ impl ReadSession {
         })();
         let metadata = source.finish_checked(&file, parsed)?;
         check_cancel(Some(cancel))?;
-        Ok(Self { file, source, metadata: Arc::new(metadata), dispatch_bytes })
+        Ok(Self {
+            file,
+            source,
+            metadata: Arc::new(metadata),
+            dispatch_bytes,
+            checked_identity: super::read::projected_identity()
+                .map_err(|_| Error::Corrupt("ZIP identity counter exhausted"))?,
+        })
     }
 
     /// Source bytes fetched by format dispatch before ZIP directory parsing.
@@ -214,8 +226,40 @@ impl ReadSession {
         Arc::clone(&self.metadata)
     }
 
-    /// Checks that the retained handle and the original path still identify the opened version.
-    ///
+    /// Admits the actual output descriptor against this original checked owner.
+    #[cfg(unix)]
+    #[allow(clippy::result_large_err)]
+    pub fn admit_output_fd(
+        &mut self,
+        fd: std::os::fd::BorrowedFd<'_>,
+        context: &mut EncryptedReadContext,
+    ) -> ZipReadResult<()> {
+        if !context.has_action_plan() {
+            return Err(super::ReadFault::InvalidPlan.into());
+        }
+        self.check_source_checked(context)?;
+        context.admit_output_descriptor(self.checked_identity, self.source.stamp, fd)
+    }
+
+    /// Checks the original source without allocating an error wrapper.
+    /// The first observation is moved out; subsequent checks return a Copy invalidation code.
+    #[allow(clippy::result_large_err)] // Fixed inline terminal evidence must survive allocation refusal.
+    pub fn check_source_checked(&mut self, context: &mut EncryptedReadContext) -> ZipReadResult<()> {
+        context.verify_identity(self.checked_identity)?;
+        if let Some(fault) = self.source.previous_invalidation() {
+            return Err(ZipReadError::from(fault).with_usage(context.usage(), context.run_usage()));
+        }
+        context
+            .source_group(self.source.stamp)
+            .map_err(|fault| ZipReadError::from(fault).with_usage(context.usage(), context.run_usage()))?;
+        self.source
+            .verify_checked(&self.file, context)
+            .map_err(|fault| ZipReadError::from(fault).with_usage(context.usage(), context.run_usage()))?;
+        context.successful_source_observation(self.checked_identity, self.source.stamp)?;
+        Ok(())
+    }
+
+    /// Checks that the retained handle and original path still identify the opened version.
     /// A failed check invalidates this session permanently.
     pub fn check_source(&mut self) -> SessionResult<()> {
         self.source.finish_checked(&self.file, Ok(()))
@@ -236,7 +280,7 @@ impl ReadSession {
         let entry = self.metadata.view(ordinal);
         check_selection(entry.is_dir(), entry.is_link(), entry.packed_size(), entry.size(), max_bytes)?;
         let relative_path = sanitize(entry.name(), entry.creator_host() != HOST_UNIX)?;
-        Ok(SelectedZipEntry { session: self, ordinal, relative_path, cancel })
+        Ok(SelectedZipEntry { session: self, ordinal, relative_path, cancel, max_bytes })
     }
 }
 
@@ -312,8 +356,22 @@ struct SessionIdentity {
 /// An opaque reference to one central-directory ordinal in one snapshot.
 #[derive(Clone, Debug)]
 pub struct EntryId {
-    identity: Arc<SessionIdentity>,
-    ordinal: usize,
+    identity: EntryIdentity,
+    pub(super) ordinal: usize,
+}
+
+#[derive(Clone, Debug)]
+enum EntryIdentity {
+    Canonical(Arc<SessionIdentity>),
+    Projected(u64),
+}
+impl EntryId {
+    pub(super) fn projected(identity: u64, ordinal: usize) -> Self {
+        Self { identity: EntryIdentity::Projected(identity), ordinal }
+    }
+    pub(super) fn is_projected(&self, identity: u64) -> bool {
+        matches!(self.identity, EntryIdentity::Projected(id) if id == identity)
+    }
 }
 
 /// The immutable ZIP directory and archive envelope from a successfully opened session.
@@ -357,11 +415,14 @@ impl Metadata {
 
     /// Returns an ID for an ordinal in central order.
     pub fn entry_id(&self, ordinal: usize) -> Option<EntryId> {
-        (ordinal < self.len()).then(|| EntryId { identity: Arc::clone(&self.identity), ordinal })
+        (ordinal < self.len())
+            .then(|| EntryId { identity: EntryIdentity::Canonical(Arc::clone(&self.identity)), ordinal })
     }
 
     pub(super) fn ordinal(&self, id: &EntryId) -> SessionResult<usize> {
-        if !Arc::ptr_eq(&id.identity, &self.identity) || id.ordinal >= self.len() {
+        if !matches!(&id.identity, EntryIdentity::Canonical(identity) if Arc::ptr_eq(identity, &self.identity))
+            || id.ordinal >= self.len()
+        {
             return Err(SessionError::ForeignEntryId);
         }
         Ok(id.ordinal)
@@ -691,7 +752,7 @@ impl<'a> EntryMetadata<'a> {
         self.entry.modified
     }
 
-    fn read_description(self) -> ReadDescription<'a> {
+    pub(super) fn read_description(self) -> ReadDescription<'a> {
         ReadDescription {
             name: self.name(),
             flags: self.entry.header.flags,
@@ -711,9 +772,32 @@ pub struct SelectedZipEntry<'a> {
     ordinal: usize,
     relative_path: PathBuf,
     cancel: Cancellation,
+    max_bytes: u64,
 }
 
 impl SelectedZipEntry<'_> {
+    /// Borrows this original selected record and its original sanitized path.
+    #[allow(clippy::result_large_err)]
+    pub fn stage_entry(&mut self) -> ZipReadResult<super::ZipStageEntry<'_>> {
+        let metadata = self.session.metadata.view(self.ordinal);
+        if metadata.is_dir() || metadata.is_link() || !super::supported(metadata.effective_method()) {
+            return Err(super::ReadFault::InvalidPlan.into());
+        }
+        if let Some(fault) = self.session.source.previous_invalidation() {
+            return Err(fault.into());
+        }
+        Ok(super::ZipStageEntry::original(
+            &self.session.file,
+            &mut self.session.source,
+            self.session.checked_identity,
+            self.ordinal,
+            metadata.read_description(),
+            metadata.creator_host() != 3,
+            metadata.extraction_unix_mode(),
+            metadata.modified(),
+            Some(&self.relative_path),
+        ))
+    }
     /// Borrows the selected metadata for output staging.
     pub fn metadata(&self) -> EntryMetadata<'_> {
         self.session.metadata.view(self.ordinal)
@@ -739,6 +823,30 @@ impl SelectedZipEntry<'_> {
         self.metadata().modified()
     }
 
+    /// Streams this original selection under its bound single-use action.
+    #[allow(clippy::result_large_err)]
+    pub fn read_with_context(
+        self,
+        password: Option<&str>,
+        context: &mut EncryptedReadContext,
+        mut sink: impl FnMut(&[u8]) -> super::read::ZipSinkResult<()>,
+    ) -> ZipReadResult<()> {
+        let Self { session, ordinal, cancel, max_bytes, .. } = self;
+        let e = session.metadata.view(ordinal).read_description();
+        super::read::checked_read(
+            &mut session.file,
+            &mut session.source,
+            session.checked_identity,
+            ordinal,
+            e,
+            password,
+            max_bytes,
+            &cancel,
+            context,
+            &mut sink,
+        )
+    }
+
     /// Decodes and verifies the complete entry. Every sink byte is provisional
     /// until this returns success. Caller output publication is a separate step.
     ///
@@ -761,17 +869,21 @@ impl SelectedZipEntry<'_> {
     }
 }
 
-struct SourceBinding {
-    path: PathBuf,
-    stamp: SourceStamp,
+pub(super) struct SourceBinding {
+    pub(super) path: PathBuf,
+    pub(super) stamp: SourceStamp,
     invalid: Option<SourceChange>,
+    checked_invalid: Option<(SourceInvalidationCode, Option<i32>)>,
 }
 
 impl SourceBinding {
+    pub(super) fn from_checked(path: PathBuf, stamp: SourceStamp) -> Self {
+        Self { path, stamp, invalid: None, checked_invalid: None }
+    }
     fn capture(file: &File, path: PathBuf) -> SessionResult<Self> {
         let stamp = SourceStamp::capture(file, &path)
             .map_err(|change| SessionError::SourceChanged { change, context: None })?;
-        Ok(Self { path, stamp, invalid: None })
+        Ok(Self { path, stamp, invalid: None, checked_invalid: None })
     }
 
     fn finish_checked<T>(&mut self, file: &File, attempt: Result<T>) -> SessionResult<T> {
@@ -781,9 +893,80 @@ impl SourceBinding {
         }
     }
 
-    fn verify(&mut self, file: &File) -> std::result::Result<(), SourceChange> {
+    pub(super) fn previous_invalidation(&self) -> Option<CheckedSourceFault> {
+        if let Some((code, raw_os_error)) = self.checked_invalid {
+            return Some(CheckedSourceFault::PreviouslyInvalidated { code, raw_os_error });
+        }
+        // Inspect the preexisting legacy owner by borrow; do not clone its Arc.
+        if let Some(change) = &self.invalid {
+            let (code, raw_os_error) = match change {
+                SourceChange::StampMismatch => (SourceInvalidationCode::StampMismatch, None),
+                SourceChange::Unverifiable(error) => (SourceInvalidationCode::LegacyUnavailable, error.raw_os_error()),
+            };
+            return Some(CheckedSourceFault::PreviouslyInvalidated { code, raw_os_error });
+        }
+        None
+    }
+    /// A current namespace observation after ownership of the original File ended.
+    /// This deliberately performs no held-descriptor observation and never refreshes the stamp.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    pub(super) fn verify_retired_path(
+        &mut self,
+        mut stat: impl FnMut(
+            IoStage,
+            &mut dyn FnMut() -> io::Result<SourceStamp>,
+        ) -> std::result::Result<SourceStamp, SourceCheckError>,
+    ) -> std::result::Result<(), SourceCheckError> {
+        if let Some(fault) = self.previous_invalidation() {
+            return Err(SourceCheckError::Source(fault));
+        }
+        let result = stat(IoStage::SourcePath, &mut || SourceStamp::stat_path(&self.path)).and_then(|stamp| {
+            if stamp == self.stamp { Ok(()) } else { Err(SourceCheckError::Source(CheckedSourceFault::StampMismatch)) }
+        });
+        if let Err(SourceCheckError::Source(fault)) = &result {
+            self.checked_invalid = Some(fault.invalidation());
+        }
+        result
+    }
+    pub(super) fn verify_checked(
+        &mut self,
+        file: &File,
+        context: &mut EncryptedReadContext,
+    ) -> std::result::Result<(), SourceCheckError> {
+        self.verify_with(file, |stage, call| context.source_stat(stage, call))
+    }
+    pub(super) fn verify_with(
+        &mut self,
+        file: &File,
+        stat: impl FnMut(
+            IoStage,
+            &mut dyn FnMut() -> io::Result<SourceStamp>,
+        ) -> std::result::Result<SourceStamp, SourceCheckError>,
+    ) -> std::result::Result<(), SourceCheckError> {
+        if let Some(fault) = self.previous_invalidation() {
+            return Err(SourceCheckError::Source(fault));
+        }
+        let result = SourceStamp::capture_checked(file, &self.path, stat).and_then(|stamp| {
+            if stamp == self.stamp { Ok(()) } else { Err(SourceCheckError::Source(CheckedSourceFault::StampMismatch)) }
+        });
+        if let Err(SourceCheckError::Source(fault)) = &result {
+            self.checked_invalid = Some(fault.invalidation());
+        }
+        result
+    }
+
+    pub(super) fn verify(&mut self, file: &File) -> std::result::Result<(), SourceChange> {
         if let Some(change) = &self.invalid {
             return Err(change.clone());
+        }
+        if let Some((code, os_error)) = self.checked_invalid {
+            // Only the old API adapts to its historical allocated/cloneable representation.
+            return Err(match code {
+                SourceInvalidationCode::StampMismatch => SourceChange::StampMismatch,
+                _ => SourceChange::from(
+                    os_error.map(io::Error::from_raw_os_error).unwrap_or_else(|| io::ErrorKind::Other.into()),
+                ),
+            });
         }
         let verified = SourceStamp::capture(file, &self.path)
             .and_then(|stamp| if stamp == self.stamp { Ok(()) } else { Err(SourceChange::StampMismatch) });
@@ -794,17 +977,108 @@ impl SourceBinding {
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-struct SourceStamp {
-    file_type: FileType,
-    len: u64,
-    dev: u64,
-    ino: u64,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SourceStamp {
+    regular: bool,
+    pub(super) len: u64,
+    pub(super) dev: u64,
+    pub(super) ino: u64,
     mtime: (i64, i64),
     ctime: (i64, i64),
 }
 
 impl SourceStamp {
+    pub(super) fn capture_checked(
+        file: &File,
+        path: &Path,
+        mut stat: impl FnMut(IoStage, &mut dyn FnMut() -> io::Result<Self>) -> std::result::Result<Self, SourceCheckError>,
+    ) -> std::result::Result<Self, SourceCheckError> {
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let (before, resolved, after) = (
+            stat(IoStage::SourceHandle, &mut || Self::stat_handle(file))?,
+            stat(IoStage::SourcePath, &mut || Self::stat_path(path))?,
+            stat(IoStage::SourceHandle, &mut || Self::stat_handle(file))?,
+        );
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        let (before, resolved, after) = (
+            stat(IoStage::SourceHandle, &mut || Self::from_metadata_checked(file.metadata()?))?,
+            stat(IoStage::SourcePath, &mut || Self::from_metadata_checked(fs::metadata(path)?))?,
+            stat(IoStage::SourceHandle, &mut || Self::from_metadata_checked(file.metadata()?))?,
+        );
+        if before != resolved || before != after {
+            return Err(SourceCheckError::Source(CheckedSourceFault::StampMismatch));
+        }
+        Ok(before)
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn stat_handle(file: &File) -> io::Result<Self> {
+        use std::os::fd::AsRawFd;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: descriptor is borrowed and live, stat is a writable output of
+        // exactly the required layout. One syscall; EINTR returns to the budget.
+        if unsafe { libc::fstat(file.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Self::from_stat(unsafe { stat.assume_init() })
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn stat_path(path: &Path) -> io::Result<Self> {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        // Match the kernel pathname limit without a temporary CString allocation.
+        let mut terminated = [0u8; libc::PATH_MAX as usize];
+        if bytes.len() >= terminated.len() {
+            return Err(io::Error::from_raw_os_error(libc::ENAMETOOLONG));
+        }
+        if bytes.contains(&0) {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        terminated[..bytes.len()].copy_from_slice(bytes);
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: pathname has a trailing NUL and no interior NUL; output has
+        // exact stat layout. Follow symlinks exactly as legacy fs::metadata does.
+        if unsafe { libc::stat(terminated.as_ptr().cast(), stat.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Self::from_stat(unsafe { stat.assume_init() })
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // stat inode/device widths vary with the Unix ABI; preserve MetadataExt casts.
+    #[allow(clippy::unnecessary_cast)]
+    fn from_stat(stat: libc::stat) -> io::Result<Self> {
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        Ok(Self {
+            regular: true,
+            len: u64::try_from(stat.st_size).map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?,
+            dev: stat.st_dev as u64,
+            ino: stat.st_ino as u64,
+            mtime: (stat.st_mtime, stat.st_mtime_nsec),
+            ctime: (stat.st_ctime, stat.st_ctime_nsec),
+        })
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
+    fn from_metadata_checked(metadata: fs::Metadata) -> io::Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let file_type = metadata.file_type();
+        if !file_type.is_file() {
+            return Err(io::ErrorKind::InvalidInput.into());
+        }
+        Ok(Self {
+            regular: true,
+            len: metadata.len(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            mtime: (metadata.mtime(), metadata.mtime_nsec()),
+            ctime: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    }
+    #[cfg(not(unix))]
+    fn from_metadata_checked(_: fs::Metadata) -> io::Result<Self> {
+        Err(io::ErrorKind::Unsupported.into())
+    }
+
     fn capture(file: &File, path: &Path) -> std::result::Result<Self, SourceChange> {
         let before = Self::from_metadata(file.metadata()?)?;
         let resolved = Self::from_metadata(fs::metadata(path)?)?;
@@ -824,7 +1098,7 @@ impl SourceStamp {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "ZIP source is not a regular file"));
         }
         Ok(Self {
-            file_type,
+            regular: true,
             len: metadata.len(),
             dev: metadata.dev(),
             ino: metadata.ino(),

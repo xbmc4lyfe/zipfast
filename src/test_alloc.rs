@@ -23,6 +23,7 @@ thread_local! {
     pub(crate) static REFUSE_ALLOCATIONS: Cell<bool> = const { Cell::new(false) };
     pub(crate) static TRACK_ALLOC: Cell<bool> = const { Cell::new(false) };
     pub(crate) static ALLOC_REQUESTS: Cell<usize> = const { Cell::new(0) };
+    pub(crate) static DEALLOC_REQUESTS: Cell<usize> = const { Cell::new(0) };
     pub(crate) static DENY_LAYOUT: Cell<Option<(usize, usize)>> = const { Cell::new(None) };
     pub(crate) static DENY_DICTIONARY: Cell<bool> = const { Cell::new(false) };
 }
@@ -76,6 +77,9 @@ unsafe impl GlobalAlloc for TestAllocator {
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        if TRACK_ALLOC.try_with(Cell::get).unwrap_or(false) {
+            let _ = DEALLOC_REQUESTS.try_with(|count| count.set(count.get().saturating_add(1)));
+        }
         unsafe { System.dealloc(pointer, layout) }
     }
 }

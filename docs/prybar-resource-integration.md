@@ -1,6 +1,6 @@
 # Prybar resource-efficiency integration
 
-This handoff compares Prybar `95a0fccb696c4e8e3b46ecceed760cc7941fc2ba` and its live Zipfast/zip-container Git dependencies at `82e88a6dabd2025dde0342583fa41345287dde73` with the Resource Maxxer audit of standalone Zipfast `f41aae515472ce25b6309d777fcc3e738b2a98ec` and Prybar `3149c2437b8f7db74ee810b336610661d91a8404`.
+The historical resource-efficiency audit below compares Prybar `95a0fccb696c4e8e3b46ecceed760cc7941fc2ba` and its live Zipfast/zip-container Git dependencies at `82e88a6dabd2025dde0342583fa41345287dde73` with the Resource Maxxer audit of standalone Zipfast `f41aae515472ce25b6309d777fcc3e738b2a98ec` and Prybar `3149c2437b8f7db74ee810b336610661d91a8404`.
 
 Prybar now resolves its runtime engines from the Git dependencies in `crates/pry/Cargo.toml`. Its excluded bundled source directories are historical snapshots, with some fixture references. Confirm the Cargo resolution when adopting this change.
 
@@ -10,7 +10,17 @@ Update **both** `zipfast` and the direct `zip-container` dependency in `crates/p
 
 The engine changes add private owned-buffer paths behind the existing ZIP reader. `Archive::read_at`, `ReadSession` selections and ordinary extraction retain their public interfaces. AES authenticates ciphertext before in-place decryption. ZIP, TAR and RAR listing conversions consume their owned names and link metadata. Existing Prybar callers receive those changes through the dependency update.
 
-Public encrypted ZIP reading has a 128 MiB packed-member ceiling. The larger-file streaming reader requested in Prybar's local `NO_COMPATIBILITY.md` remains a separate compatibility milestone.
+Legacy encrypted ZIP APIs retain their 128 MiB packed-member ceiling. The additive checked reader and ordinary engine CLI now use bounded streaming; see [checked ZIP reads](zip-checked-reads.md). Engine qualification does not claim that Prybar's live adapters have adopted these APIs.
+
+For the checked-reader update, pin both Git engine dependencies to the actual reviewed, merged engine revision recorded by the coordinator. No future merge SHA is available at qualification time. Use `EncryptedReadContext::for_session` with the original retained `EntryId`, a fresh context per retry and `SelectedZipEntry::read_with_context`. A generic ZIP selection can instead use `open_cancelable_with_zip_limit`, `zip_read_context` and `read_with_zip_context` while retaining its original owner through output completion. Keep Prybar's selected extraction/print 8 GiB policy, preview 64 MiB full-verification ceiling and 4096-byte displayed prefix. These are caller policies, independent of the engine's catalogue-derived CLI allowances and conservative library defaults.
+
+Bind verified print output with `ZipReadStage`, admit the actual stdout FD and retain the original source through `copy_verified`'s final check. `EntryGuard::default()` does not justify dropping or reopening the original source. Preserve typed failures, partial accepted counts and publication state. Source/namespace checks remain optimistic under the storage threat model documented in the checked-reader guide. Task7 still owns actual printing/preview/extraction, UI/status, aliases, BrokenPipe and source-mutation qualification; no engine-only result closes those caller gates.
+
+## Checked extraction storage and legacy error channels
+
+The milestone deliberately restricts checked ZIP extraction, including clear members, to ownership-enforced local APFS on macOS or ext-family/XFS/Btrfs/tmpfs on Linux, with the implemented trusted procfs descriptor and ACL facilities. Linux overlayfs/container root, network mounts, exFAT and macOS HFS+ are common refused destinations. Provide supported mounted output and encrypted-snapshot temporary locations; changing temp storage cannot enable an unsupported destination, and permissions cannot enable an unlisted backend. Physical qualification covers APFS/ext4/Btrfs/tmpfs; XFS is admitted but not physically qualified and no other ext variant is claimed tested. Preserve this visible restriction in the release PR and caller handoff; full filesystem compatibility remains open. See [release notes](zip-checked-release-notes.md).
+
+For generic non-ZIP run fallback, preserve Prybar's existing LEGACY sink path. `LegacyDiagnostic` is the original mixed progress/skip/failure callback text. Normal output prints that channel and ignores `LegacyError`. Quiet output ignores mixed diagnostics and prints only ordered borrowed `LegacyError` strings from the original successful `Summary.errors`; silent output ignores both. Both channels reach a plain closure observer, so explicitly choose which to render. Legacy preparation remains skipped and its scope has no checked `emit` capability. No string matching or newly typed failure inference is needed. Observer failure suppresses every later callback/error replay/RunEnded; returned partial counts remain available.
 
 ## Catalogue reuse
 

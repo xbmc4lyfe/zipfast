@@ -1005,6 +1005,17 @@ fn crypto_mask(keys: &[u32; 3]) -> u8 {
 pub(crate) struct ZipCrypto([u32; 3]);
 
 impl ZipCrypto {
+    pub(crate) fn new_cancellable<E>(password: &str, mut poll: impl FnMut() -> Result<(), E>) -> Result<Self, E> {
+        let mut keys = [0x1234_5678, 0x2345_6789, 0x3456_7890];
+        poll()?;
+        for chunk in password.as_bytes().chunks(4096) {
+            poll()?;
+            for &byte in chunk {
+                crypto_update(&mut keys, byte);
+            }
+        }
+        Ok(Self(keys))
+    }
     pub(crate) fn new(password: &str) -> Self {
         Self(crypto_keys(password.as_bytes()))
     }
@@ -1076,13 +1087,13 @@ fn hmac_sha1(ipad: &[u8; 64], opad: &[u8; 64], data: &[u8]) -> [u8; 20] {
     outer.finalize_bytes()
 }
 
-struct HmacSha1 {
+pub(crate) struct HmacSha1 {
     inner: Sha1,
     outer: Sha1,
 }
 
 impl HmacSha1 {
-    fn new(key: &[u8]) -> Self {
+    pub(crate) fn new(key: &[u8]) -> Self {
         let mut block = [0; 64];
         if key.len() > block.len() {
             let mut hash = Sha1::new();
@@ -1104,13 +1115,13 @@ impl HmacSha1 {
         Self { inner, outer }
     }
 
-    fn update(&mut self, bytes: &[u8]) -> Option<()> {
+    pub(crate) fn update(&mut self, bytes: &[u8]) -> Option<()> {
         self.inner.total_len.checked_add(bytes.len() as u64)?.checked_mul(8)?;
         self.inner.update(bytes);
         Some(())
     }
 
-    fn finish(&self) -> [u8; 20] {
+    pub(crate) fn finish(&self) -> [u8; 20] {
         let mut outer = self.outer.clone();
         outer.update(&self.inner.finalize_bytes());
         outer.finalize_bytes()
@@ -1149,6 +1160,86 @@ fn derive_winzip_fixed(password: &[u8], salt: &[u8], key_len: usize) -> Option<[
         target.copy_from_slice(&combined[..target.len()]);
     }
     Some(result)
+}
+
+/// Fixed PBKDF2-HMAC-SHA1; polling leaves the 1000-round result unchanged.
+pub(crate) fn derive_winzip_cancellable<E>(
+    password: &[u8],
+    salt: &[u8],
+    key_len: usize,
+    mut poll: impl FnMut() -> Result<(), E>,
+) -> Result<Option<[u8; 66]>, E> {
+    if ![16, 24, 32].contains(&key_len) || salt.len() != key_len / 2 {
+        return Ok(None);
+    }
+    poll()?;
+    let mut digest = [0; 20];
+    let key = if password.len() > 64 {
+        let mut hash = Sha1::new();
+        for chunk in password.chunks(4096) {
+            poll()?;
+            hash.update(chunk);
+        }
+        digest.copy_from_slice(&hash.finalize_bytes());
+        &digest[..]
+    } else {
+        password
+    };
+    let keyed = HmacSha1::new(key);
+    let mut result = [0; 66];
+    let mut block = [0; 20];
+    block[..salt.len()].copy_from_slice(salt);
+    for (index, target) in result[..2 * key_len + 2].chunks_mut(20).enumerate() {
+        poll()?;
+        block[salt.len()..salt.len() + 4].copy_from_slice(&((index + 1) as u32).to_be_bytes());
+        let mut u = keyed.mac(&block[..salt.len() + 4]);
+        let mut combined = u;
+        for round in 1..1000 {
+            if round % 64 == 0 {
+                poll()?;
+            }
+            u = keyed.mac(&u);
+            for (byte, next) in combined.iter_mut().zip(u) {
+                *byte ^= next;
+            }
+        }
+        target.copy_from_slice(&combined[..target.len()]);
+    }
+    poll()?;
+    Ok(Some(result))
+}
+
+/// Persistent byte-granular WinZip counter, including partial keystream blocks.
+pub(crate) struct WinZipCtr {
+    cipher: AesKey,
+    counter: [u8; 16],
+    block: [u8; 16],
+    used: usize,
+}
+impl WinZipCtr {
+    pub(crate) fn new(key: &[u8]) -> Option<Self> {
+        Some(Self { cipher: AesKey::new(key)?, counter: [0; 16], block: [0; 16], used: 16 })
+    }
+    pub(crate) fn apply(&mut self, bytes: &mut [u8]) -> Option<()> {
+        for byte in bytes {
+            if self.used == 16 {
+                if self.counter == [255; 16] {
+                    return None;
+                }
+                for b in &mut self.counter {
+                    *b = b.wrapping_add(1);
+                    if *b != 0 {
+                        break;
+                    }
+                }
+                self.block = self.cipher.encrypt_block(&self.counter);
+                self.used = 0;
+            }
+            *byte ^= self.block[self.used];
+            self.used += 1;
+        }
+        Some(())
+    }
 }
 
 pub(crate) struct WinZipAesEncryptor {
@@ -1405,6 +1496,64 @@ mod tests {
             b"WinZip AES fixture across CTR blocks",
         ),
     ];
+
+    #[test]
+    fn cancellable_derivation_and_persistent_ctr_match_legacy() {
+        for key_len in [16, 24, 32] {
+            let salt = [3; 16];
+            let password = vec![b'p'; 65535];
+            let reference = derive_winzip_fixed(&password, &salt[..key_len / 2], key_len).unwrap();
+            let mut polls = 0;
+            let actual = derive_winzip_cancellable(&password, &salt[..key_len / 2], key_len, || {
+                polls += 1;
+                Ok::<_, ()>(())
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(actual, reference);
+            for stop in 1..=polls {
+                let mut current = 0;
+                assert_eq!(
+                    derive_winzip_cancellable(&password, &salt[..key_len / 2], key_len, || {
+                        current += 1;
+                        if current == stop { Err(()) } else { Ok(()) }
+                    }),
+                    Err(())
+                );
+                assert_eq!(current, stop);
+            }
+            let plain = (0..193).map(|i| i as u8).collect::<Vec<_>>();
+            let expected = decrypt_winzip_ctr(&reference[..key_len], &plain).unwrap();
+            for split in 0..=plain.len() {
+                let mut actual = plain.clone();
+                let mut ctr = WinZipCtr::new(&reference[..key_len]).unwrap();
+                ctr.apply(&mut actual[..split]).unwrap();
+                for chunk in actual[split..].chunks_mut(1) {
+                    ctr.apply(chunk).unwrap();
+                }
+                assert_eq!(actual, expected);
+            }
+            let mut ctr = WinZipCtr::new(&reference[..key_len]).unwrap();
+            ctr.counter = [255; 16];
+            assert!(ctr.apply(&mut [0]).is_none());
+        }
+        let password = "p".repeat(65535);
+        let mut expected = [0; 64];
+        ZipCrypto::new(&password).decrypt(&mut expected);
+        let mut actual = [0; 64];
+        ZipCrypto::new_cancellable(&password, || Ok::<_, ()>(())).unwrap().decrypt(&mut actual);
+        assert_eq!(actual, expected);
+        for stop in 1..=17 {
+            let mut polls = 0;
+            assert!(
+                ZipCrypto::new_cancellable(&password, || {
+                    polls += 1;
+                    if polls == stop { Err(()) } else { Ok(()) }
+                })
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn incremental_winzip_aes_matches_independent_vectors_at_chunk_boundaries() {

@@ -22,7 +22,8 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
   filters), including files split across `name.partNN.rar` or `name.rar`/`name.r00` volume sets, self-extracting
   stubs, CRC32 and BLAKE2sp checks, modification times and Unix permissions. Big files decode on several cores.
 - ZIP archives: stored, deflated, bzip2, LZMA, xz and zstd entries, ZIP64, self-extracting stubs, UTF-8 and code page 437 names,
-  Unix permissions, and extended or NTFS timestamps.
+  Unix permissions, and extended or NTFS timestamps. Checked streaming reads support ZipCrypto and WinZip AES
+  (all strengths, AE-1/AE-2); see [checked ZIP reads](docs/zip-checked-reads.md) for policy, staging and legacy caps.
 - tar archives, plain or compressed with gzip, xz, zstd or bzip2 (`.tar.gz`, `.tgz`, `.tar.xz`, `.tar.zst`,
   `.tar.bz2` and so on): POSIX ustar and pax (long names, big sizes, fractional times), GNU long names and base-256
   sizes, and pre-POSIX headers. A compressed file that holds no tar archive comes out as the one file it
@@ -30,7 +31,7 @@ See [workspace integration](docs/zipview-workspace.md) for Git dependencies, bui
 - Extraction never writes outside the destination: `..`, absolute paths, drive letters and links in the way are
   refused.
 
-Encrypted archives, links, remaining RAR4 capabilities, 7z and the rarer ZIP methods (Deflate64, PPMd) are next.
+Remaining RAR4 capabilities, links, 7z and the rarer ZIP methods (Deflate64, PPMd) are next.
 
 ## Usage
 
@@ -40,6 +41,8 @@ zipfast t archive.rar             # test every checksum, write nothing
 zipfast x archive.part01.rar out  # extract with folders
 zipfast e archive.rar out         # extract without folders
 ```
+
+**ZIP extraction storage:** the default checked command requires ownership-enforced local APFS on macOS, or ext-family/XFS/Btrfs/tmpfs on Linux with the implemented procfs descriptor and ACL facilities. This applies to clear ZIP members too. Unlisted destinations—including Linux overlayfs/container root, network mounts, exFAT and macOS HFS+—fail closed. Choose supported mounted output and, for encrypted disk snapshots, temporary locations (`ZIPFAST_ZIP_TEMP_DIR`); changing temp storage cannot fix an unsupported destination. Physical qualification covers APFS/ext4/Btrfs/tmpfs; XFS is admitted but unqualified, and other ext variants are not claimed tested. Full filesystem compatibility remains open. See [checked storage and release notes](docs/zip-checked-release-notes.md).
 
 Switches: `-o+`/`-y` overwrite existing files, `-o-` skip them (default), `-q` quiet, `-mt<n>` use up to n
 threads (default: one per core).
