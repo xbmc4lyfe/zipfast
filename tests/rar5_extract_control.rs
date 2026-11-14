@@ -760,3 +760,80 @@ fn known_target_alias_precedes_an_unrelated_metadata_obstruction() {
     assert!(matches!(f.diagnostic_failure, Some(RarDiagnosticFailure::AliasTarget { ordinal: 1 })));
     assert_eq!(fs::read(alias).unwrap(), b"original");
 }
+
+#[test]
+fn corrupt_payload_keeps_regular_diagnostics_for_created_directories() {
+    struct Log<'a> {
+        bad: &'a Path,
+        messages: usize,
+    }
+    impl RarExtractObserver for Log<'_> {
+        fn overwrite(
+            &mut self,
+            _: &RarOverwriteConflict<'_>,
+            _: RarDiagnostic<'_>,
+        ) -> Result<RarOverwriteDecision, RarDecisionError> {
+            panic!("no existing targets")
+        }
+        fn entry(&mut self, entry: &RarEntryOutcome, mut diagnostic: RarDiagnostic<'_>) {
+            if entry.entry.order == 0 {
+                assert!(
+                    matches!(&entry.outcome, zipfast::extract::RarOutcome::Failed(failure) if matches!(failure.as_ref(), zipfast::error::RarFailure::Integrity { .. }))
+                );
+                assert!(!self.bad.exists());
+                assert_eq!(
+                    fs::read_dir(self.bad.parent().unwrap()).unwrap().count(),
+                    0,
+                    "unsuccessful stage is cleaned before callback"
+                );
+            }
+            diagnostic
+                .writer()
+                .expect("independent log remains writable after a corrupt payload")
+                .write_all(if entry.entry.order == 0 { b"corrupt\n" } else { b"valid\n" })
+                .unwrap();
+            self.messages += 1;
+        }
+    }
+    for nested in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("source.rar");
+        let dest = d.path().join("new-destination");
+        let log = d.path().join("log");
+        let bad = if nested { "new/parents/bad" } else { "bad" };
+        let good = if nested { "new/parents/good" } else { "good" };
+        let corrupt = vec![b'x'; 70_000];
+        let original = archive_with(
+            &[
+                (FileSpec::new(bad, &corrupt), crc32fast::hash(&corrupt) ^ 1),
+                (FileSpec::new(good, b"verified"), crc32fast::hash(b"verified")),
+            ],
+            false,
+        );
+        fs::write(&source, &original).unwrap();
+        let diagnostic = OpenOptions::new().create_new(true).append(true).open(&log).unwrap();
+        let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let mut control =
+            RarExtractControl::new(Some(diagnostic), RarOverwriteMode::Always, RarExtractControlLimits::default());
+        let bad_target = dest.join(bad);
+        let mut observer = Log { bad: &bad_target, messages: 0 };
+        let mut report = session.extract_selected_controlled(
+            &selected,
+            &options(&dest),
+            RarDecodeLimits::default(),
+            &mut control,
+            &mut observer,
+        );
+        let summary = report.outcome().as_ref().unwrap();
+        assert_eq!((summary.files, summary.failed, summary.skipped, summary.bytes), (1, 1, 0, 8));
+        assert!(report.diagnostic_failure().is_none(), "{:?}", report.diagnostic_failure());
+        report.diagnostic().writer().expect("delayed terminal log").write_all(b"terminal\n").unwrap();
+        assert!(report.finish().diagnostic_failure.is_none());
+        assert_eq!(observer.messages, 2);
+        assert!(!bad_target.exists());
+        assert_eq!(fs::read(dest.join(good)).unwrap(), b"verified");
+        assert_eq!(fs::read(log).unwrap(), b"corrupt\nvalid\nterminal\n");
+        assert_eq!(fs::read(source).unwrap(), original);
+    }
+}

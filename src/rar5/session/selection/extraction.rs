@@ -150,7 +150,7 @@ impl<'a> Extraction<'a> {
         let mut output = None;
         let mut sink = |chunk: &[u8]| {
             if output.is_none() {
-                output = Some(self.open_stage(parent, &target)?);
+                output = Some(self.open_stage(parent, &target, hooks)?);
             }
             #[cfg(test)]
             event(Event::Write, &target)
@@ -163,9 +163,8 @@ impl<'a> Extraction<'a> {
         };
         let output = match output {
             Some(output) => output,
-            None => self.open_stage(parent, &target).map_err(own_fault)?,
+            None => self.open_stage(parent, &target, hooks).map_err(own_fault)?,
         };
-        hooks.created(target.parent().expect("target parent"));
         let mut file = output.handoff_detailed().map_err(|error| own_fault(error.detailed(false)))?;
         #[cfg(test)]
         event(Event::Flush, &target).map_err(|source| output_fault(IoOperation::Flush, &target, source))?;
@@ -293,9 +292,16 @@ impl<'a> Extraction<'a> {
         Ok(())
     }
 
-    fn open_stage(&self, parent: &Path, target: &Path) -> RarResult<Output> {
+    fn open_stage(&self, parent: &Path, target: &Path, hooks: &mut impl ExtractionHooks) -> RarResult<Output> {
         self.ensure_root()?;
-        make_dirs_detailed(&self.options.dest, parent)?;
+        let directories = make_dirs_detailed(&self.options.dest, parent);
+        // Capture completed native directory preparation before tempfile creation
+        // or payload verification can fail. before_path already checked the old
+        // bindings; this advances only that known engine change. On a partial
+        // preparation error only the completed root is known, so do not adopt
+        // an uncertain descendant merely because it now exists.
+        hooks.created(if directories.is_ok() { target.parent().expect("target parent") } else { &self.options.dest });
+        directories?;
         let stage = temporary(target.parent().expect("target has a parent")).map_err(|source| {
             RarFault::output(IoOperation::CreateFile, Some(target.to_path_buf()), None, source, false)
         })?;
@@ -682,5 +688,74 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), original);
         assert_eq!(fs::metadata(&first).unwrap().ino(), fs::metadata(&target).unwrap().ino());
         assert_eq!(fs::read_dir(&dest).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn controlled_write_failure_keeps_completed_parent_preparation_admitted() {
+        use crate::rar5::session::{
+            RarDecisionError, RarDiagnostic, RarExtractControl, RarExtractControlLimits, RarExtractError,
+            RarExtractObserver, RarOverwriteConflict, RarOverwriteDecision, RarOverwriteMode,
+        };
+        struct Observer {
+            events: usize,
+        }
+        impl RarExtractObserver for Observer {
+            fn overwrite(
+                &mut self,
+                _: &RarOverwriteConflict<'_>,
+                _: RarDiagnostic<'_>,
+            ) -> Result<RarOverwriteDecision, RarDecisionError> {
+                panic!("new target");
+            }
+            fn entry(&mut self, event: &RarEntryOutcome, mut diagnostic: RarDiagnostic<'_>) {
+                assert!(
+                    matches!(&event.outcome, RarOutcome::Failed(failure) if matches!(failure.as_ref(), RarFailure::Output { operation: IoOperation::Write, .. }))
+                );
+                diagnostic
+                    .writer()
+                    .expect("native failure may still describe created directories")
+                    .write_all(b"failed\n")
+                    .unwrap();
+                self.events += 1;
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.rar");
+        fs::write(&source, archive(false, &[(b'x', b'n')])).unwrap();
+        let dest = dir.path().join("new/destination");
+        let log = dir.path().join("log");
+        let file = OpenOptions::new().create_new(true).append(true).open(&log).unwrap();
+        let mut session = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = session.select(|_| true).unwrap();
+        let mut control =
+            RarExtractControl::new(Some(file), RarOverwriteMode::Always, RarExtractControlLimits::default());
+        let mut observer = Observer { events: 0 };
+        let mut report = with_hook(
+            |event, _| {
+                if event == Event::Write { Err(io::Error::from_raw_os_error(libc::EIO)) } else { Ok(()) }
+            },
+            || {
+                session.extract_selected_controlled(
+                    &selected,
+                    &options(&dest),
+                    RarDecodeLimits::default(),
+                    &mut control,
+                    &mut observer,
+                )
+            },
+        );
+        assert!(
+            matches!(report.outcome(), Err(RarExtractError::Native(error)) if error.partial.files == 0 && error.partial.failed == 1 && matches!(error.failure.as_ref(), RarFailure::Output { operation: IoOperation::Write, source, .. } if source.raw_os_error() == Some(libc::EIO)))
+        );
+        assert_eq!(fs::read_dir(&dest).unwrap().count(), 0);
+        report
+            .diagnostic()
+            .writer()
+            .expect("terminal diagnostic after native failure")
+            .write_all(b"terminal\n")
+            .unwrap();
+        assert!(report.finish().diagnostic_failure.is_none());
+        assert_eq!(observer.events, 1);
+        assert_eq!(fs::read(log).unwrap(), b"failed\nterminal\n");
     }
 }
