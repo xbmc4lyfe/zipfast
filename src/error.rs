@@ -168,6 +168,12 @@ pub enum RarResource {
     PrintMemberSpoolBytes,
     PrintLiveSpoolBytes,
     PrintIoAttempts,
+    ExtractControlCapacity,
+    ExtractControlWork,
+    ExtractControlAllocation,
+    ExtractDecisionCalls,
+    ExtractControlIoAttempts,
+    ExtractControlHandles,
 }
 
 #[derive(Debug)]

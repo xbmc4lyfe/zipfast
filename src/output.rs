@@ -227,6 +227,15 @@ impl WriteFile {
 
     #[cfg(unix)]
     pub(crate) fn publish_selected(self, replace: bool) -> Result<(), OutputError> {
+        self.publish_selected_observed(replace, |_, _| {})
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn publish_selected_observed(
+        self,
+        replace: bool,
+        mut observe: impl FnMut(&File, bool),
+    ) -> Result<(), OutputError> {
         let Self { file, pending } = self;
         let Some(PendingPath::Selected(mut stage, target)) = pending else {
             unreachable!("selected output has a stage");
@@ -244,6 +253,7 @@ impl WriteFile {
                 source: error.error,
             })
         };
+        observe(&file, result.is_ok());
         drop(file);
         result
     }
