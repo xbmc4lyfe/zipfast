@@ -1055,3 +1055,85 @@ fn listing_mid_and_final_source_changes_keep_provisional_rows_and_constant_metad
         assert_eq!(failure.usage.accepted_bytes, out.bytes.len() as u128);
     }
 }
+
+#[test]
+fn whole_wave_first_real_write_fault_survives_distinct_caller_error() {
+    struct RealWrite {
+        socket: UnixStream,
+        peer: Option<UnixStream>,
+        source: std::path::PathBuf,
+        mutate: bool,
+        calls: usize,
+    }
+    impl AsFd for RealWrite {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            self.socket.as_fd()
+        }
+    }
+    impl Write for RealWrite {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 1 {
+                let n = self.socket.write(&bytes[..bytes.len().min(3)])?;
+                let mut received = [0; 3];
+                std::io::Read::read_exact(self.peer.as_mut().unwrap(), &mut received[..n])?;
+                self.peer.take();
+                Ok(n)
+            } else {
+                if self.mutate {
+                    std::fs::OpenOptions::new().append(true).open(&self.source)?.write_all(b"change")?;
+                }
+                self.socket.write(bytes)
+            }
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    struct Observer<'a> {
+        out: &'a mut RealWrite,
+        callbacks: &'a mut usize,
+    }
+    impl ZipRunObserver for Observer<'_> {
+        fn prepare(&mut self, s: &mut ZipDiagnosticScope<'_>) -> ZipObserverResult<()> {
+            s.admit_sinks(None, Some(self.out))?;
+            Ok(())
+        }
+        fn observe(&mut self, _: ZipRunEvent<'_>, s: &mut ZipDiagnosticScope<'_>) -> ZipObserverResult<()> {
+            *self.callbacks += 1;
+            assert!(s.emit(ZipDiagnosticSink::Stderr, self.out, |_, w| w.write_fmt(format_args!("fault\n"))).is_err());
+            Err(ZipSinkFault::StageChanged.into())
+        }
+    }
+    for mutate in [false, true] {
+        let mut bad = Member::stored(b"bad", b"bad");
+        bad.crc = Some(1);
+        let (file, mut session, options, mut context) =
+            super::run::setup(&[bad, Member::stored(b"unvisited", b"good")]);
+        let (socket, peer) = UnixStream::pair().unwrap();
+        let mut out = RealWrite { socket, peer: Some(peer), source: file.path().to_path_buf(), mutate, calls: 0 };
+        let mut callbacks = 0;
+        let error = session
+            .run_with_context(
+                &options,
+                Some("pw"),
+                &Cancellation::default(),
+                &mut context,
+                Observer { out: &mut out, callbacks: &mut callbacks },
+            )
+            .unwrap_err();
+        assert!(
+            matches!(error.diagnostic_fault(),Some(ZipSinkFault::Io{operation:ReadIoOperation::Write,offset:0,error})if error.raw_os_error()==Some(libc::EPIPE)),
+            "diagnostic={:?}",
+            error.diagnostic_fault()
+        );
+        assert!(matches!(error.operation(), Some(ReadFault::Integrity { .. })));
+        assert_eq!(error.source_change().is_some(), mutate);
+        assert_eq!(callbacks, 1);
+        assert_eq!(out.calls, 2);
+        let report = error.partial_run().unwrap();
+        assert_eq!(report.run_usage().records, 1);
+        assert_eq!(report.diagnostic_usage().accepted_bytes, 3);
+        assert_eq!(report.diagnostic_usage().write_attempts, 2);
+    }
+}

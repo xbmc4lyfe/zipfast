@@ -394,3 +394,216 @@ fn methods_six_and_seven_decode_valid_algorithm_zero_streams() {
     }
     assert_eq!(fs::read(arc).unwrap(), bytes);
 }
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn whole_wave_generic_legacy_errors_preserve_quiet_silent_normal_and_stops() {
+    use zipfast::zip::{EncryptedReadOverrides, ZipRunEvent, ZipSinkFault};
+    let root = tempfile::tempdir().unwrap();
+    let arc = root.path().join("legacy.rar");
+    let mut bytes = SIG.to_vec();
+    bytes.extend(main_block(false, None));
+    bytes.extend(stored_block(&FileSpec::new("exists", b"replacement")));
+    for name in ["bad-first", "bad-middle", "bad-last"] {
+        bytes.extend(file_block(&FileSpec::new(name, b"bad"), b"bad", 0, false, false));
+    }
+    bytes.extend(stored_block(&FileSpec::new("good", b"good")));
+    bytes.extend(end_block(false));
+    fs::write(&arc, &bytes).unwrap();
+    let setup = |label: &str| {
+        let out = root.path().join(label);
+        fs::create_dir(&out).unwrap();
+        fs::write(out.join("exists"), b"original").unwrap();
+        Options { overwrite: Overwrite::Skip, ..options(&out, 1) }
+    };
+    let legacy_opts = setup("legacy");
+    let mut baseline_lines = Vec::new();
+    let summary =
+        extract::run_with_password(&arc, &legacy_opts, None, |line| baseline_lines.push(line.to_owned())).unwrap();
+    assert_eq!(summary.errors, ["bad-first: checksum error", "bad-middle: checksum error", "bad-last: checksum error"]);
+    assert_eq!(baseline_lines[0], "exists: exists, skipped");
+    assert_eq!((summary.files, summary.skipped), (1, 1));
+    for mode in ["quiet", "silent", "normal"] {
+        let opts = setup(mode);
+        let (mut mixed, mut errors, mut displayed, mut ended) = (Vec::new(), Vec::new(), Vec::new(), 0);
+        let report = extract::run_with_zip_policy(
+            &arc,
+            &opts,
+            None,
+            &extract::Cancellation::default(),
+            &EncryptedReadOverrides::default(),
+            |event: ZipRunEvent<'_>| {
+                match event {
+                    ZipRunEvent::LegacyDiagnostic { message } => {
+                        mixed.push(message.to_owned());
+                        if mode == "normal" {
+                            displayed.push(message.to_owned());
+                        }
+                    }
+                    ZipRunEvent::LegacyError { message, .. } => {
+                        errors.push(message.to_owned());
+                        if mode == "quiet" {
+                            displayed.push(message.to_owned());
+                        }
+                    }
+                    ZipRunEvent::RunEnded { .. } => ended += 1,
+                    _ => panic!("non-ZIP route emitted checked member event"),
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(mixed, baseline_lines);
+        assert_eq!(errors, summary.errors);
+        assert_eq!(ended, 1);
+        assert_eq!((report.files(), report.skipped(), report.failed()), (1, 1, 3));
+        assert_eq!(
+            displayed,
+            if mode == "normal" {
+                baseline_lines.clone()
+            } else if mode == "quiet" {
+                summary.errors.clone()
+            } else {
+                Vec::new()
+            }
+        );
+        assert_eq!(fs::read(opts.dest.join("exists")).unwrap(), b"original");
+        assert_eq!(fs::read(opts.dest.join("good")).unwrap(), b"good");
+    }
+    // Structured legacy observers never prepare or obtain checked emit authority.
+    struct Quiet<'a> {
+        out: &'a mut Vec<u8>,
+        ended: &'a mut usize,
+    }
+    impl zipfast::zip::ZipRunObserver for Quiet<'_> {
+        fn prepare(&mut self, _: &mut zipfast::zip::ZipDiagnosticScope<'_>) -> zipfast::zip::ZipObserverResult<()> {
+            panic!("legacy prepare must remain skipped");
+        }
+        fn observe(
+            &mut self,
+            e: ZipRunEvent<'_>,
+            _: &mut zipfast::zip::ZipDiagnosticScope<'_>,
+        ) -> zipfast::zip::ZipObserverResult<()> {
+            if let ZipRunEvent::LegacyError { message, .. } = e {
+                self.out.extend_from_slice(message.as_bytes());
+                self.out.push(b'\n');
+            } else if matches!(e, ZipRunEvent::RunEnded { .. }) {
+                *self.ended += 1;
+            }
+            Ok(())
+        }
+    }
+    let opts = setup("structured-context");
+    let (mut quiet_output, mut ended) = (Vec::new(), 0);
+    let mut context = zipfast::zip::EncryptedReadContext::new(Default::default()).unwrap();
+    let report = extract::run_with_zip_context(
+        &arc,
+        &opts,
+        None,
+        &extract::Cancellation::default(),
+        &mut context,
+        Quiet { out: &mut quiet_output, ended: &mut ended },
+    )
+    .unwrap();
+    assert_eq!(quiet_output, (summary.errors.join("\n") + "\n").as_bytes());
+    assert_eq!(ended, 1);
+    assert_eq!(
+        (report.files(), report.dirs(), report.skipped(), report.failed(), report.decoded_bytes(), report.volumes()),
+        (summary.files, summary.dirs, summary.skipped, 3, u128::from(summary.bytes), summary.volumes)
+    );
+    struct Reject<'a> {
+        out: &'a mut std::fs::File,
+        calls: &'a mut usize,
+    }
+    impl zipfast::zip::ZipRunObserver for Reject<'_> {
+        fn prepare(&mut self, _: &mut zipfast::zip::ZipDiagnosticScope<'_>) -> zipfast::zip::ZipObserverResult<()> {
+            panic!("legacy prepare must remain skipped");
+        }
+        fn observe(
+            &mut self,
+            _: ZipRunEvent<'_>,
+            s: &mut zipfast::zip::ZipDiagnosticScope<'_>,
+        ) -> zipfast::zip::ZipObserverResult<()> {
+            *self.calls += 1;
+            let _ = s.emit(zipfast::zip::ZipDiagnosticSink::Stderr, self.out, |_, w| {
+                w.write_fmt(format_args!("must refuse"))
+            });
+            Ok(())
+        }
+    }
+    let opts = setup("unbound-checked-emit");
+    let mut sink = tempfile::tempfile().unwrap();
+    let mut calls = 0;
+    let error = extract::run_with_zip_policy(
+        &arc,
+        &opts,
+        None,
+        &extract::Cancellation::default(),
+        &EncryptedReadOverrides::default(),
+        Reject { out: &mut sink, calls: &mut calls },
+    )
+    .unwrap_err();
+    assert_eq!(calls, 1);
+    assert_eq!(sink.metadata().unwrap().len(), 0);
+    assert!(error.diagnostic_boundary_fault().is_some());
+    assert_eq!(error.partial_run().unwrap().failed(), 3);
+    for fail_at in [0, baseline_lines.len() / 2, baseline_lines.len() - 1] {
+        let opts = setup(&format!("mixed-stop-{fail_at}"));
+        let (mut calls, mut replayed, mut ended) = (0, 0, 0);
+        let error = extract::run_with_zip_policy(
+            &arc,
+            &opts,
+            None,
+            &extract::Cancellation::default(),
+            &EncryptedReadOverrides::default(),
+            |event: ZipRunEvent<'_>| {
+                match event {
+                    ZipRunEvent::LegacyDiagnostic { .. } => {
+                        let n = calls;
+                        calls += 1;
+                        if n == fail_at {
+                            return Err(ZipSinkFault::StageChanged);
+                        }
+                    }
+                    ZipRunEvent::LegacyError { .. } => replayed += 1,
+                    ZipRunEvent::RunEnded { .. } => ended += 1,
+                    _ => {}
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!((calls, replayed, ended), (fail_at + 1, 0, 0));
+        assert_eq!((error.partial_run().unwrap().files(), error.partial_run().unwrap().failed()), (1, 3));
+    }
+    for fail_at in 0..3 {
+        let opts = setup(&format!("stop-{fail_at}"));
+        let (mut replayed, mut ended) = (0, 0);
+        let error = extract::run_with_zip_policy(
+            &arc,
+            &opts,
+            None,
+            &extract::Cancellation::default(),
+            &EncryptedReadOverrides::default(),
+            |event: ZipRunEvent<'_>| {
+                match event {
+                    ZipRunEvent::LegacyError { .. } => {
+                        let n = replayed;
+                        replayed += 1;
+                        if n == fail_at {
+                            return Err(ZipSinkFault::StageChanged);
+                        }
+                    }
+                    ZipRunEvent::RunEnded { .. } => ended += 1,
+                    _ => {}
+                }
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!((replayed, ended), (fail_at + 1, 0));
+        assert!(matches!(error.diagnostic_fault(), Some(ZipSinkFault::StageChanged)));
+        let report = error.partial_run().unwrap();
+        assert_eq!((report.files(), report.skipped(), report.failed()), (1, 1, 3));
+    }
+}

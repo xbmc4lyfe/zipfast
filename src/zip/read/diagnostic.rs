@@ -30,6 +30,7 @@ pub use writer::{ZipDiagnosticUsage, ZipDiagnosticWriter};
 pub type ZipDiagnosticResult<T> = Result<T, ZipDiagnosticStop>;
 pub type ZipObserverResult<T> = Result<T, ZipObserverFault>;
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum ZipObserverFault {
     Caller(ZipSinkFault),
     Recorded(ZipDiagnosticStop),
@@ -264,7 +265,9 @@ impl<'a> ZipDiagnosticScope<'a> {
             ScopeInner::Legacy(mut e) => {
                 match result {
                     Ok(()) => {}
-                    Err(ZipObserverFault::Caller(f)) => e.write = Some(f),
+                    Err(ZipObserverFault::Caller(f)) => {
+                        e.write.get_or_insert(f);
+                    }
                     Err(ZipObserverFault::Recorded(_)) => {
                         e.stop_callbacks = true;
                         e.boundary = Some(DiagnosticBoundaryFault::Admission(ReadFault::InvalidPlan))
@@ -741,7 +744,9 @@ impl<'a> BoundScope<'a> {
     pub(super) fn finish(mut self, result: ZipObserverResult<()>) -> Evidence {
         match result {
             Ok(()) => {}
-            Err(ZipObserverFault::Caller(f)) => self.evidence.write = Some(f),
+            Err(ZipObserverFault::Caller(f)) => {
+                self.evidence.write.get_or_insert(f);
+            }
             Err(ZipObserverFault::Recorded(stop)) if stop.token == self.token && self.evidence.failed() => {}
             Err(ZipObserverFault::Recorded(_)) => {
                 self.evidence.stop_callbacks = true;

@@ -4,6 +4,14 @@ The additive checked reader streams Stored, Deflate, Bzip2, ZIP LZMA, XZ and Zst
 
 Existing `Archive::read_at`, consuming selected reads, `run` and `run_with_password` preserve the 128 MiB packed encrypted-member ceiling. Their signatures and `extract::Options` literals remain compatible. The ordinary command uses the checked policy path. Applications opt into checked reads with `EncryptedReadContext` and the methods below.
 
+## Required output and temporary storage
+
+The default checked CLI intentionally restricts ZIP extraction storage, including **clear, unencrypted members**. Destination storage must be ownership-enforced **local APFS on macOS**, or an admitted **ext-family, XFS, Btrfs or tmpfs filesystem on Linux**. Linux also requires the implemented trusted procfs descriptor view and native ACL facilities. The ownership, privacy and other native-capability checks still apply on these filesystems.
+
+Extraction fails closed on unlisted destinations: common examples are Linux overlayfs/container root filesystems, network mounts, exFAT and macOS HFS+. Use a supported mounted destination. Large encrypted snapshots also need supported temporary storage; set `ZIPFAST_ZIP_TEMP_DIR` to an appropriate mounted location when needed. A supported temporary directory does not make an unsupported destination usable. Permission changes do not add a filesystem to the allowlist. There is no silent fallback to legacy extraction or weaker staging.
+
+Physical qualification currently covers macOS APFS and Linux ext4, Btrfs and tmpfs. XFS is admitted by the code but has **not** been physically qualified in this campaign; other ext variants are not claimed tested. This milestone sacrifices extraction compatibility on previously usable unlisted storage. The full filesystem compatibility goal remains open. Carry this restriction into release and consumer adoption; see [release/adoption notes](zip-checked-release-notes.md).
+
 ## Read one original catalogue entry
 
 ```rust
@@ -56,10 +64,16 @@ Ciphertext payload requests never exceed 64 KiB. AES ciphertext at or below the 
 
 ## Verified output and terminal evidence
 
-`ZipReadStage::prepare_stdout` consumes original entry provenance from a projected session, retained selection or generic selected ZIP. First admit the actual output FD through that same owner. Write callbacks into the private stage, then call `copy_verified` with a final source-check closure bound to that owner. The stage checks source and descriptor identity before copying and again after output operations. The run APIs use checked synchronous file staging and publication for extraction.
+`ZipReadStage::prepare_stdout` consumes original entry provenance from a projected session, retained selection or generic selected ZIP. First admit the actual output FD through that same owner. Write callbacks into the private stage, then call `copy_verified` with a final source-check closure bound to that owner. The owner admits the external output descriptor, and `copy_verified` revalidates that actual descriptor before copying. It observes the original source before and after the copy, then explicitly retires its owned stage. Retain the same locked external output handle throughout; there is no extra post-copy external-descriptor validation. The run APIs use checked synchronous file staging and publication for extraction.
 
 Explicit finish and close run on success and error. A close is attempted once: an interrupted or failed close retains unresolved FD usage and poisons further acquisition. Drop is a bounded fallback, not evidence of successful cleanup. `ZipReadError` retains typed operation, source, sink, diagnostic and cleanup evidence inline, plus partial run totals, publication state (`NotPublished`, `Published` or `Unknown`) and accepted output-byte counts. An error after accepted stdout bytes or successful publication cannot promise rollback. Preserve the complete error and report when adapting it to a UI.
 
 The temporary directory/file checks require trusted functioning storage and process credentials, appropriate type/ownership/mode/ACL, identity and link count. The threat model excludes privileged or same-process compromise and hostile same-UID acquisition of private handles. Already-open same-UID handles can outlive namespace changes. Source and namespace checks detect observed changes optimistically; they do not eliminate check-to-unlink/rename races or malicious restoration of all observed state between checks.
 
 See [qualification evidence](validation/encrypted-streaming-2026-11-13.md) and the [Prybar integration handoff](prybar-resource-integration.md) for measured coverage and caller work.
+
+## Generic non-ZIP legacy events
+
+`extract::run_with_zip_policy` and `run_with_zip_context` retain the incumbent non-ZIP engine. Their legacy observer skips `prepare`; its scope is unbound and cannot admit checked sinks or use checked `emit`. Use the consumer's existing legacy output path. Legacy allocation, parsing and callback behavior are not checked ZIP resource guarantees.
+
+`LegacyDiagnostic { message }` forwards the original mixed callback stream, which includes skips/progress as well as failures. After a successful legacy `Summary`, `LegacyError { message, .. }` borrows each original `Summary.errors` string in order, before `RunEnded`. These are legacy strings, not new typed archive-error classifications. Normal renderers that already print `LegacyDiagnostic` ignore `LegacyError` to avoid duplicates. Quiet renderers ignore mixed diagnostics and print only `LegacyError`; silent renderers ignore both. Counts remain the summary's counts. Plain closure observers receive both event kinds and must choose the channel they render; the adapter does not print either implicitly. The first observer failure stops later callbacks, error replay and `RunEnded`, while retaining the available summary counts; the incumbent legacy operation itself keeps its existing completion behavior.

@@ -338,7 +338,7 @@ impl crate::zip::ZipRunObserver for Renderer<'_> {
         if self.fatal_rendered && matches!(event, ZipRunEvent::RunEnded { error: Some(_), .. }) {
             return Ok(());
         }
-        if matches!(event, ZipRunEvent::MemberSucceeded { .. })
+        if matches!(event, ZipRunEvent::MemberSucceeded { .. } | ZipRunEvent::LegacyError { .. })
             || self.quiet && matches!(event, ZipRunEvent::RunEnded { error: None, .. })
         {
             return Ok(());

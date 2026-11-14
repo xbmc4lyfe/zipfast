@@ -16,6 +16,12 @@ For the checked-reader update, pin both Git engine dependencies to the actual re
 
 Bind verified print output with `ZipReadStage`, admit the actual stdout FD and retain the original source through `copy_verified`'s final check. `EntryGuard::default()` does not justify dropping or reopening the original source. Preserve typed failures, partial accepted counts and publication state. Source/namespace checks remain optimistic under the storage threat model documented in the checked-reader guide. Task7 still owns actual printing/preview/extraction, UI/status, aliases, BrokenPipe and source-mutation qualification; no engine-only result closes those caller gates.
 
+## Checked extraction storage and legacy error channels
+
+The milestone deliberately restricts checked ZIP extraction, including clear members, to ownership-enforced local APFS on macOS or ext-family/XFS/Btrfs/tmpfs on Linux, with the implemented trusted procfs descriptor and ACL facilities. Linux overlayfs/container root, network mounts, exFAT and macOS HFS+ are common refused destinations. Provide supported mounted output and encrypted-snapshot temporary locations; changing temp storage cannot enable an unsupported destination, and permissions cannot enable an unlisted backend. Physical qualification covers APFS/ext4/Btrfs/tmpfs; XFS is admitted but not physically qualified and no other ext variant is claimed tested. Preserve this visible restriction in the release PR and caller handoff; full filesystem compatibility remains open. See [release notes](zip-checked-release-notes.md).
+
+For generic non-ZIP run fallback, preserve Prybar's existing LEGACY sink path. `LegacyDiagnostic` is the original mixed progress/skip/failure callback text. Normal output prints that channel and ignores `LegacyError`. Quiet output ignores mixed diagnostics and prints only ordered borrowed `LegacyError` strings from the original successful `Summary.errors`; silent output ignores both. Both channels reach a plain closure observer, so explicitly choose which to render. Legacy preparation remains skipped and its scope has no checked `emit` capability. No string matching or newly typed failure inference is needed. Observer failure suppresses every later callback/error replay/RunEnded; returned partial counts remain available.
+
 ## Catalogue reuse
 
 Current inspection and ZIP browsing already retain one `zipfast::zip::ReadSession`. Inspection metadata and background browser reads share its source-bound catalogue. The audit's older two-catalogue browser implementation has been replaced.

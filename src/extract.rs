@@ -967,12 +967,24 @@ fn legacy_zip_report(
             }
         }
     });
-    let (report, mut terminal) = match result {
-        Ok(summary) => (ZipRunReport::from_legacy(&summary), None),
-        Err(error) => (ZipRunReport::default(), Some(ZipReadError::from(ReadFault::Legacy(error)))),
+    let (report, summary, mut terminal) = match result {
+        Ok(summary) => (ZipRunReport::from_legacy(&summary), Some(summary), None),
+        Err(error) => (ZipRunReport::default(), None, Some(ZipReadError::from(ReadFault::Legacy(error)))),
     };
     if let Some(fault) = fault {
         return Err(fault.with_partial(report));
+    }
+    // Borrow the original legacy strings while the successful Summary is live.
+    // This error-only channel lets quiet consumers omit mixed skip/progress text.
+    if let Some(summary) = &summary {
+        for message in &summary.errors {
+            let mut scope = crate::zip::ZipDiagnosticScope::legacy();
+            let result = observe.observe(ZipRunEvent::LegacyError { message }, &mut scope);
+            let evidence = scope.finish(result);
+            if evidence.failed() {
+                return Err(evidence.merge(ReadFault::InvalidPlan.into()).with_partial(report));
+            }
+        }
     }
     let mut scope = crate::zip::ZipDiagnosticScope::legacy();
     let result = observe.observe(ZipRunEvent::RunEnded { report: &report, error: terminal.as_ref() }, &mut scope);

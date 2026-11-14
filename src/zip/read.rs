@@ -606,11 +606,36 @@ impl Drop for OutputReservation {
 }
 #[non_exhaustive]
 pub enum ZipRunEvent<'a> {
-    MemberFailed { ordinal: u64, name: &'a str, error: &'a ZipReadError },
-    MemberSkipped { ordinal: u64, name: &'a str },
-    MemberSucceeded { ordinal: u64, name: &'a str, decoded_bytes: u64 },
-    LegacyDiagnostic { message: &'a str },
-    RunEnded { report: &'a ZipRunReport, error: Option<&'a ZipReadError> },
+    MemberFailed {
+        ordinal: u64,
+        name: &'a str,
+        error: &'a ZipReadError,
+    },
+    MemberSkipped {
+        ordinal: u64,
+        name: &'a str,
+    },
+    MemberSucceeded {
+        ordinal: u64,
+        name: &'a str,
+        decoded_bytes: u64,
+    },
+    /// Original mixed non-ZIP callbacks: skip/progress text as well as errors.
+    /// Normal renderers use this channel and ignore LegacyError.
+    LegacyDiagnostic {
+        message: &'a str,
+    },
+    /// Borrowed original legacy Summary.errors text, in its original order.
+    /// Quiet renderers use this channel; silent renderers ignore both channels.
+    /// Plain closure observers receive both and choose what to render.
+    #[non_exhaustive]
+    LegacyError {
+        message: &'a str,
+    },
+    RunEnded {
+        report: &'a ZipRunReport,
+        error: Option<&'a ZipReadError>,
+    },
 }
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ZipRunReport {
