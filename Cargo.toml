@@ -24,6 +24,7 @@ resolver = "3"
 name = "zipfast"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.100"
 license = "RPL-1.5"
 description = "Fast universal archive extractor"
 publish = false

@@ -5,6 +5,9 @@ byte ranges, lists its entries, and reads Stored and Deflate entries. It
 supports ZipCrypto and WinZip AES decryption and operates on bytes supplied
 by the caller.
 
+The minimum supported Rust version is 1.100. Workspace development and CI
+use the pinned Rust 1.100.0 toolchain.
+
 ```rust
 let archive = zipview::ZipReader::new(bytes)?;
 
@@ -156,11 +159,15 @@ cargo clippy --all-targets -- -D warnings
 
 ### Fuzzing
 
+Fuzz instrumentation requires nightly. Override the repository's stable pin
+for cargo-fuzz and its nested Cargo commands using rustup's shims:
+
 ```bash
 python3 fuzz/gen_seeds.py            # valid archives to start from
 cargo run --example seedcheck        # confirm they are actually valid
 mkdir -p fuzz/corpus/fuzz_zip
-cargo +nightly fuzz run fuzz_zip fuzz/corpus/fuzz_zip fuzz/seeds
+PATH="$HOME/.cargo/bin:$PATH" RUSTUP_TOOLCHAIN=nightly \
+  cargo fuzz run fuzz_zip fuzz/corpus/fuzz_zip fuzz/seeds
 ```
 
 The target both lists *and reads* every entry, because a reader that parsed

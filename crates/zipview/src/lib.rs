@@ -1035,7 +1035,7 @@ fn sha1_compress_call(state: [u32; 5], block: [u32; 16]) -> [u32; 5] {
 /// The big-endian words of a 64-byte block.
 fn sha1_words(block: &[u8]) -> [u32; 16] {
     let mut w = [0u32; 16];
-    for (word, bytes) in w.iter_mut().zip(block.chunks_exact(4)) {
+    for (word, bytes) in w.iter_mut().zip(block.as_chunks::<4>().0.iter()) {
         *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
     }
     w
@@ -1045,18 +1045,17 @@ fn sha1_words(block: &[u8]) -> [u32; 16] {
 /// compressed into it (a multiple of 64), with `data` as the rest of the
 /// message.
 fn sha1_finish(mut state: [u32; 5], prefix_len: u64, data: &[u8]) -> [u32; 5] {
-    let mut blocks = data.chunks_exact(64);
-    for block in &mut blocks {
+    let (blocks, rest) = data.as_chunks::<64>();
+    for block in blocks {
         state = sha1_compress_call(state, sha1_words(block));
     }
-    let rest = blocks.remainder();
     let bit_len = (prefix_len + data.len() as u64) * 8;
     let mut tail = [0u8; 128];
     tail[..rest.len()].copy_from_slice(rest);
     tail[rest.len()] = 0x80;
     let end = if rest.len() < 56 { 64 } else { 128 };
     tail[end - 8..end].copy_from_slice(&bit_len.to_be_bytes());
-    for block in tail[..end].chunks_exact(64) {
+    for block in tail[..end].as_chunks::<64>().0.iter() {
         state = sha1_compress_call(state, sha1_words(block));
     }
     state
@@ -1073,7 +1072,12 @@ impl HmacSha1 {
     fn new(key: &[u8]) -> Self {
         let mut k = [0u8; 64];
         if key.len() > 64 {
-            for (slot, word) in k.chunks_exact_mut(4).zip(sha1_finish(SHA1_INIT, 0, key)) {
+            for (slot, word) in k
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .zip(sha1_finish(SHA1_INIT, 0, key))
+            {
                 slot.copy_from_slice(&word.to_be_bytes());
             }
         } else {
@@ -1149,7 +1153,7 @@ fn pbkdf2_sha1(
         let sum = accel::pbkdf2_sha1_rest(mac.inner, mac.outer, u, iterations)
             .unwrap_or_else(|| mac.rest(u, iterations));
         let mut block = [0u8; 20];
-        for (bytes, word) in block.chunks_exact_mut(4).zip(sum) {
+        for (bytes, word) in block.as_chunks_mut::<4>().0.iter_mut().zip(sum) {
             bytes.copy_from_slice(&word.to_be_bytes());
         }
         let from = start.saturating_sub(index * 20);
@@ -1331,7 +1335,7 @@ fn aes_expand_key(key: &[u8]) -> Option<([u32; 60], usize)> {
     };
     let total_words = 4 * (nr + 1);
     let mut w = [0u32; 60];
-    for (i, chunk) in key.chunks_exact(4).enumerate() {
+    for (i, chunk) in key.as_chunks::<4>().0.iter().enumerate() {
         w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
     }
     for i in nk..total_words {
@@ -1435,7 +1439,7 @@ fn ctr_xor<const NR: usize>(rk: &[u32; 60], data: &mut [u8]) {
     /// XORs one keystream block into up to 16 bytes.
     fn apply(chunk: &mut [u8], ks: [u32; 4]) {
         let mut bytes = [0u8; 16];
-        for (dst, w) in bytes.chunks_exact_mut(4).zip(ks) {
+        for (dst, w) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(ks) {
             dst.copy_from_slice(&w.to_be_bytes());
         }
         if let Ok(whole) = <&mut [u8; 16]>::try_from(&mut *chunk) {
@@ -1447,19 +1451,21 @@ fn ctr_xor<const NR: usize>(rk: &[u32; 60], data: &mut [u8]) {
         }
     }
     let mut counter = 1u128;
-    let mut groups = data.chunks_exact_mut(16 * CTR_LANES);
-    for group in &mut groups {
+    let (groups, rest) = data.as_chunks_mut::<{ 16 * CTR_LANES }>();
+    for group in groups {
         let blocks: [[u32; 4]; CTR_LANES] =
             std::array::from_fn(|i| block(counter.wrapping_add(i as u128)));
         counter = counter.wrapping_add(CTR_LANES as u128);
         for (chunk, ks) in group
-            .chunks_exact_mut(16)
+            .as_chunks_mut::<16>()
+            .0
+            .iter_mut()
             .zip(aes_encrypt::<NR, CTR_LANES>(rk, blocks))
         {
             apply(chunk, ks);
         }
     }
-    for chunk in groups.into_remainder().chunks_mut(16) {
+    for chunk in rest.chunks_mut(16) {
         let [ks] = aes_encrypt::<NR, 1>(rk, [block(counter)]);
         counter = counter.wrapping_add(1);
         apply(chunk, ks);
@@ -1756,7 +1762,7 @@ mod tests {
         }
         msg.extend_from_slice(&bit_len.to_be_bytes());
 
-        for chunk in msg.chunks_exact(64) {
+        for chunk in msg.as_chunks::<64>().0.iter() {
             let mut w = [0u32; 80];
             for (i, word) in w.iter_mut().take(16).enumerate() {
                 let off = i * 4;
@@ -2006,7 +2012,7 @@ mod tests {
         };
         let total_words = 4 * (nr + 1);
         let mut w = [0u32; 60];
-        for (i, chunk) in key.chunks_exact(4).enumerate() {
+        for (i, chunk) in key.as_chunks::<4>().0.iter().enumerate() {
             w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
         }
         for i in nk..total_words {
@@ -2040,7 +2046,7 @@ mod tests {
                 s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3], s[8], s[13], s[2], s[7], s[12],
                 s[1], s[6], s[11],
             ];
-            for col in s.chunks_exact_mut(4) {
+            for col in s.as_chunks_mut::<4>().0.iter_mut() {
                 let (s0, s1, s2, s3) = (col[0], col[1], col[2], col[3]);
                 let t = s0 ^ s1 ^ s2 ^ s3;
                 col[0] ^= t ^ xtime(s0 ^ s1);
