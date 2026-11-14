@@ -4,6 +4,10 @@ A fast, universal archive extractor written in Rust. Work in progress.
 
 ## Workspace
 
+The workspace requires Rust 1.100.0 or newer. `rust-toolchain.toml` pins development
+and CI to Rust 1.100.0 with rustfmt and Clippy. Use rustup's Cargo and rustc
+from `PATH` so the pin also applies to nested commands.
+
 The root package builds the `zipfast` library and command.
 [`zipview`](crates/zipview/README.md) is a read-only ZIP library for in-memory and range-based access.
 See [workspace integration](docs/zipview-workspace.md) for Git dependencies, build commands, and import provenance.

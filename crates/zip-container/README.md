@@ -13,7 +13,7 @@ retain the raw archive comment, source ranges, and the declared and physical
 directory positions. The discovery result carries cumulative usage for
 continued parsing.
 
-The minimum supported Rust version is 1.87. The crate has zero third-party
+The minimum supported Rust version is 1.100. The crate has zero third-party
 dependencies.
 
 The fixed header, layout, extra framing, and ZIP64 and AES field handling

@@ -40,8 +40,8 @@ pub(crate) fn aes_ctr_xor(rk: &[u32; 60], nr: usize, data: &mut [u8]) -> bool {
 )]
 fn key_bytes(rk: &[u32; 60]) -> [[u8; 16]; 15] {
     let mut out = [[0u8; 16]; 15];
-    for (block, words) in out.iter_mut().zip(rk.chunks_exact(4)) {
-        for (bytes, w) in block.chunks_exact_mut(4).zip(words) {
+    for (block, words) in out.iter_mut().zip(rk.as_chunks::<4>().0.iter()) {
+        for (bytes, w) in block.as_chunks_mut::<4>().0.iter_mut().zip(words) {
             bytes.copy_from_slice(&w.to_be_bytes());
         }
     }
@@ -94,8 +94,8 @@ mod imp {
             unsafe { vld1q_u8(b.as_ptr()) }
         };
         let mut counter = 1u128;
-        let mut groups = data.chunks_exact_mut(16 * LANES);
-        for group in &mut groups {
+        let (groups, rest) = data.as_chunks_mut::<{ 16 * LANES }>();
+        for group in groups {
             let mut s: [uint8x16_t; LANES] =
                 std::array::from_fn(|i| block(counter.wrapping_add(i as u128)));
             counter = counter.wrapping_add(LANES as u128);
@@ -112,7 +112,7 @@ mod imp {
                 unsafe { vst1q_u8(p, veorq_u8(vld1q_u8(p), ks)) };
             }
         }
-        for chunk in groups.into_remainder().chunks_mut(16) {
+        for chunk in rest.chunks_mut(16) {
             let mut b = block(counter);
             counter = counter.wrapping_add(1);
             for key in &rk[..NR - 1] {
@@ -162,8 +162,8 @@ mod imp {
         // the counter's low 64 bits are its first eight bytes, as stored
         let block = |counter: u128| _mm_set_epi64x((counter >> 64) as i64, counter as i64);
         let mut counter = 1u128;
-        let mut groups = data.chunks_exact_mut(16 * LANES);
-        for group in &mut groups {
+        let (groups, rest) = data.as_chunks_mut::<{ 16 * LANES }>();
+        for group in groups {
             let mut s: [__m128i; LANES] = std::array::from_fn(|i| {
                 _mm_xor_si128(block(counter.wrapping_add(i as u128)), rk[0])
             });
@@ -181,7 +181,7 @@ mod imp {
                 unsafe { _mm_storeu_si128(p, _mm_xor_si128(_mm_loadu_si128(p), ks)) };
             }
         }
-        for chunk in groups.into_remainder().chunks_mut(16) {
+        for chunk in rest.chunks_mut(16) {
             let mut b = _mm_xor_si128(block(counter), rk[0]);
             counter = counter.wrapping_add(1);
             for key in &rk[1..NR] {
