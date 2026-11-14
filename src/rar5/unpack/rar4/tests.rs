@@ -557,6 +557,9 @@ fn vm_legacy_label_allocation_refusal_preserves_typed_reason() {
 #[path = "boundary_tests.rs"]
 mod boundary;
 
+#[path = "successor_tests.rs"]
+pub(super) mod successor;
+
 // Fixed, opt-in observations only. No token log or dictionary/payload snapshot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TraceKind {

@@ -22,7 +22,7 @@ use std::io::Write;
 // Byte-identical retained RARLAB solid fixture; provenance and hashes are in the
 // first-boundary report. Keeping the whole archive lets the original parser
 // derive payload position/extent rather than trusting a hand-selected offset.
-const SOLID: &[u8] = &[
+pub(super) const SOLID: &[u8] = &[
     0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00, 0x3b, 0xd0, 0x73, 0x08, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0xe5, 0x95, 0x74, 0x80, 0x80, 0x25, 0x00, 0x5c, 0x00, 0x00, 0x00, 0x90, 0x4c, 0x00, 0x00, 0x03, 0x98, 0x5c,
     0xa5, 0x58, 0x84, 0x18, 0x22, 0x50, 0x1d, 0x35, 0x05, 0x00, 0xa4, 0x81, 0x00, 0x00, 0x61, 0x2e, 0x74, 0x78, 0x74,
@@ -38,7 +38,7 @@ const SOLID: &[u8] = &[
     0x07, 0x00,
 ];
 
-fn solid_first() -> (crate::rar5::FileHeader, &'static [u8], Vec<u8>) {
+pub(super) fn solid_first() -> (crate::rar5::FileHeader, &'static [u8], Vec<u8>) {
     assert_eq!(SOLID.len(), 230);
     assert_eq!(
         crate::crypto::sha256(SOLID),
@@ -76,7 +76,7 @@ fn solid_first() -> (crate::rar5::FileHeader, &'static [u8], Vec<u8>) {
 // Declaring one extra byte is solely a test-driver escape from size-first
 // completion. A real end must still fail with the original DecodedSize error;
 // actual output is independently bounded and checked. Nothing becomes success.
-fn probe<'a>(
+pub(super) fn probe<'a>(
     packed_len: usize,
     actual: usize,
     dictionary: u64,
