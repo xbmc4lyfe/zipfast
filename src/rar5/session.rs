@@ -37,6 +37,8 @@ use super::reader::{Block, Volume, read_failure};
 use super::{FileHeader, FileWire, MHFL_VOLNUMBER, MainHeader, MemberCrypt, Redirection};
 
 mod selection;
+#[cfg(unix)]
+pub use selection::control::*;
 pub use selection::{RarDecodeLimits, RarPrintOptions, RarSelection};
 
 const MAX_VOLUMES: u64 = 4_096;

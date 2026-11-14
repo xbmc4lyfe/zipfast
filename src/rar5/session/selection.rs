@@ -27,7 +27,11 @@ use crate::rar5::RarFormat;
 use crate::rar5::unpack::rar4::{Rar4DecodeError, Rar4Decoder};
 
 #[cfg(unix)]
+pub(super) mod control;
+#[cfg(unix)]
 mod extraction;
+#[cfg(unix)]
+pub use control::*;
 mod printing;
 pub use printing::RarPrintOptions;
 
@@ -110,46 +114,69 @@ impl RarSession {
         mut member: impl FnMut(&mut SelectedRun, &mut RarSession, usize) -> Result<RarOutcome, Arc<RarFailure>>,
         mut on_entry: impl FnMut(&RarEntryOutcome),
     ) -> Result<RarRunSummary, RarRunError> {
+        let mut driver = LegacyDriver { member: &mut member, on_entry: &mut on_entry };
+        self.execute_driver(selection, limits, &mut driver).map_err(|error| match error {
+            DriverError::Native(error) => error,
+            DriverError::Owned { .. } => unreachable!("legacy driver has no owned control stops"),
+        })
+    }
+
+    #[allow(
+        clippy::result_large_err,
+        reason = "owned control stops preserve allocation refusal and partial summary without boxing"
+    )]
+    fn execute_driver(
+        &mut self,
+        selection: &RarSelection,
+        limits: RarDecodeLimits,
+        driver: &mut impl SelectedDriver,
+    ) -> Result<RarRunSummary, DriverError> {
         if !Arc::ptr_eq(&self.token, &selection.token) {
-            return Err(run_error(self.summary(0), None, Arc::new(RarFailure::ForeignSelection)));
+            return Err(DriverError::Native(run_error(self.summary(0), None, Arc::new(RarFailure::ForeignSelection))));
         }
         let mut summary = self.summary(selection.matched);
-        self.check_run_sources(&mut summary)?;
+        self.check_run_sources(&mut summary).map_err(DriverError::Native)?;
         if selection.matched == 0 {
             return Ok(summary);
         }
-        let mut run = match SelectedRun::new(limits) {
-            Ok(run) => run,
-            Err(fault) => return Err(run_error(summary, None, Arc::from(fault.failure))),
-        };
+        driver.prepare(self).map_err(|cause| DriverError::Owned {
+            partial: std::mem::take(&mut summary),
+            entry: None,
+            cause,
+        })?;
+        let mut run = SelectedRun::new(limits).map_err(|fault| {
+            DriverError::Native(run_error(std::mem::take(&mut summary), None, Arc::from(fault.failure)))
+        })?;
         for (word, mut bits) in selection.bits.iter().copied().enumerate() {
             while bits != 0 {
                 let index = word * 64 + bits.trailing_zeros() as usize;
                 bits &= bits - 1;
-                let header = &self.members[index].header;
-                let context = EntryContext {
-                    entry: RarEntryIdentity {
-                        index: Some(index as u64),
-                        order: index as u64,
-                        name: header.name.clone(),
-                    },
-                    method: header.method,
-                    password: RarPasswordEvidence::NotEncrypted,
+                let entry = driver.identity(self, index).map_err(|cause| DriverError::Owned {
+                    partial: std::mem::take(&mut summary),
+                    entry: None,
+                    cause,
+                })?;
+                let method = self.members[index].header.method;
+                let (outcome, terminal) = match driver.member(&mut run, self, index, &entry) {
+                    Ok(outcome) => (outcome, None),
+                    Err(SelectedStop::Native(failure)) => (RarOutcome::Failed(Arc::clone(&failure)), Some(failure)),
+                    Err(cause) => return Err(DriverError::Owned { partial: summary, entry: Some(entry), cause }),
                 };
-                match member(&mut run, self, index) {
-                    Ok(outcome) => {
-                        if let Err(fault) = count_outcome(&mut summary, &outcome) {
-                            return Err(run_error(summary, Some(context.entry), Arc::from(fault.failure)));
+                if let Err(fault) = count_outcome(&mut summary, &outcome) {
+                    return Err(DriverError::Native(run_error(summary, Some(entry), Arc::from(fault.failure))));
+                }
+                let event = RarEntryOutcome { entry, method, outcome };
+                let callback = driver.entry(&event, self);
+                if let Some(failure) = terminal {
+                    return Err(DriverError::Native(run_error(summary, Some(event.entry), failure)));
+                }
+                if let Err(cause) = callback {
+                    return Err(match cause {
+                        SelectedStop::Native(failure) => {
+                            DriverError::Native(run_error(summary, Some(event.entry), failure))
                         }
-                        on_entry(&context.event(outcome));
-                    }
-                    Err(failure) => {
-                        if let Err(fault) = count_outcome(&mut summary, &RarOutcome::Failed(Arc::clone(&failure))) {
-                            return Err(run_error(summary, Some(context.entry), Arc::from(fault.failure)));
-                        }
-                        on_entry(&context.event(RarOutcome::Failed(Arc::clone(&failure))));
-                        return Err(run_error(summary, Some(context.entry), failure));
-                    }
+                        cause => DriverError::Owned { partial: summary, entry: Some(event.entry), cause },
+                    });
                 }
             }
         }
@@ -189,6 +216,72 @@ impl RarSession {
             self.invalid_binding = Some(Arc::clone(&failure));
             return Err(failure);
         }
+        Ok(())
+    }
+}
+
+enum SelectedStop {
+    Native(Arc<RarFailure>),
+    #[cfg(unix)]
+    Control(control::RarExtractControlError),
+    #[cfg(unix)]
+    Decision(control::RarDecisionError),
+}
+impl From<Arc<RarFailure>> for SelectedStop {
+    fn from(failure: Arc<RarFailure>) -> Self {
+        Self::Native(failure)
+    }
+}
+#[cfg(unix)]
+impl From<control::RarExtractControlError> for SelectedStop {
+    fn from(cause: control::RarExtractControlError) -> Self {
+        Self::Control(cause)
+    }
+}
+enum DriverError {
+    Native(RarRunError),
+    Owned { partial: RarRunSummary, entry: Option<RarEntryIdentity>, cause: SelectedStop },
+}
+trait SelectedDriver {
+    fn prepare(&mut self, _session: &RarSession) -> Result<(), SelectedStop> {
+        Ok(())
+    }
+    fn identity(&mut self, session: &RarSession, index: usize) -> Result<RarEntryIdentity, SelectedStop> {
+        Ok(RarEntryIdentity {
+            index: Some(index as u64),
+            order: index as u64,
+            name: session.members[index].header.name.clone(),
+        })
+    }
+    fn member(
+        &mut self,
+        run: &mut SelectedRun,
+        session: &mut RarSession,
+        index: usize,
+        entry: &RarEntryIdentity,
+    ) -> Result<RarOutcome, SelectedStop>;
+    fn entry(&mut self, event: &RarEntryOutcome, session: &mut RarSession) -> Result<(), SelectedStop>;
+}
+struct LegacyDriver<'a, M, E> {
+    member: &'a mut M,
+    on_entry: &'a mut E,
+}
+impl<M, E> SelectedDriver for LegacyDriver<'_, M, E>
+where
+    M: FnMut(&mut SelectedRun, &mut RarSession, usize) -> Result<RarOutcome, Arc<RarFailure>>,
+    E: FnMut(&RarEntryOutcome),
+{
+    fn member(
+        &mut self,
+        run: &mut SelectedRun,
+        session: &mut RarSession,
+        index: usize,
+        _: &RarEntryIdentity,
+    ) -> Result<RarOutcome, SelectedStop> {
+        (self.member)(run, session, index).map_err(SelectedStop::Native)
+    }
+    fn entry(&mut self, event: &RarEntryOutcome, _: &mut RarSession) -> Result<(), SelectedStop> {
+        (self.on_entry)(event);
         Ok(())
     }
 }
@@ -623,7 +716,13 @@ fn is_terminal(failure: &RarFailure) -> bool {
                     | RarResource::SelectedDecodedBytes
                     | RarResource::PrintMemberSpoolBytes
                     | RarResource::PrintLiveSpoolBytes
-                    | RarResource::PrintIoAttempts,
+                    | RarResource::PrintIoAttempts
+                    | RarResource::ExtractControlCapacity
+                    | RarResource::ExtractControlWork
+                    | RarResource::ExtractControlAllocation
+                    | RarResource::ExtractDecisionCalls
+                    | RarResource::ExtractControlIoAttempts
+                    | RarResource::ExtractControlHandles,
                 ..
             }
     )
