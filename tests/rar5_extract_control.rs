@@ -736,29 +736,49 @@ fn flattened_duplicate_and_empty_outputs_share_the_guard_projection() {
 
 #[test]
 fn known_target_alias_precedes_an_unrelated_metadata_obstruction() {
-    use std::os::unix::fs::PermissionsExt;
-    let d = tempfile::tempdir().unwrap();
-    let source = d.path().join("a.rar");
-    let out = d.path().join("out");
-    let blocked = out.join("blocked");
-    fs::create_dir_all(&blocked).unwrap();
-    let alias = out.join("alias");
-    fs::write(&alias, b"original").unwrap();
-    fs::write(&source, archive(&[FileSpec::new("blocked/item", b"A"), FileSpec::new("alias", b"B")])).unwrap();
-    fs::set_permissions(&blocked, fs::Permissions::from_mode(0o0)).unwrap();
-    let mut s = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
-    let selected = s.select(|_| true).unwrap();
-    let mut c = RarExtractControl::new(
-        Some(OpenOptions::new().append(true).open(&alias).unwrap()),
-        RarOverwriteMode::Always,
-        RarExtractControlLimits::default(),
-    );
-    let f = s
-        .extract_selected_controlled(&selected, &options(&out), RarDecodeLimits::default(), &mut c, &mut Quiet)
-        .finish();
-    fs::set_permissions(blocked, fs::Permissions::from_mode(0o700)).unwrap();
-    assert!(matches!(f.diagnostic_failure, Some(RarDiagnosticFailure::AliasTarget { ordinal: 1 })));
-    assert_eq!(fs::read(alias).unwrap(), b"original");
+    use zipfast::error::{IoOperation, RarFailure};
+    for aliases_target in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let source = d.path().join("a.rar");
+        let out = d.path().join("out");
+        fs::create_dir(&out).unwrap();
+        // A real metadata obstruction that root cannot bypass, unlike mode000.
+        let blocked_name = "x".repeat(4096);
+        let blocked = out.join(&blocked_name);
+        assert_eq!(fs::symlink_metadata(&blocked).unwrap_err().raw_os_error(), Some(libc::ENAMETOOLONG));
+        let alias = out.join("alias");
+        fs::write(&alias, b"original").unwrap();
+        fs::write(&source, archive(&[FileSpec::new(&blocked_name, b"A"), FileSpec::new("alias", b"B")])).unwrap();
+        let log = d.path().join("log");
+        fs::write(&log, b"").unwrap();
+        let diagnostic = if aliases_target { &alias } else { &log };
+        let mut s = RarSession::open(&source, None, RarSessionOptions::default()).unwrap();
+        let selected = s.select(|_| true).unwrap();
+        let mut c = RarExtractControl::new(
+            Some(OpenOptions::new().append(true).open(diagnostic).unwrap()),
+            RarOverwriteMode::Always,
+            RarExtractControlLimits::default(),
+        );
+        let f = s
+            .extract_selected_controlled(&selected, &options(&out), RarDecodeLimits::default(), &mut c, &mut Quiet)
+            .finish();
+        assert!(matches!(f.outcome, Err(RarExtractError::Native(error))
+            if error.partial.failed == 1 && error.partial.files == 0 && error.partial.dirs == 0
+                && error.partial.skipped == 0 && error.partial.bytes == 0
+                && error.entry.as_ref().is_some_and(|entry| entry.order == 0 && entry.name == blocked_name)
+                && matches!(error.failure.as_ref(), RarFailure::Output {
+                    operation: IoOperation::Metadata, path: Some(path), source, ..
+                } if path == &blocked && source.raw_os_error() == Some(libc::ENAMETOOLONG))));
+        if aliases_target {
+            assert!(matches!(f.diagnostic_failure, Some(RarDiagnosticFailure::AliasTarget { ordinal: 1 })));
+        } else {
+            assert!(matches!(f.diagnostic_failure, Some(RarDiagnosticFailure::Metadata {
+                operation: IoOperation::Metadata, source,
+            }) if source.raw_os_error() == Some(libc::ENAMETOOLONG)));
+        }
+        assert_eq!(fs::read(alias).unwrap(), b"original");
+        assert_eq!(fs::read(log).unwrap(), b"");
+    }
 }
 
 #[test]
